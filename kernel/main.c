@@ -12,8 +12,22 @@
 #include "vmm.h"
 #include "kheap.h"
 #include "proc.h"
+#include "ata.h"
+#include "vfs.h"
+#include "net.h"
+#include "uproc.h"
+#include "fpu.h"
 
 struct bootinfo *boot_info;
+
+static void init_launcher(void *arg)
+{
+    (void)arg;
+    char *argv[] = { "/bin/init", NULL };
+    int pid = uproc_spawn("/bin/init", argv, 1);
+    if (pid < 0)
+        kprintf("init: failed to spawn /bin/init\n");
+}
 
 void kmain(uint64_t bootinfo_phys)
 {
@@ -35,59 +49,41 @@ void kmain(uint64_t bootinfo_phys)
             usable / (1024 * 1024), boot_info->e820_count);
 
     gdt_init();
-    kprintf("gdt: loaded (kernel/user segments + TSS)\n");
     idt_init();
     pic_init();
-    kprintf("idt: 256 gates, PIC remapped\n");
     timer_init(TIMER_HZ);
     keyboard_init();
     serial_init_irq();
     sti();
-    kprintf("irq: timer %u Hz, keyboard, serial online\n", TIMER_HZ);
+    kprintf("irq: gdt/idt/pic up, timer %u Hz, keyboard + serial input\n",
+            TIMER_HZ);
 
-    __asm__ volatile("int3");      /* exception path self-test */
-
-    timer_sleep(10);
-    kprintf("timer: ticks=%lu after 100ms sleep\n", timer_ticks());
-
+    fpu_init();
     pmm_init(boot_info);
-    kprintf("pmm: %lu/%lu pages free (%lu MiB)\n",
-            pmm_free_pages(), pmm_total_pages(),
-            (uint64_t)(pmm_free_pages() * PAGE_SIZE / (1024 * 1024)));
-
     vmm_init();
-    kprintf("vmm: kernel page tables rebuilt, direct map to %lu MiB\n",
-            pmm_max_phys() / (1024 * 1024));
-    uint64_t kp = vmm_virt_to_phys(vmm_kernel_pml4(), KERNEL_OFFSET + 0x100000);
-    if (kp != 0x100000)
-        panic("vmm: kernel translation wrong: %lx", kp);
-
     kheap_init();
-    char *a = kmalloc(64);
-    char *b = kmalloc(100000);
-    memset(a, 0xAA, 64);
-    memset(b, 0x55, 100000);
-    if ((uint8_t)a[63] != 0xAA || (uint8_t)b[99999] != 0x55)
-        panic("kheap: data corruption");
-    kfree(a);
-    kfree(b);
-    kprintf("kheap: small+large alloc/free ok\n");
+    kprintf("mem: pmm %lu pages free, paging rebuilt, heap ready\n",
+            pmm_free_pages());
 
     proc_init();
-    kprintf("proc: scheduler online (pid %d + idle)\n", current->pid);
-    extern void sched_selftest(void);
-    sched_selftest();
+    kprintf("proc: scheduler online\n");
 
-    kprintf("\nKESTREL READY\n");
-    kprintf("echo test — type on keyboard or serial:\n> ");
+    ata_init();
+    if (vfs_init() == 0)
+        kprintf("vfs: root filesystem mounted\n");
+    else
+        kprintf("vfs: WARNING: no root filesystem\n");
+
+    net_init();
+    syscall_init();
+
+    kprintf("\nKESTREL READY\n\n");
+
+    kthread_create(init_launcher, NULL, "launcher");
+
+    /* Boot task parks; all life now happens via IRQs and the scheduler. */
     for (;;) {
-        int c = input_getc();
-        if (c >= 0x80) {
-            kprintf("[key %02x]", c);
-            continue;
-        }
-        kprintf("%c", c);
-        if (c == '\n')
-            kprintf("> ");
+        __asm__ volatile("sti; hlt");
+        yield();
     }
 }

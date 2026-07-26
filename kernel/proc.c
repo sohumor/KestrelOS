@@ -5,6 +5,7 @@
 #include "gdt.h"
 #include "timer.h"
 #include "vmm.h"
+#include "fpu.h"
 
 struct task *current;
 bool sched_active;
@@ -72,10 +73,33 @@ void task_wake_sleepers(void)
     } while (t != runq);
 }
 
+static void fpu_attach(struct task *t)
+{
+    t->fpu_alloc = kmalloc(FPU_STATE_SIZE + 16);
+    t->fpu_state = (void *)(((uint64_t)t->fpu_alloc + 15) & ~15ULL);
+    fpu_state_init(t->fpu_state);
+}
+
+static void all_tasks_remove(struct task *t)
+{
+    if (all_tasks == t) {
+        all_tasks = t->allnext;
+        return;
+    }
+    for (struct task *p = all_tasks; p; p = p->allnext) {
+        if (p->allnext == t) {
+            p->allnext = t->allnext;
+            return;
+        }
+    }
+}
+
 static void reap(void)
 {
     if (reap_me && reap_me != current) {
+        all_tasks_remove(reap_me);
         kfree(reap_me->kstack);
+        kfree(reap_me->fpu_alloc);
         kfree(reap_me);
         reap_me = NULL;
     }
@@ -126,6 +150,8 @@ void schedule(void)
     if (pick->pml4 != prev->pml4)
         vmm_switch(pick->pml4);
 
+    fpu_save(prev->fpu_state);
+    fpu_restore(pick->fpu_state);
     ctx_switch(&prev->rsp, pick->rsp);
     /* running as `prev` again */
     reap();
@@ -165,7 +191,9 @@ void task_exit(int code)
         current->user = false;
     }
     if (reap_me) {
+        all_tasks_remove(reap_me);
         kfree(reap_me->kstack);
+        kfree(reap_me->fpu_alloc);
         kfree(reap_me);
     }
     reap_me = current;
@@ -187,6 +215,7 @@ struct task *kthread_create(void (*func)(void *), void *arg, const char *name)
     t->kstack = kmalloc(KSTACK_SIZE);
     t->pml4 = vmm_kernel_pml4();
     t->parent = current;
+    fpu_attach(t);
 
     /* Initial frame popped by ctx_switch: r15 r14 r13 r12 rbx rbp | rip.
      * task_bootstrap expects r12 = entry function, r13 = argument. */
@@ -236,6 +265,7 @@ void proc_init(void)
     t->state = TASK_RUNNING;
     t->kstack = NULL;                   /* boot stack, never freed */
     t->pml4 = vmm_kernel_pml4();
+    fpu_attach(t);
     current = t;
     all_tasks = t;
     runq_insert(t);

@@ -24,6 +24,8 @@ struct task {
     enum task_state state;
     uint64_t rsp;                /* saved kernel stack pointer */
     uint8_t *kstack;             /* kernel stack base */
+    void *fpu_state;             /* 16-byte-aligned FXSAVE area */
+    void *fpu_alloc;             /* unaligned allocation to free */
     uint64_t *pml4;              /* address space (virtual pointer) */
     bool user;                   /* has a user half to tear down */
     uint64_t sleep_until;
