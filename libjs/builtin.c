@@ -446,7 +446,7 @@ typedef struct {
     int          icase;
     int          multiline;
     long         steps, budget;
-    int          depth;
+    int          depth, maxdepth;
     int          overrun;
     long         end;
 } rectx;
@@ -479,6 +479,7 @@ static int is_word(int c)
 }
 
 static int re_run(rectx *m, renode *n, recont *k, long pos);
+static int re_run_inner(rectx *m, renode *n, recont *k, long pos);
 
 static int re_pop(rectx *m, recont *k, long pos)
 {
@@ -524,7 +525,17 @@ static int re_pop(rectx *m, recont *k, long pos)
 static int re_run(rectx *m, renode *n, recont *k, long pos)
 {
     if (++m->steps > m->budget) { m->overrun = 1; return 0; }
-    if (m->depth >= 160) { m->overrun = 1; return 0; }
+    if (m->depth >= m->maxdepth) { m->overrun = 1; return 0; }
+    m->depth++;
+    {
+        int r = re_run_inner(m, n, k, pos);
+        m->depth--;
+        return r;
+    }
+}
+
+static int re_run_inner(rectx *m, renode *n, recont *k, long pos)
+{
     if (!n)
         return re_pop(m, k, pos);
 
@@ -533,9 +544,21 @@ static int re_run(rectx *m, renode *n, recont *k, long pos)
         return re_run(m, n->next, k, pos);
 
     case RE_CHAR: case RE_ANY: case RE_CLASS:
-        if (!char_at_matches(m, n, pos))
-            return 0;
-        return re_run(m, n->next, k, pos + 1);
+        /* Consume a whole run of single-character terms in a loop. A
+         * literal like /abcdef.../ would otherwise cost one C frame per
+         * character matched, which the 64 KiB user stack cannot afford. */
+        for (;;) {
+            if (!char_at_matches(m, n, pos))
+                return 0;
+            pos++;
+            n = n->next;
+            if (!n)
+                return re_pop(m, k, pos);
+            if (n->type != RE_CHAR && n->type != RE_ANY && n->type != RE_CLASS)
+                break;
+            if (++m->steps > m->budget) { m->overrun = 1; return 0; }
+        }
+        return re_run(m, n, k, pos);
 
     case RE_BOL:
         if (pos == 0) return re_run(m, n->next, k, pos);
@@ -581,10 +604,8 @@ static int re_run(rectx *m, renode *n, recont *k, long pos)
         renode *alt;
         int hit = 0;
         long save_end = m->end;
-        m->depth++;
         for (alt = n->sub; alt && !hit; alt = alt->alt)
             hit = re_run(m, alt, 0, pos);
-        m->depth--;
         m->end = save_end;
         if (m->overrun) return 0;
         if (hit == (int)n->negate)
@@ -600,10 +621,8 @@ static int re_run(rectx *m, renode *n, recont *k, long pos)
             /* non-capturing: just splice the alternatives in */
             kk.kind = 0; kk.node = n->next; kk.next = k;
             kk.rep = 0; kk.count = 0; kk.mark = 0;
-            m->depth++;
             for (alt = n->sub; alt; alt = alt->alt)
-                if (re_run(m, alt, &kk, pos)) { m->depth--; return 1; }
-            m->depth--;
+                if (re_run(m, alt, &kk, pos)) return 1;
             return 0;
         }
         /* The kind-2 continuation restores this group's own capture when a
@@ -612,10 +631,8 @@ static int re_run(rectx *m, renode *n, recont *k, long pos)
          * stack than the 64 KiB user stack can spare at depth. */
         kk.kind = 2; kk.node = n->next; kk.next = k;
         kk.rep = n; kk.count = 0; kk.mark = pos;
-        m->depth++;
         for (alt = n->sub; alt; alt = alt->alt)
-            if (re_run(m, alt, &kk, pos)) { m->depth--; return 1; }
-        m->depth--;
+            if (re_run(m, alt, &kk, pos)) return 1;
         return 0;
     }
 
@@ -648,23 +665,16 @@ static int re_run(rectx *m, renode *n, recont *k, long pos)
         }
         kk.kind = 1; kk.node = 0; kk.next = k;
         kk.rep = n; kk.count = 1; kk.mark = pos;
-        m->depth++;
         if (n->greedy) {
-            if ((n->max < 0 || n->max > 0) && re_run(m, sub, &kk, pos)) { m->depth--; return 1; }
-            m->depth--;
+            if ((n->max < 0 || n->max > 0) && re_run(m, sub, &kk, pos))
+                return 1;
             if (n->min == 0)
                 return re_run(m, n->next, k, pos);
             return 0;
         }
-        m->depth--;
         if (n->min == 0 && re_run(m, n->next, k, pos))
             return 1;
-        m->depth++;
-        {
-            int r = (n->max < 0 || n->max > 0) ? re_run(m, sub, &kk, pos) : 0;
-            m->depth--;
-            return r;
-        }
+        return (n->max < 0 || n->max > 0) ? re_run(m, sub, &kk, pos) : 0;
     }
 
     default:
@@ -739,6 +749,7 @@ int js_regexp_exec_raw(js_ctx *ctx, js_regexp *re, const char *s,
     m.icase = re->ignore_case;
     m.multiline = re->multiline;
     m.budget = 200000;
+    m.maxdepth = 48;      /* ~11 KiB of C stack; see the note in js.h */
 
     for (at = start; at <= len; at++) {
         for (i = 0; i < 2 * re->ngroups; i++)

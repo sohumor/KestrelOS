@@ -2432,9 +2432,16 @@ void js_config_default(js_config *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->max_heap = 16UL * 1024 * 1024;
     cfg->max_steps = 20000000UL;
-    cfg->max_call_depth = 32;
-    cfg->max_depth = 160;
-    cfg->max_parse_depth = 64;
+    /* Sized for the 16-page (64 KiB) user stack, not for comfort. Measured
+     * cost is ~1.3 KiB of C stack per nested JS call and ~430 bytes per
+     * level of expression nesting; max_parse_depth is what bounds the
+     * latter, since an expression cannot nest deeper at run time than it
+     * nests in the source. Together these hold the interpreter under about
+     * 40 KiB. Raise all three together if the caller gives libjs a bigger
+     * stack -- see the stack budget note in tools/test_js.c. */
+    cfg->max_call_depth = 24;
+    cfg->max_depth = 140;
+    cfg->max_parse_depth = 40;
     cfg->max_string = 4UL * 1024 * 1024;
 }
 
@@ -2453,9 +2460,9 @@ js_ctx *js_new(const js_config *cfg)
         ctx->cfg.max_heap = 262144UL;
     if (ctx->cfg.max_string == 0 || ctx->cfg.max_string > ctx->cfg.max_heap)
         ctx->cfg.max_string = ctx->cfg.max_heap / 2;
-    if (ctx->cfg.max_call_depth <= 0) ctx->cfg.max_call_depth = 32;
-    if (ctx->cfg.max_depth <= 0) ctx->cfg.max_depth = 160;
-    if (ctx->cfg.max_parse_depth <= 0) ctx->cfg.max_parse_depth = 64;
+    if (ctx->cfg.max_call_depth <= 0) ctx->cfg.max_call_depth = 24;
+    if (ctx->cfg.max_depth <= 0) ctx->cfg.max_depth = 140;
+    if (ctx->cfg.max_parse_depth <= 0) ctx->cfg.max_parse_depth = 40;
     ctx->exception = js_undefined();
 
     if (!js_init_builtins(ctx)) {

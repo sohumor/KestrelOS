@@ -61,6 +61,12 @@ $(BUILD)/$(1).a: $$(patsubst $(1)/%.c,$(BUILD)/$(1)/%.o,$$(wildcard $(1)/*.c))
 endef
 $(foreach l,$(BROWSER_LIBS),$(eval $(call BROWSER_LIB_RULE,$(l))))
 
+# The cascade's DOM binding (css_dom_ops / css_style_dom_sink) is compiled
+# in only here, so the CSS engine stays usable without a DOM.
+$(BUILD)/libweb/style.o: libweb/style.c
+	@mkdir -p $(dir $@)
+	$(CC) $(UCFLAGS) -DCSS_WITH_DOM -c $< -o $@
+
 # apps/html.c is the browser's rendering engine, not a program.
 APP_LIBS  := html
 APP_NAMES := $(filter-out $(APP_LIBS) $(CONFIG_APPS_EXCLUDE), \

@@ -22,15 +22,25 @@
  * long-run efficiency for the absence of use-after-free and cycle bugs. The
  * intended use is one context per document, or one per script evaluation.
  *
- * SAFETY. Four caller-configurable limits bound a hostile page:
+ * SAFETY. Five caller-configurable limits bound a hostile page:
  *   cfg.max_heap        total bytes the script may allocate
  *   cfg.max_steps       interpreter steps before the script is killed
  *   cfg.max_call_depth  nested JS function calls
  *   cfg.max_depth       total interpreter recursion depth (C stack guard)
  *   cfg.max_parse_depth parser recursion depth
  * Heap and step exhaustion are FATAL: they cannot be caught by try/catch,
- * so `try { while (1) {} } catch (e) {}` still terminates. Call-depth and
- * parse-depth overflow raise ordinary catchable errors.
+ * so `try { while (1) {} } catch (e) {}` still terminates. Call-depth,
+ * interpreter-depth and parse-depth overflow raise ordinary catchable
+ * errors. Regular expression matching has its own step budget and depth
+ * cap, so catastrophic backtracking throws instead of hanging.
+ *
+ * STACK. This interpreter uses the C stack for the JS stack, and the
+ * KestrelOS user stack is 16 pages (64 KiB, USER_STACK_PAGES in
+ * abi/kestrel_abi.h) with unmapped pages below it. Measured cost is about
+ * 1.3 KiB per nested JS call and 430 bytes per level of expression
+ * nesting; the shipped defaults hold the worst adversarial case measured
+ * to 32 KiB. If the embedder gives libjs a larger stack, raise
+ * max_call_depth, max_depth and max_parse_depth together.
  */
 
 #include <stdint.h>
@@ -88,9 +98,9 @@ typedef void (*js_host_free)(void *user, void *host);
 typedef struct js_config {
     unsigned long max_heap;       /* bytes; default 16 MiB */
     unsigned long max_steps;      /* default 20,000,000; 0 = unlimited */
-    int  max_call_depth;          /* default 32  */
-    int  max_depth;               /* default 160 */
-    int  max_parse_depth;         /* default 64  */
+    int  max_call_depth;          /* default 24  */
+    int  max_depth;               /* default 140 */
+    int  max_parse_depth;         /* default 40  */
     unsigned long max_string;     /* longest single string; default 4 MiB */
     void (*print)(void *user, const char *text);   /* console.log sink */
     double (*now_ms)(void *user);                  /* ms since Unix epoch */
@@ -247,14 +257,21 @@ const char *js_error_text(js_ctx *ctx, js_value v);
  *     named groups, sticky/unicode flags and \p classes are not. Every
  *     match runs under a step budget and throws if it is exhausted, so
  *     catastrophic backtracking cannot hang the caller.
- * 10. Date implements construction from now/ms/parts/ISO-ish strings and
- *     the UTC getters, getTime, and toISOString; local time is UTC because
- *     the kernel has no timezone database. Date parsing accepts ISO 8601
- *     and little else.
+ * 10. Date implements construction from now/ms/parts/ISO strings and the
+ *     getters, getTime, setTime and toISOString; local time IS UTC and
+ *     getTimezoneOffset() is always 0, because the kernel has no timezone
+ *     database. Date parsing accepts ISO 8601 and little else. There are
+ *     no setFullYear/setMonth/... mutators beyond setTime.
  * 11. The lexer decides `/` is a regex or a division from the previous
  *     token. This is the standard heuristic and it is wrong for a handful
  *     of pathological inputs (an object literal immediately divided, for
  *     instance).
+ * 12. `__proto__` is not implemented; use Object.getPrototypeOf and
+ *     Object.create. `arguments` is not aliased to the parameters.
+ * 13. Verified against Node on 514 programs covering the whole subset:
+ *     510 produce byte-identical output. The four that differ are the
+ *     scope cuts above -- the ES2016 `**` operator, the ES6 method
+ *     String.prototype.repeat, `__proto__`, and local-time-is-UTC.
  */
 
 /* ================================================================== */

@@ -241,6 +241,69 @@ int js_define_accessor(js_ctx *ctx, js_object *obj, const char *name,
     return JS_OK;
 }
 
+
+/* Both of these run once on scope entry and return before the body does,
+ * so keeping them out of invoke() takes their locals off the stack for the
+ * whole duration of the call rather than for a few microseconds. */
+static __attribute__((noinline)) int make_arguments(js_ctx *ctx, js_object *f,
+                                                    js_object *act, int argc,
+                                                    js_value *argv)
+{
+    js_object *ao = js_obj_alloc(ctx, JS_CLASS_ARGUMENTS, ctx->proto[P_OBJECT]);
+    js_prop *p;
+    int i;
+
+    if (!ao) return JS_THROW;
+    for (i = 0; i < argc; i++) {
+        char buf[16], t[16];
+        int m = 0, k = i, tn = 0;
+        if (k == 0) buf[m++] = '0';
+        else {
+            while (k) { t[tn++] = (char)('0' + k % 10); k /= 10; }
+            while (tn) buf[m++] = t[--tn];
+        }
+        p = js_add_prop(ctx, ao, js_str_intern(ctx, buf, (unsigned long)m),
+                        JS_P_DEFAULT);
+        if (!p) return JS_THROW;
+        p->value = argv[i];
+    }
+    p = js_add_prop(ctx, ao, ctx->s_length, JS_P_HIDDEN);
+    if (!p) return JS_THROW;
+    p->value = js_number((double)argc);
+    p = js_add_prop(ctx, ao, ctx->s_callee, JS_P_HIDDEN);
+    if (!p) return JS_THROW;
+    p->value = js_object_value(f);
+    p = js_add_prop(ctx, act, ctx->s_arguments, JS_P_WRITE);
+    if (!p) return JS_THROW;
+    p->value = js_object_value(ao);
+    return JS_OK;
+}
+
+static __attribute__((noinline)) int instantiate_funcs(js_ctx *ctx, js_node *list,
+                                                       js_object *act, js_env *env)
+{
+    js_node *q;
+
+    for (q = list; q; q = q->next) {
+        js_func *nf = (js_func *)js_alloc(ctx, sizeof(js_func));
+        js_object *fo;
+        js_prop *p;
+        if (!nf) return JS_THROW;
+        nf->name = q->a->str;
+        nf->params = q->a->a;
+        nf->body = q->a->b;
+        nf->vars = q->a->c;
+        nf->funcs = q->a->d;
+        nf->nparams = (int)q->a->num;
+        fo = js_make_function(ctx, nf, env);
+        if (!fo) return JS_THROW;
+        p = js_add_prop(ctx, act, q->str, JS_P_ENUM | JS_P_WRITE);
+        if (!p) return JS_THROW;
+        p->value = js_object_value(fo);
+    }
+    return JS_OK;
+}
+
 /* Create the activation record for a call and run the body. */
 static int invoke(js_ctx *ctx, js_object *f, js_value this_val,
                   int argc, js_value *argv, js_value *ret)
@@ -276,50 +339,11 @@ static int invoke(js_ctx *ctx, js_object *f, js_value this_val,
             p->value = (i < argc) ? argv[i] : js_undefined();
         }
     }
-    if (!js_own_prop(act, ctx->s_arguments)) {
-        js_object *ao = js_obj_alloc(ctx, JS_CLASS_ARGUMENTS, ctx->proto[P_OBJECT]);
-        js_prop *p;
-        if (!ao) return JS_THROW;
-        for (i = 0; i < argc; i++) {
-            char buf[16];
-            int m = 0, k = i;
-            char t[16];
-            int tn = 0;
-            if (k == 0) buf[m++] = '0';
-            else { while (k) { t[tn++] = (char)('0' + k % 10); k /= 10; }
-                   while (tn) buf[m++] = t[--tn]; }
-            p = js_add_prop(ctx, ao, js_str_intern(ctx, buf, (unsigned long)m),
-                            JS_P_DEFAULT);
-            if (!p) return JS_THROW;
-            p->value = argv[i];
-        }
-        p = js_add_prop(ctx, ao, ctx->s_length, JS_P_HIDDEN);
-        if (!p) return JS_THROW;
-        p->value = js_number((double)argc);
-        p = js_add_prop(ctx, ao, ctx->s_callee, JS_P_HIDDEN);
-        if (!p) return JS_THROW;
-        p->value = js_object_value(f);
-        p = js_add_prop(ctx, act, ctx->s_arguments, JS_P_WRITE);
-        if (!p) return JS_THROW;
-        p->value = js_object_value(ao);
-    }
-    for (q = fn->funcs; q; q = q->next) {
-        js_func *nf = (js_func *)js_alloc(ctx, sizeof(js_func));
-        js_object *fo;
-        js_prop *p;
-        if (!nf) return JS_THROW;
-        nf->name = q->a->str;
-        nf->params = q->a->a;
-        nf->body = q->a->b;
-        nf->vars = q->a->c;
-        nf->funcs = q->a->d;
-        nf->nparams = (int)q->a->num;
-        fo = js_make_function(ctx, nf, env);
-        if (!fo) return JS_THROW;
-        p = js_add_prop(ctx, act, q->str, JS_P_ENUM | JS_P_WRITE);
-        if (!p) return JS_THROW;
-        p->value = js_object_value(fo);
-    }
+    if (!js_own_prop(act, ctx->s_arguments) &&
+        make_arguments(ctx, f, act, argc, argv) != JS_OK)
+        return JS_THROW;
+    if (instantiate_funcs(ctx, fn->funcs, act, env) != JS_OK)
+        return JS_THROW;
 
     for (q = fn->body; q; q = q->next) {
         r = exec(ctx, q, env, &cv, &lbl);
@@ -688,7 +712,7 @@ static int eval_call(js_ctx *ctx, js_node *n, js_env *env, js_value *out)
                 return JS_THROW;
             }
     }
-    r = js_call(ctx, fnv, thisv, argc, args, out);
+    r = js_call_func(ctx, fnv.u.obj, thisv, argc, args, out);
     pop_args(ctx, argc);
     return r;
 }

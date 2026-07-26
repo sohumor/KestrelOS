@@ -13,7 +13,18 @@
  *                  ./test_js --emit > /tmp/ref.js && node /tmp/ref.js > /tmp/ref.tsv
  *                  ./test_js --dump > /tmp/ours.tsv && diff /tmp/ref.tsv /tmp/ours.tsv
  *   --limits   exercise the four safety caps and report what actually fired
+ *   --embed    run the embedding demo: native functions, native property
+ *              accessors and opaque host pointers, i.e. the surface the DOM
+ *              binding layer is expected to build on
  *   --fuzz N   run N mutated programs through the parser and interpreter
+ *
+ * Stack budget. The KestrelOS user stack is 16 pages (64 KiB) with
+ * unmapped pages below it, so overflow faults rather than corrupting.
+ * Measured with a probe in the console.log callback: about 1.3 KiB of C
+ * stack per nested JS call, about 430 bytes per level of expression
+ * nesting, and the shipped defaults hold the worst adversarial program
+ * measured (deepest legal call chain plus a catastrophically backtracking
+ * regular expression) to roughly 32 KiB.
  *
  * Result encoding: a completion value is rendered with String(); a thrown
  * value is rendered as "!" followed by the error's name; a fatal limit is
@@ -796,6 +807,115 @@ static int fuzz(int n)
     return crashed;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Embedding demo                                                      */
+/* ------------------------------------------------------------------ */
+/* This is not a language test. It exercises exactly the three things a
+ * DOM binding layer needs from libjs -- native functions, native property
+ * getters and setters, and opaque host pointers surfaced as JS objects --
+ * so that the contract is executable rather than merely described. */
+
+#define TAG_ELEM 0x454c454dU
+
+struct demo_elem { const char *id; char text[128]; int clicks; };
+static struct demo_elem demo_body = { "body", "Hello", 0 };
+static struct demo_elem demo_para = { "p1", "old text", 0 };
+static js_object *demo_proto;
+
+static int demo_get_text(js_ctx *c, js_value t, int argc, js_value *v, js_value *r)
+{
+    struct demo_elem *e = (struct demo_elem *)js_host_ptr(t, TAG_ELEM);
+    (void)argc; (void)v;
+    if (!e) return js_throw_error(c, JS_ERR_TYPE, "not an element");
+    *r = js_mkcstring(c, e->text);
+    return JS_OK;
+}
+
+static int demo_set_text(js_ctx *c, js_value t, int argc, js_value *v, js_value *r)
+{
+    struct demo_elem *e = (struct demo_elem *)js_host_ptr(t, TAG_ELEM);
+    js_value s;
+    if (!e) return js_throw_error(c, JS_ERR_TYPE, "not an element");
+    if (js_to_string(c, argc ? v[0] : js_undefined(), &s) != JS_OK) return JS_THROW;
+    snprintf(e->text, sizeof(e->text), "%s", js_string_bytes(s, 0));
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int demo_get_id(js_ctx *c, js_value t, int argc, js_value *v, js_value *r)
+{
+    struct demo_elem *e = (struct demo_elem *)js_host_ptr(t, TAG_ELEM);
+    (void)argc; (void)v;
+    *r = e ? js_mkcstring(c, e->id) : js_undefined();
+    return JS_OK;
+}
+
+static int demo_click(js_ctx *c, js_value t, int argc, js_value *v, js_value *r)
+{
+    struct demo_elem *e = (struct demo_elem *)js_host_ptr(t, TAG_ELEM);
+    (void)argc; (void)v; (void)c;
+    if (e) e->clicks++;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int demo_get_by_id(js_ctx *c, js_value t, int argc, js_value *v, js_value *r)
+{
+    const char *n;
+    (void)t;
+    n = js_to_cstring(c, argc ? v[0] : js_undefined());
+    if (!n) return JS_THROW;
+    if (strcmp(n, "p1") == 0)
+        { *r = js_object_value(js_new_host(c, &demo_para, TAG_ELEM, demo_proto)); return JS_OK; }
+    if (strcmp(n, "body") == 0)
+        { *r = js_object_value(js_new_host(c, &demo_body, TAG_ELEM, demo_proto)); return JS_OK; }
+    *r = js_null();
+    return JS_OK;
+}
+
+static void demo_print(void *user, const char *s) { (void)user; printf("  [script] %s\n", s); }
+
+static int embed_demo(void)
+{
+    js_config cfg;
+    js_ctx *c;
+    js_object *doc;
+    js_value r;
+    int rc;
+    static const char *src =
+        "var el = document.getElementById('p1');\n"
+        "console.log('id =', el.id, 'text =', el.textContent);\n"
+        "el.textContent = 'new ' + [1,2,3].map(function(x){return x*2}).join('-');\n"
+        "for (var i = 0; i < 3; i++) el.click();\n"
+        "console.log('missing is', String(document.getElementById('nope')));\n"
+        "el.id = 'ignored';\n"
+        "'done: ' + el.textContent;\n";
+
+    js_config_default(&cfg);
+    cfg.print = demo_print;
+    c = js_new(&cfg);
+    if (!c) { printf("no context\n"); return 1; }
+    demo_proto = js_new_object(c);
+    js_define_accessor(c, demo_proto, "textContent", demo_get_text, demo_set_text, 1);
+    js_define_accessor(c, demo_proto, "id", demo_get_id, 0, 1);  /* read-only */
+    js_define_native(c, demo_proto, "click", demo_click, 0);
+    doc = js_new_object(c);
+    js_define_native(c, doc, "getElementById", demo_get_by_id, 1);
+    js_set(c, js_global(c), "document", js_object_value(doc));
+
+    rc = js_eval(c, src, "page.js", &r);
+    printf("  result: %s\n", rc == JS_OK ? js_to_cstring(c, r) : js_error_text(c, r));
+    printf("  host state: text=\"%s\" clicks=%d id=%s\n",
+           demo_para.text, demo_para.clicks, demo_para.id);
+    rc = (rc == JS_OK && demo_para.clicks == 3 &&
+          strcmp(demo_para.text, "new 2-4-6") == 0 &&
+          strcmp(demo_para.id, "p1") == 0) ? 0 : 1;
+    printf("  %s\n", rc ? "EMBEDDING DEMO FAILED" : "embedding surface behaved as documented");
+    js_free(c);
+    return rc;
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
@@ -814,6 +934,10 @@ int main(int argc, char **argv)
             f = check_limits();
             printf("%s\n", f ? "LIMIT CHECKS FAILED" : "all four limits fired as designed");
             return f ? 1 : 0;
+        }
+        if (strcmp(argv[i], "--embed") == 0) {
+            printf("embedding surface (what the DOM bindings will use):\n");
+            return embed_demo();
         }
         if (strcmp(argv[i], "--fuzz") == 0) {
             int n = (i + 1 < argc) ? atoi(argv[i + 1]) : 20000;
