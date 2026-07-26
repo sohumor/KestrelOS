@@ -193,8 +193,8 @@ def t_echo(h):
 
 def t_ls_bin(h):
     h.send("ls /bin")
+    h.expect("ls")     # alphabetical: ls prints before sh
     h.expect("sh")
-    h.expect("ls")
     wait_prompt(h)
 
 
@@ -247,7 +247,8 @@ def t_nslookup(h):
 
 def t_uptime(h):
     h.send("uptime")
-    h.expect_any(["ms", "s"])
+    # "up H:MM:SS" — a bare "s" would match the prompt and eat it
+    h.expect_any([r"up \d+:\d\d:\d\d", r"\d+ ?ms"], regex=True)
     wait_prompt(h)
 
 
