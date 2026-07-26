@@ -11,6 +11,7 @@
 #include "pmm.h"
 #include "vmm.h"
 #include "kheap.h"
+#include "proc.h"
 
 struct bootinfo *boot_info;
 
@@ -71,6 +72,11 @@ void kmain(uint64_t bootinfo_phys)
     kfree(a);
     kfree(b);
     kprintf("kheap: small+large alloc/free ok\n");
+
+    proc_init();
+    kprintf("proc: scheduler online (pid %d + idle)\n", current->pid);
+    extern void sched_selftest(void);
+    sched_selftest();
 
     kprintf("\nKESTREL READY\n");
     kprintf("echo test — type on keyboard or serial:\n> ");

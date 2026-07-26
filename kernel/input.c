@@ -1,5 +1,6 @@
 #include "input.h"
 #include "interrupts.h"
+#include "proc.h"
 
 #define BUFSZ 512
 
@@ -35,6 +36,9 @@ int input_getc(void)
         int c = input_trygetc();
         if (c >= 0)
             return c;
-        __asm__ volatile("sti; hlt");
+        if (sched_active)
+            yield();
+        else
+            __asm__ volatile("sti; hlt");
     }
 }
