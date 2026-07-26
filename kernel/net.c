@@ -3,7 +3,9 @@
 #include "timer.h"
 #include "proc.h"
 #include "pci.h"
+#include "netdev.h"
 #include "rtl8139.h"
+#include "e1000.h"
 #include "net.h"
 
 /* Ethernet / ARP / IPv4 / ICMP core.
@@ -64,6 +66,20 @@ static uint32_t cfg_ip, cfg_mask, cfg_gw, cfg_dns;   /* network order */
 
 static const uint8_t bcast_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
+/* ---- netdev registry: the single active NIC ---- */
+
+static const struct netdev *netdev_active;
+
+void netdev_register(const struct netdev *dev)
+{
+    netdev_active = dev;
+}
+
+const struct netdev *netdev_current(void)
+{
+    return netdev_active;
+}
+
 /* ---- helpers ---- */
 
 uint16_t net_checksum(const void *data, int len)
@@ -87,7 +103,7 @@ uint16_t net_checksum(const void *data, int len)
 
 bool net_ready(void)
 {
-    return ready;
+    return ready && netdev_current() != NULL;
 }
 
 uint32_t net_ip_addr(void)
@@ -102,8 +118,9 @@ uint32_t net_dns_addr(void)
 
 void net_poll(void)
 {
-    if (ready)
-        rtl8139_poll();
+    const struct netdev *nd = netdev_current();
+    if (ready && nd)
+        nd->poll();
 }
 
 void net_wait_tick(void)
@@ -128,14 +145,15 @@ static int eth_send(const uint8_t *dst_mac, uint16_t ethertype,
 {
     uint8_t frame[sizeof(struct eth_hdr) + ETH_MTU];
     struct eth_hdr *eh = (struct eth_hdr *)frame;
+    const struct netdev *nd = netdev_current();
 
-    if (len < 0 || len > ETH_MTU)
+    if (!nd || len < 0 || len > ETH_MTU)
         return -1;
     memcpy(eh->dst, dst_mac, 6);
-    memcpy(eh->src, rtl8139_mac(), 6);
+    memcpy(eh->src, nd->mac, 6);
     eh->type = htons(ethertype);
     memcpy(frame + sizeof(*eh), payload, len);
-    return rtl8139_send(frame, (int)sizeof(*eh) + len);
+    return nd->send(frame, (int)sizeof(*eh) + len);
 }
 
 /* ---- ARP ---- */
@@ -193,7 +211,7 @@ static void arp_send_request(uint32_t ip)
     a.hlen = 6;
     a.plen = 4;
     a.oper = htons(1);               /* request */
-    memcpy(a.sha, rtl8139_mac(), 6);
+    memcpy(a.sha, netdev_current()->mac, 6);
     a.spa = cfg_ip;
     memset(a.tha, 0, 6);
     a.tpa = ip;
@@ -246,7 +264,7 @@ static void arp_input(const uint8_t *pkt, int len)
         r.hlen = 6;
         r.plen = 4;
         r.oper = htons(2);           /* reply */
-        memcpy(r.sha, rtl8139_mac(), 6);
+        memcpy(r.sha, netdev_current()->mac, 6);
         r.spa = cfg_ip;
         memcpy(r.tha, a->sha, 6);
         r.tpa = a->spa;
@@ -462,8 +480,8 @@ void net_rx(const uint8_t *frame, int len)
 void net_init(void)
 {
     pci_init();
-    if (!rtl8139_init()) {
-        kprintf("net: no rtl8139 found, networking disabled\n");
+    if (!rtl8139_init() && !e1000_init()) {
+        kprintf("net: no NIC found, networking disabled\n");
         return;
     }
 
@@ -476,7 +494,7 @@ void net_init(void)
     udp_init();
     ready = true;
 
-    const uint8_t *m = rtl8139_mac();
+    const uint8_t *m = netdev_current()->mac;
     kprintf("net: up, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
             m[0], m[1], m[2], m[3], m[4], m[5]);
     kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static)\n");
@@ -491,6 +509,6 @@ void net_get_info(struct k_netinfo *out)
     out->netmask = cfg_mask;
     out->gateway = cfg_gw;
     out->dns = cfg_dns;
-    memcpy(out->mac, rtl8139_mac(), 6);
+    memcpy(out->mac, netdev_current()->mac, 6);
     out->up = 1;
 }

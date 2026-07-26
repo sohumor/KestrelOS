@@ -6,6 +6,7 @@
 #include "interrupts.h"
 #include "proc.h"
 #include "net.h"
+#include "netdev.h"
 #include "rtl8139.h"
 
 /* Realtek RTL8139 (QEMU: -device rtl8139). I/O-port register file.
@@ -105,6 +106,12 @@ static void rtl_irq(struct regs *r)
     /* TOK/TER: nothing to do, the send path polls descriptor status. */
 }
 
+static struct netdev rtl_netdev = {
+    .name = "rtl8139",
+    .send = rtl8139_send,
+    .poll = rtl8139_poll,
+};
+
 bool rtl8139_init(void)
 {
     struct pci_dev d;
@@ -163,6 +170,8 @@ bool rtl8139_init(void)
     }
 
     present = true;
+    memcpy(rtl_netdev.mac, mac, 6);
+    netdev_register(&rtl_netdev);
     kprintf("rtl8139: io 0x%x irq %d mac %02x:%02x:%02x:%02x:%02x:%02x\n",
             io_base, irq, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     return true;
