@@ -29,11 +29,17 @@
  * rather than inventing a "--stdout=<path>" argument that today's apps
  * would mistake for a filename.
  *
- * Screen updates are done by rewriting the line: '\r', prompt, buffer,
- * CSI K, then CSI <n> D to place the cursor. That works on the VGA
- * console (kernel/console.c implements \r, CSI K and CSI C/D) and on a
- * plain serial terminal. '\b' is never used to move the cursor, only to
- * erase, because the VGA console's backspace is destructive.
+ * Screen updates are done by rewriting the line. A line longer than
+ * TERM_COLS occupies several physical rows, so the repaint first walks
+ * back up to the row the prompt started on (CSI A), rewrites prompt and
+ * buffer, erases every row the line used to reach (CSI K per row), then
+ * places the cursor with CSI A/B plus '\r' and CSI C. That works on the
+ * VGA console (kernel/console.c implements \r, CSI K and CSI A/B/C/D,
+ * and wraps to the next row as soon as column 80 is passed) and on a
+ * plain serial terminal. CSI J is deliberately not used: the console
+ * only implements the "whole screen" form of it. '\b' is never used to
+ * move the cursor, only to erase, because the VGA console's backspace
+ * is destructive.
  */
 
 #include <kestrel.h>
@@ -48,10 +54,13 @@
 #define HIST_MAX    32
 #define MAX_CAND    64
 #define NAME_MAX    64
+#define TERM_COLS   80          /* the VGA console is a fixed 80x25 */
 
 /* Kernel spawn limits, from kernel/include/uproc.h. Exceeding either of
- * them is silent truncation (too many args) or a failed spawn (an arg
- * that does not fit), so sh2 checks both before calling spawn(). */
+ * them is silent truncation - of the argument list past the 16th entry,
+ * or of an individual argument past 127 bytes - so sh2 checks both
+ * before calling spawn() and refuses rather than letting an app run on
+ * half an argument. */
 #define SPAWN_MAX_ARGS 16
 #define SPAWN_ARG_MAX  128
 
@@ -100,8 +109,11 @@ static int is_name_char(int c)
 }
 
 /* Split line in place. Returns token count, or -1 on too many tokens.
- * Double quotes group words and are stripped from the token. */
-static int tokenize(char *line, char **tokens)
+ * Double quotes group words and are stripped from the token; quoted[i]
+ * records whether the FIRST character of token i came from inside
+ * quotes, which is what tells a literal ">" from the redirection
+ * operator while leaving >"file" a redirection. */
+static int tokenize(char *line, char **tokens, int *quoted)
 {
     int n = 0;
     char *p = line;
@@ -116,7 +128,9 @@ static int tokenize(char *line, char **tokens)
             break;
         if (n >= MAX_TOKENS)
             return -1;
-        tokens[n++] = p;
+        tokens[n] = p;
+        quoted[n] = 0;
+        n++;
         w = p;
         while (*p && (inq || (*p != ' ' && *p != '\t'))) {
             if (*p == '"') {
@@ -124,6 +138,8 @@ static int tokenize(char *line, char **tokens)
                 p++;
                 continue;
             }
+            if (w == tokens[n - 1])         /* first byte kept, if any */
+                quoted[n - 1] = inq;
             *w++ = *p++;
         }
         if (*p)
@@ -243,13 +259,55 @@ static void hist_add(const char *line)
 
 /* --- line editing ----------------------------------------------------- */
 
-/* Full repaint: carriage return, prompt, buffer, erase to end of line,
- * then walk the cursor back to its logical position. */
+/* Where the line editor currently is on screen, in physical rows counted
+ * from the row the prompt starts on. line_row is the cursor, line_rows
+ * the last row the painted line reaches. Nothing but the line editor
+ * writes to the screen while a line is being edited, so tracking these
+ * two is enough to repaint a line that wraps over several rows. */
+static int line_row;
+static int line_rows;
+
+static void line_up(int n)
+{
+    if (n > 0)
+        printf("\033[%dA", n);
+}
+
+/* Place the cursor at logical offset cur without repainting. */
+static void line_seek(const char *prompt, int cur)
+{
+    int plen = (int)strlen(prompt);
+    int row = (plen + cur) / TERM_COLS;
+    int col = (plen + cur) % TERM_COLS;
+
+    if (row < line_row)
+        line_up(line_row - row);
+    else if (row > line_row)
+        printf("\033[%dB", row - line_row);
+    putchar('\r');
+    if (col > 0)
+        printf("\033[%dC", col);
+    line_row = row;
+}
+
+/* Full repaint: back to the first row of the line, prompt, buffer, erase
+ * every row the line used to occupy, then place the cursor. */
 static void line_redraw(const char *prompt, const char *buf, int len, int cur)
 {
+    int plen = (int)strlen(prompt);
+    int end = (plen + len) / TERM_COLS;   /* row the line now ends on */
+    int i;
+
+    line_up(line_row);
     printf("\r%s%s\033[K", prompt, buf);
-    if (cur < len)
-        printf("\033[%dD", len - cur);
+    /* CSI K only clears the row the cursor is on and the console has no
+     * erase-below, so wipe the rows a longer line left behind by hand. */
+    for (i = end; i < line_rows; i++)
+        printf("\n\033[K");
+    line_up(line_rows - end);
+    line_rows = end;
+    line_row = end;
+    line_seek(prompt, cur);
 }
 
 /* Insert s at the cursor. Returns the number of characters inserted. */
@@ -396,10 +454,16 @@ static void do_complete(const char *prompt, char *buf, int *len, int *cur,
         line_insert(buf, len, cur, max, add);
     }
 
+    /* Step below the whole painted line before listing the candidates,
+     * or the listing lands on top of a wrapped line's tail. */
+    if (line_rows > line_row)
+        printf("\033[%dB", line_rows - line_row);
     putchar('\n');
     for (i = 0; i < n; i++)
         printf("%s%s  ", cand[i], cand_dir[i] ? "/" : "");
     putchar('\n');
+    line_row = 0;               /* the listing scrolled the line away */
+    line_rows = 0;
     line_redraw(prompt, buf, *len, *cur);
 }
 
@@ -411,10 +475,14 @@ static int sh_readline(const char *prompt, char *buf, int max)
 {
     char saved[MAX_LINE];
     int len = 0, cur = 0, hpos = 0;
+    int plen = (int)strlen(prompt);
 
     saved[0] = '\0';
     buf[0] = '\0';
     printf("%s", prompt);
+    /* A long cwd can wrap the prompt itself, so start from where it ends. */
+    line_row = plen / TERM_COLS;
+    line_rows = line_row;
 
     for (;;) {
         int c = getchar();
@@ -423,15 +491,18 @@ static int sh_readline(const char *prompt, char *buf, int max)
             if (len == 0)
                 return 0;
             buf[len] = '\0';
+            line_seek(prompt, len);
             putchar('\n');
             return 1;
         }
         if (c == '\n' || c == '\r') {
             buf[len] = '\0';
+            line_seek(prompt, len);     /* past the tail of a wrapped line */
             putchar('\n');
             return 1;
         }
         if (c == 3) {                   /* ctrl-C: drop the line */
+            line_seek(prompt, len);
             printf("^C\n");
             buf[0] = '\0';
             return 1;
@@ -471,28 +542,26 @@ static int sh_readline(const char *prompt, char *buf, int max)
             continue;
         }
         if (c == 1 || c == KEY_HOME) {
-            if (cur > 0)
-                printf("\033[%dD", cur);
             cur = 0;
+            line_seek(prompt, cur);
             continue;
         }
         if (c == 5 || c == KEY_END) {
-            if (cur < len)
-                printf("\033[%dC", len - cur);
             cur = len;
+            line_seek(prompt, cur);
             continue;
         }
         if (c == KEY_LEFT) {
             if (cur > 0) {
                 cur--;
-                printf("\033[1D");
+                line_seek(prompt, cur);
             }
             continue;
         }
         if (c == KEY_RIGHT) {
             if (cur < len) {
                 cur++;
-                printf("\033[1C");
+                line_seek(prompt, cur);
             }
             continue;
         }
@@ -534,11 +603,15 @@ static int sh_readline(const char *prompt, char *buf, int max)
         if (len >= max - 1)
             continue;
         if (cur == len) {
-            /* Appending: echo the one character, no repaint needed. */
+            /* Appending: echo the one character, no repaint needed. The
+             * console wraps as soon as column 80 is passed, so the row
+             * the cursor lands on follows from the new length. */
             buf[len++] = (char)c;
             buf[len] = '\0';
             cur = len;
             putchar(c);
+            line_row = (plen + cur) / TERM_COLS;
+            line_rows = line_row;
         } else {
             char one[2];
 
@@ -552,7 +625,8 @@ static int sh_readline(const char *prompt, char *buf, int max)
 
 /* --- line preprocessing ----------------------------------------------- */
 
-/* Truncate the line at an unquoted '#' that starts a word. */
+/* Truncate the line at an unquoted '#' that starts a word. A ';' ends a
+ * word just as whitespace does, so "echo a;# comment" comments too. */
 static void strip_comment(char *s)
 {
     int inq = 0, i;
@@ -562,7 +636,8 @@ static void strip_comment(char *s)
             inq = !inq;
             continue;
         }
-        if (!inq && s[i] == '#' && (i == 0 || is_space(s[i - 1]))) {
+        if (!inq && s[i] == '#' &&
+            (i == 0 || is_space(s[i - 1]) || s[i - 1] == ';')) {
             s[i] = '\0';
             return;
         }
@@ -630,17 +705,20 @@ static int expand_vars(const char *in, char *out, unsigned long outsz)
 }
 
 /* Pull '>' / '>>' plus their target out of the token array. Returns the
- * remaining token count, or -1 on a syntax error. */
-static int parse_redirect(int ntok, char **tok, char *file,
+ * remaining token count, or -1 on a syntax error. A token that carried
+ * double quotes is never an operator, so `echo ">"` passes a literal '>'
+ * along the way sh always did. */
+static int parse_redirect(int ntok, char **tok, int *quoted, char *file,
                           unsigned long fsz, int *mode)
 {
     char *out[MAX_TOKENS];
+    int outq[MAX_TOKENS];
     int i, n = 0;
 
     *mode = 0;
     file[0] = '\0';
     for (i = 0; i < ntok; i++) {
-        if (tok[i][0] == '>') {
+        if (!quoted[i] && tok[i][0] == '>') {
             const char *rest = tok[i] + 1;
             int append = 0;
 
@@ -649,7 +727,8 @@ static int parse_redirect(int ntok, char **tok, char *file,
                 rest++;
             }
             if (!*rest) {
-                if (i + 1 >= ntok || tok[i + 1][0] == '>')
+                if (i + 1 >= ntok ||
+                    (!quoted[i + 1] && tok[i + 1][0] == '>'))
                     return -1;
                 rest = tok[++i];
             }
@@ -657,10 +736,14 @@ static int parse_redirect(int ntok, char **tok, char *file,
             snprintf(file, fsz, "%s", rest);
             continue;
         }
-        out[n++] = tok[i];
+        out[n] = tok[i];
+        outq[n] = quoted[i];
+        n++;
     }
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         tok[i] = out[i];
+        quoted[i] = outq[i];
+    }
     return n;
 }
 
@@ -801,6 +884,16 @@ static void run_external(int ntok, char **tok)
         last_status = 1;
         return;
     }
+    /* An argument longer than SPAWN_ARG_MAX is truncated by the kernel
+     * without a word, which hands the app half a path. Refuse instead. */
+    for (i = 0; i < ntok; i++) {
+        if (strlen(tok[i]) >= SPAWN_ARG_MAX) {
+            printf("sh: argument %d too long (max %d)\n", i,
+                   SPAWN_ARG_MAX - 1);
+            last_status = 1;
+            return;
+        }
+    }
     for (i = 0; i < ntok; i++)
         sargv[argn++] = tok[i];
 
@@ -835,6 +928,7 @@ static void run_segment(char *seg)
     char rfile[MAX_PATH];
     char rpath[MAX_PATH];
     char *tok[MAX_TOKENS];
+    int quoted[MAX_TOKENS];
     int ntok, rmode, fd;
 
     if (expand_vars(seg, expanded, sizeof(expanded)) != 0) {
@@ -842,7 +936,7 @@ static void run_segment(char *seg)
         last_status = 1;
         return;
     }
-    ntok = tokenize(expanded, tok);
+    ntok = tokenize(expanded, tok, quoted);
     if (ntok < 0) {
         printf("sh: too many tokens (max %d)\n", MAX_TOKENS);
         last_status = 1;
@@ -851,7 +945,7 @@ static void run_segment(char *seg)
     if (ntok == 0)
         return;
 
-    ntok = parse_redirect(ntok, tok, rfile, sizeof(rfile), &rmode);
+    ntok = parse_redirect(ntok, tok, quoted, rfile, sizeof(rfile), &rmode);
     if (ntok < 0) {
         printf("sh: syntax error near '>'\n");
         last_status = 1;

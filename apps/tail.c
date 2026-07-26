@@ -12,7 +12,7 @@
 
 #define MAX_PATH  256
 #define BUFSZ     512
-#define LINESZ    256
+#define LINESZ    512
 #define MAX_LINES 128
 #define CTRL_D    4
 
@@ -90,12 +90,18 @@ static int lr_line(struct lreader *r, char *out, int outsz)
 static void tail_fd(int fd, int tty, int nlines)
 {
     struct lreader r;
+    char line[LINESZ];
     long total = 0;
     int i, first, count;
 
+    /* Read into a scratch buffer: lr_line terminates "out" even on the
+     * final call that returns 0 at EOF, so writing straight into the
+     * ring would blank the oldest slot we are about to print. */
     lr_init(&r, fd, tty);
-    while (lr_line(&r, g_ring[total % nlines], LINESZ))
+    while (lr_line(&r, line, LINESZ)) {
+        memcpy(g_ring[total % nlines], line, strlen(line) + 1);
         total++;
+    }
 
     count = (int)(total < nlines ? total : nlines);
     first = (int)(total - count);

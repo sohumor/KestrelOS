@@ -18,6 +18,11 @@
 #define ERR_NONE   0
 #define ERR_SYNTAX 1
 #define ERR_DIVZ   2
+#define ERR_RANGE  3
+
+/* No <limits.h> in the KestrelOS libc; GCC always predefines __LONG_MAX__. */
+#define CALC_LONG_MAX  __LONG_MAX__
+#define CALC_LONG_MIN  (-__LONG_MAX__ - 1L)
 
 static const char *g_p;
 static int g_err;
@@ -67,7 +72,15 @@ static long parse_primary(void)
         return 0;
     }
     while (*g_p >= '0' && *g_p <= '9') {
-        v = v * 10 + (*g_p - '0');
+        long d = *g_p - '0';
+
+        /* Refuse the literal rather than wrapping around silently. */
+        if (v > (CALC_LONG_MAX - d) / 10) {
+            if (!g_err)
+                g_err = ERR_RANGE;
+            return 0;
+        }
+        v = v * 10 + d;
         g_p++;
     }
     return v;
@@ -87,9 +100,15 @@ static long parse_unary(void)
     if (*g_p == '-') {
         g_p++;
         g_depth++;
-        v = -parse_unary();
+        v = parse_unary();
         g_depth--;
-        return v;
+        if (g_err)
+            return 0;
+        if (v == CALC_LONG_MIN) {      /* -LONG_MIN is not representable */
+            g_err = ERR_RANGE;
+            return 0;
+        }
+        return -v;
     }
     if (*g_p == '+') {
         g_p++;
@@ -126,13 +145,23 @@ static long parse_term(void)
             return 0;
 
         if (op == '*') {
-            v = v * r;
+            if (__builtin_mul_overflow(v, r, &v)) {
+                g_err = ERR_RANGE;
+                return 0;
+            }
         } else if (r == 0) {
             g_err = ERR_DIVZ;
             return 0;
         } else if (r == -1) {
             /* Avoids the LONG_MIN / -1 divide fault. */
-            v = (op == '/') ? -v : 0;
+            if (op != '/') {
+                v = 0;
+            } else if (v == CALC_LONG_MIN) {
+                g_err = ERR_RANGE;
+                return 0;
+            } else {
+                v = -v;
+            }
         } else if (op == '/') {
             v = v / r;
         } else {
@@ -173,7 +202,11 @@ static long parse_expr(void)
         if (g_err)
             return 0;
 
-        v = (op == '+') ? v + r : v - r;
+        if (op == '+' ? __builtin_add_overflow(v, r, &v)
+                      : __builtin_sub_overflow(v, r, &v)) {
+            g_err = ERR_RANGE;
+            return 0;
+        }
     }
 }
 
@@ -192,9 +225,17 @@ int main(int argc, char **argv)
 
     expr[0] = '\0';
     for (i = 1; i < argc; i++) {
+        int n;
+
         len = strlen(expr);
-        snprintf(expr + len, sizeof(expr) - len, "%s%s",
-                 i > 1 ? " " : "", argv[i]);
+        n = snprintf(expr + len, sizeof(expr) - len, "%s%s",
+                     i > 1 ? " " : "", argv[i]);
+        /* snprintf reports what it *would* have written: never evaluate a
+         * silently shortened expression, that yields a wrong answer. */
+        if (n < 0 || (unsigned long)n >= sizeof(expr) - len) {
+            printf("expression too long\n");
+            return 1;
+        }
     }
 
     g_p = expr;
@@ -208,6 +249,10 @@ int main(int argc, char **argv)
 
     if (g_err == ERR_DIVZ) {
         printf("divide by zero\n");
+        return 1;
+    }
+    if (g_err == ERR_RANGE) {
+        printf("overflow\n");
         return 1;
     }
     if (g_err) {

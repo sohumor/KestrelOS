@@ -1,8 +1,11 @@
 /* yes.c - repeat a string until 'q' is pressed.
  *
  * usage: yes [string...]   (default "y")
- * The console is polled non-blockingly, so the loop stops as soon as
- * 'q', ESC or ctrl-C arrives.
+ * The console is polled non-blockingly and 'q'/'Q' stops the loop at
+ * once. ESC and ctrl-C are accepted too, but do not work today: the
+ * console driver holds a lone ESC back waiting for the rest of a
+ * possible ANSI sequence, and discards ctrl-C (0x03) outright instead of
+ * queueing it for the foreground process. Use 'q'.
  */
 
 #include <kestrel.h>

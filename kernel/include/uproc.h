@@ -7,7 +7,10 @@
  * exit-code bookkeeping for waitpid, and the int 0x80 syscall layer. */
 
 #define UPROC_MAX_ARGS 16
-#define UPROC_ARG_MAX  128
+/* Must be >= sh.c's MAX_LINE (256) so a single token typed at the shell can
+ * never be truncated on the way into a process: a shortened argv[] element
+ * makes tools like calc compute a wrong answer instead of failing. */
+#define UPROC_ARG_MAX  256
 #define UPROC_PATH_MAX 256
 
 /* syscall.c: install the int 0x80 dispatcher + ring-3 fault handler. */

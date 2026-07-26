@@ -34,6 +34,9 @@ QEMU_CMD = [
 
 DEFAULT_TIMEOUT = 20
 BOOT_TIMEOUT = 30
+# Recursive walkers (tree/du/find) must finish well inside this; a
+# runaway recursion shows up as a timeout instead of a wedged harness.
+WALK_TIMEOUT = 10
 TAIL_LINES = 40
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
@@ -252,6 +255,125 @@ def t_uptime(h):
     wait_prompt(h)
 
 
+def t_calc(h):
+    h.send("calc 2*(3+4)")
+    # "\n14\n" cannot match the echoed command line or the prompt
+    h.expect(r"\n14\n", regex=True)
+    wait_prompt(h)
+
+
+def t_calc_divzero(h):
+    h.send("calc 1/0")
+    h.expect("divide by zero")
+    wait_prompt(h)
+
+
+def t_cp_wc(h):
+    h.send("cp /etc/version /t2.txt")
+    wait_prompt(h)
+    h.send("wc -c /t2.txt")
+    # wc prints "<count> /t2.txt"; the echoed command has no digits there
+    h.expect(r"\n *\d+ /t2\.txt\n", regex=True)
+    wait_prompt(h)
+
+
+def t_mv_rm(h):
+    h.send("mv /t2.txt /t3.txt")
+    wait_prompt(h)
+    h.send("cat /t3.txt")
+    h.expect("KestrelOS 0.1.0")     # body of /etc/version, moved twice
+    wait_prompt(h)
+    h.send("rm /t3.txt")
+    wait_prompt(h)
+    h.send("cat /t3.txt")
+    h.expect("cat: cannot open")    # not present in the echoed command
+    wait_prompt(h)
+
+
+def t_mkdir_ls(h):
+    h.send("mkdir /d1")
+    wait_prompt(h)
+    h.send("ls /")
+    # ls prints "d <size>  <name>"; the leading 'd' flag makes it unique
+    h.expect(r"\nd +\d+ +d1\n", regex=True)
+    wait_prompt(h)
+
+
+def t_grep(h):
+    h.send("grep -n Kestrel /etc/motd")
+    # "<lineno>:<line>" — the echoed command has no "<digits>:"
+    h.expect(r"\n\d+:[^\n]*KestrelOS", regex=True)
+    wait_prompt(h)
+
+
+def t_head(h):
+    h.send("head -n 1 /doc/welcome.md")
+    # requiring the prompt immediately after asserts "first line only"
+    h.expect(r"# Welcome to KestrelOS\nkestrel:[^\n]*\$", regex=True)
+
+
+def t_tail(h):
+    h.send("tail -n 1 /doc/welcome.md")
+    # last line of welcome.md, and nothing after it but the prompt
+    h.expect(r"for the release\.\nkestrel:[^\n]*\$", regex=True)
+
+
+def t_tree(h):
+    h.send("tree /etc")
+    h.expect(r"\d+ director(y|ies), \d+ files?", regex=True,
+             timeout=WALK_TIMEOUT)
+    wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_du(h):
+    h.send("du /etc")
+    h.expect(r"\n *\d+  /etc\n", regex=True, timeout=WALK_TIMEOUT)
+    wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_find(h):
+    h.send("find /etc")
+    # a path the echoed "find /etc" cannot contain
+    h.expect(r"\n/etc/version\n", regex=True, timeout=WALK_TIMEOUT)
+    wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_date(h):
+    h.send("date")
+    got = h.expect_any([r"\d{4}-\d\d-\d\d", re.escape("no clock")],
+                       regex=True)
+    wait_prompt(h)
+    if got != r"\d{4}-\d\d-\d\d":
+        return "SKIP"
+
+
+def t_err_cat_missing(h):
+    h.send("cat /nope")
+    h.expect("cat: cannot open")
+    wait_prompt(h)
+
+
+def t_err_rm_missing(h):
+    h.send("rm /nope")
+    h.expect("rm: cannot remove")
+    wait_prompt(h)
+
+
+def t_err_unknown_cmd(h):
+    h.send("notacommand42")
+    # the echoed line is just the word; this prefix is shell-only
+    h.expect("sh: command not found")
+    wait_prompt(h)
+
+
+def t_long_line(h):
+    # 300 chars: past the shell's 256-byte line buffer. Excess input is
+    # dropped by readline, so the shell must still reach a prompt.
+    h.send("zq" * 150)
+    h.expect_any(["sh: command not found", "sh: too many tokens"])
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("shell-prompt", t_prompt),
@@ -265,6 +387,22 @@ TESTS = [
     ("ping", t_ping),
     ("nslookup", t_nslookup),
     ("uptime", t_uptime),
+    ("calc", t_calc),
+    ("calc-divzero", t_calc_divzero),
+    ("cp-wc", t_cp_wc),
+    ("mv-rm", t_mv_rm),
+    ("mkdir-ls", t_mkdir_ls),
+    ("grep", t_grep),
+    ("head", t_head),
+    ("tail", t_tail),
+    ("tree", t_tree),
+    ("du", t_du),
+    ("find", t_find),
+    ("date", t_date),
+    ("err-cat-missing", t_err_cat_missing),
+    ("err-rm-missing", t_err_rm_missing),
+    ("err-unknown-cmd", t_err_unknown_cmd),
+    ("long-line", t_long_line),
 ]
 
 

@@ -15,6 +15,7 @@
 
 static const char *g_cwd = "/";
 static char g_path[MAX_PATH];
+static int g_rc;
 
 /* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
 static int strip_cwd_arg(int argc, char **argv)
@@ -30,6 +31,45 @@ static int strip_cwd_arg(int argc, char **argv)
     return out;
 }
 
+/* Collapse "//", "." and ".." segments of an absolute path in place. */
+static void canonicalize(char *p)
+{
+    int r = 0, w = 0;
+
+    if (p[0] != '/')
+        return;
+
+    while (p[r]) {
+        int seg, len;
+
+        while (p[r] == '/')
+            r++;
+        if (!p[r])
+            break;
+        seg = r;
+        while (p[r] && p[r] != '/')
+            r++;
+        len = r - seg;
+
+        if (len == 1 && p[seg] == '.')
+            continue;
+        if (len == 2 && p[seg] == '.' && p[seg + 1] == '.') {
+            while (w > 0 && p[w - 1] != '/')
+                w--;
+            if (w > 0)
+                w--;
+            continue;
+        }
+        /* w <= seg always holds, so this forward copy cannot clobber. */
+        p[w++] = '/';
+        while (len--)
+            p[w++] = p[seg++];
+    }
+    if (w == 0)
+        p[w++] = '/';
+    p[w] = '\0';
+}
+
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
@@ -39,6 +79,7 @@ static void resolve(const char *tok, char *out, unsigned long outsz)
         snprintf(out, outsz, "/%s", tok);
     else
         snprintf(out, outsz, "%s/%s", g_cwd, tok);
+    canonicalize(out);
 }
 
 /* Append "/name" to g_path at offset len; -1 if it would not fit. */
@@ -64,8 +105,13 @@ static unsigned long walk(int len, int depth)
     unsigned long total = 0;
     int i;
 
-    if (depth >= MAX_DEPTH)
+    /* Say so when the cap bites: a silent stop reports a wrong total. */
+    if (depth >= MAX_DEPTH) {
+        printf("du: %s: max depth %d reached, not descending\n",
+               g_path, MAX_DEPTH);
+        printf("%10lu  %s\n", total, g_path);
         return 0;
+    }
 
     for (i = 0; i < MAX_ENTRY && readdir_at(g_path, i, &de) == 0; i++) {
         int nlen;
@@ -96,6 +142,7 @@ static unsigned long du_one(const char *arg)
     resolve(arg, g_path, sizeof(g_path));
     if (stat_(g_path, &st) != 0) {
         printf("du: %s: no such file or directory\n", g_path);
+        g_rc = 1;
         return 0;
     }
     if (!st.is_dir) {
@@ -122,7 +169,7 @@ int main(int argc, char **argv)
 
     if (paths == 0) {
         du_one(g_cwd);
-        return 0;
+        return g_rc;
     }
 
     for (i = 1; i < argc; i++)
@@ -130,5 +177,5 @@ int main(int argc, char **argv)
 
     if (paths > 1)
         printf("%10lu  total\n", total);
-    return 0;
+    return g_rc;
 }

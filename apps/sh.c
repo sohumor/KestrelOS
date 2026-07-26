@@ -3,9 +3,10 @@
  * Prompt: "kestrel:<cwd>$ ". Tokenizes on whitespace (max 16 tokens,
  * double quotes group words). Builtins: cd, pwd, exit, help. Anything
  * else is resolved to a binary (absolute, then <cwd>/name, then
- * /bin/name) and spawned. The shell always appends one extra argv
- * element "--cwd=<cwd>" so path-taking apps can resolve relative
- * arguments themselves; apps that ignore argv are unaffected.
+ * /bin/name) and spawned. The shell appends one extra argv element
+ * "--cwd=<cwd>" so path-taking apps can resolve relative arguments
+ * themselves; apps that ignore argv are unaffected. The hint is dropped
+ * (with a warning) when it would not fit the kernel's per-argument limit.
  */
 
 #include <kestrel.h>
@@ -18,6 +19,10 @@
  * an extra element, and an argv[16] would be dropped by the copy-in loop. */
 #define MAX_TOKENS 15
 #define MAX_PATH   256
+/* Kernel per-argument limit, from kernel/include/uproc.h (UPROC_ARG_MAX).
+ * The kernel copies each argv entry with strncpy into a slot this big, so
+ * a longer argument reaches the child silently truncated. */
+#define SPAWN_ARG_MAX 128
 
 static char cwd[MAX_PATH] = "/";
 
@@ -157,11 +162,19 @@ static void run_external(int ntok, char **tok)
         }
     }
 
-    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
     for (i = 0; i < ntok; i++)
         sargv[i] = tok[i];
-    sargv[ntok] = cwdarg;
-    sargv[ntok + 1] = 0;
+
+    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
+    /* A hint the kernel would truncate points at a directory that does not
+     * exist, which is worse than no hint at all: apps then resolve against /. */
+    if (strlen(cwdarg) < SPAWN_ARG_MAX) {
+        sargv[i++] = cwdarg;
+    } else {
+        printf("sh: cwd too long to pass on; %s will resolve against /\n",
+               tok[0]);
+    }
+    sargv[i] = 0;
 
     pid = spawn(path, sargv);
     if (pid < 0) {
@@ -171,6 +184,32 @@ static void run_external(int ntok, char **tok)
     code = waitpid(pid);
     if (code != 0)
         printf("[exit %d]\n", code);
+}
+
+/* The banner promises "help" lists every command, so the builtin names the
+ * builtins and then runs /bin/help, falling back to a pointer if it cannot. */
+static void builtin_help(void)
+{
+    char cwdarg[MAX_PATH + 8];
+    char arg0[] = "help";
+    char *hargv[3];
+    struct k_stat st;
+    int n = 0, pid;
+
+    puts("builtins: cd pwd exit help");
+    if (stat_("/bin/help", &st) == 0 && !st.is_dir) {
+        hargv[n++] = arg0;
+        snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
+        if (strlen(cwdarg) < SPAWN_ARG_MAX)
+            hargv[n++] = cwdarg;
+        hargv[n] = 0;
+        pid = spawn("/bin/help", hargv);
+        if (pid >= 0) {
+            waitpid(pid);
+            return;
+        }
+    }
+    puts("run /bin/help for all commands");
 }
 
 int main(int argc, char **argv)
@@ -204,7 +243,7 @@ int main(int argc, char **argv)
         else if (strcmp(tok[0], "exit") == 0)
             return ntok > 1 ? atoi(tok[1]) : 0;
         else if (strcmp(tok[0], "help") == 0)
-            puts("builtins: cd pwd exit help -- run /bin/help for all commands");
+            builtin_help();
         else
             run_external(ntok, tok);
     }

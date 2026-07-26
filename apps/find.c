@@ -31,6 +31,45 @@ static int strip_cwd_arg(int argc, char **argv)
     return out;
 }
 
+/* Collapse "//", "." and ".." segments of an absolute path in place. */
+static void canonicalize(char *p)
+{
+    int r = 0, w = 0;
+
+    if (p[0] != '/')
+        return;
+
+    while (p[r]) {
+        int seg, len;
+
+        while (p[r] == '/')
+            r++;
+        if (!p[r])
+            break;
+        seg = r;
+        while (p[r] && p[r] != '/')
+            r++;
+        len = r - seg;
+
+        if (len == 1 && p[seg] == '.')
+            continue;
+        if (len == 2 && p[seg] == '.' && p[seg + 1] == '.') {
+            while (w > 0 && p[w - 1] != '/')
+                w--;
+            if (w > 0)
+                w--;
+            continue;
+        }
+        /* w <= seg always holds, so this forward copy cannot clobber. */
+        p[w++] = '/';
+        while (len--)
+            p[w++] = p[seg++];
+    }
+    if (w == 0)
+        p[w++] = '/';
+    p[w] = '\0';
+}
+
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
@@ -40,6 +79,7 @@ static void resolve(const char *tok, char *out, unsigned long outsz)
         snprintf(out, outsz, "/%s", tok);
     else
         snprintf(out, outsz, "%s/%s", g_cwd, tok);
+    canonicalize(out);
 }
 
 static const char *basename_of(const char *p)
@@ -74,8 +114,12 @@ static void walk(int len, int depth)
     struct k_dirent de;
     int i;
 
-    if (depth >= MAX_DEPTH)
+    /* Say so when the cap bites: a silent stop looks like "no matches". */
+    if (depth >= MAX_DEPTH) {
+        printf("find: %s: max depth %d reached, not descending\n",
+               g_path, MAX_DEPTH);
         return;
+    }
 
     for (i = 0; i < MAX_ENTRY && readdir_at(g_path, i, &de) == 0; i++) {
         int nlen;

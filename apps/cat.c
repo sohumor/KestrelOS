@@ -33,6 +33,7 @@ int main(int argc, char **argv)
 {
     char buf[512];
     char path[MAX_PATH];
+    struct k_stat st;
     long n;
     int i, fd, rc = 0;
 
@@ -44,6 +45,13 @@ int main(int argc, char **argv)
 
     for (i = 1; i < argc; i++) {
         resolve(argv[i], path, sizeof(path));
+        /* Dumping raw directory entries would spray escape bytes at the
+         * console, so refuse directories the way cp/mv do. */
+        if (stat_(path, &st) == 0 && st.is_dir) {
+            printf("cat: %s: is a directory\n", path);
+            rc = 1;
+            continue;
+        }
         fd = open(path, O_RDONLY);
         if (fd < 0) {
             printf("cat: cannot open %s\n", path);

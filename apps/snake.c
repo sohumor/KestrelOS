@@ -140,10 +140,14 @@ static void step(void)
         return;
     }
 
-    /* old head becomes body */
-    term_goto(CELL_ROW(h.y), CELL_COL(h.x));
     term_color(TERM_GREEN);
-    putchar('o');
+    /* Old head becomes body. At length 1 the tail we just erased IS the
+     * old head, so painting 'o' here would undo that erase and leave a
+     * trail behind the snake for the whole game. */
+    if (ate || snake_len > 1) {
+        term_goto(CELL_ROW(h.y), CELL_COL(h.x));
+        putchar('o');
+    }
 
     head = (head + 1) % MAX_LEN;
     body[head].x = nx;

@@ -1,7 +1,9 @@
 /* ls.c - list directory contents.
  *
+ * usage: ls [-a] [path...]
  * Always long-style: "TYPE  SIZE  NAME", directories first (marked
- * 'd'), aligned columns, trailing entry count. With no arguments the
+ * 'd'), aligned columns, trailing entry count. "." and ".." are hidden
+ * (and not counted) unless -a is given. With no path arguments the
  * shell-provided cwd is listed.
  */
 
@@ -35,7 +37,12 @@ static void resolve(const char *tok, char *out, unsigned long outsz)
         snprintf(out, outsz, "%s/%s", g_cwd, tok);
 }
 
-static int list_path(const char *path)
+static int is_dot(const char *name)
+{
+    return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
+}
+
+static int list_path(const char *path, int show_all)
 {
     static struct k_dirent ents[MAX_ENTRIES];
     struct k_stat st;
@@ -60,6 +67,8 @@ static int list_path(const char *path)
         for (i = 0; i < n; i++) {
             if ((pass == 0) != (ents[i].is_dir != 0))
                 continue;
+            if (!show_all && is_dot(ents[i].name))
+                continue;
             printf("%c %8u  %s\n", ents[i].is_dir ? 'd' : '-',
                    ents[i].size, ents[i].name);
             count++;
@@ -72,18 +81,31 @@ static int list_path(const char *path)
 int main(int argc, char **argv)
 {
     char path[MAX_PATH];
-    int i, rc = 0;
+    int i, rc = 0, show_all = 0, paths = 0;
 
     argc = strip_cwd_arg(argc, argv);
 
-    if (argc < 2)
-        return list_path(g_cwd);
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-a") == 0) {
+            show_all = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            printf("usage: ls [-a] [path...]\n");
+            return 1;
+        } else {
+            paths++;
+        }
+    }
+
+    if (paths == 0)
+        return list_path(g_cwd, show_all);
 
     for (i = 1; i < argc; i++) {
+        if (argv[i][0] == '-' && argv[i][1] != '\0')
+            continue;
         resolve(argv[i], path, sizeof(path));
-        if (argc > 2)
+        if (paths > 1)
             printf("%s:\n", path);
-        if (list_path(path) != 0)
+        if (list_path(path, show_all) != 0)
             rc = 1;
     }
     return rc;

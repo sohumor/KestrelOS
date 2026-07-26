@@ -11,7 +11,9 @@
 
 #define UDP_SPORT   40000
 #define RECV_MAX    1472
-#define RECV_WAIT_MS 5000
+/* Short window: the loop below is infinite, so a timeout only sets how
+ * often the keyboard is polled. 5s made q take up to 5s to register. */
+#define RECV_WAIT_MS 100
 
 static void usage(void)
 {
@@ -29,6 +31,12 @@ static int do_send(int nargs, char *args[])
     uint32_t ip = ip_aton(args[0]);
     if (ip == 0 && dns_resolve(args[0], &ip) != 0) {
         printf("udp: cannot resolve %s\n", args[0]);
+        return 1;
+    }
+    /* dns_resolve() also accepts "0.0.0.0"; the unspecified address is not
+     * a usable destination, so refuse it rather than spraying the gateway. */
+    if (ip == 0) {
+        printf("udp: invalid destination %s\n", args[0]);
         return 1;
     }
     int port = atoi(args[1]);

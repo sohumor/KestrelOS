@@ -90,7 +90,8 @@ int main(int argc, char *argv[])
     char proc_str[16];
     snprintf(proc_str, sizeof(proc_str), "%d", nproc);
     snprintf(info[0], sizeof(info[0]), "\033[1;36mKestrelOS\033[0m");
-    snprintf(info[1], sizeof(info[1]), "\033[36mos:\033[0m      KestrelOS %s", version);
+    /* /etc/version already reads "KestrelOS <ver>": do not prefix it again. */
+    snprintf(info[1], sizeof(info[1]), "\033[36mos:\033[0m      %s", version);
     snprintf(info[2], sizeof(info[2]), "\033[36mkernel:\033[0m  kestrel x86_64");
     snprintf(info[3], sizeof(info[3]), "\033[36muptime:\033[0m  %s", uptime_str);
     snprintf(info[4], sizeof(info[4]), "\033[36mmemory:\033[0m  %s", mem_str);

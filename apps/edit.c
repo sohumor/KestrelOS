@@ -64,6 +64,16 @@ static void resolve_path(const char *path, const char *cwd, char *out,
 
 static void load_file(void)
 {
+    struct k_stat st;
+
+    /* A directory opens and reads just fine, handing back raw directory
+     * entry bytes that would be presented as a one-line text file. Bail
+     * out before the screen is ever taken over. */
+    if (stat_(filename, &st) == 0 && st.is_dir) {
+        printf("edit: %s: is a directory\n", filename);
+        exit(1);
+    }
+
     int fd = open(filename, O_RDONLY);
     if (fd < 0) {
         nlines = 1;
@@ -163,9 +173,17 @@ static void draw(void)
             if ((unsigned long)leftcol < len) {
                 const char *p = l + leftcol;
                 unsigned long vis = len - (unsigned long)leftcol;
+                char vbuf[TEXT_COLS];
                 if (vis > TEXT_COLS)
                     vis = TEXT_COLS;
-                write(1, p, vis);
+                /* Never hand file bytes to the terminal raw: an ESC or a
+                 * stray control byte would be parsed as an escape
+                 * sequence and corrupt our own status and message rows. */
+                for (unsigned long k = 0; k < vis; k++) {
+                    unsigned char ch = (unsigned char)p[k];
+                    vbuf[k] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                }
+                write(1, vbuf, vis);
             }
         } else {
             term_color(TERM_CYAN);
