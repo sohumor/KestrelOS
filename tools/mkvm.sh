@@ -46,6 +46,10 @@ note "source image: $IMG"
 
 # ---------------- VirtualBox (VDI) ----------------
 
+# Under WSL the host's Windows VirtualBox is usable directly; it needs
+# Windows-style paths, which wslpath -w provides.
+VBOX_WIN="/mnt/c/Program Files/Oracle/VirtualBox/VBoxManage.exe"
+
 if have VBoxManage; then
     rm -f "$VDI"
     if VBoxManage convertfromraw "$IMG" "$VDI" --format VDI >/dev/null 2>&1; then
@@ -53,6 +57,16 @@ if have VBoxManage; then
         made=$((made + 1))
     else
         note "VBoxManage failed; skipping $VDI"
+        skipped=$((skipped + 1))
+    fi
+elif [ -x "$VBOX_WIN" ] && have wslpath; then
+    rm -f "$VDI"
+    if "$VBOX_WIN" convertfromraw "$(wslpath -w "$IMG")" \
+           "$(wslpath -w "$OUTDIR")\\kestrel.vdi" --format VDI >/dev/null 2>&1; then
+        note "wrote $VDI (VirtualBox, via the Windows host install)"
+        made=$((made + 1))
+    else
+        note "Windows VBoxManage failed; skipping $VDI"
         skipped=$((skipped + 1))
     fi
 else
