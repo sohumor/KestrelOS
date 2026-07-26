@@ -1,0 +1,39 @@
+# /etc/inittab - KestrelOS init configuration.
+#
+# One directive per line. A '#' starts a comment at the beginning of a line
+# or after whitespace, so a value like --tag=#1 survives.
+#
+#   sysinit <path> [args]   run to completion, in order, before anything else
+#   service <name>          start the service in /etc/services/<name>.svc
+#   respawn <path> [args]   keep it running: restart it whenever it exits
+#   once    <path> [args]   start it once, do not supervise it
+#
+# Any directive may be prefixed with a condition:
+#   if-exists  <path> <directive...>
+#   if-missing <path> <directive...>
+#
+# A program may be written as several alternatives separated by '|'; init
+# runs the first one that exists. Startup order is: every sysinit in file
+# order, then the services in dependency order, then once/respawn in file
+# order.
+#
+# The full format, the /run control protocol and the shutdown sequence are
+# described in docs/init.md.
+
+# --- sysinit ---------------------------------------------------------
+# Greet the console before anything else starts.
+sysinit /bin/cat /etc/motd
+
+# --- services --------------------------------------------------------
+# Copies the kernel log ring into /var/log/messages.
+service logger
+
+# Template unit, disabled: `service start example` starts it by hand.
+service example
+
+# --- console ---------------------------------------------------------
+# Create /etc/autologin (an empty file is enough) to boot straight into a
+# shell instead of the login prompt - that is what an unattended test run
+# wants. /bin/sh is also the fallback if /bin/login is ever missing.
+if-exists  /etc/autologin respawn /bin/sh
+if-missing /etc/autologin respawn /bin/login|/bin/sh

@@ -1,0 +1,5 @@
+# groupname:gid:members   (comma-separated, see docs/users.md)
+root:0:root
+wheel:10:root
+users:100:kestrel
+kestrel:1000:kestrel

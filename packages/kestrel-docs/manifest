@@ -1,0 +1,14 @@
+# kpkg manifest - documentation installed under /doc/kestrel.
+
+name: kestrel-docs
+version: 1.0.0
+description: KestrelOS handbook pages installed under /doc/kestrel.
+arch: x86_64
+maintainer: KestrelOS
+depends:
+
+default-file-mode: 0644
+default-dir-mode: 0755
+
+exclude *.o
+exclude *.swp

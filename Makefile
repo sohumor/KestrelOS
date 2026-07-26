@@ -15,7 +15,9 @@ CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
 LDFLAGS := -nostdlib -z max-page-size=0x1000 --no-warn-rwx-segments
 
 UCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
-           -mno-red-zone -Wall -Wextra -O2 -g -Ilibc/include -Iabi -MMD -MP
+           -mno-red-zone -Wall -Wextra -O2 -g \
+           -Ilibc/include -Iabi -Ilibgui -MMD -MP
+AR      := ar
 
 KERNEL_CSRC := $(wildcard kernel/*.c)
 KERNEL_ASRC := $(wildcard kernel/*.asm)
@@ -24,11 +26,30 @@ KERNEL_OBJS := $(BUILD)/kernel/entry.o \
                  $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASRC))) \
                $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRC))
 
-LIBC_OBJS := $(patsubst libc/%.c,$(BUILD)/libc/%.o,$(wildcard libc/*.c)) \
-             $(patsubst libc/%.asm,$(BUILD)/libc/%.o,$(wildcard libc/*.asm))
+# crt0 is linked explicitly first on every app, so it stays out of the
+# archive; everything else is pulled in on demand by the linker.
+CRT0      := $(BUILD)/libc/crt0.o
+LIBC_OBJS := $(filter-out $(CRT0), \
+               $(patsubst libc/%.c,$(BUILD)/libc/%.o,$(wildcard libc/*.c)) \
+               $(patsubst libc/%.asm,$(BUILD)/libc/%.o,$(wildcard libc/*.asm)))
+LIBC_A    := $(BUILD)/libc.a
 
-APP_NAMES := $(patsubst apps/%.c,%,$(wildcard apps/*.c))
+LIBGUI_OBJS := $(patsubst libgui/%.c,$(BUILD)/libgui/%.o,$(wildcard libgui/*.c))
+LIBGUI_A    := $(BUILD)/libgui.a
+
+# apps/html.c is the browser's rendering engine, not a program.
+APP_LIBS  := html
+APP_NAMES := $(filter-out $(APP_LIBS), \
+               $(patsubst apps/%.c,%,$(wildcard apps/*.c)))
 APP_BINS  := $(patsubst %,$(BUILD)/apps/%,$(APP_NAMES))
+
+# Packages are built like apps but staged into .kpkg archives instead of /bin.
+PKG_NAMES := $(notdir $(wildcard packages/*))
+PKG_SRC   := $(wildcard packages/*/src/*.c)
+KPKGS     := $(patsubst %,$(BUILD)/repo/%.kpkg,$(PKG_NAMES))
+PKG_PROGS := $(foreach s,$(PKG_SRC),\
+               $(BUILD)/pkg/$(word 2,$(subst /, ,$(s)))/root/bin/$(notdir $(basename $(s))))
+PKG_DATA  := $(shell find packages -path '*/root/*' -type f 2>/dev/null)
 
 ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 
@@ -76,23 +97,72 @@ $(BUILD)/libc/%.o: libc/%.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
 
+$(BUILD)/libgui/%.o: libgui/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(UCFLAGS) -c $< -o $@
+
+# Archives, so an app links only the objects it actually references.
+$(LIBC_A): $(LIBC_OBJS)
+	$(AR) rcs $@ $^
+
+$(LIBGUI_A): $(LIBGUI_OBJS)
+	$(AR) rcs $@ $^
+
 $(BUILD)/apps/%.o: apps/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(UCFLAGS) -c $< -o $@
 
-$(BUILD)/apps/%: $(BUILD)/apps/%.o $(LIBC_OBJS) apps/user.ld
-	$(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $@ \
-	  $(BUILD)/libc/crt0.o $(BUILD)/apps/$*.o \
-	  $(filter-out $(BUILD)/libc/crt0.o,$(LIBC_OBJS))
+USER_LINK = $(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $@
+
+$(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
+	$(USER_LINK) $(CRT0) $< $(LIBGUI_A) $(LIBC_A)
+
+# The browser also needs its rendering engine.
+$(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(BUILD)/apps/html.o $(CRT0) \
+                       $(LIBC_A) $(LIBGUI_A) apps/user.ld
+	$(USER_LINK) $(CRT0) $(BUILD)/apps/browser.o $(BUILD)/apps/html.o \
+	  $(LIBGUI_A) $(LIBC_A)
+
+# ---------------- packages ----------------
+
+define PKG_PROG_RULE
+$(BUILD)/pkgobj/$(1)/$(2).o: packages/$(1)/src/$(2).c
+	@mkdir -p $$(dir $$@)
+	$(CC) $(UCFLAGS) -c $$< -o $$@
+
+$(BUILD)/pkg/$(1)/root/bin/$(2): $(BUILD)/pkgobj/$(1)/$(2).o $(CRT0) $(LIBC_A) \
+                                 $(LIBGUI_A) apps/user.ld
+	@mkdir -p $$(dir $$@)
+	$(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $$@ \
+	  $(CRT0) $(BUILD)/pkgobj/$(1)/$(2).o $(LIBGUI_A) $(LIBC_A)
+endef
+$(foreach p,$(PKG_NAMES),$(foreach s,$(wildcard packages/$(p)/src/*.c),\
+  $(eval $(call PKG_PROG_RULE,$(p),$(notdir $(basename $(s)))))))
+
+$(BUILD)/repo/%.kpkg: packages/%/manifest $(PKG_PROGS) tools/mkpkg.py $(PKG_DATA)
+	@mkdir -p $(BUILD)/pkg/$*/root $(BUILD)/repo
+	if [ -d packages/$*/root ]; then cp -r packages/$*/root/. $(BUILD)/pkg/$*/root/; fi
+	$(PY) tools/mkpkg.py --manifest packages/$*/manifest \
+	  --root $(BUILD)/pkg/$*/root --out $@
+
+$(BUILD)/repo/index.kpi: $(KPKGS) tools/mkrepo.py
+	$(PY) tools/mkrepo.py --repo $(BUILD)/repo --out $@
 
 # ---------------- filesystem image ----------------
 
-$(BUILD)/fs.img: $(APP_BINS) tools/mkfs.py $(ROOTFS_SRC)
+$(BUILD)/fs.img: $(APP_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
+                 $(BUILD)/repo/index.kpi
 	rm -rf $(BUILD)/rootfs
-	mkdir -p $(BUILD)/rootfs/bin
+	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run \
+	         $(BUILD)/rootfs/tmp $(BUILD)/rootfs/var/log \
+	         $(BUILD)/rootfs/var/pkg/repo $(BUILD)/rootfs/var/pkg/db \
+	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
-	$(PY) tools/mkfs.py $(BUILD)/rootfs $@ 32
+	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
+	$(PY) tools/mkfs.py --mode /etc/shadow:0600 --mode /var/pkg/db:0700 \
+	  --mode /tmp:0777 --mode /run:0777 \
+	  $(BUILD)/rootfs $@ 32
 
 # ---------------- disk image ----------------
 

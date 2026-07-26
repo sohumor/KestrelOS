@@ -7,6 +7,7 @@
 #include "vmm.h"
 #include "vfs.h"
 #include "fpu.h"
+#include "wm.h"
 
 struct task *current;
 bool sched_active;
@@ -177,6 +178,10 @@ void task_sleep_ticks(uint64_t t)
 
 void task_exit(int code)
 {
+    /* Before the address space goes away: the compositor clears its own
+     * PTEs and returns the pixel frames itself. */
+    wm_cleanup_task(current->pid);
+
     cli();
     current->state = TASK_ZOMBIE;
     current->exit_code = code;

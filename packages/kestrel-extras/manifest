@@ -1,0 +1,11 @@
+# kpkg manifest - extra userland tools that do not ship in the base image.
+
+name: kestrel-extras
+version: 1.0.0
+description: Extra command line tools - cal and factor.
+arch: x86_64
+maintainer: KestrelOS
+depends:
+
+exclude *.o
+exclude *.d

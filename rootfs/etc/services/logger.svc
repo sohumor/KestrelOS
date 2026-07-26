@@ -1,0 +1,7 @@
+# System logger: drains the kernel log ring into /var/log/messages and
+# keeps that file under 64 KiB by dropping its oldest half.
+name=logger
+exec=/bin/logger
+args=-i 500 -c 64
+respawn=yes
+enabled=yes

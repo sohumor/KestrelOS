@@ -1,0 +1,22 @@
+# kpkg manifest - the `hello` demo package.
+#
+# Built by the Makefile from packages/hello/src/*.c; see docs/packages.md
+# for the manifest syntax.
+
+name: hello
+version: 1.0.0
+description: A trivial demo program that greets you.
+arch: x86_64
+maintainer: KestrelOS
+
+# hello pulls in kestrel-extras purely so that `kpkg install hello` has
+# a dependency to resolve.
+depends: kestrel-extras
+
+# /bin already defaults to 0755; spelled out here as the worked example
+# of the mode/own rules.
+mode /bin/hello 0755
+own  /bin/hello 0:0
+
+exclude *.o
+exclude *.d
