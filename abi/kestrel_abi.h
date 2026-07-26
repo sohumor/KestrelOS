@@ -34,6 +34,8 @@
 #define SYS_NETINFO   22  /* (struct k_netinfo*) -> 0 / -1 if no nic */
 #define SYS_SEEK      23  /* (fd, off, whence 0|1|2) -> new pos */
 #define SYS_READ_NB   24  /* (fd, buf, len) -> read, 0 if none ready */
+#define SYS_RTC       25  /* (struct k_rtc*) -> 0/-1 */
+#define SYS_POWER     26  /* (0=reboot, 1=halt) */
 
 /* open() flags */
 #define O_RDONLY 0x000
@@ -64,6 +66,17 @@ struct k_psinfo {
     int32_t pid;
     char name[32];
     int32_t state;
+};
+
+/* SYS_POWER actions */
+#define K_POWER_REBOOT 0
+#define K_POWER_HALT   1
+
+/* Wall-clock time from the CMOS RTC. wday is 0 = Sunday .. 6 = Saturday,
+ * computed from the date rather than read from the chip. */
+struct k_rtc {
+    uint16_t year;
+    uint8_t mon, day, hour, min, sec, wday, pad;
 };
 
 struct k_netinfo {

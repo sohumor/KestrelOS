@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "pmm.h"
+#include "proc.h"
 #include "string.h"
 
 /* Bitmap physical allocator. 1 bit per 4 KiB page; supports up to 4 GiB. */
@@ -63,24 +64,32 @@ void pmm_init(struct bootinfo *bi)
     search_from = kernel_end_phys / PAGE_SIZE;
 }
 
+/* The bitmap, free_count and search_from are shared mutable state and the
+ * scheduler is preemptive (and reap() frees from IRQ context), so every
+ * scan/claim sequence has to be atomic against a task switch. */
+
 uint64_t pmm_alloc(void)
 {
+    uint64_t f = irq_save();
     for (uint64_t p = search_from; p < max_phys / PAGE_SIZE; p++) {
         if (!is_used(p)) {
             set_used(p);
             free_count--;
             search_from = p + 1;
             uint64_t phys = p * PAGE_SIZE;
+            irq_restore(f);
             memset(P2V(phys), 0, PAGE_SIZE);
             return phys;
         }
     }
+    irq_restore(f);
     panic("pmm: out of memory");
 }
 
 uint64_t pmm_alloc_contig(int npages)
 {
     uint64_t limit = max_phys / PAGE_SIZE;
+    uint64_t f = irq_save();
     for (uint64_t p = 256; p + npages <= limit; p++) {
         int ok = 1;
         for (int i = 0; i < npages; i++) {
@@ -97,21 +106,27 @@ uint64_t pmm_alloc_contig(int npages)
             free_count--;
         }
         uint64_t phys = p * PAGE_SIZE;
+        irq_restore(f);
         memset(P2V(phys), 0, (uint64_t)npages * PAGE_SIZE);
         return phys;
     }
+    irq_restore(f);
     panic("pmm: out of contiguous memory (%d pages)", npages);
 }
 
 void pmm_free(uint64_t phys)
 {
     uint64_t p = phys / PAGE_SIZE;
-    if (!is_used(p))
+    uint64_t f = irq_save();
+    if (!is_used(p)) {
+        irq_restore(f);
         panic("pmm: double free of %lx", phys);
+    }
     set_free(p);
     free_count++;
     if (p < search_from)
         search_from = p;
+    irq_restore(f);
 }
 
 void pmm_free_contig(uint64_t phys, int npages)

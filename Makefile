@@ -35,7 +35,7 @@ ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless test clean
+.PHONY: all run run-headless test smoke fsck screenshot vm-images clean help
 
 all: $(BUILD)/os.img
 
@@ -109,6 +109,30 @@ run-headless: all
 
 test: all
 	$(PY) tools/e2e.py
+
+smoke: all
+	$(PY) tools/e2e.py --smoke
+
+fsck: $(BUILD)/fs.img
+	$(PY) tools/kfsck.py -l $<
+
+screenshot: all
+	sh tools/screenshot.sh $(BUILD)/shots/kestrel.png 8 $(CMD)
+
+vm-images: all
+	sh tools/mkvm.sh
+
+help:
+	@echo "KestrelOS build targets:"
+	@echo "  make            build build/os.img (bootable raw disk image)"
+	@echo "  make run        boot it in QEMU (window + serial on stdio)"
+	@echo "  make run-headless   boot it with serial only"
+	@echo "  make test       run the end-to-end suite in headless QEMU"
+	@echo "  make smoke      boot-only quick check"
+	@echo "  make fsck       validate + list the generated KFS image"
+	@echo "  make screenshot capture the VGA console to a PNG"
+	@echo "  make vm-images  convert to VirtualBox/VMware disk formats"
+	@echo "  make clean      remove build/"
 
 clean:
 	rm -rf $(BUILD)

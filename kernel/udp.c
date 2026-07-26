@@ -32,6 +32,7 @@ struct udp_slot {
 struct udp_bind {
     bool used;
     uint16_t port;              /* host order */
+    int owner_pid;              /* task that claimed it, 0 = kernel */
     struct udp_slot q[UDP_QUEUE];
     int head;                   /* oldest queued packet */
     int count;
@@ -52,13 +53,45 @@ static struct udp_bind *bind_find(uint16_t port)
     return 0;
 }
 
+/* Task context: reclaim bindings whose owning task is gone. udp_recv()
+ * auto-binds and there is no unbind syscall, so without this a handful of
+ * `udp listen` runs would exhaust the table and kill UDP receive (and DNS
+ * with it) for the rest of the boot. */
+static void bind_gc(void)
+{
+    for (int i = 0; i < UDP_PORTS; i++) {
+        if (!binds[i].used || binds[i].owner_pid <= 0)
+            continue;
+        if (task_find(binds[i].owner_pid))
+            continue;
+        uint64_t f = irq_save();
+        binds[i].used = false;
+        binds[i].head = 0;
+        binds[i].count = 0;
+        irq_restore(f);
+    }
+}
+
 /* Task context: find an existing binding or claim a free entry. Slot
  * buffers persist across rebinds so the IRQ path never allocates. */
 static struct udp_bind *bind_get(uint16_t port)
 {
+    int pid = current ? current->pid : 0;
     struct udp_bind *b = bind_find(port);
-    if (b)
+
+    if (b) {
+        /* A new owner must not inherit datagrams queued for the old one. */
+        if (b->owner_pid != pid) {
+            uint64_t f = irq_save();
+            b->owner_pid = pid;
+            b->head = 0;
+            b->count = 0;
+            irq_restore(f);
+        }
         return b;
+    }
+
+    bind_gc();
 
     for (int i = 0; i < UDP_PORTS; i++) {
         if (binds[i].used)
@@ -72,6 +105,7 @@ static struct udp_bind *bind_get(uint16_t port)
         }
         uint64_t f = irq_save();
         b->port = port;
+        b->owner_pid = pid;
         b->head = 0;
         b->count = 0;
         b->used = true;
@@ -88,6 +122,7 @@ void udp_unbind(uint16_t port)
         return;
     uint64_t f = irq_save();
     b->used = false;
+    b->owner_pid = 0;
     b->head = 0;
     b->count = 0;
     irq_restore(f);
@@ -96,7 +131,7 @@ void udp_unbind(uint16_t port)
 /* IRQ context: parse a UDP segment and queue it on its binding. */
 void udp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
 {
-    if (len < (int)sizeof(struct udp_hdr))
+    if (!seg || len < (int)sizeof(struct udp_hdr))
         return;
     const struct udp_hdr *uh = (const struct udp_hdr *)seg;
 

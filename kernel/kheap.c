@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "kheap.h"
 #include "pmm.h"
+#include "proc.h"
 #include "string.h"
 
 /* Kernel heap living in the physical direct map.
@@ -21,6 +22,9 @@ struct freeobj {
     struct freeobj *next;
 };
 
+/* freelist[] is shared mutable state: the scheduler is preemptive and
+ * schedule()/reap() calls kfree() from IRQ context, so every read-modify-
+ * write of a list head runs with interrupts masked. */
 static struct freeobj *freelist[MAX_SHIFT + 1];
 
 void kheap_init(void)
@@ -28,6 +32,8 @@ void kheap_init(void)
     /* nothing to do — grown on demand */
 }
 
+/* Caller holds the interrupt mask: this relinks the shared list head 256
+ * times, which must not be interleaved with another kmalloc/kfree. */
 static void refill(int shift)
 {
     uint64_t phys = pmm_alloc();
@@ -50,10 +56,16 @@ void *kmalloc(size_t size)
         int shift = MIN_SHIFT;
         while (((size_t)1 << shift) < need)
             shift++;
+        uint64_t f = irq_save();
         if (!freelist[shift])
             refill(shift);
         struct freeobj *o = freelist[shift];
+        if (!o) {
+            irq_restore(f);
+            return NULL;
+        }
         freelist[shift] = o->next;
+        irq_restore(f);
         struct hdr *h = (struct hdr *)o;
         h->magic = MAGIC_SMALL;
         h->info = shift;
@@ -85,8 +97,10 @@ void kfree(void *ptr)
         int shift = h->info;
         h->magic = 0;
         struct freeobj *o = (struct freeobj *)h;
+        uint64_t f = irq_save();
         o->next = freelist[shift];
         freelist[shift] = o;
+        irq_restore(f);
     } else if (h->magic == MAGIC_LARGE) {
         h->magic = 0;
         pmm_free_contig(V2P(h), h->info);

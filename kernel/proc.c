@@ -5,6 +5,7 @@
 #include "gdt.h"
 #include "timer.h"
 #include "vmm.h"
+#include "vfs.h"
 #include "fpu.h"
 
 struct task *current;
@@ -76,6 +77,8 @@ void task_wake_sleepers(void)
 static void fpu_attach(struct task *t)
 {
     t->fpu_alloc = kmalloc(FPU_STATE_SIZE + 16);
+    if (!t->fpu_alloc)
+        return;
     t->fpu_state = (void *)(((uint64_t)t->fpu_alloc + 15) & ~15ULL);
     fpu_state_init(t->fpu_state);
 }
@@ -178,6 +181,15 @@ void task_exit(int code)
     current->state = TASK_ZOMBIE;
     current->exit_code = code;
 
+    /* Nothing else references these handles, and the task struct itself is
+     * about to be freed — a ring-3 fault must not leak them. */
+    for (int fd = 0; fd < MAX_OPEN_FILES; fd++) {
+        if (current->files[fd]) {
+            vfs_close(current->files[fd]);
+            current->files[fd] = NULL;
+        }
+    }
+
     if (current->parent && current->parent->state == TASK_SLEEPING &&
         current->parent->wait_child_pid == current->pid)
         current->parent->state = TASK_RUNNABLE;
@@ -209,13 +221,20 @@ void task_exit_from_bootstrap(int code)
 struct task *kthread_create(void (*func)(void *), void *arg, const char *name)
 {
     struct task *t = kzalloc(sizeof(*t));
-    t->pid = next_pid++;
+    if (!t)
+        return NULL;
     strncpy(t->name, name, TASK_NAME_MAX - 1);
     t->state = TASK_RUNNABLE;
     t->kstack = kmalloc(KSTACK_SIZE);
     t->pml4 = vmm_kernel_pml4();
     t->parent = current;
     fpu_attach(t);
+    if (!t->kstack || !t->fpu_alloc) {
+        kfree(t->kstack);
+        kfree(t->fpu_alloc);
+        kfree(t);
+        return NULL;
+    }
 
     /* Initial frame popped by ctx_switch: r15 r14 r13 r12 rbx rbp | rip.
      * task_bootstrap expects r12 = entry function, r13 = argument. */
@@ -230,6 +249,7 @@ struct task *kthread_create(void (*func)(void *), void *arg, const char *name)
     t->rsp = (uint64_t)sp;
 
     uint64_t f = irq_save();
+    t->pid = next_pid++;
     t->allnext = all_tasks;
     all_tasks = t;
     runq_insert(t);

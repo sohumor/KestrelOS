@@ -256,17 +256,17 @@ static void arp_input(const uint8_t *pkt, int len)
 
 /* ---- IPv4 ---- */
 
-int net_ip_send(uint32_t dst_ip_be, uint8_t proto,
-                const void *payload, int len)
+/* Transmit to an already-known next-hop MAC. The RX path must use this:
+ * resolving ARP from IRQ context would re-enter rx_drain on the same
+ * unconsumed frame and recurse until the kernel stack overflows. */
+static int ip_send_mac(const uint8_t *dst_mac, uint32_t dst_ip_be,
+                       uint8_t proto, const void *payload, int len)
 {
     uint8_t pkt[ETH_MTU];
     struct ip_hdr *ip = (struct ip_hdr *)pkt;
     static uint16_t ip_id;
-    uint8_t dst_mac[6];
 
     if (!ready || len < 0 || len > ETH_MTU - (int)sizeof(*ip))
-        return -1;
-    if (arp_resolve(dst_ip_be, dst_mac) < 0)
         return -1;
 
     ip->ver_ihl = 0x45;
@@ -285,15 +285,31 @@ int net_ip_send(uint32_t dst_ip_be, uint8_t proto,
     return eth_send(dst_mac, ETHERTYPE_IP, pkt, (int)sizeof(*ip) + len);
 }
 
+/* Task context only: may block for seconds inside arp_resolve. */
+int net_ip_send(uint32_t dst_ip_be, uint8_t proto,
+                const void *payload, int len)
+{
+    uint8_t dst_mac[6];
+
+    if (!ready || len < 0 || len > ETH_MTU - (int)sizeof(struct ip_hdr))
+        return -1;
+    if (arp_resolve(dst_ip_be, dst_mac) < 0)
+        return -1;
+    return ip_send_mac(dst_mac, dst_ip_be, proto, payload, len);
+}
+
 /* ---- ICMP ---- */
 
+static volatile bool ping_busy;                  /* one ping at a time */
 static volatile bool ping_waiting;
 static volatile bool ping_got;
 static volatile uint16_t ping_id, ping_seq;      /* host order */
+static volatile uint32_t ping_target;            /* network order */
 static volatile uint64_t ping_reply_ticks;
 
-/* IRQ context. */
-static void icmp_input(uint32_t src_ip, const uint8_t *pkt, int len)
+/* IRQ context. src_mac is the frame's sender, i.e. our next hop back. */
+static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
+                       const uint8_t *pkt, int len)
 {
     if (len < (int)sizeof(struct icmp_hdr))
         return;
@@ -302,8 +318,10 @@ static void icmp_input(uint32_t src_ip, const uint8_t *pkt, int len)
     const struct icmp_hdr *ic = (const struct icmp_hdr *)pkt;
 
     if (ic->type == 8 && ic->code == 0) {
-        /* Echo request: reply. The sender's MAC was learned in
-         * ipv4_input, so net_ip_send will not block on ARP. */
+        /* Echo request: reply straight to the sender's MAC. Going through
+         * net_ip_send() would call arp_resolve() here, and for an
+         * off-subnet source that means waiting on the (possibly unknown)
+         * gateway from inside the RX interrupt. */
         uint8_t reply[ETH_MTU - 20];
         if (len > (int)sizeof(reply))
             return;
@@ -312,11 +330,13 @@ static void icmp_input(uint32_t src_ip, const uint8_t *pkt, int len)
         rh->type = 0;
         rh->csum = 0;
         rh->csum = net_checksum(reply, len);
-        net_ip_send(src_ip, IP_PROTO_ICMP, reply, len);
+        ip_send_mac(src_mac, src_ip, IP_PROTO_ICMP, reply, len);
         return;
     }
 
-    if (ic->type == 0 && ping_waiting &&
+    /* Match the address too: id is just a pid and seq is a small counter,
+     * so without it any host on the segment can satisfy our wait. */
+    if (ic->type == 0 && ping_waiting && src_ip == ping_target &&
         ntohs(ic->id) == ping_id && ntohs(ic->seq) == ping_seq) {
         ping_reply_ticks = timer_ticks();
         ping_got = true;
@@ -334,11 +354,19 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
     if (timeout_ms <= 0)
         timeout_ms = 1000;
 
+    /* The match state is a single set of globals, so a second concurrent
+     * ping would steal the first one's reply. Refuse instead. */
     uint64_t f = irq_save();
+    if (ping_busy) {
+        irq_restore(f);
+        return -1;
+    }
+    ping_busy = true;
     uint16_t myseq = ++seq_counter;
     uint16_t myid = (uint16_t)(current ? current->pid : 1);
     ping_id = myid;
     ping_seq = myseq;
+    ping_target = ip_be;
     ping_got = false;
     ping_waiting = true;
     irq_restore(f);
@@ -352,21 +380,29 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
         pkt[sizeof(*ic) + i] = (uint8_t)('a' + (i & 15));
     ic->csum = net_checksum(pkt, sizeof(pkt));
 
-    uint64_t start = timer_ticks();
     if (net_ip_send(ip_be, IP_PROTO_ICMP, pkt, sizeof(pkt)) < 0) {
         ping_waiting = false;
+        ping_busy = false;
         return -1;
     }
 
+    /* Sample the clock only once the request is on the wire: net_ip_send
+     * can spend up to 3 s in arp_resolve, which would otherwise be charged
+     * to the round-trip time and could expire the deadline before the
+     * wait loop runs even once. */
+    uint64_t start = timer_ticks();
     uint64_t deadline = start + (uint64_t)(timeout_ms + 9) / 10;
     while (timer_ticks() <= deadline) {
         if (ping_got) {
+            uint64_t got = ping_reply_ticks;
             ping_waiting = false;
-            return (long)((ping_reply_ticks - start) * 10);
+            ping_busy = false;
+            return got > start ? (long)((got - start) * 10) : 0;
         }
         net_wait_tick();
     }
     ping_waiting = false;
+    ping_busy = false;
     return -1;
 }
 
@@ -399,7 +435,7 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
     int plen = total - ihl;
 
     if (ip->proto == IP_PROTO_ICMP)
-        icmp_input(ip->src, payload, plen);
+        icmp_input(ip->src, eh->src, payload, plen);
     else if (ip->proto == IP_PROTO_UDP)
         udp_input(ip->src, payload, plen);
 }

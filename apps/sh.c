@@ -14,7 +14,9 @@
 #include <string.h>
 
 #define MAX_LINE   256
-#define MAX_TOKENS 16
+/* One below the kernel's argv limit: run_external appends --cwd=<path> as
+ * an extra element, and an argv[16] would be dropped by the copy-in loop. */
+#define MAX_TOKENS 15
 #define MAX_PATH   256
 
 static char cwd[MAX_PATH] = "/";

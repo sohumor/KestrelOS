@@ -2,12 +2,75 @@
 #include "vfs.h"
 #include "kfs.h"
 #include "kheap.h"
+#include "proc.h"
 #include "string.h"
 #include "kestrel_abi.h"
 
 /* Thin VFS over KFS. All paths are absolute. */
 
 static int vfs_ready;
+
+/* --- open-inode table ------------------------------------------------
+ * struct file holds a bare inum, and KFS hands a freed inode slot straight
+ * back out to the next create. Unlinking an inode that still has open
+ * handles would therefore let an old fd read and write a different file,
+ * so a referenced inode is not removable. */
+
+#define VFS_OPEN_INODES 64
+
+static struct {
+    uint32_t inum;
+    int count;
+} open_inodes[VFS_OPEN_INODES];
+
+static int inode_ref(uint32_t inum)
+{
+    int slot = -1;
+    uint64_t f = irq_save();
+    for (int i = 0; i < VFS_OPEN_INODES; i++) {
+        if (open_inodes[i].count > 0 && open_inodes[i].inum == inum) {
+            open_inodes[i].count++;
+            irq_restore(f);
+            return 0;
+        }
+        if (open_inodes[i].count == 0 && slot < 0)
+            slot = i;
+    }
+    if (slot < 0) {
+        irq_restore(f);
+        return -1;                  /* too many distinct inodes open */
+    }
+    open_inodes[slot].inum = inum;
+    open_inodes[slot].count = 1;
+    irq_restore(f);
+    return 0;
+}
+
+static void inode_unref(uint32_t inum)
+{
+    uint64_t f = irq_save();
+    for (int i = 0; i < VFS_OPEN_INODES; i++) {
+        if (open_inodes[i].count > 0 && open_inodes[i].inum == inum) {
+            open_inodes[i].count--;
+            break;
+        }
+    }
+    irq_restore(f);
+}
+
+static int inode_is_open(uint32_t inum)
+{
+    int open = 0;
+    uint64_t f = irq_save();
+    for (int i = 0; i < VFS_OPEN_INODES; i++) {
+        if (open_inodes[i].count > 0 && open_inodes[i].inum == inum) {
+            open = 1;
+            break;
+        }
+    }
+    irq_restore(f);
+    return open;
+}
 
 int vfs_init(void)
 {
@@ -52,15 +115,22 @@ struct file *vfs_open(const char *path, int flags)
     if (ip.type == KFS_TYPE_DIR && flags_allow_write(flags))
         return NULL;            /* directories are read-only via the VFS */
 
+    if (inode_ref((uint32_t)ino) < 0)
+        return NULL;
+
     if ((flags & O_TRUNC) && flags_allow_write(flags) &&
         ip.type == KFS_TYPE_FILE) {
-        if (kfs_truncate((uint32_t)ino) < 0)
+        if (kfs_truncate((uint32_t)ino) < 0) {
+            inode_unref((uint32_t)ino);
             return NULL;
+        }
     }
 
     struct file *f = kzalloc(sizeof(struct file));
-    if (f == NULL)
+    if (f == NULL) {
+        inode_unref((uint32_t)ino);
         return NULL;
+    }
     f->inum = (uint32_t)ino;
     f->pos = 0;
     f->flags = flags;
@@ -72,8 +142,10 @@ void vfs_close(struct file *f)
 {
     if (f == NULL)
         return;
-    if (--f->refs <= 0)
+    if (--f->refs <= 0) {
+        inode_unref(f->inum);
         kfree(f);
+    }
 }
 
 long vfs_read(struct file *f, void *buf, unsigned long n)
@@ -129,9 +201,13 @@ long vfs_seek(struct file *f, long off, int whence)
     default:
         return -1;
     }
+    /* f->pos is 32-bit: narrowing an unchecked 64-bit offset would wrap a
+     * huge seek back into range and silently redirect the next write. */
+    if (off > 0 && base > (long)0x7FFFFFFFFFFFFFFFLL - off)
+        return -1;
     long pos = base + off;
-    if (pos < 0)
-        pos = 0;
+    if (pos < 0 || pos > (long)KFS_MAX_FILE_SIZE)
+        return -1;
     f->pos = (uint32_t)pos;
     return pos;
 }
@@ -178,6 +254,9 @@ int vfs_unlink(const char *path)
 {
     if (!vfs_ready || path == NULL)
         return -1;
+    int ino = kfs_lookup(path);
+    if (ino >= 0 && inode_is_open((uint32_t)ino))
+        return -1;              /* still open: the slot must not be reused */
     return kfs_unlink(path);
 }
 

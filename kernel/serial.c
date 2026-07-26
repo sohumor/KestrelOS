@@ -47,10 +47,15 @@ char serial_getc(void)
  * Translates VT100 escape sequences (arrows, home/end, delete) into the
  * same special key codes the keyboard driver produces. */
 
-static int esc_state;   /* 0: normal, 1: got ESC, 2: got ESC [ */
+/* 0: normal, 1: got ESC, 2: got ESC [, 3/5/6: got the parameter digit of
+ * ESC [ 3/5/6 ~ (delete / pgup / pgdn), 4: discarding an unknown CSI. */
+static int esc_state;
 
 static void serial_handle_byte(uint8_t b)
 {
+    /* CSI parameter and intermediate bytes, everything before the final. */
+    bool param = (b >= 0x30 && b <= 0x3F);
+
     switch (esc_state) {
     case 1:
         if (b == '[') {
@@ -70,12 +75,30 @@ static void serial_handle_byte(uint8_t b)
         case 'H': input_push(KEY_HOME); return;
         case 'F': input_push(KEY_END); return;
         case '3': esc_state = 3; return;
-        default: return;                  /* swallow unknown sequence */
+        case '5': esc_state = 5; return;
+        case '6': esc_state = 6; return;
+        default:
+            /* Unknown sequence: swallow it through its final byte, so a
+             * trailing '~' is never delivered as literal text. */
+            if (param)
+                esc_state = 4;
+            return;
         }
     case 3:
+    case 5:
+    case 6: {
+        int st = esc_state;
         esc_state = 0;
         if (b == '~')
-            input_push(KEY_DELETE);
+            input_push(st == 3 ? KEY_DELETE :
+                       st == 5 ? KEY_PGUP : KEY_PGDN);
+        else if (param)
+            esc_state = 4;            /* modifiers, e.g. ESC [ 5 ; 2 ~ */
+        return;
+    }
+    case 4:
+        if (!param)
+            esc_state = 0;            /* final byte consumed */
         return;
     }
 

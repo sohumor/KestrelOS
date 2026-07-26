@@ -26,6 +26,9 @@ static int top = 0;            /* first visible line */
 static int leftcol = 0;        /* horizontal scroll offset */
 static char message[80];
 static int quit_pending = 0;
+static int save_pending = 0;   /* confirm overwrite of a truncated buffer */
+static int truncated = 0;      /* file did not fit in the buffer */
+static int had_final_nl = 1;   /* source file ended with a newline */
 
 static char *alloc_line(const char *text)
 {
@@ -73,31 +76,53 @@ static void load_file(void)
     int curlen = 0;
     char buf[512];
     long n;
+    int last = -1;
     nlines = 0;
     while ((n = read(fd, buf, sizeof(buf))) > 0) {
         for (long i = 0; i < n; i++) {
             char c = buf[i];
+            last = (unsigned char)c;
             if (c == '\n') {
                 if (nlines < MAX_LINES) {
                     cur[curlen] = 0;
                     lines[nlines++] = alloc_line(cur);
+                } else {
+                    truncated = 1;
                 }
                 curlen = 0;
-            } else if (c != '\r' && curlen < MAX_COLS - 1) {
-                cur[curlen++] = c;
+            } else if (c != '\r') {
+                if (curlen < MAX_COLS - 1)
+                    cur[curlen++] = c;
+                else
+                    truncated = 1;      /* the rest of this line is lost */
             }
         }
     }
-    if ((curlen > 0 || nlines == 0) && nlines < MAX_LINES) {
-        cur[curlen] = 0;
-        lines[nlines++] = alloc_line(cur);
+    had_final_nl = (last < 0 || last == '\n');
+    if (curlen > 0 || nlines == 0) {
+        if (nlines < MAX_LINES) {
+            cur[curlen] = 0;
+            lines[nlines++] = alloc_line(cur);
+        } else {
+            truncated = 1;
+        }
     }
     close(fd);
-    set_message("loaded");
+    /* Saving writes the buffer back with O_TRUNC, so a partial load would
+     * silently destroy the rest of the file. Say so, loudly. */
+    set_message(truncated ? "loaded, TRUNCATED - saving will destroy data"
+                          : "loaded");
 }
 
 static void save_file(void)
 {
+    if (truncated && !save_pending) {
+        save_pending = 1;
+        set_message("buffer is TRUNCATED - ctrl-S again to overwrite anyway");
+        return;
+    }
+    save_pending = 0;
+
     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         set_message("save failed: cannot open file");
@@ -108,9 +133,13 @@ static void save_file(void)
         unsigned long len = strlen(lines[i]);
         if (len > 0)
             write(fd, lines[i], len);
-        if (i < nlines - 1)
+        /* Separator between lines, plus the file's own terminator if it
+         * had one — otherwise every save shaves a byte off the file. */
+        if (i < nlines - 1 || (had_final_nl && (nlines > 1 || len > 0))) {
             write(fd, "\n", 1);
-        total += (long)len + 1;
+            total++;
+        }
+        total += (long)len;
     }
     close(fd);
     modified = 0;
@@ -147,9 +176,10 @@ static void draw(void)
 
     /* status bar, row 24, inverse video */
     char status[96];
-    snprintf(status, sizeof(status), " %s%s  ln %d/%d col %d  ^S save ^Q quit",
+    snprintf(status, sizeof(status),
+             " %s%s%s  ln %d/%d col %d  ^S save ^Q quit",
              filename[0] ? filename : "(no name)", modified ? " *" : "",
-             cy + 1, nlines, cx + 1);
+             truncated ? " [TRUNCATED]" : "", cy + 1, nlines, cx + 1);
     term_goto(24, 1);
     printf("\033[7m");
     int slen = (int)strlen(status);
@@ -206,8 +236,12 @@ static void delete_at(void)
         char *next = lines[cy + 1];
         int nl = (int)strlen(next);
         int room = MAX_COLS - 1 - len;
-        if (nl > room)
-            nl = room;
+        if (nl > room) {
+            /* Truncating here would silently drop the overflow, the way
+             * insert_char refuses when a line is full. */
+            set_message("lines too long to join");
+            return;
+        }
         memcpy(l + len, next, (unsigned long)nl);
         l[len + nl] = 0;
         free(next);
@@ -289,6 +323,8 @@ int main(int argc, char *argv[])
 
         if (c != 17)
             quit_pending = 0;
+        if (c != 19)
+            save_pending = 0;
 
         switch (c) {
         case KEY_UP:

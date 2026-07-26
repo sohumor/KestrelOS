@@ -17,6 +17,7 @@
 #include "net.h"
 #include "uproc.h"
 #include "fpu.h"
+#include "rtc.h"
 
 struct bootinfo *boot_info;
 
@@ -76,6 +77,10 @@ void kmain(uint64_t bootinfo_phys)
 
     net_init();
     syscall_init();
+
+    char when[40];
+    if (rtc_format(when, sizeof(when)) == 0)
+        kprintf("rtc: %s\n", when);
 
     kprintf("\nKESTREL READY\n\n");
 

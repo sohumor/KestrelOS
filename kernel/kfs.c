@@ -1,15 +1,47 @@
 #include "kernel.h"
 #include "kfs.h"
 #include "ata.h"
+#include "proc.h"
 #include "string.h"
 
-/* KFS driver. Single-threaded, write-through: every metadata update goes
- * straight to disk. A handful of static scratch blocks stand in for a
- * buffer cache; they are carefully assigned so no code path aliases two
- * uses of the same buffer (see comments at each declaration). */
+/* KFS driver. Write-through: every metadata update goes straight to disk.
+ * A handful of static scratch blocks stand in for a buffer cache; they are
+ * carefully assigned so no code path aliases two uses of the same buffer
+ * (see comments at each declaration).
+ *
+ * Those buffers, the superblock and the singleton ATA controller are all
+ * shared state, but syscalls run preemptible (syscall.c enables interrupts
+ * on entry), so every public entry point takes a whole-filesystem lock.
+ * Without it two tasks interleaved inside balloc()/writei() double-allocate
+ * blocks and cross-write each other's file data. */
 
 static struct kfs_superblock sb;
 static int kfs_mounted;
+
+/* Recursive: kfs_unlink()/kfs_mkdir() call the public kfs_truncate(). */
+static struct task *fs_owner;
+static int fs_depth;
+
+static void fs_lock(void)
+{
+    uint64_t f = irq_save();
+    while (fs_owner && fs_owner != current) {
+        irq_restore(f);
+        yield();
+        f = irq_save();
+    }
+    fs_owner = current;
+    fs_depth++;
+    irq_restore(f);
+}
+
+static void fs_unlock(void)
+{
+    uint64_t f = irq_save();
+    if (--fs_depth == 0)
+        fs_owner = NULL;
+    irq_restore(f);
+}
 
 static uint8_t sb_block[KFS_BLOCK_SIZE];  /* raw block 0 for writeback */
 static uint8_t bitmap_buf[KFS_BLOCK_SIZE]; /* balloc/bfree only */
@@ -98,7 +130,8 @@ static int ino_valid(uint32_t ino)
     return ino >= 1 && ino <= sb.inode_count;
 }
 
-int kfs_iget(uint32_t ino, struct kfs_inode *out)
+/* Unlocked: every caller inside this file already holds the FS lock. */
+static int iget(uint32_t ino, struct kfs_inode *out)
 {
     if (!kfs_mounted || !ino_valid(ino))
         return -1;
@@ -108,6 +141,16 @@ int kfs_iget(uint32_t ino, struct kfs_inode *out)
         return -1;
     memcpy(out, inode_buf + off, sizeof(struct kfs_inode));
     return 0;
+}
+
+int kfs_iget(uint32_t ino, struct kfs_inode *out)
+{
+    if (out == NULL)
+        return -1;
+    fs_lock();
+    int r = iget(ino, out);
+    fs_unlock();
+    return r;
 }
 
 static int iput(uint32_t ino, const struct kfs_inode *ip)
@@ -125,7 +168,7 @@ static uint32_t ialloc(uint16_t type)
 {
     struct kfs_inode ino;
     for (uint32_t i = 1; i <= sb.inode_count; i++) {
-        if (kfs_iget(i, &ino) < 0)
+        if (iget(i, &ino) < 0)
             return 0;
         if (ino.type == KFS_TYPE_FREE) {
             memset(&ino, 0, sizeof(ino));
@@ -200,7 +243,7 @@ static uint32_t bmap(uint32_t ino, struct kfs_inode *ip, uint32_t fbn, int alloc
 static long readi(uint32_t ino, uint32_t off, void *buf, uint32_t n)
 {
     struct kfs_inode ip;
-    if (kfs_iget(ino, &ip) < 0 || ip.type == KFS_TYPE_FREE)
+    if (iget(ino, &ip) < 0 || ip.type == KFS_TYPE_FREE)
         return -1;
     if (off >= ip.size)
         return 0;
@@ -226,7 +269,7 @@ static long readi(uint32_t ino, uint32_t off, void *buf, uint32_t n)
 static long writei(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
 {
     struct kfs_inode ip;
-    if (kfs_iget(ino, &ip) < 0 || ip.type == KFS_TYPE_FREE)
+    if (iget(ino, &ip) < 0 || ip.type == KFS_TYPE_FREE)
         return -1;
     if (n == 0)
         return 0;
@@ -262,19 +305,26 @@ static long writei(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
 
 long kfs_read(uint32_t ino, uint32_t off, void *buf, uint32_t n)
 {
-    if (!kfs_mounted)
+    if (!kfs_mounted || buf == NULL)
         return -1;
-    return readi(ino, off, buf, n);
+    fs_lock();
+    long r = readi(ino, off, buf, n);
+    fs_unlock();
+    return r;
 }
 
 long kfs_write(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
 {
     struct kfs_inode ip;
-    if (!kfs_mounted || kfs_iget(ino, &ip) < 0)
+    long r = -1;
+
+    if (!kfs_mounted || buf == NULL)
         return -1;
-    if (ip.type != KFS_TYPE_FILE)
-        return -1;
-    return writei(ino, off, buf, n);
+    fs_lock();
+    if (iget(ino, &ip) == 0 && ip.type == KFS_TYPE_FILE)
+        r = writei(ino, off, buf, n);
+    fs_unlock();
+    return r;
 }
 
 /* ---------- directories ---------- */
@@ -285,7 +335,7 @@ static uint32_t dir_lookup(uint32_t dir, const char *name, uint32_t *slot_out)
 {
     struct kfs_inode ip;
     struct kfs_dirent de;
-    if (kfs_iget(dir, &ip) < 0 || ip.type != KFS_TYPE_DIR)
+    if (iget(dir, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return 0;
     for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
         if (readi(dir, off, &de, sizeof(de)) != sizeof(de))
@@ -304,7 +354,7 @@ static int dir_add(uint32_t dir, const char *name, uint32_t ino)
 {
     struct kfs_inode ip;
     struct kfs_dirent de;
-    if (kfs_iget(dir, &ip) < 0 || ip.type != KFS_TYPE_DIR)
+    if (iget(dir, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return -1;
 
     uint32_t slot = ip.size;
@@ -342,13 +392,14 @@ static int dir_is_empty(uint32_t dir)
 {
     struct kfs_inode ip;
     struct kfs_dirent de;
-    if (kfs_iget(dir, &ip) < 0)
+    if (iget(dir, &ip) < 0)
         return 0;
     for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
         if (readi(dir, off, &de, sizeof(de)) != sizeof(de))
             return 0;
         if (de.ino == 0)
             continue;
+        de.name[sizeof(de.name) - 1] = '\0';   /* on-disk name may be junk */
         if (strcmp(de.name, ".") != 0 && strcmp(de.name, "..") != 0)
             return 0;
     }
@@ -380,7 +431,8 @@ static int path_next(const char **pp, char *name)
     return 1;
 }
 
-int kfs_lookup(const char *path)
+/* Unlocked: callers hold the FS lock. */
+static int lookup_path(const char *path)
 {
     char name[60];
     if (!kfs_mounted || path == NULL || path[0] != '/')
@@ -398,6 +450,14 @@ int kfs_lookup(const char *path)
     if (r < 0)
         return -1;
     return (int)cur;
+}
+
+int kfs_lookup(const char *path)
+{
+    fs_lock();
+    int r = lookup_path(path);
+    fs_unlock();
+    return r;
 }
 
 /* Resolve everything but the last component. Returns the parent dir ino
@@ -425,7 +485,7 @@ static int lookup_parent(const char *path, char *name)
         if (nino == 0)
             return -1;
         struct kfs_inode ip;
-        if (kfs_iget(nino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
+        if (iget(nino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
             return -1;
         cur = nino;
         if (path_next(&p, comp) != 1)
@@ -433,9 +493,13 @@ static int lookup_parent(const char *path, char *name)
     }
 }
 
-/* ---------- public operations ---------- */
+/* ---------- public operations ----------
+ * Each public entry point takes the whole-filesystem lock once and does
+ * its work through the *_locked helpers, which never take it again. */
 
-int kfs_create(const char *path)
+static int truncate_locked(uint32_t ino);
+
+static int create_locked(const char *path)
 {
     char name[60];
     int parent = lookup_parent(path, name);
@@ -453,7 +517,15 @@ int kfs_create(const char *path)
     return (int)ino;
 }
 
-int kfs_mkdir(const char *path)
+int kfs_create(const char *path)
+{
+    fs_lock();
+    int r = create_locked(path);
+    fs_unlock();
+    return r;
+}
+
+static int mkdir_locked(const char *path)
 {
     char name[60];
     int parent = lookup_parent(path, name);
@@ -467,14 +539,22 @@ int kfs_mkdir(const char *path)
     if (dir_add(ino, ".", ino) < 0 ||
         dir_add(ino, "..", (uint32_t)parent) < 0 ||
         dir_add((uint32_t)parent, name, ino) < 0) {
-        kfs_truncate(ino);
+        truncate_locked(ino);
         ifree(ino);
         return -1;
     }
     return 0;
 }
 
-int kfs_unlink(const char *path)
+int kfs_mkdir(const char *path)
+{
+    fs_lock();
+    int r = mkdir_locked(path);
+    fs_unlock();
+    return r;
+}
+
+static int unlink_locked(const char *path)
 {
     char name[60];
     struct kfs_inode ip;
@@ -485,28 +565,39 @@ int kfs_unlink(const char *path)
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
         return -1;
     uint32_t ino = dir_lookup((uint32_t)parent, name, NULL);
-    if (!ino || kfs_iget(ino, &ip) < 0)
+    if (!ino || iget(ino, &ip) < 0)
         return -1;
     if (ip.type == KFS_TYPE_DIR && !dir_is_empty(ino))
         return -1;
-    if (kfs_truncate(ino) < 0)
+    /* Detach the name first: a failing dir_remove() must never leave an
+     * entry pointing at an inode slot that has already been freed. */
+    if (dir_remove((uint32_t)parent, name) < 0)
+        return -1;
+    if (truncate_locked(ino) < 0)
         return -1;
     ifree(ino);
-    return dir_remove((uint32_t)parent, name);
+    return 0;
 }
 
-int kfs_readdir(uint32_t ino, int index, struct kfs_dirent *out)
+int kfs_unlink(const char *path)
+{
+    fs_lock();
+    int r = unlink_locked(path);
+    fs_unlock();
+    return r;
+}
+
+static int readdir_locked(uint32_t ino, int index, struct kfs_dirent *out)
 {
     struct kfs_inode ip;
     struct kfs_dirent de;
-    if (!kfs_mounted || index < 0)
-        return -1;
-    if (kfs_iget(ino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
+    if (iget(ino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return -1;
     int seen = 0;
     for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
         if (readi(ino, off, &de, sizeof(de)) != sizeof(de))
             return -1;
+        de.name[sizeof(de.name) - 1] = '\0';   /* on-disk name may be junk */
         if (de.ino == 0)
             continue;
         if (seen == index) {
@@ -518,10 +609,20 @@ int kfs_readdir(uint32_t ino, int index, struct kfs_dirent *out)
     return -1;
 }
 
-int kfs_truncate(uint32_t ino)
+int kfs_readdir(uint32_t ino, int index, struct kfs_dirent *out)
+{
+    if (!kfs_mounted || index < 0 || out == NULL)
+        return -1;
+    fs_lock();
+    int r = readdir_locked(ino, index, out);
+    fs_unlock();
+    return r;
+}
+
+static int truncate_locked(uint32_t ino)
 {
     struct kfs_inode ip;
-    if (!kfs_mounted || kfs_iget(ino, &ip) < 0)
+    if (!kfs_mounted || iget(ino, &ip) < 0)
         return -1;
 
     for (int i = 0; i < KFS_NDIRECT; i++) {
@@ -545,27 +646,48 @@ int kfs_truncate(uint32_t ino)
     return iput(ino, &ip);
 }
 
+int kfs_truncate(uint32_t ino)
+{
+    fs_lock();
+    int r = truncate_locked(ino);
+    fs_unlock();
+    return r;
+}
+
 int kfs_mount(void)
 {
+    fs_lock();
     if (bread(0, sb_block) < 0) {
         kprintf("kfs: cannot read superblock (no disk?)\n");
+        fs_unlock();
         return -1;
     }
     memcpy(&sb, sb_block, sizeof(sb));
     if (sb.magic != KFS_MAGIC) {
         kprintf("kfs: bad magic 0x%x (expected 0x%x)\n", sb.magic, KFS_MAGIC);
+        fs_unlock();
         return -1;
     }
+    /* Every field below is used unchecked as a block index or loop bound,
+     * so a corrupt superblock must be rejected here, not dereferenced. */
     if (sb.root_ino != KFS_ROOT_INO ||
+        sb.bitmap_start == 0 ||
+        sb.bitmap_blocks == 0 ||
+        sb.bitmap_start + sb.bitmap_blocks > sb.inode_start ||
         sb.data_start <= sb.inode_start ||
         sb.inode_start <= sb.bitmap_start ||
+        sb.inode_start + sb.inode_blocks > sb.data_start ||
         sb.data_start > sb.total_blocks ||
-        sb.inode_count == 0) {
+        sb.free_blocks > sb.total_blocks ||
+        sb.inode_count == 0 ||
+        sb.inode_count > sb.inode_blocks * KFS_INODES_PER_BLOCK) {
         kprintf("kfs: superblock is inconsistent\n");
+        fs_unlock();
         return -1;
     }
     kfs_mounted = 1;
     kprintf("kfs: mounted, %u blocks (%u free), %u inodes\n",
             sb.total_blocks, sb.free_blocks, sb.inode_count);
+    fs_unlock();
     return 0;
 }

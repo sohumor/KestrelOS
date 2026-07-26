@@ -10,6 +10,18 @@
 
 #define ELF_MAX_PHNUM 64
 
+/* p_memsz is attacker-controlled, so the mapped image needs a hard cap and
+ * a free-frame margin: pmm_alloc() panics on exhaustion, and elf.h promises
+ * elf_load never panics. */
+#define ELF_MAX_IMAGE_PAGES 8192          /* 32 MiB per executable */
+#define ELF_PMM_RESERVE     512
+
+/* Segments must stay clear of the stack: uproc.c maps the stack pages
+ * afterwards, and vmm_map_page overwrites a live PTE without freeing it,
+ * so an overlapping segment silently orphans its frames. */
+#define USER_STACK_LIMIT \
+    (USER_STACK_TOP - (uint64_t)USER_STACK_PAGES * PAGE_SIZE)
+
 static int ehdr_valid(const struct elf64_ehdr *eh)
 {
     if (eh->e_ident[0] != 0x7F || eh->e_ident[1] != 'E' ||
@@ -63,6 +75,7 @@ int elf_load(uint64_t *pml4, const void *image, size_t size,
     const uint8_t *img = image;
     const struct elf64_ehdr *eh = image;
     uint64_t max_end = 0;
+    uint64_t total_pages = 0;
 
     if (!image || size < sizeof(*eh) || !ehdr_valid(eh))
         return -1;
@@ -87,6 +100,17 @@ int elf_load(uint64_t *pml4, const void *image, size_t size,
             return -1;
         if (ph->p_vaddr + ph->p_memsz < ph->p_vaddr ||
             ph->p_vaddr + ph->p_memsz >= USER_VA_LIMIT)
+            return -1;
+        if (ph->p_vaddr + ph->p_memsz > USER_STACK_LIMIT)
+            return -1;
+
+        /* Bound what this image may map, and leave the allocator a margin
+         * so a huge-but-legal binary fails cleanly instead of panicking. */
+        total_pages += ((ph->p_vaddr + ph->p_memsz + PAGE_SIZE - 1) / PAGE_SIZE)
+                       - (ph->p_vaddr / PAGE_SIZE);
+        if (total_pages > ELF_MAX_IMAGE_PAGES)
+            return -1;
+        if (total_pages + ELF_PMM_RESERVE > pmm_free_pages())
             return -1;
 
         if (load_segment(pml4, img, ph) < 0)

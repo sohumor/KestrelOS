@@ -9,6 +9,8 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "timer.h"
+#include "rtc.h"
+#include "power.h"
 #include "string.h"
 #include "kestrel_abi.h"
 
@@ -23,6 +25,12 @@ extern void (*user_fault_hook)(struct regs *r);
 #define FILE_CHUNK    512
 #define UDP_MAX       1400
 #define BRK_CEILING   (USER_STACK_TOP - (64ULL << 20))
+#define BRK_MAX_GROW  16384          /* pages per call: 64 MiB */
+#define PMM_RESERVE   512            /* frames the kernel keeps for itself */
+
+/* copy_str_from_user: no NUL within `max`. dst holds a truncated but
+ * NUL-terminated prefix; still negative, so plain `< 0` callers reject. */
+#define COPY_STR_TRUNC (-2)
 
 /* --- user-memory access ---------------------------------------------- */
 
@@ -83,7 +91,8 @@ long copy_str_from_user(char *dst, const void *usrc, size_t max)
         if (dst[i] == '\0')
             return (long)i;
     }
-    return -1;                       /* unterminated within max */
+    dst[max - 1] = '\0';
+    return COPY_STR_TRUNC;           /* unterminated within max */
 }
 
 /* --- per-call helpers ------------------------------------------------- */
@@ -251,6 +260,22 @@ static long sys_brk(uint64_t new_brk)
 
     uint64_t lo = old & ~(PAGE_SIZE - 1);
     uint64_t hi = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* BRK_CEILING is a ~128 TiB *virtual* bound, so it says nothing about
+     * whether the frames exist. pmm_alloc() panics when they do not, which
+     * would let any ring-3 process halt the kernel with a malloc loop.
+     * Refuse the whole request up front — libc's heap_grow() already
+     * treats an unchanged break as "out of memory". */
+    if ((hi - lo) / PAGE_SIZE > BRK_MAX_GROW)
+        return (long)old;
+
+    uint64_t need = 0;
+    for (uint64_t p = lo; p < hi; p += PAGE_SIZE)
+        if (!vmm_virt_to_phys(current->pml4, p))
+            need++;
+    if (need + PMM_RESERVE > pmm_free_pages())
+        return (long)old;            /* keeps the page-table frames too */
+
     for (uint64_t p = lo; p < hi; p += PAGE_SIZE)
         if (!vmm_virt_to_phys(current->pml4, p))
             vmm_map_page(current->pml4, p, pmm_alloc(), PTE_U | PTE_W);
@@ -338,6 +363,32 @@ static long sys_netinfo(uint64_t uinfo)
         return -1;
     net_get_info(&ni);
     return copy_to_user((void *)uinfo, &ni, sizeof(ni));
+}
+
+static long sys_rtc(uint64_t urtc)
+{
+    struct k_rtc rt;
+    /* rtc_read already rejects a chip that never settled or reported an
+     * impossible date, so a bad clock surfaces as -1 and never as garbage. */
+    if (rtc_read(&rt) < 0)
+        return -1;
+    return copy_to_user((void *)urtc, &rt, sizeof(rt));
+}
+
+static long sys_power(uint64_t action)
+{
+    switch (action) {
+    case K_POWER_REBOOT:
+        kprintf("power: reboot requested by %s (pid %d)\n",
+                current->name, current->pid);
+        power_reboot();              /* noreturn */
+    case K_POWER_HALT:
+        kprintf("power: halt requested by %s (pid %d)\n",
+                current->name, current->pid);
+        power_halt();                /* noreturn */
+    default:
+        return -1;
+    }
 }
 
 /* --- dispatcher ------------------------------------------------------- */
@@ -432,6 +483,12 @@ static void syscall_dispatch(struct regs *r)
         break;
     case SYS_NETINFO:
         ret = sys_netinfo(a1);
+        break;
+    case SYS_RTC:
+        ret = sys_rtc(a1);
+        break;
+    case SYS_POWER:
+        ret = sys_power(a1);
         break;
     default:
         kprintf("syscall: unknown %lu from %s (pid %d)\n",

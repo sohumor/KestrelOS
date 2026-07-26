@@ -37,6 +37,12 @@ static void kbd_irq(struct regs *r)
 
     if (ext) {
         ext = false;
+        /* Right ctrl (E0 1D / E0 9D) carries state, so its break code must
+         * be handled before the release filter or `ctrl` latches on. */
+        if (sc == 0x1D) {
+            ctrl = !release;
+            return;
+        }
         if (release)
             return;
         switch (sc) {
@@ -50,7 +56,6 @@ static void kbd_irq(struct regs *r)
         case 0x51: input_push(KEY_PGDN); return;
         case 0x53: input_push(KEY_DELETE); return;
         case 0x1C: input_push('\n'); return;      /* keypad enter */
-        case 0x1D: ctrl = true; return;           /* right ctrl (make) */
         }
         return;
     }

@@ -21,6 +21,14 @@ struct uproc_pkg {
     char argv[UPROC_MAX_ARGS][UPROC_ARG_MAX];
 };
 
+/* Frames kept in reserve so a failing user allocation degrades into a
+ * killed process instead of a kernel-wide "out of memory" panic. */
+#define UPROC_PMM_RESERVE 512
+
+/* copy_str_from_user's "no NUL within max" result; the destination still
+ * holds a NUL-terminated prefix. Mirrors COPY_STR_TRUNC in syscall.c. */
+#define UPROC_COPY_TRUNC (-2)
+
 /* --- exit-code ring for waitpid ------------------------------------- */
 
 #define EXIT_RING 64
@@ -60,9 +68,20 @@ long uproc_waitpid(int pid)
         return -1;
     for (;;) {
         long code;
-        if (exit_lookup(pid, &code))
+        int alive, done;
+
+        /* Both observations must come from the same instant: the child can
+         * exit, be recorded and be reaped between them, which would other-
+         * wise report -1 for a process that finished normally. Masking also
+         * keeps task_find off a list reap() may be unlinking from. */
+        uint64_t f = irq_save();
+        alive = task_find(pid) != NULL;
+        done = exit_lookup(pid, &code);
+        irq_restore(f);
+
+        if (done)
             return code;
-        if (!task_find(pid))
+        if (!alive)
             return -1;             /* never existed, or record overwritten */
         task_sleep_ticks(1);
     }
@@ -155,6 +174,12 @@ static void user_task_thunk(void *arg)
         goto fail;
     }
 
+    /* pmm_alloc() panics on exhaustion, so refuse to start a mapping that
+     * would drain the last frames: kill this process, not the kernel. */
+    if (pmm_free_pages() < USER_STACK_PAGES + UPROC_PMM_RESERVE) {
+        kprintf("uproc: out of memory, cannot start %s\n", pkg->path);
+        goto fail;
+    }
     for (int i = 0; i < USER_STACK_PAGES; i++)
         vmm_map_page(pml4, USER_STACK_TOP - (uint64_t)(i + 1) * PAGE_SIZE,
                      pmm_alloc(), PTE_U | PTE_W);
@@ -209,12 +234,18 @@ int uproc_spawn(const char *path, char *const argv[], int argc)
     name = strrchr(path, '/');
     name = name ? name + 1 : path;
 
+    /* Keep the child unschedulable until its pid has been read: once it is
+     * runnable it can run to completion and be reaped, freeing *t. */
+    uint64_t f = irq_save();
     t = kthread_create(user_task_thunk, pkg, name);
+    int pid = t ? t->pid : -1;
+    irq_restore(f);
+
     if (!t) {
         kfree(pkg);
         return -1;
     }
-    return t->pid;
+    return pid;
 }
 
 int uproc_spawn_from_user(const char *upath, char *const *uargv)
@@ -234,8 +265,12 @@ int uproc_spawn_from_user(const char *upath, char *const *uargv)
                 return -1;
             if (!p)
                 break;
-            if (copy_str_from_user(args[argc], (const void *)p,
-                                   UPROC_ARG_MAX) < 0)
+            /* An over-long argument is truncated, matching what the
+             * in-kernel uproc_spawn() path does; only an unreadable
+             * pointer fails the whole spawn. */
+            long n = copy_str_from_user(args[argc], (const void *)p,
+                                        UPROC_ARG_MAX);
+            if (n < 0 && n != UPROC_COPY_TRUNC)
                 return -1;
             kargv[argc] = args[argc];
             argc++;
