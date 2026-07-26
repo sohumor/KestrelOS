@@ -21,10 +21,25 @@ void syscall_init(void);
  * before this returns, so the caller keeps ownership. Returns pid or -1. */
 int uproc_spawn(const char *path, char *const argv[], int argc);
 
+/* Same, with redirected stdio (SYS_SPAWN_IO): the child's fd 0 reads
+ * in_path, its fd 1 writes out_path (created; truncated unless append),
+ * fd 2 stays on the console. NULL or "" inherits the console. Paths are
+ * bounded by struct k_spawn_io's 128-byte fields; longer ones fail the
+ * spawn rather than truncate. uproc_spawn is this with NULL/NULL/0. */
+int uproc_spawn_io(const char *path, char *const argv[], int argc,
+                   const char *in_path, const char *out_path, int append);
+
 /* Same, but `upath`/`uargv` are userspace pointers from the current
  * process (SYS_SPAWN). Performs bounded copy-in (UPROC_MAX_ARGS args of
  * UPROC_ARG_MAX bytes, path UPROC_PATH_MAX) then calls uproc_spawn. */
 int uproc_spawn_from_user(const char *upath, char *const *uargv);
+
+/* SYS_SPAWN_IO copy-in: upath/uargv are userspace pointers, in_path/
+ * out_path already live in kernel memory (the syscall layer copies and
+ * validates struct k_spawn_io before calling this). */
+int uproc_spawn_io_from_user(const char *upath, char *const *uargv,
+                             const char *in_path, const char *out_path,
+                             int append);
 
 /* Exit-code ring for waitpid; record is called right before task_exit. */
 void uproc_record_exit(int pid, long code);

@@ -67,6 +67,26 @@ int spawn(const char *path, char *const argv[])
     return (int)syscall(SYS_SPAWN, (long)path, (long)argv, 0, 0);
 }
 
+int spawn_io(const char *path, char *const argv[], const char *in_path,
+             const char *out_path, int append)
+{
+    struct k_spawn_io io;
+
+    memset(&io, 0, sizeof(io));
+    if (in_path) {
+        if (strlen(in_path) >= sizeof(io.in_path))
+            return -1;
+        strncpy(io.in_path, in_path, sizeof(io.in_path) - 1);
+    }
+    if (out_path) {
+        if (strlen(out_path) >= sizeof(io.out_path))
+            return -1;
+        strncpy(io.out_path, out_path, sizeof(io.out_path) - 1);
+    }
+    io.out_append = append ? 1 : 0;
+    return (int)syscall(SYS_SPAWN_IO, (long)path, (long)argv, (long)&io, 0);
+}
+
 int waitpid(int pid)
 {
     return (int)syscall(SYS_WAITPID, pid, 0, 0, 0);

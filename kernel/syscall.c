@@ -97,9 +97,12 @@ long copy_str_from_user(char *dst, const void *usrc, size_t max)
 
 /* --- per-call helpers ------------------------------------------------- */
 
+/* fd -> open file. A NULL entry for fd 0/1/2 means "the console"; a
+ * non-NULL one (installed by open() or by SYS_SPAWN_IO) means the fd is
+ * backed by a file, so redirected stdio flows through the VFS. */
 static struct file *fd_file(uint64_t fd)
 {
-    if (fd < 3 || fd >= MAX_OPEN_FILES)
+    if (fd >= MAX_OPEN_FILES)
         return NULL;
     return current->files[fd];
 }
@@ -109,7 +112,7 @@ static long sys_write(uint64_t fd, uint64_t ubuf, uint64_t len)
     char chunk[FILE_CHUNK];
     uint64_t done = 0;
 
-    if (fd == 1 || fd == 2) {
+    if ((fd == 1 || fd == 2) && !current->files[fd]) {
         while (done < len) {
             uint64_t n = len - done;
             if (n > COPY_CHUNK)
@@ -151,7 +154,7 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
     if (len == 0)
         return 0;
 
-    if (fd == 0) {
+    if (fd == 0 && !current->files[0]) {
         /* Raw console bytes, special keys arrive as values >= 0x80. */
         uint64_t want = len > COPY_CHUNK ? COPY_CHUNK : len;
         uint64_t got = 0;
@@ -208,6 +211,8 @@ static long sys_open(uint64_t upath, uint64_t flags)
     return -1;
 }
 
+/* Closing a file-backed fd 0/1/2 reverts it to the console (the entry
+ * goes back to NULL); a console fd has nothing to close and fails. */
 static long sys_close(uint64_t fd)
 {
     struct file *f = fd_file(fd);
@@ -216,6 +221,32 @@ static long sys_close(uint64_t fd)
     vfs_close(f);
     current->files[fd] = NULL;
     return 0;
+}
+
+/* True if s carries a NUL somewhere within its first `max` bytes. */
+static int str_terminated(const char *s, size_t max)
+{
+    for (size_t i = 0; i < max; i++)
+        if (s[i] == '\0')
+            return 1;
+    return 0;
+}
+
+static long sys_spawn_io(uint64_t upath, uint64_t uargv, uint64_t uio)
+{
+    struct k_spawn_io io;
+
+    if (copy_from_user(&io, (const void *)uio, sizeof(io)) < 0)
+        return -1;
+    /* Each path must carry its NUL inside its own field: an unterminated
+     * one would let the child's vfs_open read past the copied struct. */
+    if (!str_terminated(io.in_path, sizeof(io.in_path)) ||
+        !str_terminated(io.out_path, sizeof(io.out_path)))
+        return -1;
+    return uproc_spawn_io_from_user((const char *)upath,
+                                    (char *const *)uargv,
+                                    io.in_path, io.out_path,
+                                    io.out_append ? 1 : 0);
 }
 
 static long sys_stat(uint64_t upath, uint64_t ust)
@@ -428,6 +459,9 @@ static void syscall_dispatch(struct regs *r)
     }
     case SYS_SPAWN:
         ret = uproc_spawn_from_user((const char *)a1, (char *const *)a2);
+        break;
+    case SYS_SPAWN_IO:
+        ret = sys_spawn_io(a1, a2, a3);
         break;
     case SYS_WAITPID:
         ret = uproc_waitpid((int)a1);

@@ -31,6 +31,12 @@ int stat_(const char *path, struct k_stat *out);
 
 /* ---- processes ---- */
 int spawn(const char *path, char *const argv[]);     /* -> pid or -1 */
+/* spawn with redirected stdio: the child's fd 0 reads in_path, its fd 1
+ * writes out_path (created; truncated unless append != 0), fd 2 stays
+ * on the console. NULL inherits the console. A path that does not fit
+ * struct k_spawn_io's 128-byte fields returns -1. -> pid or -1 */
+int spawn_io(const char *path, char *const argv[], const char *in_path,
+             const char *out_path, int append);
 int waitpid(int pid);                                /* blocks; -> exit code */
 int getpid(void);
 void sleep_ms(unsigned long ms);

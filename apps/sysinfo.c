@@ -105,7 +105,7 @@ int main(int argc, char *argv[])
         info[7][0] = 0;
         info[8][0] = 0;
     }
-    snprintf(info[9], sizeof(info[9]), "\033[36mshell:\033[0m   ksh");
+    snprintf(info[9], sizeof(info[9]), "\033[36mshell:\033[0m   /bin/sh");
 
     printf("\n");
     int rows = LOGO_LINES > INFO_LINES ? LOGO_LINES : INFO_LINES;

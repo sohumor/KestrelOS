@@ -292,6 +292,27 @@ whitespace into at most 16 tokens (double quotes group words), and
 resolves a command name as an absolute path, then `<cwd>/name`, then
 `/bin/name`. Paths may be absolute or relative to the current directory.
 
+On top of that it offers:
+
+- **Line editing** — insert anywhere on the line; left/right, home/end
+  (also ctrl-A/ctrl-E), backspace, delete, ctrl-U (kill line), ctrl-K
+  (kill to end); ctrl-C cancels the line, ctrl-D on an empty line exits.
+- **History** — up/down recall the last 32 commands; the `history`
+  builtin lists them.
+- **Tab completion** — command names from `/bin` in the first word,
+  file and directory names elsewhere.
+- **I/O redirection** — `cmd > file` truncates, `cmd >> file` appends,
+  `cmd < file` feeds the file to the command's stdin. External commands
+  get the files opened onto fd 0/1 by the kernel (`SYS_SPAWN_IO`), so
+  every program's normal output/input is redirected; builtin output
+  works with `>`/`>>` too. A quoted `">"` is a literal argument.
+- **Syntax** — `;` separates commands on one line, `#` starts a
+  comment, `$?` expands to the last exit status and `$PWD` to the
+  current directory.
+
+A minimal fallback shell without any of this is kept as `/bin/minsh`
+(run `minsh`, leave with `exit`).
+
 `/bin/help` is the authoritative in-system list; run it after any change
 to `apps/`.
 
@@ -302,13 +323,18 @@ to `apps/`.
 | `cd [dir]`    | change directory; no argument means `/`              |
 | `pwd`         | print the current directory                          |
 | `exit [code]` | leave the shell (init immediately restarts it)       |
-| `help`        | one-line reminder of the builtins                    |
+| `help`        | summary of builtins, editing keys and shell syntax   |
+| `history`     | list the remembered commands, oldest first           |
+| `clear`       | clear the screen                                     |
+| `which <cmd>` | show what a name resolves to (builtin or path)       |
+| `set`         | print the shell variables (`PWD`, `?`)               |
 
 ### Programs in `/bin`
 
 | Command                              | Description                                             |
 |--------------------------------------|---------------------------------------------------------|
 | `help`                               | list every command with a one-line description          |
+| `minsh`                              | minimal fallback shell; `exit` returns to `/bin/sh`     |
 | `ls [dir]`                           | list a directory: type, size, name; directories first   |
 | `cat <file>...`                      | print file contents                                     |
 | `head [-n N] [file...]`              | first N lines (default 10); reads the console with no file |

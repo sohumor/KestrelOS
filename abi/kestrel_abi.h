@@ -36,6 +36,7 @@
 #define SYS_READ_NB   24  /* (fd, buf, len) -> read, 0 if none ready */
 #define SYS_RTC       25  /* (struct k_rtc*) -> 0/-1 */
 #define SYS_POWER     26  /* (0=reboot, 1=halt) */
+#define SYS_SPAWN_IO  27  /* (path, argv, struct k_spawn_io *) -> pid */
 
 /* open() flags */
 #define O_RDONLY 0x000
@@ -66,6 +67,16 @@ struct k_psinfo {
     int32_t pid;
     char name[32];
     int32_t state;
+};
+
+/* SYS_SPAWN_IO: where the child's stdin (fd 0) and stdout (fd 1) go.
+ * An empty path leaves that fd on the console; fd 2 always stays on the
+ * console. Each path must be NUL-terminated within its field. */
+struct k_spawn_io {
+    char in_path[128];    /* "" = inherit console */
+    char out_path[128];   /* "" = inherit console */
+    uint32_t out_append;  /* 0 = truncate, 1 = append */
+    uint32_t _pad;
 };
 
 /* SYS_POWER actions */

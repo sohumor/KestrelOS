@@ -22,8 +22,8 @@ struct cmd {
 static const struct cmd commands[] = {
     { "shell and session", 0 },
     { "help",      "this list" },
-    { "sh",        "the KestrelOS shell (started by init)" },
-    { "sh2",       "second-generation shell: history, tab completion, $?" },
+    { "sh",        "the shell: history, tab completion, redirection" },
+    { "minsh",     "minimal fallback shell (no editing, no redirection)" },
     { "init",      "PID 1: prints /etc/motd, keeps a shell running" },
     { "clear",     "clear the screen" },
     { "sleep",     "pause for N seconds" },
@@ -108,7 +108,9 @@ int main(int argc, char **argv)
             printf("  %-10s %s\n", commands[i].name, commands[i].desc);
     }
     puts("");
-    puts("shell builtins: cd <dir>, pwd, exit [code], help");
+    puts("shell builtins: cd, pwd, exit, help, history, clear, which, set");
+    puts("the shell redirects with > >> <; ';' separates, '#' comments,");
+    puts("$? and $PWD expand, tab completes, up/down recalls history");
     puts("paths may be absolute (/doc/welcome.md) or relative to the cwd");
     puts("\"help <substring>\" lists just the matching commands");
     return 0;

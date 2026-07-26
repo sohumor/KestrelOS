@@ -35,5 +35,19 @@ Try these at the `kestrel:/$ ` prompt:
 
     snake                   you know what this is
 
+## The shell
+
+The shell edits the line in place (arrows, home/end, ctrl-U/ctrl-K),
+recalls history with up/down, and tab-completes command names from
+/bin and paths elsewhere. Some syntax to try:
+
+    ls /bin > list.txt      redirect output ('>>' appends)
+    wc -l < list.txt        redirect input
+    echo one; echo two      ';' separates commands
+    echo $? $PWD            last exit status and current directory
+    # anything              '#' starts a comment
+
+/bin/minsh is a minimal fallback shell without editing or redirection.
+
 The shell resolves commands from /bin; paths can be absolute or
 relative to the current directory. See /etc/version for the release.

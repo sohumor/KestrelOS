@@ -14,11 +14,13 @@ extern void enter_usermode(uint64_t entry, uint64_t user_rsp,
     __attribute__((noreturn));
 
 /* Everything the new task needs, copied so the spawner keeps ownership
- * of whatever it passed in. Freed by the thunk. */
+ * of whatever it passed in. Freed by the thunk. io carries the child's
+ * redirected stdin/stdout paths; empty strings mean "the console". */
 struct uproc_pkg {
     char path[UPROC_PATH_MAX];
     int argc;
     char argv[UPROC_MAX_ARGS][UPROC_ARG_MAX];
+    struct k_spawn_io io;
 };
 
 /* Frames kept in reserve so a failing user allocation degrades into a
@@ -184,6 +186,30 @@ static void user_task_thunk(void *arg)
         vmm_map_page(pml4, USER_STACK_TOP - (uint64_t)(i + 1) * PAGE_SIZE,
                      pmm_alloc(), PTE_U | PTE_W);
 
+    /* Redirected stdio (SYS_SPAWN_IO). A NULL files[0]/files[1] means
+     * the console, so only a named path installs a file; fd 2 always
+     * stays on the console. Installed on `current` before the address-
+     * space switch: if either open fails, the fail path's task_exit
+     * closes whatever was already installed. */
+    if (pkg->io.in_path[0]) {
+        current->files[0] = vfs_open(pkg->io.in_path, O_RDONLY);
+        if (!current->files[0]) {
+            kprintf("uproc: %s: cannot open %s for stdin\n",
+                    pkg->path, pkg->io.in_path);
+            goto fail;
+        }
+    }
+    if (pkg->io.out_path[0]) {
+        current->files[1] = vfs_open(pkg->io.out_path, O_WRONLY | O_CREAT |
+                                     (pkg->io.out_append ? O_APPEND
+                                                         : O_TRUNC));
+        if (!current->files[1]) {
+            kprintf("uproc: %s: cannot open %s for stdout\n",
+                    pkg->path, pkg->io.out_path);
+            goto fail;
+        }
+    }
+
     /* Adopt the new address space. From here on the process page tables
      * are live, so the user stack is directly addressable. */
     f = irq_save();
@@ -201,7 +227,9 @@ static void user_task_thunk(void *arg)
     enter_usermode(entry, rsp, (uint64_t)argc, argv_user);
 
 fail:
-    /* Nothing was installed on `current` yet: still on the kernel pml4. */
+    /* Still on the kernel pml4: the address-space switch never happened.
+     * Any files[] entry the redirection setup installed is closed by
+     * task_exit's descriptor sweep. */
     if (pml4)
         vmm_destroy_user(pml4);
     if (buf)
@@ -211,7 +239,8 @@ fail:
     task_exit(-1);
 }
 
-int uproc_spawn(const char *path, char *const argv[], int argc)
+int uproc_spawn_io(const char *path, char *const argv[], int argc,
+                   const char *in_path, const char *out_path, int append)
 {
     struct uproc_pkg *pkg;
     struct task *t;
@@ -231,6 +260,24 @@ int uproc_spawn(const char *path, char *const argv[], int argc)
         if (argv && argv[i])
             strncpy(pkg->argv[i], argv[i], UPROC_ARG_MAX - 1);
 
+    /* A truncated redirection target would open the wrong file, so an
+     * over-long path fails the spawn instead. */
+    if (in_path && in_path[0]) {
+        if (strlen(in_path) >= sizeof(pkg->io.in_path)) {
+            kfree(pkg);
+            return -1;
+        }
+        strncpy(pkg->io.in_path, in_path, sizeof(pkg->io.in_path) - 1);
+    }
+    if (out_path && out_path[0]) {
+        if (strlen(out_path) >= sizeof(pkg->io.out_path)) {
+            kfree(pkg);
+            return -1;
+        }
+        strncpy(pkg->io.out_path, out_path, sizeof(pkg->io.out_path) - 1);
+    }
+    pkg->io.out_append = append ? 1 : 0;
+
     name = strrchr(path, '/');
     name = name ? name + 1 : path;
 
@@ -248,14 +295,21 @@ int uproc_spawn(const char *path, char *const argv[], int argc)
     return pid;
 }
 
-int uproc_spawn_from_user(const char *upath, char *const *uargv)
+int uproc_spawn(const char *path, char *const argv[], int argc)
 {
-    char path[UPROC_PATH_MAX];
-    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
-    char *kargv[UPROC_MAX_ARGS];
+    return uproc_spawn_io(path, argv, argc, NULL, NULL, 0);
+}
+
+/* Bounded copy-in of a spawn's path + argv from the current process.
+ * Fills path/args/kargv; returns argc (>= 0) or -1 on a bad pointer. */
+static int spawn_args_from_user(const char *upath, char *const *uargv,
+                                char path[UPROC_PATH_MAX],
+                                char args[UPROC_MAX_ARGS][UPROC_ARG_MAX],
+                                char *kargv[UPROC_MAX_ARGS])
+{
     int argc = 0;
 
-    if (copy_str_from_user(path, upath, sizeof(path)) < 0)
+    if (copy_str_from_user(path, upath, UPROC_PATH_MAX) < 0)
         return -1;
 
     if (uargv) {
@@ -276,5 +330,32 @@ int uproc_spawn_from_user(const char *upath, char *const *uargv)
             argc++;
         }
     }
+    return argc;
+}
+
+int uproc_spawn_from_user(const char *upath, char *const *uargv)
+{
+    char path[UPROC_PATH_MAX];
+    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
+    char *kargv[UPROC_MAX_ARGS];
+    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+
+    if (argc < 0)
+        return -1;
     return uproc_spawn(path, argc ? kargv : NULL, argc);
+}
+
+int uproc_spawn_io_from_user(const char *upath, char *const *uargv,
+                             const char *in_path, const char *out_path,
+                             int append)
+{
+    char path[UPROC_PATH_MAX];
+    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
+    char *kargv[UPROC_MAX_ARGS];
+    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+
+    if (argc < 0)
+        return -1;
+    return uproc_spawn_io(path, argc ? kargv : NULL, argc,
+                          in_path, out_path, append);
 }
