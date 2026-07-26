@@ -15,7 +15,10 @@ CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
 LDFLAGS := -nostdlib -z max-page-size=0x1000 --no-warn-rwx-segments
 
 KERNEL_CSRC := $(wildcard kernel/*.c)
+KERNEL_ASRC := $(wildcard kernel/*.asm)
 KERNEL_OBJS := $(BUILD)/kernel/entry.o \
+               $(filter-out $(BUILD)/kernel/entry.o, \
+                 $(patsubst kernel/%.asm,$(BUILD)/kernel/%.o,$(KERNEL_ASRC))) \
                $(patsubst kernel/%.c,$(BUILD)/kernel/%.o,$(KERNEL_CSRC))
 
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot \
@@ -29,7 +32,7 @@ $(BUILD)/kernel/%.o: kernel/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel/entry.o: kernel/entry.asm
+$(BUILD)/kernel/%.o: kernel/%.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf64 $< -o $@
 

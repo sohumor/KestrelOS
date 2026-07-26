@@ -22,8 +22,10 @@ void kvprintf(const char *fmt, va_list ap);
 __attribute__((noreturn))
 void panic(const char *fmt, ...);
 
+__attribute__((noreturn))
 static inline void hang(void)
 {
     for (;;)
         __asm__ volatile("cli; hlt");
+    __builtin_unreachable();
 }
