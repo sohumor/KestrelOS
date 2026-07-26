@@ -1,0 +1,88 @@
+# KestrelOS build configuration.
+#
+# Format: one KEY=VALUE per line. Blank lines and '#' comments are ignored;
+# a '#' also starts a comment at the end of a line. Whitespace around the
+# key and the value is allowed.
+#
+#   y   build the subsystem into the kernel image (or ship the component)
+#   m   build it as a loadable kernel module (.kmod), loaded with insmod
+#   n   leave it out entirely
+#
+# Not every option has a module form: the ones marked "y/n" below are
+# either not drivers at all or are needed before the module loader exists.
+# Setting such an option to m is an error, as is enabling an option whose
+# dependencies are off - tools/mkconfig.py reports both with the line
+# number of the offending line and refuses to generate anything.
+#
+# tools/mkconfig.py turns this file into:
+#
+#   kernel/include/config.h   #define CONFIG_X 1        for y
+#                             #define CONFIG_X_MODULE 1 for m
+#                             (nothing at all)          for n
+#   build/config.mk           the object and app lists the Makefile uses
+#                             to leave things out of the build
+#
+# Regenerate both with:  python3 tools/mkconfig.py
+# Check without writing: python3 tools/mkconfig.py --check
+# See docs/config.md for what each option does and which combinations are
+# known to work. Every option below is y here, so the default build is
+# exactly the system that shipped before the configuration system existed.
+
+# --- core infrastructure ---------------------------------------------
+
+# Loadable kernel modules: the exported symbol table, the ET_REL relocating
+# loader and insmod/rmmod/lsmod. Required before any option can be set to
+# m. (y/n)
+CONFIG_MODULES=y
+
+# The kernel log ring behind kprintf, klog_printf, dmesg and /dev/klog.
+# (y/n)
+CONFIG_KLOG=y
+
+# The /dev filesystem: null, zero, full, console, random, klog. (y/n)
+CONFIG_DEVFS=y
+
+# The in-kernel rescue console. Without it a machine that cannot start
+# /bin/init just halts. (y/n)
+CONFIG_KMON=y
+
+# --- network ---------------------------------------------------------
+
+# RealTek RTL8139 ethernet driver. This is QEMU's default NIC and the one
+# `make run` attaches, so turning it off costs the network tests. (y/m/n)
+CONFIG_NET_RTL8139=y
+
+# Intel 82540EM (e1000) ethernet driver. VirtualBox's default NIC. (y/m/n)
+CONFIG_NET_E1000=y
+
+# TCP, and with it curl, wget, telnet, the browser's http:// support and
+# kpkg over the network. (y/n)
+CONFIG_TCP=y
+
+# UDP datagram sockets and the `udp` tool. (y/n)
+CONFIG_UDP=y
+
+# The DNS resolver and `nslookup`. Needs UDP. (y/n)
+CONFIG_DNS=y
+
+# --- graphics --------------------------------------------------------
+
+# Linear framebuffer and the graphical console backend. With this off the
+# console is VGA text mode only and nothing graphical can run. (y/n)
+CONFIG_GRAPHICS=y
+
+# The compositor and window manager, and the GUI apps that need it:
+# desktop, terminal, gclock, gfiles, gpaint. Needs GRAPHICS. (y/n)
+CONFIG_WM=y
+
+# PS/2 mouse driver. (y/n)
+CONFIG_MOUSE=y
+
+# --- userspace -------------------------------------------------------
+
+# Stage the package repository (the .kpkg files and index.kpi) into the
+# disk image, so `kpkg install <name>` works offline. (y/n)
+CONFIG_PACKAGES=y
+
+# Games: apps/snake.c. (y/n)
+CONFIG_APPS_GAMES=y

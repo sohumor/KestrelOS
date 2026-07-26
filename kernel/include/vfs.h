@@ -3,23 +3,36 @@
 #include <stdint.h>
 #include "kestrel_abi.h"
 
-/* Thin VFS over KFS. All paths are absolute ("/bin/sh").
+/* The VFS: a thin dispatcher over mounted filesystems. All paths are
+ * absolute ("/bin/sh").
  *
- * Access control lives here, not in KFS: every entry point that names a
- * path checks current->uid / current->gid against the inode's mode, uid
- * and gid. uid 0 is root and bypasses every check. */
+ * Every entry point resolves the path to (mount, path within that mount)
+ * by longest prefix (see mount.h) and calls that mount's operations. It
+ * knows nothing about KFS, about /dev or about pipes; a handle carries
+ * its own operations vector, so a pipe, a device and a regular file all
+ * travel the same read/write path.
+ *
+ * Access control *policy* lives here -- vfs_perm_ok() below is the one
+ * place the uid/gid/mode rules are written down -- while the walk that
+ * applies it belongs to each filesystem, which is the only thing that
+ * can traverse its own directories in one pass. */
 
-/* What a struct file actually refers to. FILE_KFS is 0 so a zeroed
- * (kzalloc'd) struct file is a regular file by default. */
+/* What a struct file refers to. FILE_KFS is 0 so a zeroed (kzalloc'd)
+ * struct file is a regular file by default. The tag survives for the
+ * benefit of pipe.c, which checks it; dispatch no longer uses it. */
 #define FILE_KFS  0
 #define FILE_PIPE 1
 
 struct pipe;                    /* defined by pipe.c */
+struct fs_ops;                  /* defined by mount.h */
+struct mount;                   /* defined by mount.h */
 
 struct file {
+    const struct fs_ops *ops;   /* how to read/write/seek/close this */
+    struct mount *mnt;          /* the mount it came from, NULL for pipes */
     int type;                   /* FILE_KFS or FILE_PIPE */
-    uint32_t inum;              /* FILE_KFS: inode number */
-    uint32_t pos;               /* FILE_KFS: byte offset */
+    uint32_t inum;              /* filesystem's own handle id */
+    uint32_t pos;               /* byte offset */
     int flags;                  /* open() flags */
     int refs;                   /* dup / spawn share a struct file */
     struct pipe *pipe;          /* FILE_PIPE: the shared ring buffer */
@@ -31,7 +44,7 @@ struct file {
 #define VFS_W 2
 #define VFS_X 1
 
-int  vfs_init(void);   /* mount root fs; returns 0 or -1 */
+int  vfs_init(void);   /* register the filesystems and mount / and /dev */
 struct file *vfs_open(const char *path, int flags);
 void vfs_close(struct file *f);
 long vfs_read(struct file *f, void *buf, unsigned long n);
@@ -51,6 +64,26 @@ int  vfs_chown(const char *path, uint32_t uid, uint32_t gid);
  * the caller matches, reachable through directories it may search),
  * else 0. The ELF loader calls this before reading the image. */
 int  vfs_exec_ok(const char *path);
+
+/* Create a pipe whose two ends carry this layer's pipe operations, so
+ * they read and write through the same dispatcher as everything else.
+ * Returns 0, or -1 with nothing allocated. Close each end with
+ * vfs_close(). */
+int  vfs_pipe(struct file **read_end, struct file **write_end);
+
+/* --- shared access-control policy ------------------------------------
+ * The calling task's identity, and the one rule that decides whether it
+ * may do `want` (a bitwise OR of VFS_R / VFS_W / VFS_X) to an object
+ * with these owners and permission bits. uid 0 is root and passes
+ * everything; pre-scheduler boot code counts as root. Filesystems call
+ * these instead of writing the comparison out again. */
+uint32_t vfs_uid(void);
+uint32_t vfs_gid(void);
+int  vfs_perm_ok(uint32_t mode, uint32_t uid, uint32_t gid, int want);
+
+/* Access-mode tests on open() flags. */
+int  vfs_flags_allow_read(int flags);
+int  vfs_flags_allow_write(int flags);
 
 /* Current wall-clock time in seconds since the Unix epoch, 0 if the RTC
  * is unreadable. rtc_unix_time() is the general-purpose entry point (use

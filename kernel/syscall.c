@@ -17,6 +17,10 @@
 #include "mouse.h"
 #include "tcp.h"
 #include "wm.h"
+#include "module.h"
+#include "mount.h"
+#include "blockdev.h"
+#include "device.h"
 #include "string.h"
 #include "kestrel_abi.h"
 
@@ -541,6 +545,136 @@ static long sys_logread(uint64_t index, uint64_t uent)
     return copy_to_user((void *)uent, &e, sizeof(e));
 }
 
+/* --- loadable kernel modules -------------------------------------------
+ * Loading code into the kernel is the most privileged thing a process can
+ * ask for, so all three are root-only. The loader reports the reason for a
+ * failure to the kernel log; the syscall only says yes or no. */
+
+static long sys_insmod(uint64_t upath)
+{
+    char path[UPROC_PATH_MAX];
+
+    if (current->uid != 0)
+        return -1;
+    if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
+        return -1;
+    return module_load_path(path) == 0 ? 0 : -1;
+}
+
+static long sys_rmmod(uint64_t uname)
+{
+    char name[MODULE_NAME_MAX];
+
+    if (current->uid != 0)
+        return -1;
+    if (copy_str_from_user(name, (const void *)uname, sizeof(name)) < 0)
+        return -1;
+    return module_unload(name) == 0 ? 0 : -1;
+}
+
+static long sys_modlist(uint64_t index, uint64_t uinfo)
+{
+    struct module_info mi;
+    struct k_modinfo ki;
+
+    if (module_list((int)index, &mi) < 0)
+        return -1;
+    memset(&ki, 0, sizeof(ki));
+    strncpy(ki.name, mi.name, sizeof(ki.name) - 1);
+    strncpy(ki.desc, mi.desc, sizeof(ki.desc) - 1);
+    ki.size = (uint32_t)mi.size;
+    ki.refs = (uint32_t)mi.refs;
+    ki.state = (uint32_t)mi.state;
+    return copy_to_user((void *)uinfo, &ki, sizeof(ki));
+}
+
+/* --- mounts, block devices, device tree -------------------------------- */
+
+static long sys_mount(uint64_t upath, uint64_t utype, uint64_t udev)
+{
+    char path[UPROC_PATH_MAX], type[32], dev[32];
+
+    if (current->uid != 0)
+        return -1;
+    if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
+        return -1;
+    if (copy_str_from_user(type, (const void *)utype, sizeof(type)) < 0)
+        return -1;
+    if (udev) {
+        if (copy_str_from_user(dev, (const void *)udev, sizeof(dev)) < 0)
+            return -1;
+    } else {
+        dev[0] = '\0';
+    }
+    return mount_add(path, type, dev[0] ? dev : NULL);
+}
+
+static long sys_umount(uint64_t upath)
+{
+    char path[UPROC_PATH_MAX];
+
+    if (current->uid != 0)
+        return -1;
+    if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
+        return -1;
+    return mount_remove(path);
+}
+
+static long sys_mountlist(uint64_t index, uint64_t uinfo)
+{
+    struct mount *m;
+    struct k_mountinfo ki;
+    struct fs_statfs sf;
+
+    if (mount_list((int)index, &m) < 0 || !m)
+        return -1;
+    memset(&ki, 0, sizeof(ki));
+    strncpy(ki.path, m->path, sizeof(ki.path) - 1);
+    if (m->type)
+        strncpy(ki.fstype, m->type->name, sizeof(ki.fstype) - 1);
+    if (m->bd)
+        strncpy(ki.device, m->bd->name, sizeof(ki.device) - 1);
+    if (m->type && m->type->ops && m->type->ops->statfs &&
+        m->type->ops->statfs(m, &sf) == 0) {
+        ki.blocks = sf.blocks;
+        ki.free_blocks = sf.free_blocks;
+        ki.block_size = sf.block_size;
+    }
+    return copy_to_user((void *)uinfo, &ki, sizeof(ki));
+}
+
+static long sys_blklist(uint64_t index, uint64_t uinfo)
+{
+    struct blockdev *bd;
+    struct k_blkinfo ki;
+
+    if (blockdev_list((int)index, &bd) < 0 || !bd)
+        return -1;
+    memset(&ki, 0, sizeof(ki));
+    strncpy(ki.name, bd->name, sizeof(ki.name) - 1);
+    ki.block_size = bd->block_size;
+    ki.blocks = bd->blocks;
+    return copy_to_user((void *)uinfo, &ki, sizeof(ki));
+}
+
+static long sys_devlist(uint64_t index, uint64_t uinfo)
+{
+    struct device_info di;
+    struct k_devinfo ki;
+
+    if (device_list((int)index, &di) < 0)
+        return -1;
+    memset(&ki, 0, sizeof(ki));
+    strncpy(ki.bus, di.bus, sizeof(ki.bus) - 1);
+    strncpy(ki.name, di.name, sizeof(ki.name) - 1);
+    strncpy(ki.driver, di.driver, sizeof(ki.driver) - 1);
+    ki.bound = di.bound;
+    ki.vendor = di.vendor;
+    ki.device = di.device;
+    ki.class_id = di.class_id;
+    return copy_to_user((void *)uinfo, &ki, sizeof(ki));
+}
+
 /* --- graphics and input ------------------------------------------------ */
 
 static long sys_fbinfo(uint64_t uinfo)
@@ -757,6 +891,34 @@ static void syscall_dispatch(struct regs *r)
         break;
     case SYS_SYNC:
         ret = 0;                     /* KFS is write-through */
+        break;
+
+    /* --- loadable kernel modules --- */
+    case SYS_INSMOD:
+        ret = sys_insmod(a1);
+        break;
+    case SYS_RMMOD:
+        ret = sys_rmmod(a1);
+        break;
+    case SYS_MODLIST:
+        ret = sys_modlist(a1, a2);
+        break;
+
+    /* --- mounts, block devices, device tree --- */
+    case SYS_MOUNT:
+        ret = sys_mount(a1, a2, a3);
+        break;
+    case SYS_UMOUNT:
+        ret = sys_umount(a1);
+        break;
+    case SYS_MOUNTLIST:
+        ret = sys_mountlist(a1, a2);
+        break;
+    case SYS_BLKLIST:
+        ret = sys_blklist(a1, a2);
+        break;
+    case SYS_DEVLIST:
+        ret = sys_devlist(a1, a2);
         break;
 
     /* --- graphics, input, windows --- */

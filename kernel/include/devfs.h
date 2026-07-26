@@ -2,23 +2,23 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include "vfs.h"
-#include "kestrel_abi.h"
 
-/* /dev pseudo-filesystem.
+/* devfs: the /dev pseudo-filesystem.
  *
- * A self-contained module the VFS consults before it reaches KFS. It owns
- * no disk blocks: every path under /dev is synthesised. The handles it
- * returns are `struct devfile` allocations whose first member is a plain
- * struct file, so a `struct file *` from devfs_open() can be stored in the
- * per-task fd table exactly like a KFS handle.
+ * A filesystem type like any other. It owns no disk blocks -- every path
+ * under it is synthesised -- and it is mounted at /dev by vfs_init(),
+ * where longest-prefix resolution puts it in front of the root
+ * filesystem without anyone special-casing the path.
  *
- * Dispatch: devfs_owns(f) answers "did this handle come from here?" using
- * a private registry, so it does not depend on any field inside struct
- * file. If struct file gains a `type` tag, DEVFS_FILE_TYPE is the value
- * reserved for these handles and may be used instead. */
-
-#define DEVFS_FILE_TYPE 1
+ * What it publishes:
+ *   the character devices below (null, zero, full, console, random, klog);
+ *   one entry per registered block device (hda, ...), readable and
+ *     writable at any byte offset, so `hexdump /dev/hda` shows the boot
+ *     sector;
+ *   two text views of the kernel's own tables, `mounts` and `blocks`,
+ *     which is how mount(1), df(1) and lsblk(1) read the system without
+ *     a syscall of their own.
+ */
 
 /* Device ids, also used as the synthetic inode numbers in k_stat. */
 #define DEV_NULL     1
@@ -27,22 +27,12 @@
 #define DEV_CONSOLE  4
 #define DEV_RANDOM   5
 #define DEV_KLOG     6
+#define DEV_MOUNTS   7
+#define DEV_BLOCKS   8
+#define DEV_BLOCKDEV 9          /* any registered struct blockdev */
 
+/* Register the "devfs" filesystem type and seed the PRNG. Idempotent. */
 void devfs_init(void);
-
-/* true for exactly "/dev" and for anything under "/dev/". */
-bool devfs_claims(const char *path);
-
-/* true if this handle was produced by devfs_open(). */
-bool devfs_owns(struct file *f);
-
-struct file *devfs_open(const char *path, int flags);
-long devfs_read(struct file *f, void *buf, unsigned long n);
-long devfs_write(struct file *f, const void *buf, unsigned long n);
-long devfs_seek(struct file *f, long off, int whence);
-void devfs_close(struct file *f);
-int  devfs_stat(const char *path, struct k_stat *st);
-int  devfs_readdir(const char *path, int index, struct k_dirent *de);
 
 /* Non-cryptographic PRNG behind /dev/random. Do NOT use for keys. */
 uint32_t devfs_random32(void);

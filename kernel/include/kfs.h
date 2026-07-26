@@ -5,8 +5,11 @@
 /* KFS: the native KestrelOS filesystem, on-disk version 2.
  * (see docs/kfs.md)
  *
- *   Block size 4096 bytes = 8 disk sectors. The FS partition starts at
- *   disk LBA FS_START_LBA (ata.h); all block numbers are FS-relative.
+ *   Block size 4096 bytes = 8 disk sectors. A KFS image starts at some
+ *   LBA of a block device; that offset is a property of the *mount*
+ *   (kfs_fs.start_lba), discovered when the superblock is found, not a
+ *   compile-time constant. On the boot disk it is KFS_PART_LBA; a raw
+ *   filesystem image on its own device starts at 0.
  *
  *   block 0                superblock
  *   bitmap_start ..        block bitmap, 1 bit per FS block, set = used
@@ -21,6 +24,7 @@
 #define KFS_MAGIC             0x3253464B  /* "KFS2" little-endian */
 #define KFS_MAGIC_V1          0x3153464B  /* "KFS1": recognised, rejected */
 #define KFS_BLOCK_SIZE        4096
+#define KFS_SECTOR_SIZE       512
 #define KFS_SECTORS_PER_BLOCK 8
 #define KFS_NDIRECT           10
 #define KFS_NINDIRECT         (KFS_BLOCK_SIZE / 4)          /* 1024 */
@@ -30,6 +34,11 @@
 #define KFS_ROOT_INO          1
 #define KFS_INODES_PER_BLOCK  (KFS_BLOCK_SIZE / 64)         /* 64 */
 #define KFS_DIRENTS_PER_BLOCK (KFS_BLOCK_SIZE / 64)         /* 64 */
+
+/* Where the boot disk keeps its KFS partition (tools/mkimage.py writes
+ * it there). Only used as a probe candidate: a device whose superblock
+ * sits at sector 0 mounts just as well. */
+#define KFS_PART_LBA          2048
 
 /* Only permission bits live in the mode field; there is no type or setuid
  * bit (the type has its own field and KestrelOS has no setuid). */
@@ -77,50 +86,73 @@ struct kfs_dirent {
     char name[60];          /* NUL-terminated */
 };
 
-/* Mount / verify the superblock. Returns 0, or -1 if no valid KFS v2. */
-int kfs_mount(void);
+struct blockdev;
+
+/* One mounted KFS instance: which device, where on it the filesystem
+ * starts, and its superblock. Instances come from a small fixed pool;
+ * they all share the driver-wide scratch buffers and lock in kfs.c. */
+struct kfs_fs {
+    struct blockdev *bd;
+    uint64_t start_lba;     /* first device block of the FS on `bd` */
+    uint32_t spb;           /* device blocks per 4 KiB FS block */
+    struct kfs_superblock sb;
+    int used;               /* slot in use (mounted, or still referenced) */
+    int mounted;            /* superblock valid, I/O permitted */
+    int handles;            /* open struct files pointing at this instance */
+};
+
+/* Register the "kfs" filesystem type. Idempotent; call before mounting. */
+void kfs_init(void);
+
+/* --- the driver's own interface, below the fs_ops layer ---------------
+ * These enforce no access control at all: the ops layer in kfs.c checks
+ * permissions before it calls them (using the shared policy in vfs.h).
+ * Every one of them takes the whole-filesystem lock on entry. */
 
 /* Resolve an absolute path to an inode number, or -1. */
-int kfs_lookup(const char *path);
+int kfs_lookup(struct kfs_fs *fs, const char *path);
 
 /* Look one single name up in directory `dir`. Returns the inode number,
- * or -1 if `dir` is not a directory or the name is absent. Lets the VFS
- * walk a path component by component so it can check search permission on
- * each directory it passes through. */
-int kfs_lookup_in(uint32_t dir, const char *name);
+ * or -1 if `dir` is not a directory or the name is absent. Lets the ops
+ * layer walk a path component by component so it can check search
+ * permission on each directory it passes through. */
+int kfs_lookup_in(struct kfs_fs *fs, uint32_t dir, const char *name);
 
 /* Copy inode `ino` into *out. Returns 0 or -1. */
-int kfs_iget(uint32_t ino, struct kfs_inode *out);
+int kfs_iget(struct kfs_fs *fs, uint32_t ino, struct kfs_inode *out);
 
 /* File (or raw directory) data I/O at a byte offset.
  * Read returns bytes read (0 at/after EOF); write grows the file,
  * allocating blocks as needed, and stamps the inode's mtime. Both return
  * -1 on error. The caller supplies `mtime` (see the locking note in
  * kfs.c: the clock must not be read with the FS lock held). */
-long kfs_read(uint32_t ino, uint32_t off, void *buf, uint32_t n);
-long kfs_write(uint32_t ino, uint32_t off, const void *buf, uint32_t n,
-               uint32_t mtime);
+long kfs_read(struct kfs_fs *fs, uint32_t ino, uint32_t off, void *buf,
+              uint32_t n);
+long kfs_write(struct kfs_fs *fs, uint32_t ino, uint32_t off, const void *buf,
+               uint32_t n, uint32_t mtime);
 
 /* Create a regular file at `path` (parent must exist). Returns ino or -1.
  * Fails if the name already exists. Ownership and permissions come from
  * the caller; KFS itself enforces no access control. */
-int kfs_create(const char *path, uint16_t mode, uint32_t uid, uint32_t gid,
-               uint32_t mtime);
+int kfs_create(struct kfs_fs *fs, const char *path, uint16_t mode,
+               uint32_t uid, uint32_t gid, uint32_t mtime);
 
 /* Create a directory (with "." and "..") at `path`. Returns 0 or -1. */
-int kfs_mkdir(const char *path, uint16_t mode, uint32_t uid, uint32_t gid,
-              uint32_t mtime);
+int kfs_mkdir(struct kfs_fs *fs, const char *path, uint16_t mode,
+              uint32_t uid, uint32_t gid, uint32_t mtime);
 
 /* Remove a file, or an empty directory. Returns 0 or -1. */
-int kfs_unlink(const char *path, uint32_t mtime);
+int kfs_unlink(struct kfs_fs *fs, const char *path, uint32_t mtime);
 
 /* Fetch the index'th valid entry (free slots skipped) of directory `ino`
  * into *out. Returns 0, or -1 past the end / on error. */
-int kfs_readdir(uint32_t ino, int index, struct kfs_dirent *out);
+int kfs_readdir(struct kfs_fs *fs, uint32_t ino, int index,
+                struct kfs_dirent *out);
 
 /* Free all data blocks of `ino` and set size to 0. Returns 0 or -1. */
-int kfs_truncate(uint32_t ino, uint32_t mtime);
+int kfs_truncate(struct kfs_fs *fs, uint32_t ino, uint32_t mtime);
 
 /* Metadata updates. No permission checks here either. Return 0 or -1. */
-int kfs_chmod(uint32_t ino, uint16_t mode, uint32_t mtime);
-int kfs_chown(uint32_t ino, uint32_t uid, uint32_t gid, uint32_t mtime);
+int kfs_chmod(struct kfs_fs *fs, uint32_t ino, uint16_t mode, uint32_t mtime);
+int kfs_chown(struct kfs_fs *fs, uint32_t ino, uint32_t uid, uint32_t gid,
+              uint32_t mtime);

@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Kestrel Renderer Test</title>
+<style>
+  /* The renderer ignores CSS; this block is here so the parser has a
+     <style> element to skip instead of printing. */
+  body { color: #202020; }
+</style>
+</head>
+<body>
+
+<h1>Kestrel Renderer Test</h1>
+
+<p>RENDERER-OK: this paragraph is one run of plain body text, long
+enough that the layout engine has to wrap it across more than a single
+line at the default width of eighty columns.</p>
+
+<h2>Inline runs</h2>
+
+<p>Styled spans: <b>bold-run</b>, <i>italic-run</i>, <code>code-run</code>
+and an entity: 5 &lt; 7 &amp; 7 &gt; 5.</p>
+
+<hr>
+
+<h2>Lists</h2>
+
+<ul>
+  <li>bullet-alpha</li>
+  <li>bullet-beta</li>
+  <li>bullet-gamma</li>
+</ul>
+
+<ol>
+  <li>ordered-one</li>
+  <li>ordered-two</li>
+</ol>
+
+<h2>Preformatted</h2>
+
+<pre>
+PRE-BLOCK   column   alignment
+    two         spaces      kept
+</pre>
+
+<blockquote>QUOTE-BLOCK: an indented block quotation.</blockquote>
+
+<h2>Table</h2>
+
+<table>
+  <tr><th>cell-head-a</th><th>cell-head-b</th></tr>
+  <tr><td>cell-body-a</td><td>cell-body-b</td></tr>
+</table>
+
+<h2>Links</h2>
+
+<p>See <a href="/doc/welcome.md">the welcome page</a> and
+<a href="http://example.com/">an absolute link</a>.</p>
+
+<p><img src="missing.png" alt="ALT-TEXT"></p>
+
+<!-- A comment. The parser must drop it, not render it. -->
+
+<p>END-OF-PAGE</p>
+
+</body>
+</html>

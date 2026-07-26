@@ -1,9 +1,14 @@
 #include "kernel.h"
 #include "ata.h"
+#include "blockdev.h"
 #include "io.h"
 #include "string.h"
 
-/* ATA PIO driver: primary bus, master drive, 28-bit LBA, polling. */
+/* ATA PIO driver: primary bus, master drive, 28-bit LBA, polling.
+ *
+ * The transfer path below is unchanged; the only new thing is that
+ * ata_init() publishes the drive as block device "hda" instead of
+ * leaving KFS to call ata_read()/ata_write() by name. */
 
 #define ATA_IO_BASE   0x1F0
 #define ATA_REG_DATA     (ATA_IO_BASE + 0)
@@ -31,6 +36,7 @@
 #define ATA_TIMEOUT 1000000
 
 static int ata_present;
+static struct blockdev ata_bdev;
 
 /* >= 400ns settle time after a drive select. */
 static void ata_delay_400ns(void)
@@ -148,6 +154,31 @@ int ata_write(uint32_t lba, uint32_t count, const void *buf)
     return ata_rw(lba, count, (void *)buf, 1);
 }
 
+/* --- block device face ------------------------------------------------
+ * One block = one 512-byte sector, so the LBA needs no scaling. The
+ * command registers only carry 28 bits of LBA, so anything above that is
+ * refused here rather than silently truncated into the wrong sector. */
+
+#define ATA_LBA28_MAX 0x0FFFFFFFu
+
+static int ata_bd_read(struct blockdev *bd, uint64_t lba, uint32_t count,
+                       void *buf)
+{
+    (void)bd;
+    if (lba > ATA_LBA28_MAX || count > ATA_LBA28_MAX - (uint32_t)lba)
+        return -1;
+    return ata_read((uint32_t)lba, count, buf);
+}
+
+static int ata_bd_write(struct blockdev *bd, uint64_t lba, uint32_t count,
+                        const void *buf)
+{
+    (void)bd;
+    if (lba > ATA_LBA28_MAX || count > ATA_LBA28_MAX - (uint32_t)lba)
+        return -1;
+    return ata_write((uint32_t)lba, count, buf);
+}
+
 /* Model string is stored word-swapped in IDENTIFY words 27..46. */
 static void ata_extract_model(const uint16_t *id, char *model)
 {
@@ -206,4 +237,17 @@ void ata_init(void)
     ata_present = 1;
     kprintf("ata: primary master: %s, %u sectors (%u MiB)\n",
             model, sectors, sectors / 2048);
+
+    /* IDENTIFY word 60/61 is the 28-bit sector count; a drive that
+     * reports more than LBA28 can address is clamped, not trusted. */
+    if (sectors > ATA_LBA28_MAX)
+        sectors = ATA_LBA28_MAX;
+
+    strncpy(ata_bdev.name, "hda", sizeof(ata_bdev.name) - 1);
+    ata_bdev.block_size = ATA_SECTOR_SIZE;
+    ata_bdev.blocks = sectors;
+    ata_bdev.priv = NULL;
+    ata_bdev.read = ata_bd_read;
+    ata_bdev.write = ata_bd_write;
+    blockdev_register(&ata_bdev);
 }

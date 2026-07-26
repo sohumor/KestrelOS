@@ -8,6 +8,12 @@ QEMU    := qemu-system-x86_64
 
 BUILD := build
 
+# Build configuration. `config` (repo root) generates kernel/include/config.h
+# and this fragment; it is included above the wildcards so the object and app
+# lists can be filtered. GNU make remakes an included file and restarts
+# itself, so the rule further down keeps it current on its own.
+-include $(BUILD)/config.mk
+
 CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
           -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
           -fno-omit-frame-pointer -Wall -Wextra -O2 -g \
@@ -19,7 +25,7 @@ UCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie 
            -Ilibc/include -Iabi -Ilibgui -MMD -MP
 AR      := ar
 
-KERNEL_CSRC := $(wildcard kernel/*.c)
+KERNEL_CSRC := $(filter-out $(CONFIG_KERNEL_EXCLUDE), $(wildcard kernel/*.c))
 KERNEL_ASRC := $(wildcard kernel/*.asm)
 KERNEL_OBJS := $(BUILD)/kernel/entry.o \
                $(filter-out $(BUILD)/kernel/entry.o, \
@@ -39,7 +45,7 @@ LIBGUI_A    := $(BUILD)/libgui.a
 
 # apps/html.c is the browser's rendering engine, not a program.
 APP_LIBS  := html
-APP_NAMES := $(filter-out $(APP_LIBS), \
+APP_NAMES := $(filter-out $(APP_LIBS) $(CONFIG_APPS_EXCLUDE), \
                $(patsubst apps/%.c,%,$(wildcard apps/*.c)))
 APP_BINS  := $(patsubst %,$(BUILD)/apps/%,$(APP_NAMES))
 
@@ -56,7 +62,8 @@ ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless test smoke fsck screenshot vm-images clean help
+.PHONY: all run run-headless test smoke fsck screenshot vm-images clean help \
+        reconfig checkconfig
 
 all: $(BUILD)/os.img
 
@@ -75,6 +82,43 @@ $(BUILD)/kernel.elf: $(KERNEL_OBJS) kernel/linker.ld
 
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
+
+# ---------------- kernel modules ----------------
+# Built exactly like the kernel but never linked: the ET_REL object *is*
+# the .kmod. -fno-common keeps SHN_COMMON symbols out (the loader refuses
+# them) and -fno-asynchronous-unwind-tables keeps .eh_frame -- which is
+# SHF_ALLOC, so it would be copied and relocated for nothing -- out.
+MODCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic \
+             -fno-pie -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+             -mcmodel=kernel -fno-common -fno-asynchronous-unwind-tables \
+             -Wall -Wextra -O2 -Ikernel/include -Iabi -MMD -MP
+
+MOD_NAMES := $(patsubst modules/%.c,%,$(wildcard modules/*.c))
+MOD_BINS  := $(patsubst %,$(BUILD)/modules/%.kmod,$(MOD_NAMES))
+
+$(BUILD)/modules/%.kmod: modules/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(MODCFLAGS) -c $< -o $@
+
+# ---------------- configuration ----------------
+
+# One mkconfig run writes both outputs; the header rule only orders them.
+# Outputs are rewritten only when their content changes, so regenerating
+# the configuration does not force a needless kernel rebuild.
+$(BUILD)/config.mk: config tools/mkconfig.py
+	@mkdir -p $(BUILD)
+	$(PY) tools/mkconfig.py --config config \
+	  --header kernel/include/config.h --mk $@ --quiet
+
+kernel/include/config.h: $(BUILD)/config.mk
+	@:
+
+reconfig:
+	$(PY) tools/mkconfig.py --config config \
+	  --header kernel/include/config.h --mk $(BUILD)/config.mk
+
+checkconfig:
+	$(PY) tools/mkconfig.py --config config --check
 
 # ---------------- bootloader ----------------
 
@@ -150,15 +194,17 @@ $(BUILD)/repo/index.kpi: $(KPKGS) tools/mkrepo.py
 
 # ---------------- filesystem image ----------------
 
-$(BUILD)/fs.img: $(APP_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
+$(BUILD)/fs.img: $(APP_BINS) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
                  $(BUILD)/repo/index.kpi
 	rm -rf $(BUILD)/rootfs
 	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run \
 	         $(BUILD)/rootfs/tmp $(BUILD)/rootfs/var/log \
+	         $(BUILD)/rootfs/lib/modules \
 	         $(BUILD)/rootfs/var/pkg/repo $(BUILD)/rootfs/var/pkg/db \
 	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
+	cp $(MOD_BINS) $(BUILD)/rootfs/lib/modules/
 	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
 	$(PY) tools/mkfs.py --mode /etc/shadow:0600 --mode /var/pkg/db:0700 \
 	  --mode /tmp:0777 --mode /run:0777 \
@@ -207,5 +253,6 @@ help:
 clean:
 	rm -rf $(BUILD)
 
--include $(wildcard $(BUILD)/kernel/*.d) $(wildcard $(BUILD)/libc/*.d) \
+-include $(wildcard $(BUILD)/modules/*.d) \
+         $(wildcard $(BUILD)/kernel/*.d) $(wildcard $(BUILD)/libc/*.d) \
          $(wildcard $(BUILD)/apps/*.d)

@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """KestrelOS end-to-end test harness.
 
-Boots build/os.img in headless QEMU and drives the shell over serial
-(stdio). Python 3 stdlib only.
+Boots build/os.img in headless QEMU, logs in on the serial console and
+drives the shell over serial (stdio). Python 3 stdlib only.
+
+The boot now ends at /bin/login, so the suite signs in as root before it
+can do anything else; a build with /etc/autologin lands straight on a
+shell and is handled too. See t_login.
+
+Writing a test: every expect() pattern must be unique to the command's
+OUTPUT. The shell echoes the line you typed and then prints its prompt,
+so a pattern that can match either of those consumes the wrong text and
+desynchronises everything that follows. Anchoring on a leading "\\n", on
+punctuation the command line does not contain, or on a word only the
+program prints are the three tricks used throughout.
 
 Usage:
     python3 tools/e2e.py            # full test sequence
@@ -37,9 +48,20 @@ BOOT_TIMEOUT = 30
 # Recursive walkers (tree/du/find) must finish well inside this; a
 # runaway recursion shows up as a timeout instead of a wedged harness.
 WALK_TIMEOUT = 10
+# kpkg hashes every file it installs or verifies with a userspace SHA-256,
+# which is slow enough on an emulated machine to need its own budget.
+PKG_TIMEOUT = 90
+# The network tests all SKIP on failure, but a DNS lookup plus a TCP
+# handshake to the outside world still has to be given time to fail.
+NET_TIMEOUT = 45
 TAIL_LINES = 40
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
+# An escape sequence the current chunk ends in the middle of. QEMU hands us
+# whatever has arrived, so a repaint's "\x1b[20C" is regularly split across
+# two reads; stripping each half separately would leave "20C" sitting in
+# the buffer where a pattern could trip over it.
+ANSI_TAIL_RE = re.compile(r"\x1b(\[[0-9;?]*[ -/]*)?$")
 
 
 def clean(text):
@@ -56,6 +78,7 @@ class Harness:
         self.cond = threading.Condition(self.lock)
         self.tail = collections.deque(maxlen=TAIL_LINES)
         self._partial = ""
+        self._esc = ""                # half of an escape sequence, held back
         self.eof = False
 
     def start(self):
@@ -77,7 +100,16 @@ class Harness:
             chunk = self.proc.stdout.read1(4096)
             if not chunk:
                 break
-            text = clean(chunk.decode("utf-8", errors="replace"))
+            raw = self._esc + chunk.decode("utf-8", errors="replace")
+            m = ANSI_TAIL_RE.search(raw)
+            if m:
+                self._esc = raw[m.start():]
+                raw = raw[:m.start()]
+            else:
+                self._esc = ""
+            text = clean(raw)
+            if not text:
+                continue
             with self.cond:
                 self.buf += text
                 self._partial += text
@@ -87,6 +119,7 @@ class Harness:
                     self.tail.append(line)
                 self.cond.notify_all()
         with self.cond:
+            self._esc = ""            # nothing will ever complete it now
             if self._partial:
                 self.tail.append(self._partial)
                 self._partial = ""
@@ -169,13 +202,57 @@ class Harness:
 PROMPT = "kestrel:"
 DOTTED_QUAD = r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"
 
+SHELL_PROMPT = r"kestrel:[^\n]*\$"
+LOGIN_PROMPT = r"\nlogin: "
+
+# /etc/shadow ships these on purpose; see docs/users.md.
+ROOT_USER, ROOT_PASS = "root", "root"
+USER_NAME, USER_PASS = "kestrel", "kestrel"
+MAX_LOGIN_TRIES = 3
+
+# Set by t_pipe once it has found out whether this shell understands '|'.
+# The shell grew redirection before it grew pipes, so the tests that need
+# one have to ask rather than assume.
+have_pipes = False
+
 
 def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
-    h.expect_any([r"kestrel:[^\n]*\$"], timeout=timeout, regex=True)
+    h.expect_any([SHELL_PROMPT], timeout=timeout, regex=True)
 
 
 def t_boot(h):
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+
+
+def t_login(h):
+    """Get to a shell, logging in on the console if init asks us to.
+
+    /etc/inittab respawns /bin/login unless /etc/autologin exists, so both
+    outcomes are legal and the harness has to handle both: answer the login
+    prompt, or find a shell already waiting. Every single test after this
+    one needs a shell, which is why it retries and why it is deliberately
+    the only test allowed to match a bare prompt.
+
+    On the login path the shell's *first* prompt is left unconsumed, so
+    t_prompt has something to match; on the autologin path the prompt has
+    already been eaten, so a no-output `cd /` is sent to produce another.
+    """
+    for _ in range(MAX_LOGIN_TRIES):
+        which = h.expect_any([LOGIN_PROMPT, SHELL_PROMPT],
+                             timeout=BOOT_TIMEOUT, regex=True)
+        if which == SHELL_PROMPT:
+            h.send("cd /")
+            return
+        h.send(ROOT_USER)
+        h.expect("password:", timeout=DEFAULT_TIMEOUT)
+        h.send(ROOT_PASS)
+        # login sleeps 2s after a bad password before asking again.
+        got = h.expect_any(["welcome, " + ROOT_USER, "login incorrect"],
+                           timeout=DEFAULT_TIMEOUT)
+        if got != "login incorrect":
+            return
+    raise TimeoutError("could not log in as %s after %d tries"
+                       % (ROOT_USER, MAX_LOGIN_TRIES))
 
 
 def t_prompt(h):
@@ -374,8 +451,260 @@ def t_long_line(h):
     wait_prompt(h)
 
 
+# ---- accounts and permissions ----------------------------------------
+
+
+def t_whoami(h):
+    # "\nroot\n" cannot match the echoed "whoami" or the prompt
+    h.send("whoami")
+    h.expect(r"\nroot\n", regex=True)
+    wait_prompt(h)
+
+
+def t_id(h):
+    h.send("id")
+    h.expect(r"uid=0\(root\) gid=0\(root\)", regex=True)
+    wait_prompt(h)
+
+
+def t_permissions(h):
+    """An unprivileged account must not be able to read /etc/shadow.
+
+    su drops to uid 1000 and spawns a nested shell; /etc/shadow is mode
+    0600 owned by root and there is no setuid bit, so the read has to
+    fail. Leaving the nested shell brings the suite back to root.
+    """
+    h.send("su " + USER_NAME)
+    h.expect("password:")
+    h.send(USER_PASS)
+    h.expect("su: root -> " + USER_NAME)
+    wait_prompt(h)
+
+    h.send("whoami")
+    h.expect("\n" + USER_NAME + "\n", regex=True)
+    wait_prompt(h)
+
+    h.send("id")
+    h.expect(r"uid=1000\(kestrel\)", regex=True)
+    wait_prompt(h)
+
+    h.send("cat /etc/shadow")
+    h.expect("cat: cannot open")
+    wait_prompt(h)
+
+    # ... and root can still read it, which is what makes the failure
+    # above a permission check rather than a missing file.
+    h.send("exit")
+    h.expect("su: back to root")
+    wait_prompt(h)
+    h.send("cat /etc/shadow")
+    h.expect(":4096:", timeout=DEFAULT_TIMEOUT)
+    wait_prompt(h)
+
+
+# ---- plumbing: redirection, pipes, /dev -------------------------------
+
+
+def t_redirect(h):
+    """'>' , '>>' and '<' still wire up fd 0/1 through spawn_io()."""
+    h.send("echo redirect-marker > /t4.txt")
+    wait_prompt(h)
+    h.send("cat /t4.txt")
+    h.expect(r"\nredirect-marker\n", regex=True)
+    wait_prompt(h)
+    # "redirect-marker\n" is 16 bytes; wc reading it off fd 0 proves '<'
+    h.send("wc -c < /t4.txt")
+    h.expect(r"\n *16\n", regex=True)
+    wait_prompt(h)
+    h.send("echo appended-line >> /t4.txt")
+    wait_prompt(h)
+    h.send("wc -l /t4.txt")
+    h.expect(r"\n *2 /t4\.txt\n", regex=True)
+    wait_prompt(h)
+    h.send("rm /t4.txt")
+    wait_prompt(h)
+
+
+def t_pipe(h):
+    """`ls /bin | wc -l`, if this shell has pipes yet.
+
+    Without them sh hands '|', 'wc' and '-l' to ls as arguments and ls
+    rejects '-l' with its usage line, which is what the SKIP branch
+    matches. Sets have_pipes for the tests that want to use one.
+    """
+    global have_pipes
+
+    h.send("ls /bin | wc -l")
+    h.expect("| wc -l")             # consume the echoed command line
+    got = h.expect_any([r"\n *\d+\n", r"usage: ls \[-a\]"], regex=True)
+    wait_prompt(h)
+    if got != r"\n *\d+\n":
+        return "SKIP"
+    have_pipes = True
+
+
+def t_dev(h):
+    """/dev: the devfs mount, an immediate-EOF device and an empty dump.
+
+    /dev/zero is an endless stream, so it is only ever read through a
+    pipe - and only when the shell has pipes and hexdump gives up on a
+    closed one. Reading it unpiped would wedge the harness.
+    """
+    h.send("cat /dev/null")
+    wait_prompt(h)
+
+    h.send("ls /dev")
+    # ls prints "- <size>  <name>"; "zero" appears nowhere in "ls /dev"
+    h.expect(r"\n- +\d+ +zero\n", regex=True)
+    wait_prompt(h)
+
+    h.send("hexdump /dev/null")
+    # an empty file dumps as nothing but the final offset
+    h.expect(r"\n00000000\n", regex=True)
+    wait_prompt(h)
+
+    if have_pipes:
+        h.send("cat /dev/null | wc -c")
+        h.expect("| wc -c")
+        h.expect(r"\n *0\n", regex=True)
+        wait_prompt(h)
+
+
+# ---- kernel log and services ------------------------------------------
+
+
+def t_dmesg(h):
+    h.send("dmesg -n 5")
+    # "[<ticks>] <level> <tag> (<pid>) <msg>" - the brackets and the
+    # level word are unique to the log format
+    h.expect(r"\n\[ *\d+\] (info|warn|error|debug) ", regex=True)
+    wait_prompt(h)
+
+
+def t_service_list(h):
+    h.send("service list")
+    h.expect("RESTARTS")            # column header, not in the command
+    h.expect(r"\nlogger +\w+", regex=True)
+    wait_prompt(h)
+
+
+def t_lsmod(h):
+    """Loadable modules are landing in this wave; tolerate their absence.
+
+    The existence check is `ls /bin/lsmod` rather than running lsmod, so
+    a build without the module tooling SKIPs instead of colliding with
+    the shell's "command not found" line.
+    """
+    h.send("ls /bin/lsmod")
+    got = h.expect_any([r"\n1 entry\n", r"ls: cannot access"], regex=True)
+    wait_prompt(h)
+    if got != r"\n1 entry\n":
+        return "SKIP"
+
+    h.send("lsmod")
+    h.expect_any([r"sh: command not found",
+                  r"no modules loaded",
+                  r"\n(Module|MODULE|module|name) +\w",
+                  r"\n[a-z0-9_.-]+ +\d+ +\d+",
+                  r"lsmod: [^\n]+"], regex=True)
+    wait_prompt(h)
+
+
+# ---- packages ---------------------------------------------------------
+
+
+def t_kpkg_list(h):
+    h.send("kpkg list")
+    h.expect_any([r"kpkg: no packages installed",
+                  r"\n\d+ packages? installed\n"], regex=True)
+    wait_prompt(h)
+
+
+def t_kpkg_install(h):
+    """Install `hello`, which pulls kestrel-extras in as a dependency."""
+    h.send("kpkg install hello")
+    h.expect("kpkg: installed kestrel-extras", timeout=PKG_TIMEOUT)
+    h.expect("kpkg: installed hello", timeout=PKG_TIMEOUT)
+    wait_prompt(h, timeout=PKG_TIMEOUT)
+
+    h.send("kpkg list")
+    h.expect(r"\n2 packages installed\n", regex=True, timeout=PKG_TIMEOUT)
+    wait_prompt(h, timeout=PKG_TIMEOUT)
+
+
+def t_pkg_hello(h):
+    h.send("hello e2e")
+    h.expect("Hello, e2e!")
+    wait_prompt(h)
+
+
+def t_pkg_cal(h):
+    h.send("cal 7 2026")
+    h.expect("July 2026")           # the command line says "7", not "July"
+    h.expect("Su Mo Tu We Th Fr Sa")
+    h.expect(r"\n[ 0-9]*\b31\b[ 0-9]*\n", regex=True)   # July has 31 days
+    wait_prompt(h)
+
+
+def t_pkg_factor(h):
+    h.send("factor 97 360")
+    h.expect(r"\n97: 97\n", regex=True)
+    # No leading "\n": the previous match consumed the newline these two
+    # lines share. "360: 2" cannot occur in the echoed "factor 97 360".
+    h.expect(r"360: 2 2 2 3 3 5\n", regex=True)
+    wait_prompt(h)
+
+
+def t_kpkg_verify(h):
+    h.send("kpkg verify")
+    h.expect("kpkg: everything matches", timeout=PKG_TIMEOUT)
+    wait_prompt(h, timeout=PKG_TIMEOUT)
+
+
+# ---- browser ----------------------------------------------------------
+
+
+def t_browser_text(h):
+    """The HTML renderer, run over a local page in text mode.
+
+    rootfs/doc/test.html exercises headings, wrapped body text, inline
+    styles, entities, lists, <pre>, a table, links and an <img> alt.
+    """
+    h.send("browser -t -l /doc/test.html")
+    h.expect("Kestrel Renderer Test", timeout=WALK_TIMEOUT)
+    h.expect("RENDERER-OK", timeout=WALK_TIMEOUT)
+    h.expect("bullet-alpha", timeout=WALK_TIMEOUT)
+    h.expect("PRE-BLOCK", timeout=WALK_TIMEOUT)
+    h.expect("cell-body-b", timeout=WALK_TIMEOUT)
+    h.expect("[ALT-TEXT]", timeout=WALK_TIMEOUT)
+    h.expect("END-OF-PAGE", timeout=WALK_TIMEOUT)
+    # -l resolves every href against the page URL
+    h.expect(r"\n *\[\d+\] /doc/welcome\.md\n", regex=True,
+             timeout=WALK_TIMEOUT)
+    wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_tcp_curl(h):
+    """A real TCP fetch. SKIPs like the other network tests: the host may
+    have no route out, and that is not a KestrelOS bug."""
+    ok = r"(?i)</html>"
+    h.send("curl -s http://example.com")
+    got = h.expect_any([ok,
+                        r"curl: network unavailable",
+                        r"curl: cannot resolve",
+                        r"curl: cannot connect",
+                        r"curl: this build has no HTTP client",
+                        r"curl: HTTP \d+",
+                        r"\[exit \d+\]"],
+                       timeout=NET_TIMEOUT, regex=True)
+    wait_prompt(h, timeout=NET_TIMEOUT)
+    if got != ok:
+        return "SKIP"
+
+
 TESTS = [
     ("boot", t_boot),
+    ("login", t_login),
     ("shell-prompt", t_prompt),
     ("help", t_help),
     ("echo", t_echo),
@@ -403,7 +732,27 @@ TESTS = [
     ("err-rm-missing", t_err_rm_missing),
     ("err-unknown-cmd", t_err_unknown_cmd),
     ("long-line", t_long_line),
+    ("whoami", t_whoami),
+    ("id", t_id),
+    ("redirect", t_redirect),
+    ("pipe", t_pipe),
+    ("dev", t_dev),
+    ("dmesg", t_dmesg),
+    ("service-list", t_service_list),
+    ("permissions", t_permissions),
+    ("browser-text", t_browser_text),
+    ("kpkg-list", t_kpkg_list),
+    ("kpkg-install", t_kpkg_install),
+    ("pkg-hello", t_pkg_hello),
+    ("pkg-cal", t_pkg_cal),
+    ("pkg-factor", t_pkg_factor),
+    ("kpkg-verify", t_kpkg_verify),
+    ("lsmod", t_lsmod),
+    ("tcp-curl", t_tcp_curl),
 ]
+
+# boot + login + a prompt: the least that proves the machine came up.
+SMOKE_TESTS = 3
 
 
 def run_tests(h, tests):
@@ -496,7 +845,7 @@ def main():
         print("error: build/os.img not found (run make first)")
         return 1
 
-    tests = TESTS[:2] if args.smoke else TESTS
+    tests = TESTS[:SMOKE_TESTS] if args.smoke else TESTS
     h = Harness(QEMU_CMD)
     try:
         h.start()

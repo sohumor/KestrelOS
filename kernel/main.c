@@ -26,6 +26,8 @@
 #include "klog.h"
 #include "devfs.h"
 #include "wm.h"
+#include "initcall.h"
+#include "device.h"
 
 struct bootinfo *boot_info;
 
@@ -113,6 +115,12 @@ void kmain(uint64_t bootinfo_phys)
     proc_init();
     kprintf("proc: scheduler online\n");
 
+    /* Buses register and enumerate here; drivers bind at INITCALL_DRIVER
+     * below, once the filesystem and log are up. A driver arriving later
+     * in a loadable module binds against this same device list. */
+    initcall_run_level(INITCALL_EARLY);
+    initcall_run_level(INITCALL_CORE);
+
     ata_init();
     vfs_init();              /* reports success or failure itself */
     devfs_init();
@@ -122,10 +130,13 @@ void kmain(uint64_t bootinfo_phys)
     else
         mouse_init(80 * FONT_W, 25 * FONT_H);
 
+    initcall_run_level(INITCALL_DRIVER);
+
     net_init();
     tcp_init();
     wm_init();
     syscall_init();
+    initcall_run_level(INITCALL_LATE);
 
     char when[40];
     if (rtc_format(when, sizeof(when)) == 0)

@@ -72,6 +72,18 @@
 #define SYS_TCP_RECV    50 /* (handle, buf, max, timeout_ms) -> n, 0 = closed */
 #define SYS_TCP_CLOSE   51 /* (handle) -> 0/-1 */
 #define SYS_SYNC        52 /* () -> flush filesystem caches */
+
+/* --- loadable kernel modules --- */
+#define SYS_INSMOD      53 /* (path) -> 0/-1; root only */
+#define SYS_RMMOD       54 /* (name) -> 0/-1; root only */
+#define SYS_MODLIST     55 /* (index, struct k_modinfo*) -> 0 / -1 at end */
+
+/* --- mounts, block devices, device tree --- */
+#define SYS_MOUNT       56 /* (path, fstype, devname) -> 0/-1; root only */
+#define SYS_UMOUNT      57 /* (path) -> 0/-1; root only */
+#define SYS_BLKLIST     58 /* (index, struct k_blkinfo*) -> 0 / -1 at end */
+#define SYS_DEVLIST     59 /* (index, struct k_devinfo*) -> 0 / -1 at end */
+#define SYS_MOUNTLIST   60 /* (index, struct k_mountinfo*) -> 0 / -1 at end */
 /* open() flags */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
@@ -181,6 +193,47 @@ struct k_logent {
     uint32_t pid;
     char tag[16];
     char msg[112];
+};
+
+/* --- modules, block devices, mounts, devices ------------------------ */
+
+/* module state reported by SYS_MODLIST */
+#define K_MOD_LOADING   0
+#define K_MOD_LIVE      1
+#define K_MOD_UNLOADING 2
+
+struct k_modinfo {
+    char name[32];
+    char desc[64];
+    uint32_t size;         /* bytes of module memory in use */
+    uint32_t refs;
+    uint32_t state;        /* K_MOD_* */
+};
+
+struct k_blkinfo {
+    char name[16];
+    uint32_t block_size;
+    uint64_t blocks;
+};
+
+struct k_mountinfo {
+    char path[64];
+    char fstype[16];
+    char device[16];
+    uint64_t blocks;       /* 0 when the filesystem cannot report it */
+    uint64_t free_blocks;
+    uint32_t block_size;
+    uint32_t _pad;
+};
+
+struct k_devinfo {
+    char bus[16];
+    char name[24];
+    char driver[24];       /* "" when nothing is bound */
+    uint32_t bound;        /* 1 if a driver claimed it */
+    uint32_t vendor;       /* PCI vendor id, 0 on other buses */
+    uint32_t device;       /* PCI device id, 0 on other buses */
+    uint32_t class_id;     /* PCI class << 8 | subclass, else 0 */
 };
 
 /* --- framebuffer, mouse, windows ------------------------------------ */
