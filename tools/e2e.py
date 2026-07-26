@@ -684,6 +684,24 @@ def t_browser_text(h):
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
 
+def t_browser_home(h):
+    """The start page the desktop's Browser button opens.
+
+    Regression guard: `browser` with no argument used to print usage and
+    exit 2, so clicking Browser on the desktop opened nothing at all. The
+    windowed no-argument case cannot be driven headlessly, so this checks
+    the two things that break it -- the page existing and rendering.
+    """
+    # Short phrases only: the renderer wraps at 78 columns, so anything
+    # long enough to straddle a line break would match nothing.
+    h.send("browser -t /doc/home.html")
+    h.expect("KestrelOS", timeout=WALK_TIMEOUT)
+    h.expect("HTML parser", timeout=WALK_TIMEOUT)
+    h.expect("Local pages", timeout=WALK_TIMEOUT)
+    h.expect("no TLS", timeout=WALK_TIMEOUT)
+    wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
 def t_tcp_curl(h):
     """A real TCP fetch. SKIPs like the other network tests: the host may
     have no route out, and that is not a KestrelOS bug."""
@@ -741,6 +759,7 @@ TESTS = [
     ("service-list", t_service_list),
     ("permissions", t_permissions),
     ("browser-text", t_browser_text),
+    ("browser-home", t_browser_home),
     ("kpkg-list", t_kpkg_list),
     ("kpkg-install", t_kpkg_install),
     ("pkg-hello", t_pkg_hello),

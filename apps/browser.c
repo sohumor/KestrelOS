@@ -39,6 +39,9 @@
 #endif
 
 #define URL_MAX      512
+
+/* Where the window opens when no page is named (the desktop launcher). */
+#define BROWSER_HOME "/doc/home.html"
 #define HOST_MAX     160
 #define PATH_MAX_B   384
 #define HIST_MAX     64
@@ -1453,9 +1456,19 @@ int main(int argc, char **argv)
         }
     }
 
+    /* No target: in a window, open the start page — that is what the
+     * desktop's Browser button does, and printing usage into a window
+     * nobody opened just made the button look broken. Text mode still
+     * needs something to render, so it keeps the usage message. */
     if (!target) {
-        usage();
-        return 2;
+#ifdef HAVE_GUI
+        if (!text)
+            target = BROWSER_HOME;
+#endif
+        if (!target) {
+            usage();
+            return 2;
+        }
     }
     if (cols < 20)
         cols = 20;

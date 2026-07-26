@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head><title>KestrelOS</title></head>
+<body>
+
+<h1>KestrelOS</h1>
+
+<p>This page is being rendered by <b>this operating system's own browser</b>:
+its own HTML parser and layout engine, drawn through its own window manager,
+over its own TCP/IP stack. Nothing here was ported from anywhere.</p>
+
+<h2>Local pages</h2>
+
+<ul>
+  <li><a href="/doc/welcome.md">welcome.md</a> &mdash; a guided tour of the shell</li>
+  <li><a href="/doc/test.html">test.html</a> &mdash; what the HTML engine supports</li>
+  <li><a href="/etc/motd">/etc/motd</a> &mdash; the login banner</li>
+  <li><a href="/etc/version">/etc/version</a> &mdash; the release string</li>
+</ul>
+
+<h2>The live web</h2>
+
+<p>These need working networking. In QEMU that means a NIC on the command
+line; in VirtualBox, an Intel PRO/1000 adapter.</p>
+
+<ul>
+  <li><a href="http://example.com">example.com</a></li>
+  <li><a href="http://neverssl.com">neverssl.com</a></li>
+</ul>
+
+<p><b>There is no TLS</b>, so <code>https://</code> addresses are refused
+rather than half-supported. Most of the modern web is therefore out of
+reach; plain-HTTP pages work.</p>
+
+<h2>Getting around</h2>
+
+<ul>
+  <li>Click a link to follow it</li>
+  <li><b>Back</b>, <b>Fwd</b> and <b>Reload</b>, or ctrl-B / ctrl-F / ctrl-R</li>
+  <li>ctrl-L types in the address bar, enter goes</li>
+  <li>Arrows and PgUp/PgDn scroll, ctrl-Q quits</li>
+</ul>
+
+<hr>
+
+<p>Run <code>browser -t &lt;url&gt;</code> from a shell to render any page as
+plain text instead &mdash; that works over a serial console with no graphics
+at all.</p>
+
+</body>
+</html>
