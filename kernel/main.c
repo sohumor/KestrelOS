@@ -8,6 +8,9 @@
 #include "timer.h"
 #include "keyboard.h"
 #include "input.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "kheap.h"
 
 struct bootinfo *boot_info;
 
@@ -45,6 +48,29 @@ void kmain(uint64_t bootinfo_phys)
 
     timer_sleep(10);
     kprintf("timer: ticks=%lu after 100ms sleep\n", timer_ticks());
+
+    pmm_init(boot_info);
+    kprintf("pmm: %lu/%lu pages free (%lu MiB)\n",
+            pmm_free_pages(), pmm_total_pages(),
+            (uint64_t)(pmm_free_pages() * PAGE_SIZE / (1024 * 1024)));
+
+    vmm_init();
+    kprintf("vmm: kernel page tables rebuilt, direct map to %lu MiB\n",
+            pmm_max_phys() / (1024 * 1024));
+    uint64_t kp = vmm_virt_to_phys(vmm_kernel_pml4(), KERNEL_OFFSET + 0x100000);
+    if (kp != 0x100000)
+        panic("vmm: kernel translation wrong: %lx", kp);
+
+    kheap_init();
+    char *a = kmalloc(64);
+    char *b = kmalloc(100000);
+    memset(a, 0xAA, 64);
+    memset(b, 0x55, 100000);
+    if ((uint8_t)a[63] != 0xAA || (uint8_t)b[99999] != 0x55)
+        panic("kheap: data corruption");
+    kfree(a);
+    kfree(b);
+    kprintf("kheap: small+large alloc/free ok\n");
 
     kprintf("\nKESTREL READY\n");
     kprintf("echo test — type on keyboard or serial:\n> ");
