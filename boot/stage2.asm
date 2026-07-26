@@ -410,10 +410,25 @@ vbe_pitch:
     ret
 
 align 2
+; Widest first: the best mode the adapter actually offers wins, up to
+; 1440p. A 2560x1440 32-bpp mode needs 14 MiB of video memory and another
+; 14 MiB of RAM for the kernel's shadow buffer, so the kernel re-checks
+; that it can afford the shadow and falls back to text mode if not.
 pref_list:                       ; width, height; 0 terminates
-    dw 1024, 768
+    dw 2560, 1440
+    dw 2560, 1600
+    dw 1920, 1200
+    dw 1920, 1080
+    dw 1680, 1050
+    dw 1600, 1200
+    dw 1600, 900
+    dw 1440, 900
+    dw 1366, 768
     dw 1280, 1024
+    dw 1280, 800
     dw 1280, 720
+    dw 1152, 864
+    dw 1024, 768
     dw 800, 600
     dw 640, 480
     dw 0, 0

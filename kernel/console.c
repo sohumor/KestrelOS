@@ -24,9 +24,10 @@
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
 
-/* Static grid budget for the framebuffer backend (1600x960 of text). */
-#define CON_MAX_COLS 200
-#define CON_MAX_ROWS 60
+/* Static grid budget for the framebuffer backend. 320x90 cells of the 8x16
+ * font covers 2560x1440, the largest mode the bootloader will select. */
+#define CON_MAX_COLS 320
+#define CON_MAX_ROWS 90
 
 #define ESC_MAX_PARAMS 4
 

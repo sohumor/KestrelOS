@@ -8,14 +8,16 @@
 
 /* Kernel virtual window onto the VBE linear framebuffer. The e1000
  * register file already owns 0xFFFFFFFFC0000000..+128 KiB, so start
- * 256 MiB clear of it. The largest mode stage 2 will set is
- * 1280x1024x32 (5 MiB), comfortably inside FB_MAX_BYTES. */
+ * 256 MiB clear of it. The largest mode stage 2 will set is 2560x1440x32:
+ * a 14 MiB aperture plus a 14 MiB shadow buffer. */
 #define FB_VA_BASE 0xFFFFFFFFD0000000ULL
 
-/* Sanity limits applied to whatever the BIOS reports. */
-#define FB_MAX_W      2048
-#define FB_MAX_H      1536
-#define FB_MAX_BYTES  (32u * 1024 * 1024)
+/* Sanity limits applied to whatever the BIOS reports. 2560x1600 is the
+ * widest mode in the bootloader's preference list; the byte cap leaves
+ * room for a padded pitch above that. */
+#define FB_MAX_W      2560
+#define FB_MAX_H      1600
+#define FB_MAX_BYTES  (48u * 1024 * 1024)
 
 void      fb_init(struct bootinfo *bi);
 bool      fb_present(void);
