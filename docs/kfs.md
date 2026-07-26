@@ -6,6 +6,16 @@ are write-through; there is no journal and no cache to flush.
 
 All multi-byte fields are little-endian.
 
+**This document describes on-disk format version 2** (magic `"KFS2"`).
+v2 added `mode`, `uid`, `gid` and `mtime` to the inode so KestrelOS could
+grow multi-user support, and dropped `nlink` (KFS has never supported hard
+links, so the field was never anything but decoration). The inode stayed 64
+bytes by giving up two direct block pointers. A v1 (`"KFS1"`) image is
+**not** upgraded in place: the kernel recognises the old magic and refuses
+the mount with a message telling you to rebuild, because a v1 inode's
+`nlink`/`direct[10..11]` sit exactly where v2 keeps `mode` and `indirect`.
+Rebuild with `tools/mkfs.py`.
+
 ## Placement on disk
 
 The FS lives in a partition starting at disk sector `FS_START_LBA`
@@ -33,7 +43,7 @@ First 40 bytes of block 0; the rest of the block is zero.
 
 | offset | type | field         | meaning                                  |
 |--------|------|---------------|------------------------------------------|
-| 0      | u32  | magic         | `0x3153464B` ("KFS1")                    |
+| 0      | u32  | magic         | `0x3253464B` ("KFS2")                    |
 | 4      | u32  | total_blocks  | size of the FS in blocks                 |
 | 8      | u32  | bitmap_start  | first bitmap block (= 1)                 |
 | 12     | u32  | bitmap_blocks | bitmap length in blocks                  |
@@ -60,16 +70,25 @@ the root directory. `inode_count` defaults to 1024 (16 blocks).
 | offset | type    | field    | meaning                                   |
 |--------|---------|----------|-------------------------------------------|
 | 0      | u16     | type     | 0 = free, 1 = file, 2 = directory         |
-| 2      | u16     | nlink    | link count (informational: files 1, dirs 2) |
+| 2      | u16     | mode     | permission bits, `0..0777`                |
 | 4      | u32     | size     | length in bytes                           |
-| 8      | u32[12] | direct   | direct data block numbers (0 = none)      |
-| 56     | u32     | indirect | block holding 1024 u32 block numbers      |
-| 60     | u32     | pad      | zero                                      |
+| 8      | u32     | uid      | owning user id (0 = root)                 |
+| 12     | u32     | gid      | owning group id                           |
+| 16     | u32     | mtime    | last modification, Unix seconds, 0 = unknown |
+| 20     | u32[10] | direct   | direct data block numbers (0 = none)      |
+| 60     | u32     | indirect | block holding 1024 u32 block numbers      |
 
-File block `n` maps to `direct[n]` for `n < 12`, else to entry `n - 12`
-of the indirect block. Maximum file size is `(12 + 1024) * 4096` =
-4,243,456 bytes. Sparse files are **not** supported: every block below
-`size` is allocated, and all pointers past `size` are zero.
+The size arithmetic: `2 + 2 + 4 + 4 + 4 + 4 + 40 + 4 = 64`.
+
+`mode` holds **permission bits only** — the type has its own field and
+KestrelOS has no setuid bit, so anything outside `0777` is corruption.
+A free inode slot (`type == 0`) is entirely zero.
+
+File block `n` maps to `direct[n]` for `n < 10`, else to entry `n - 10`
+of the indirect block. Maximum file size is `(10 + 1024) * 4096` =
+**4,235,264 bytes** (v1 allowed `(12 + 1024) * 4096` = 4,243,456, so v2
+costs 8 KiB off the top end). Sparse files are **not** supported: every
+block below `size` is allocated, and all pointers past `size` are zero.
 
 ## Directories
 
@@ -85,23 +104,105 @@ Every directory contains `.` (itself) and `..` (its parent; the root's
 creation reuses the first free slot before growing the directory. A
 directory's `size` is always a multiple of 64.
 
+## Permissions
+
+KFS itself enforces nothing; it only stores `mode`, `uid` and `gid`. All
+access control lives in `kernel/vfs.c`, which compares the calling task's
+`current->uid` / `current->gid` against the inode:
+
+* **uid 0 is root** and bypasses every check. Kernel threads run as root.
+* Otherwise the owner triad (`mode >> 6`) applies if `uid` matches, else
+  the group triad (`mode >> 3`) if `gid` matches, else the other triad.
+* **Search (x) permission is required on every directory component** of a
+  path. `vfs.c` walks paths one name at a time (`kfs_lookup_in()`) rather
+  than resolving the whole string in KFS, precisely so it can check this.
+* `vfs_open()` requires read permission for `O_RDONLY`, and write
+  permission for `O_WRONLY`, `O_RDWR`, `O_CREAT` and `O_TRUNC`. Creating a
+  new name additionally requires write + search on the parent directory.
+* `vfs_unlink()` and `vfs_mkdir()` require write + search on the parent.
+* `vfs_readdir()` requires read permission on the directory.
+* `vfs_chmod()` requires being the owner, or root. `vfs_chown()` is
+  root-only.
+* `vfs_exec_ok()` reports whether the caller may execute a path; the ELF
+  loader consults it before reading an image.
+* New files are created `0644`, new directories `0755`, both owned by
+  `current->uid` / `current->gid`.
+
+There is no errno: every denial is reported as the same `-1` / `NULL` as
+"not found".
+
+`mtime` is stamped by the VFS from `vfs_now()`, which converts the CMOS
+RTC (assumed to be UTC) to Unix seconds and caches the result against the
+timer tick, re-reading the chip at most once a minute. The same value is
+available to the rest of the kernel as `rtc_unix_time()` (declared in
+`kernel/include/vfs.h`, implemented in `kernel/vfs.c`).
+
+## Locking
+
+`kernel/kfs.c` keeps its scratch blocks, the in-memory superblock and the
+singleton ATA controller as shared mutable state, and syscalls are
+preemptible. Every public `kfs_*` entry point therefore takes a
+whole-filesystem mutex (a flag plus an owner, so it is recursive, with
+waiters backing off via `task_sleep_ticks(1)`); everything below the entry
+points assumes the lock is held. The lock may only be held across polled
+disk I/O — never across the clock, the keyboard or the network — which is
+why the mutating entry points take an `mtime` argument instead of reading
+the RTC themselves.
+
+## Pipes
+
+`kernel/pipe.c` implements anonymous pipes on top of the same
+`struct file` the VFS hands out; `struct file` carries a `type` tag
+(`FILE_KFS` / `FILE_PIPE`) and `vfs_read()` / `vfs_write()` dispatch on
+it. A pipe is a 4 KiB ring buffer with a reader count and a writer count:
+
+* reading blocks while the buffer is empty and a writer still exists, and
+  returns 0 (EOF) once the last writer closes;
+* writing blocks while the buffer is full and a reader exists, and fails
+  with -1 once every reader is gone (KestrelOS has no signals, so there is
+  no `SIGPIPE`);
+* `vfs_close()` drops the right side and frees the buffer when both ends
+  are gone.
+
+Pipes are not seekable and have no inode.
+
 ## Invariants (checked by `tools/kfsck.py`)
 
-- magic, geometry fields, and `root_ino == 1` are consistent;
+- magic is `"KFS2"` (a `"KFS1"` image is reported as such), geometry
+  fields and `root_ino == 1` are consistent;
 - the bitmap marks exactly the metadata blocks plus every block
   referenced by a live inode; `free_blocks` matches;
 - no block is referenced twice; all references are in
   `[data_start, total_blocks)`;
 - block pointers agree with `size` (non-sparse);
+- `mode` has no bits outside `0777`, `uid`/`gid` are <= 65535, `mtime` is
+  a plausible Unix time, and free inode slots are fully zeroed;
 - every directory has exactly one `.` and `..`, pointing at itself and
-  its parent; names are NUL-terminated and unique;
+  its parent; names are NUL-terminated, within 59 bytes, and unique;
 - every allocated inode is reachable from the root exactly once
   (hard links are not supported).
 
+There are no checksums anywhere in KFS, so bit-rot *inside file data* is
+undetectable by design; `kfsck` finds structural damage only.
+
 ## Tools
 
-- `tools/mkfs.py <rootdir> <out.img> <size_mb>` — build an image from a
-  host directory tree. Deterministic: names sorted, inodes/blocks
-  assigned in preorder.
+- `tools/mkfs.py [options] <rootdir> <out.img> <size_mb>` — build an image
+  from a host directory tree. Deterministic: names sorted, inodes/blocks
+  assigned in preorder, and no field taken from the host clock or the host
+  file mode. Defaults: everything `root:root`, directories `0755`, files
+  `0644`, and anything under the top-level `bin/` (at any depth) `0755`,
+  since those are the programs the shell execs.
+
+  | option | effect |
+  |--------|--------|
+  | `--mtime SECS` | timestamp stamped on every inode (default 0 = unknown). Pass a fixed value to keep builds reproducible. |
+  | `--mode PATH:MODE` | override one image path's permission bits, octal, e.g. `--mode /etc/shadow:0600`. Repeatable. |
+  | `--own PATH:UID[:GID]` | override one image path's owner, e.g. `--own /home/ana:1000:1000`. `GID` defaults to `UID`. Repeatable. |
+
+  `PATH` is an image-absolute path (`/etc/shadow`, `/home/ana`). Overrides
+  are applied after the defaults and win. An override that matches nothing
+  is reported as a warning, so typos do not pass silently.
+
 - `tools/kfsck.py [-l] <image>` — validate an image; `-l` lists the tree
-  with file sizes. Exits nonzero on corruption.
+  with mode, owner, size and mtime. Exits nonzero on corruption.

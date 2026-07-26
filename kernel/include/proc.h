@@ -22,6 +22,8 @@ struct task {
     int pid;
     char name[TASK_NAME_MAX];
     enum task_state state;
+    uint32_t uid;                /* 0 = root */
+    uint32_t gid;
     uint64_t rsp;                /* saved kernel stack pointer */
     uint8_t *kstack;             /* kernel stack base */
     void *fpu_state;             /* 16-byte-aligned FXSAVE area */
@@ -30,6 +32,7 @@ struct task {
     bool user;                   /* has a user half to tear down */
     uint64_t sleep_until;
     int exit_code;
+    int kill_pending;            /* set by task_kill; acted on at a safe point */
     struct task *parent;
     int wait_child_pid;          /* pid being waited on, 0 = none */
     uint64_t user_brk;           /* heap break for user processes */
@@ -50,6 +53,12 @@ __attribute__((noreturn)) void task_exit(int code);
 void task_wake_sleepers(void);
 struct task *task_all_list(void);
 struct task *task_find(int pid);
+
+/* Ask a task to die. It is not killed on the spot — that could tear it down
+ * mid-syscall while it holds a filesystem lock — instead the flag is checked
+ * on the way out of a syscall and before returning to ring 3. */
+int task_kill(struct task *t);
+void task_check_kill(void);
 
 static inline uint64_t irq_save(void)
 {

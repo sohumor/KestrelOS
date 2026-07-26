@@ -4,32 +4,65 @@
 #include "proc.h"
 #include "string.h"
 
-/* KFS driver. Write-through: every metadata update goes straight to disk.
- * A handful of static scratch blocks stand in for a buffer cache; they are
- * carefully assigned so no code path aliases two uses of the same buffer
- * (see comments at each declaration).
+/* KFS driver, on-disk format v2. Write-through: every metadata update goes
+ * straight to disk. A handful of static scratch blocks stand in for a
+ * buffer cache; they are carefully assigned so no code path aliases two
+ * uses of the same buffer (see comments at each declaration).
  *
+ * ---- locking rule ----------------------------------------------------
  * Those buffers, the superblock and the singleton ATA controller are all
- * shared state, but syscalls run preemptible (syscall.c enables interrupts
- * on entry), so every public entry point takes a whole-filesystem lock.
- * Without it two tasks interleaved inside balloc()/writei() double-allocate
- * blocks and cross-write each other's file data. */
+ * shared mutable state, but syscalls run preemptible (syscall.c enables
+ * interrupts on entry), so:
+ *
+ *   1. Every public kfs_* entry point takes the whole-filesystem mutex
+ *      fs_lock() on entry and releases it on every return path. Without it
+ *      two tasks interleaved inside balloc()/writei() double-allocate
+ *      blocks and cross-write each other's file data.
+ *   2. Everything below the entry points is a *_locked / lower-case helper
+ *      that assumes the lock is already held and never takes it again.
+ *      The mutex is recursive by owner anyway (unlink and mkdir reach the
+ *      truncate path), but new code should still call the helper.
+ *   3. The lock may only be held across disk I/O, which is polled PIO and
+ *      always terminates. Nothing under the lock may sleep, wait on the
+ *      keyboard, wait on the network, or read the CMOS clock -- that is
+ *      why every mutating entry point takes an `mtime` argument instead of
+ *      calling the clock itself. The VFS samples the (cached) time before
+ *      it calls in.
+ *   4. Nothing here runs in IRQ context, so kmalloc-free / no-sleep rules
+ *      for interrupt handlers do not apply; there is simply no allocation
+ *      in this file at all.
+ */
+
+/* The on-disk layout is fixed; a padding surprise here would silently
+ * shift every inode after the first. */
+_Static_assert(sizeof(struct kfs_inode) == 64, "kfs inode must be 64 bytes");
+_Static_assert(sizeof(struct kfs_dirent) == 64, "kfs dirent must be 64 bytes");
+_Static_assert(sizeof(struct kfs_superblock) == 40, "kfs superblock is 40 bytes");
 
 static struct kfs_superblock sb;
 static int kfs_mounted;
 
-/* Recursive: kfs_unlink()/kfs_mkdir() call the public kfs_truncate(). */
+/* Whole-filesystem mutex. `fs_held` is the flag; `fs_owner` makes it
+ * recursive so a public entry point reached from another one (unlink ->
+ * truncate) does not deadlock against itself. Waiters back off with
+ * task_sleep_ticks(1) rather than spinning. Before proc_init() runs there
+ * is exactly one thread of control and `current` is NULL, so the wait loop
+ * must never be entered then -- hence the sched_active guard. */
 static struct task *fs_owner;
+static int fs_held;
 static int fs_depth;
 
 static void fs_lock(void)
 {
     uint64_t f = irq_save();
-    while (fs_owner && fs_owner != current) {
+    while (fs_held && fs_owner != current) {
+        if (!sched_active)
+            break;              /* no other task can exist yet */
         irq_restore(f);
-        yield();
+        task_sleep_ticks(1);
         f = irq_save();
     }
+    fs_held = 1;
     fs_owner = current;
     fs_depth++;
     irq_restore(f);
@@ -38,8 +71,11 @@ static void fs_lock(void)
 static void fs_unlock(void)
 {
     uint64_t f = irq_save();
-    if (--fs_depth == 0)
+    if (--fs_depth <= 0) {
+        fs_depth = 0;
+        fs_held = 0;
         fs_owner = NULL;
+    }
     irq_restore(f);
 }
 
@@ -163,8 +199,9 @@ static int iput(uint32_t ino, const struct kfs_inode *ip)
     return bwrite(blk, inode_buf);
 }
 
-/* Allocate a free inode slot, initialized to the given type. */
-static uint32_t ialloc(uint16_t type)
+/* Allocate a free inode slot, initialized to the given type and owner. */
+static uint32_t ialloc(uint16_t type, uint16_t mode, uint32_t uid,
+                       uint32_t gid, uint32_t mtime)
 {
     struct kfs_inode ino;
     for (uint32_t i = 1; i <= sb.inode_count; i++) {
@@ -173,7 +210,10 @@ static uint32_t ialloc(uint16_t type)
         if (ino.type == KFS_TYPE_FREE) {
             memset(&ino, 0, sizeof(ino));
             ino.type = type;
-            ino.nlink = (type == KFS_TYPE_DIR) ? 2 : 1;
+            ino.mode = (uint16_t)(mode & KFS_MODE_MASK);
+            ino.uid = uid;
+            ino.gid = gid;
+            ino.mtime = mtime;
             if (iput(i, &ino) < 0)
                 return 0;
             return i;
@@ -266,7 +306,8 @@ static long readi(uint32_t ino, uint32_t off, void *buf, uint32_t n)
     return done;
 }
 
-static long writei(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
+static long writei(uint32_t ino, uint32_t off, const void *buf, uint32_t n,
+                   uint32_t mtime)
 {
     struct kfs_inode ip;
     if (iget(ino, &ip) < 0 || ip.type == KFS_TYPE_FREE)
@@ -300,6 +341,12 @@ static long writei(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
             iput(ino, &ip);
         }
     }
+    if (done) {
+        /* One final write-back so the timestamp lands even when the file
+         * did not grow (an in-place overwrite). */
+        ip.mtime = mtime;
+        iput(ino, &ip);
+    }
     return done ? (long)done : -1;
 }
 
@@ -313,7 +360,8 @@ long kfs_read(uint32_t ino, uint32_t off, void *buf, uint32_t n)
     return r;
 }
 
-long kfs_write(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
+long kfs_write(uint32_t ino, uint32_t off, const void *buf, uint32_t n,
+               uint32_t mtime)
 {
     struct kfs_inode ip;
     long r = -1;
@@ -322,7 +370,7 @@ long kfs_write(uint32_t ino, uint32_t off, const void *buf, uint32_t n)
         return -1;
     fs_lock();
     if (iget(ino, &ip) == 0 && ip.type == KFS_TYPE_FILE)
-        r = writei(ino, off, buf, n);
+        r = writei(ino, off, buf, n, mtime);
     fs_unlock();
     return r;
 }
@@ -350,7 +398,7 @@ static uint32_t dir_lookup(uint32_t dir, const char *name, uint32_t *slot_out)
 }
 
 /* Add an entry, reusing a free slot or appending at the end. */
-static int dir_add(uint32_t dir, const char *name, uint32_t ino)
+static int dir_add(uint32_t dir, const char *name, uint32_t ino, uint32_t mtime)
 {
     struct kfs_inode ip;
     struct kfs_dirent de;
@@ -370,19 +418,19 @@ static int dir_add(uint32_t dir, const char *name, uint32_t ino)
     memset(&de, 0, sizeof(de));
     de.ino = ino;
     strncpy(de.name, name, sizeof(de.name) - 1);
-    if (writei(dir, slot, &de, sizeof(de)) != sizeof(de))
+    if (writei(dir, slot, &de, sizeof(de), mtime) != sizeof(de))
         return -1;
     return 0;
 }
 
-static int dir_remove(uint32_t dir, const char *name)
+static int dir_remove(uint32_t dir, const char *name, uint32_t mtime)
 {
     struct kfs_dirent de;
     uint32_t slot;
     if (dir_lookup(dir, name, &slot) == 0)
         return -1;
     memset(&de, 0, sizeof(de));
-    if (writei(dir, slot, &de, sizeof(de)) != sizeof(de))
+    if (writei(dir, slot, &de, sizeof(de), mtime) != sizeof(de))
         return -1;
     return 0;
 }
@@ -404,6 +452,18 @@ static int dir_is_empty(uint32_t dir)
             return 0;
     }
     return 1;
+}
+
+int kfs_lookup_in(uint32_t dir, const char *name)
+{
+    uint32_t ino;
+
+    if (!kfs_mounted || name == NULL)
+        return -1;
+    fs_lock();
+    ino = dir_lookup(dir, name, NULL);
+    fs_unlock();
+    return ino ? (int)ino : -1;
 }
 
 /* ---------- path resolution ---------- */
@@ -497,9 +557,10 @@ static int lookup_parent(const char *path, char *name)
  * Each public entry point takes the whole-filesystem lock once and does
  * its work through the *_locked helpers, which never take it again. */
 
-static int truncate_locked(uint32_t ino);
+static int truncate_locked(uint32_t ino, uint32_t mtime);
 
-static int create_locked(const char *path)
+static int create_locked(const char *path, uint16_t mode, uint32_t uid,
+                         uint32_t gid, uint32_t mtime)
 {
     char name[60];
     int parent = lookup_parent(path, name);
@@ -507,25 +568,27 @@ static int create_locked(const char *path)
         return -1;
     if (dir_lookup((uint32_t)parent, name, NULL) != 0)
         return -1;              /* already exists */
-    uint32_t ino = ialloc(KFS_TYPE_FILE);
+    uint32_t ino = ialloc(KFS_TYPE_FILE, mode, uid, gid, mtime);
     if (!ino)
         return -1;
-    if (dir_add((uint32_t)parent, name, ino) < 0) {
+    if (dir_add((uint32_t)parent, name, ino, mtime) < 0) {
         ifree(ino);
         return -1;
     }
     return (int)ino;
 }
 
-int kfs_create(const char *path)
+int kfs_create(const char *path, uint16_t mode, uint32_t uid, uint32_t gid,
+               uint32_t mtime)
 {
     fs_lock();
-    int r = create_locked(path);
+    int r = create_locked(path, mode, uid, gid, mtime);
     fs_unlock();
     return r;
 }
 
-static int mkdir_locked(const char *path)
+static int mkdir_locked(const char *path, uint16_t mode, uint32_t uid,
+                        uint32_t gid, uint32_t mtime)
 {
     char name[60];
     int parent = lookup_parent(path, name);
@@ -533,28 +596,29 @@ static int mkdir_locked(const char *path)
         return -1;
     if (dir_lookup((uint32_t)parent, name, NULL) != 0)
         return -1;
-    uint32_t ino = ialloc(KFS_TYPE_DIR);
+    uint32_t ino = ialloc(KFS_TYPE_DIR, mode, uid, gid, mtime);
     if (!ino)
         return -1;
-    if (dir_add(ino, ".", ino) < 0 ||
-        dir_add(ino, "..", (uint32_t)parent) < 0 ||
-        dir_add((uint32_t)parent, name, ino) < 0) {
-        truncate_locked(ino);
+    if (dir_add(ino, ".", ino, mtime) < 0 ||
+        dir_add(ino, "..", (uint32_t)parent, mtime) < 0 ||
+        dir_add((uint32_t)parent, name, ino, mtime) < 0) {
+        truncate_locked(ino, mtime);
         ifree(ino);
         return -1;
     }
     return 0;
 }
 
-int kfs_mkdir(const char *path)
+int kfs_mkdir(const char *path, uint16_t mode, uint32_t uid, uint32_t gid,
+              uint32_t mtime)
 {
     fs_lock();
-    int r = mkdir_locked(path);
+    int r = mkdir_locked(path, mode, uid, gid, mtime);
     fs_unlock();
     return r;
 }
 
-static int unlink_locked(const char *path)
+static int unlink_locked(const char *path, uint32_t mtime)
 {
     char name[60];
     struct kfs_inode ip;
@@ -571,18 +635,18 @@ static int unlink_locked(const char *path)
         return -1;
     /* Detach the name first: a failing dir_remove() must never leave an
      * entry pointing at an inode slot that has already been freed. */
-    if (dir_remove((uint32_t)parent, name) < 0)
+    if (dir_remove((uint32_t)parent, name, mtime) < 0)
         return -1;
-    if (truncate_locked(ino) < 0)
+    if (truncate_locked(ino, mtime) < 0)
         return -1;
     ifree(ino);
     return 0;
 }
 
-int kfs_unlink(const char *path)
+int kfs_unlink(const char *path, uint32_t mtime)
 {
     fs_lock();
-    int r = unlink_locked(path);
+    int r = unlink_locked(path, mtime);
     fs_unlock();
     return r;
 }
@@ -619,7 +683,7 @@ int kfs_readdir(uint32_t ino, int index, struct kfs_dirent *out)
     return r;
 }
 
-static int truncate_locked(uint32_t ino)
+static int truncate_locked(uint32_t ino, uint32_t mtime)
 {
     struct kfs_inode ip;
     if (!kfs_mounted || iget(ino, &ip) < 0)
@@ -643,13 +707,45 @@ static int truncate_locked(uint32_t ino)
         ip.indirect = 0;
     }
     ip.size = 0;
+    ip.mtime = mtime;
     return iput(ino, &ip);
 }
 
-int kfs_truncate(uint32_t ino)
+int kfs_truncate(uint32_t ino, uint32_t mtime)
 {
     fs_lock();
-    int r = truncate_locked(ino);
+    int r = truncate_locked(ino, mtime);
+    fs_unlock();
+    return r;
+}
+
+int kfs_chmod(uint32_t ino, uint16_t mode, uint32_t mtime)
+{
+    struct kfs_inode ip;
+    int r = -1;
+
+    fs_lock();
+    if (kfs_mounted && iget(ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
+        ip.mode = (uint16_t)(mode & KFS_MODE_MASK);
+        ip.mtime = mtime;
+        r = iput(ino, &ip);
+    }
+    fs_unlock();
+    return r;
+}
+
+int kfs_chown(uint32_t ino, uint32_t uid, uint32_t gid, uint32_t mtime)
+{
+    struct kfs_inode ip;
+    int r = -1;
+
+    fs_lock();
+    if (kfs_mounted && iget(ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
+        ip.uid = uid;
+        ip.gid = gid;
+        ip.mtime = mtime;
+        r = iput(ino, &ip);
+    }
     fs_unlock();
     return r;
 }
@@ -663,6 +759,15 @@ int kfs_mount(void)
         return -1;
     }
     memcpy(&sb, sb_block, sizeof(sb));
+    if (sb.magic == KFS_MAGIC_V1) {
+        /* A v1 inode has nlink where v2 has mode and 12 direct pointers
+         * where v2 has 10: reading it as v2 would hand out garbage block
+         * numbers. Refuse it by name instead. */
+        kprintf("kfs: image is KFS v1, this kernel needs v2 "
+                "(rebuild with tools/mkfs.py)\n");
+        fs_unlock();
+        return -1;
+    }
     if (sb.magic != KFS_MAGIC) {
         kprintf("kfs: bad magic 0x%x (expected 0x%x)\n", sb.magic, KFS_MAGIC);
         fs_unlock();
@@ -686,7 +791,7 @@ int kfs_mount(void)
         return -1;
     }
     kfs_mounted = 1;
-    kprintf("kfs: mounted, %u blocks (%u free), %u inodes\n",
+    kprintf("kfs: mounted v2, %u blocks (%u free), %u inodes\n",
             sb.total_blocks, sb.free_blocks, sb.inode_count);
     fs_unlock();
     return 0;

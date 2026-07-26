@@ -2,11 +2,16 @@
 #include "console.h"
 #include "serial.h"
 #include "string.h"
+#include "klog.h"
 
 static void kputc(char c)
 {
     console_putc(c);
     serial_putc(c);
+    /* NULL until klog_hook_kprintf() runs, so this is inert during early
+     * boot and cannot recurse: klog writes via console/serial directly. */
+    if (klog_kprintf_sink)
+        klog_kprintf_sink(c);
 }
 
 static void kputs(const char *s)

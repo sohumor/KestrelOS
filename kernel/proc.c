@@ -228,6 +228,12 @@ struct task *kthread_create(void (*func)(void *), void *arg, const char *name)
     t->kstack = kmalloc(KSTACK_SIZE);
     t->pml4 = vmm_kernel_pml4();
     t->parent = current;
+    /* Children run as their parent, so the VFS permission checks mean
+     * something once login drops privileges. */
+    if (current) {
+        t->uid = current->uid;
+        t->gid = current->gid;
+    }
     fpu_attach(t);
     if (!t->kstack || !t->fpu_alloc) {
         kfree(t->kstack);
@@ -266,12 +272,34 @@ static void idle_thread(void *arg)
     }
 }
 
+int task_kill(struct task *t)
+{
+    if (!t || t->state == TASK_ZOMBIE)
+        return -1;
+    t->kill_pending = 1;
+    if (t->state == TASK_SLEEPING)
+        t->state = TASK_RUNNABLE;    /* so it reaches its next checkpoint */
+    return 0;
+}
+
+/* Safe points only: on the way out of a syscall, and just before returning
+ * to ring 3. Anywhere else the task might hold the filesystem lock. */
+void task_check_kill(void)
+{
+    if (current && current->kill_pending)
+        task_exit(-1);
+}
+
 static void preempt(struct regs *r)
 {
     if (!sched_active)
         return;
     if (r->vector == 32) {
         task_wake_sleepers();
+        /* A kill only takes effect where the victim was running usermode,
+         * so it can never be torn down inside a kernel critical section. */
+        if (current && current->kill_pending && (r->cs & 3) == 3)
+            task_exit(-1);
         if (++slice >= SCHED_QUANTUM)
             schedule();
     }

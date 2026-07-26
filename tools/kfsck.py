@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
-"""Check a KFS image for consistency; optionally list its tree.
+"""Check a KFS v2 image for consistency; optionally list its tree.
 
 Usage: kfsck.py [-l] <image>
 
-Validates the superblock, block bitmap, inode table, directory structure
-and reachability. Exits nonzero if any corruption is found. With -l the
-directory tree is printed with file sizes.
+Validates the superblock, block bitmap, inode table (including the v2
+mode/uid/gid/mtime fields), directory structure and reachability. Exits
+nonzero if any corruption is found. With -l the directory tree is printed
+with permissions, owner, size and timestamp.
 """
 import struct
 import sys
+import time
 
 BLOCK_SIZE = 4096
-MAGIC = 0x3153464B
-NDIRECT = 12
+MAGIC = 0x3253464B          # "KFS2"
+MAGIC_V1 = 0x3153464B       # "KFS1"
+NDIRECT = 10
 NINDIRECT = BLOCK_SIZE // 4
 INODE_SIZE = 64
 NAME_MAX = 59
+
+# type(2) mode(2) size(4) uid(4) gid(4) mtime(4) direct(10*4) indirect(4)
+INODE_FMT = "<HHIIII%dII" % NDIRECT
+assert struct.calcsize(INODE_FMT) == INODE_SIZE
 
 TYPE_FREE = 0
 TYPE_FILE = 1
 TYPE_DIR = 2
 
+MODE_MASK = 0o777
+UID_MAX = 0xFFFF            # KestrelOS uses small numeric ids only
+# Anything past this is a clock that ran away; the FS was written by a
+# machine whose RTC was wrong or the field is garbage.
+MTIME_MAX = 4102444800      # 2100-01-01T00:00:00Z
+
 errors = []
+warnings = []
 
 
 def err(msg):
     errors.append(msg)
     print("kfsck: ERROR: %s" % msg, file=sys.stderr)
+
+
+def warn(msg):
+    warnings.append(msg)
+    print("kfsck: warning: %s" % msg, file=sys.stderr)
 
 
 class Img:
@@ -44,13 +63,34 @@ class Img:
     def inode(self, ino):
         off = self.inode_start * BLOCK_SIZE + (ino - 1) * INODE_SIZE
         raw = self.data[off:off + INODE_SIZE]
-        f = struct.unpack("<HHI12III", raw)
-        return {"type": f[0], "nlink": f[1], "size": f[2],
-                "direct": list(f[3:15]), "indirect": f[15]}
+        f = struct.unpack(INODE_FMT, raw)
+        return {"type": f[0], "mode": f[1], "size": f[2], "uid": f[3],
+                "gid": f[4], "mtime": f[5],
+                "direct": list(f[6:6 + NDIRECT]), "indirect": f[6 + NDIRECT]}
 
     def bit(self, blk):
         b = self.data[self.bitmap_start * BLOCK_SIZE + blk // 8]
         return (b >> (blk % 8)) & 1
+
+
+def check_meta(ino, node):
+    """v2 ownership/permission/timestamp sanity."""
+    if node["mode"] & ~MODE_MASK:
+        err("ino %d: mode 0%o has bits outside 0777" % (ino, node["mode"]))
+    if node["uid"] > UID_MAX:
+        err("ino %d: uid %d out of range" % (ino, node["uid"]))
+    if node["gid"] > UID_MAX:
+        err("ino %d: gid %d out of range" % (ino, node["gid"]))
+    if node["mtime"] > MTIME_MAX:
+        err("ino %d: mtime %d is not a plausible Unix time"
+            % (ino, node["mtime"]))
+    if node["type"] == TYPE_DIR and not (node["mode"] & 0o100):
+        # A directory the owner cannot search is unusable, not corrupt.
+        warn("ino %d: directory mode 0%o has no owner search bit"
+             % (ino, node["mode"]))
+    if node["type"] == TYPE_FILE and not (node["mode"] & 0o400):
+        warn("ino %d: file mode 0%o is unreadable by its owner"
+             % (ino, node["mode"]))
 
 
 def inode_blocks_of(img, ino, node):
@@ -107,6 +147,28 @@ def parse_dir(img, ino, node):
     return ents
 
 
+def mode_str(node):
+    m = node["mode"]
+    out = "d" if node["type"] == TYPE_DIR else "-"
+    for shift in (6, 3, 0):
+        bits = (m >> shift) & 7
+        out += "r" if bits & 4 else "-"
+        out += "w" if bits & 2 else "-"
+        out += "x" if bits & 1 else "-"
+    return out
+
+
+def time_str(secs):
+    if secs == 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(secs))
+
+
+def describe(node):
+    return "%s %d:%d %8d %s" % (mode_str(node), node["uid"], node["gid"],
+                                node["size"], time_str(node["mtime"]))
+
+
 def main():
     args = sys.argv[1:]
     do_list = "-l" in args
@@ -117,6 +179,9 @@ def main():
     img = Img(args[0])
 
     # --- superblock ---
+    if img.magic == MAGIC_V1:
+        err("image is KFS v1; this checker (and the kernel) need v2")
+        return 1
     if img.magic != MAGIC:
         err("bad magic 0x%08X" % img.magic)
         return 1
@@ -159,10 +224,16 @@ def main():
         node = img.inode(ino)
         types[ino] = node["type"]
         if node["type"] == TYPE_FREE:
+            # A free slot must be entirely zero, or a stale mode/uid would
+            # be handed to the next file created in it.
+            if any(node[k] for k in ("mode", "size", "uid", "gid", "mtime",
+                                     "indirect")) or any(node["direct"]):
+                err("ino %d is free but not zeroed" % ino)
             continue
         if node["type"] not in (TYPE_FILE, TYPE_DIR):
             err("ino %d has bad type %d" % (ino, node["type"]))
             continue
+        check_meta(ino, node)
         blocks, ind = inode_blocks_of(img, ino, node)
         for b in blocks:
             claim(b, ino)
@@ -213,16 +284,17 @@ def main():
                 if eino != parent:
                     err("%s: '..' points to %d, not %d" % (path, eino, parent))
                 continue
+            if len(name.encode("utf-8")) > NAME_MAX:
+                err("%s: entry name %r longer than %d bytes"
+                    % (path, name, NAME_MAX))
             if name in seen:
                 err("%s: duplicate entry '%s'" % (path, name))
             seen.add(name)
             cnode = img.inode(eino)
             if do_list:
                 pad = "  " * depth
-                if cnode["type"] == TYPE_DIR:
-                    print("%s%s/" % (pad, name))
-                else:
-                    print("%s%s  %d" % (pad, name, cnode["size"]))
+                slash = "/" if cnode["type"] == TYPE_DIR else ""
+                print("%s  %s%s%s" % (describe(cnode), pad, name, slash))
             if cnode["type"] == TYPE_DIR:
                 walk(eino, ino, path + "/" + name, depth + 1)
             else:
@@ -234,7 +306,7 @@ def main():
         err("root inode is not a directory")
     else:
         if do_list:
-            print("/")
+            print("%s  /" % describe(img.inode(1)))
         walk(1, 1, "", 1)
 
     for ino, t in types.items():
@@ -244,9 +316,10 @@ def main():
     if errors:
         print("kfsck: %d error(s)" % len(errors), file=sys.stderr)
         return 1
-    print("kfsck: %s: clean (%d blocks, %d free, %d inodes in use)"
+    print("kfsck: %s: clean (KFS v2, %d blocks, %d free, %d inodes in use%s)"
           % (args[0], img.total_blocks, img.free_blocks,
-             sum(1 for t in types.values() if t != TYPE_FREE)))
+             sum(1 for t in types.values() if t != TYPE_FREE),
+             ", %d warning(s)" % len(warnings) if warnings else ""))
     return 0
 
 

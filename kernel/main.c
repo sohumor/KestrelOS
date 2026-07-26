@@ -19,6 +19,13 @@
 #include "fpu.h"
 #include "rtc.h"
 #include "kmon.h"
+#include "fb.h"
+#include "font.h"
+#include "mouse.h"
+#include "tcp.h"
+#include "klog.h"
+#include "devfs.h"
+#include "wm.h"
 
 struct bootinfo *boot_info;
 
@@ -49,10 +56,23 @@ static void init_launcher(void *arg)
     kmon_run(NULL);
 }
 
+/* Periodic kernel work that must not run in an interrupt handler:
+ * TCP retransmission and the compositor's frame pass. */
+static void housekeeper(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        tcp_tick();
+        wm_tick();
+        task_sleep_ticks(2);         /* ~50 Hz */
+    }
+}
+
 void kmain(uint64_t bootinfo_phys)
 {
     serial_init();
     console_init();
+    klog_init();
 
     console_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
     kprintf("\n  KestrelOS %s (x86-64)\n", KERNEL_VERSION);
@@ -85,21 +105,38 @@ void kmain(uint64_t bootinfo_phys)
     kprintf("mem: pmm %lu pages free, paging rebuilt, heap ready\n",
             pmm_free_pages());
 
+    /* Needs the physical allocator (shadow buffer) and paging (the
+     * aperture is outside the direct map), so it cannot run any earlier.
+     * On success the console switches itself to the framebuffer. */
+    fb_init(boot_info);
+
     proc_init();
     kprintf("proc: scheduler online\n");
 
     ata_init();
-    vfs_init();          /* reports success or failure itself */
+    vfs_init();              /* reports success or failure itself */
+    devfs_init();
+
+    if (fb_present())
+        mouse_init((int)fb_width(), (int)fb_height());
+    else
+        mouse_init(80 * FONT_W, 25 * FONT_H);
 
     net_init();
+    tcp_init();
+    wm_init();
     syscall_init();
 
     char when[40];
     if (rtc_format(when, sizeof(when)) == 0)
         kprintf("rtc: %s\n", when);
 
+    /* From here the log ring captures kernel output too. */
+    klog_hook_kprintf();
+
     kprintf("\nKESTREL READY\n\n");
 
+    kthread_create(housekeeper, NULL, "housekeep");
     kthread_create(init_launcher, NULL, "launcher");
 
     /* Boot task parks; all life now happens via IRQs and the scheduler. */

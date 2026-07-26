@@ -11,6 +11,12 @@
 #include "timer.h"
 #include "rtc.h"
 #include "power.h"
+#include "pipe.h"
+#include "klog.h"
+#include "fb.h"
+#include "mouse.h"
+#include "tcp.h"
+#include "wm.h"
 #include "string.h"
 #include "kestrel_abi.h"
 
@@ -337,6 +343,8 @@ static long sys_psinfo(uint64_t index, uint64_t upi)
     struct k_psinfo pi;
     memset(&pi, 0, sizeof(pi));
     pi.pid = t->pid;
+    pi.uid = t->uid;
+    pi.ppid = t->parent ? t->parent->pid : 0;
     strncpy(pi.name, t->name, sizeof(pi.name) - 1);
     switch (t->state) {
     case TASK_RUNNABLE: pi.state = K_STATE_RUNNABLE; break;
@@ -420,6 +428,184 @@ static long sys_power(uint64_t action)
     default:
         return -1;
     }
+}
+
+/* --- descriptors ------------------------------------------------------ */
+
+static int fd_alloc_from(int start, struct file *f)
+{
+    for (int fd = start; fd < MAX_OPEN_FILES; fd++) {
+        if (!current->files[fd]) {
+            current->files[fd] = f;
+            return fd;
+        }
+    }
+    return -1;
+}
+
+static long sys_pipe(uint64_t ufds)
+{
+    struct file *rd, *wr;
+    int fds[2];
+
+    if (pipe_create(&rd, &wr) < 0)
+        return -1;
+
+    fds[0] = fd_alloc_from(0, rd);
+    if (fds[0] < 0) {
+        vfs_close(rd);
+        vfs_close(wr);
+        return -1;
+    }
+    fds[1] = fd_alloc_from(0, wr);
+    if (fds[1] < 0) {
+        current->files[fds[0]] = NULL;
+        vfs_close(rd);
+        vfs_close(wr);
+        return -1;
+    }
+    if (copy_to_user((void *)ufds, fds, sizeof(fds)) < 0) {
+        current->files[fds[0]] = NULL;
+        current->files[fds[1]] = NULL;
+        vfs_close(rd);
+        vfs_close(wr);
+        return -1;
+    }
+    return 0;
+}
+
+static long sys_dup2(uint64_t oldfd, uint64_t newfd)
+{
+    if (oldfd >= MAX_OPEN_FILES || newfd >= MAX_OPEN_FILES)
+        return -1;
+    struct file *f = current->files[oldfd];
+    if (!f)
+        return -1;                   /* fd 0/1/2 on the console cannot dup */
+    if (oldfd == newfd)
+        return (long)newfd;
+
+    uint64_t flags = irq_save();
+    f->refs++;
+    irq_restore(flags);
+
+    struct file *old = current->files[newfd];
+    current->files[newfd] = f;
+    if (old)
+        vfs_close(old);
+    return (long)newfd;
+}
+
+/* --- users and permissions -------------------------------------------- */
+
+static long sys_setuid(uint64_t uid)
+{
+    if (current->uid != 0)
+        return -1;                   /* only root may change identity */
+    current->uid = (uint32_t)uid;
+    current->gid = (uint32_t)uid;
+    return 0;
+}
+
+static long sys_chmod(uint64_t upath, uint64_t mode)
+{
+    char path[UPROC_PATH_MAX];
+    if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
+        return -1;
+    return vfs_chmod(path, (uint32_t)mode & 0777);
+}
+
+static long sys_chown(uint64_t upath, uint64_t uid, uint64_t gid)
+{
+    char path[UPROC_PATH_MAX];
+    if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
+        return -1;
+    return vfs_chown(path, (uint32_t)uid, (uint32_t)gid);
+}
+
+/* --- logging ---------------------------------------------------------- */
+
+static long sys_log(uint64_t level, uint64_t umsg)
+{
+    char msg[112];
+    if (copy_str_from_user(msg, (const void *)umsg, sizeof(msg)) == -1)
+        return -1;                   /* truncation (-2) is tolerated */
+    klog_write((int)level, current->name, msg);
+    return 0;
+}
+
+static long sys_logread(uint64_t index, uint64_t uent)
+{
+    struct k_logent e;
+    if (klog_read((uint32_t)index, &e) < 0)
+        return -1;
+    return copy_to_user((void *)uent, &e, sizeof(e));
+}
+
+/* --- graphics and input ------------------------------------------------ */
+
+static long sys_fbinfo(uint64_t uinfo)
+{
+    struct k_fbinfo fi;
+    fb_get(&fi);
+    return copy_to_user((void *)uinfo, &fi, sizeof(fi));
+}
+
+static long sys_mouse(uint64_t uinfo)
+{
+    struct k_mouse m;
+    memset(&m, 0, sizeof(m));
+    mouse_get(&m);
+    return copy_to_user((void *)uinfo, &m, sizeof(m));
+}
+
+/* --- TCP --------------------------------------------------------------- */
+
+static long sys_tcp_send(uint64_t h, uint64_t ubuf, uint64_t len)
+{
+    uint8_t kb[1400];
+    if (len > sizeof(kb))
+        len = sizeof(kb);
+    if (copy_from_user(kb, (const void *)ubuf, len) < 0)
+        return -1;
+    return tcp_send((int)h, kb, (int)len);
+}
+
+static long sys_tcp_recv(uint64_t h, uint64_t ubuf, uint64_t max,
+                         uint64_t timeout_ms)
+{
+    uint8_t kb[1400];
+    if (max > sizeof(kb))
+        max = sizeof(kb);
+    int n = tcp_recv((int)h, kb, (int)max, (int)timeout_ms);
+    if (n <= 0)
+        return n;
+    if (copy_to_user((void *)ubuf, kb, (uint64_t)n) < 0)
+        return -1;
+    return n;
+}
+
+/* --- process control --------------------------------------------------- */
+
+static long sys_kill(uint64_t pid)
+{
+    struct task *t = task_find((int)pid);
+    if (!t || t->pid <= 1)
+        return -1;                   /* never the kernel task or init */
+    if (current->uid != 0 && current->uid != t->uid)
+        return -1;
+    uproc_record_exit(t->pid, -1);
+    return task_kill(t);
+}
+
+static long sys_waitany(uint64_t upid)
+{
+    int pid = 0;
+    long code = uproc_waitany(&pid);
+    if (code == -1 && pid == 0)
+        return -1;
+    if (copy_to_user((void *)upid, &pid, sizeof(pid)) < 0)
+        return -1;
+    return code;
 }
 
 /* --- dispatcher ------------------------------------------------------- */
@@ -524,6 +710,92 @@ static void syscall_dispatch(struct regs *r)
     case SYS_POWER:
         ret = sys_power(a1);
         break;
+
+    /* --- descriptors and processes --- */
+    case SYS_PIPE:
+        ret = sys_pipe(a1);
+        break;
+    case SYS_DUP2:
+        ret = sys_dup2(a1, a2);
+        break;
+    case SYS_KILL:
+        ret = sys_kill(a1);
+        break;
+    case SYS_WAITANY:
+        ret = sys_waitany(a1);
+        break;
+    case SYS_EXEC:
+        ret = uproc_exec_from_user((const char *)a1, (char *const *)a2);
+        break;
+
+    /* --- users and permissions --- */
+    case SYS_GETUID:
+        ret = (long)current->uid;
+        break;
+    case SYS_GETGID:
+        ret = (long)current->gid;
+        break;
+    case SYS_SETUID:
+        ret = sys_setuid(a1);
+        break;
+    case SYS_CHMOD:
+        ret = sys_chmod(a1, a2);
+        break;
+    case SYS_CHOWN:
+        ret = sys_chown(a1, a2, a3);
+        break;
+
+    /* --- time and logging --- */
+    case SYS_TIME:
+        ret = (long)rtc_unix_time();
+        break;
+    case SYS_LOG:
+        ret = sys_log(a1, a2);
+        break;
+    case SYS_LOGREAD:
+        ret = sys_logread(a1, a2);
+        break;
+    case SYS_SYNC:
+        ret = 0;                     /* KFS is write-through */
+        break;
+
+    /* --- graphics, input, windows --- */
+    case SYS_FBINFO:
+        ret = sys_fbinfo(a1);
+        break;
+    case SYS_MOUSE:
+        ret = sys_mouse(a1);
+        break;
+    case SYS_WIN_CREATE:
+        ret = wm_sys_create(a1, a2);
+        break;
+    case SYS_WIN_DESTROY:
+        ret = wm_sys_destroy(a1);
+        break;
+    case SYS_WIN_FLUSH:
+        ret = wm_sys_flush(a1);
+        break;
+    case SYS_WIN_EVENT:
+        ret = wm_sys_event(a1, a2, a3);
+        break;
+    case SYS_WIN_MOVE:
+        ret = wm_sys_move(a1, (int)(int64_t)a2, (int)(int64_t)a3);
+        break;
+
+    /* --- TCP --- */
+    case SYS_TCP_CONNECT:
+        ret = tcp_connect((uint32_t)a1, (uint16_t)a2, (int)a3);
+        break;
+    case SYS_TCP_SEND:
+        ret = sys_tcp_send(a1, a2, a3);
+        break;
+    case SYS_TCP_RECV:
+        ret = sys_tcp_recv(a1, a2, a3, a4);
+        break;
+    case SYS_TCP_CLOSE:
+        ret = tcp_close((int)a1);
+        break;
+
     default:
         kprintf("syscall: unknown %lu from %s (pid %d)\n",
                 (unsigned long)r->rax, current->name, current->pid);

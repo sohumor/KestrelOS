@@ -7,6 +7,7 @@
 #include "rtl8139.h"
 #include "e1000.h"
 #include "net.h"
+#include "tcp.h"
 
 /* Ethernet / ARP / IPv4 / ICMP core.
  *
@@ -20,6 +21,7 @@
 #define ETHERTYPE_ARP 0x0806
 
 #define IP_PROTO_ICMP 1
+#define IP_PROTO_TCP  6
 #define IP_PROTO_UDP  17
 
 struct eth_hdr {
@@ -456,6 +458,8 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
         icmp_input(ip->src, eh->src, payload, plen);
     else if (ip->proto == IP_PROTO_UDP)
         udp_input(ip->src, payload, plen);
+    else if (ip->proto == IP_PROTO_TCP)
+        tcp_input(ip->src, payload, plen);
 }
 
 /* ---- frame entry point (IRQ context) ---- */

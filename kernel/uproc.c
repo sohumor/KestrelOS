@@ -89,6 +89,39 @@ long uproc_waitpid(int pid)
     }
 }
 
+/* Wait for any child to exit. Returns its exit code and stores the pid;
+ * returns -1 with *pid_out = 0 when the caller has no children left, which
+ * is how a supervisor knows to stop waiting. */
+long uproc_waitany(int *pid_out)
+{
+    *pid_out = 0;
+    for (;;) {
+        int children = 0;
+        int found_pid = 0;
+        long code = -1;
+
+        uint64_t f = irq_save();
+        for (struct task *t = task_all_list(); t; t = t->allnext) {
+            if (t->parent != current || t == current)
+                continue;
+            children++;
+            if (exit_lookup(t->pid, &code)) {
+                found_pid = t->pid;
+                break;
+            }
+        }
+        irq_restore(f);
+
+        if (found_pid) {
+            *pid_out = found_pid;
+            return code;
+        }
+        if (!children)
+            return -1;
+        task_sleep_ticks(1);
+    }
+}
+
 /* --- spawning -------------------------------------------------------- */
 
 /* Read the whole file at `path` into a kmalloc buffer. Returns NULL on
@@ -343,6 +376,30 @@ int uproc_spawn_from_user(const char *upath, char *const *uargv)
     if (argc < 0)
         return -1;
     return uproc_spawn(path, argc ? kargv : NULL, argc);
+}
+
+/* Replace the caller with a new program. There is no fork here, so this is
+ * implemented as "spawn the replacement, then exit" — the pid changes,
+ * which is why the shell uses spawn+wait and only login-style handoffs use
+ * exec. Returns -1 if the new program could not be started; on success the
+ * caller does not return. */
+long uproc_exec_from_user(const char *upath, char *const *uargv)
+{
+    char path[UPROC_PATH_MAX];
+    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
+    char *kargv[UPROC_MAX_ARGS];
+    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+
+    if (argc < 0)
+        return -1;
+
+    int pid = uproc_spawn(path, argc ? kargv : NULL, argc);
+    if (pid < 0)
+        return -1;
+
+    long code = uproc_waitpid(pid);
+    uproc_record_exit(current->pid, (int)code);
+    task_exit((int)code);            /* noreturn */
 }
 
 int uproc_spawn_io_from_user(const char *upath, char *const *uargv,

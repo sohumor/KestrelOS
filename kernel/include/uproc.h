@@ -43,7 +43,9 @@ int uproc_spawn_io_from_user(const char *upath, char *const *uargv,
 
 /* Exit-code ring for waitpid; record is called right before task_exit. */
 void uproc_record_exit(int pid, long code);
-long uproc_waitpid(int pid);   /* blocks; -1 if pid unknown/forgotten */
+long uproc_waitpid(int pid);
+long uproc_waitany(int *pid_out);
+long uproc_exec_from_user(const char *upath, char *const *uargv);   /* blocks; -1 if pid unknown/forgotten */
 
 /* Bounded user-memory copies through current->pml4 (defined in
  * syscall.c). All return -1 on a bad/unmapped user pointer, never
