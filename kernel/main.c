@@ -89,10 +89,7 @@ void kmain(uint64_t bootinfo_phys)
     kprintf("proc: scheduler online\n");
 
     ata_init();
-    if (vfs_init() == 0)
-        kprintf("vfs: root filesystem mounted\n");
-    else
-        kprintf("vfs: WARNING: no root filesystem\n");
+    vfs_init();          /* reports success or failure itself */
 
     net_init();
     syscall_init();
