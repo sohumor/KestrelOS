@@ -22,7 +22,8 @@ LDFLAGS := -nostdlib -z max-page-size=0x1000 --no-warn-rwx-segments
 
 UCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
            -mno-red-zone -Wall -Wextra -O2 -g \
-           -Ilibc/include -Iabi -Ilibgui -MMD -MP
+           -Ilibc/include -Iabi -Ilibgui \
+           -Ilibz -Ilibtls -Ilibimg -Ilibweb -Ilibjs -MMD -MP
 AR      := ar
 
 KERNEL_CSRC := $(filter-out $(CONFIG_KERNEL_EXCLUDE), $(wildcard kernel/*.c))
@@ -42,6 +43,23 @@ LIBC_A    := $(BUILD)/libc.a
 
 LIBGUI_OBJS := $(patsubst libgui/%.c,$(BUILD)/libgui/%.o,$(wildcard libgui/*.c))
 LIBGUI_A    := $(BUILD)/libgui.a
+
+# Browser stack. Each is its own archive so a program that does not use a
+# library does not carry it: only the browser links libweb, and only https
+# pulls in libtls.
+BROWSER_LIBS := libz libtls libimg libweb libjs
+BROWSER_ARCHIVES := $(foreach l,$(BROWSER_LIBS),$(BUILD)/$(l).a)
+
+define BROWSER_LIB_RULE
+$(BUILD)/$(1)/%.o: $(1)/%.c
+	@mkdir -p $$(dir $$@)
+	$(CC) $(UCFLAGS) -c $$< -o $$@
+
+$(BUILD)/$(1).a: $$(patsubst $(1)/%.c,$(BUILD)/$(1)/%.o,$$(wildcard $(1)/*.c))
+	@mkdir -p $(BUILD)
+	$$(if $$^,$(AR) rcs $$@ $$^,$(AR) rcs $$@)
+endef
+$(foreach l,$(BROWSER_LIBS),$(eval $(call BROWSER_LIB_RULE,$(l))))
 
 # apps/html.c is the browser's rendering engine, not a program.
 APP_LIBS  := html
@@ -161,11 +179,14 @@ USER_LINK = $(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $@
 $(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
 	$(USER_LINK) $(CRT0) $< $(LIBGUI_A) $(LIBC_A)
 
-# The browser also needs its rendering engine.
+# The browser also needs its rendering engine and the whole web stack.
+# Archive order matters: libweb calls libz/libtls/libimg/libjs, so those
+# follow it on the line, and libc is last because everything calls it.
 $(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(BUILD)/apps/html.o $(CRT0) \
-                       $(LIBC_A) $(LIBGUI_A) apps/user.ld
+                       $(LIBC_A) $(LIBGUI_A) $(BROWSER_ARCHIVES) apps/user.ld
 	$(USER_LINK) $(CRT0) $(BUILD)/apps/browser.o $(BUILD)/apps/html.o \
-	  $(LIBGUI_A) $(LIBC_A)
+	  $(LIBGUI_A) $(BUILD)/libweb.a $(BUILD)/libjs.a $(BUILD)/libimg.a \
+	  $(BUILD)/libtls.a $(BUILD)/libz.a $(LIBC_A)
 
 # ---------------- packages ----------------
 
