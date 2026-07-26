@@ -18,16 +18,35 @@
 #include "uproc.h"
 #include "fpu.h"
 #include "rtc.h"
+#include "kmon.h"
 
 struct bootinfo *boot_info;
 
+/* Start userspace. uproc_spawn only creates the task — the ELF load
+ * happens on that task, so a missing or corrupt /bin/init shows up as an
+ * immediate exit rather than a spawn failure. Either way we land in the
+ * kernel rescue console instead of a dead machine. */
 static void init_launcher(void *arg)
 {
     (void)arg;
     char *argv[] = { "/bin/init", NULL };
-    int pid = uproc_spawn("/bin/init", argv, 1);
-    if (pid < 0)
-        kprintf("init: failed to spawn /bin/init\n");
+    struct k_stat st;
+    int pid;
+
+    if (vfs_stat("/bin/init", &st) < 0 || st.is_dir) {
+        kprintf("init: /bin/init is missing\n");
+        kmon_run(NULL);
+    }
+
+    pid = uproc_spawn("/bin/init", argv, 1);
+    if (pid < 0) {
+        kprintf("init: cannot spawn /bin/init\n");
+        kmon_run(NULL);
+    }
+
+    long code = uproc_waitpid(pid);
+    kprintf("init: /bin/init exited (%ld)\n", code);
+    kmon_run(NULL);
 }
 
 void kmain(uint64_t bootinfo_phys)
