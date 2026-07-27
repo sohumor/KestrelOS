@@ -153,7 +153,7 @@ for `page_load` before it enters layout. The apparent GUI chain is already
 65,385 bytes before ABI/callee overhead. It proves neither the 64 KiB safety
 limit nor the stricter 48 KiB integrated acceptance gate.
 
-This is a Wave 2 blocker with staged ownership:
+This was a Wave 2 blocker with staged ownership:
 
 1. **Frontend** first shrinks persistent `apps/browser.c` frames. Put URL
    canonicalization and other large-local phases in explicit non-inlined
@@ -162,15 +162,13 @@ This is a Wave 2 blocker with staged ownership:
    `-fstack-usage` with the real `-O2` userspace flags and publish the active
    caller-chain sum. Moving a large frame to another still-live caller does not
    count as a reduction.
-2. **QA** measures the watermark from the real browser entry through fetch,
-   DOM, CSS, and layout on a target-like guarded 64 KiB stack. Layout's internal
-   counter and `.su` files are supporting evidence, not the result. Run both
-   `-t` and the 900x620 GUI load; the maximum must be at most 49,152 bytes and
-   the guard/canary must remain untouched.
-3. **Backend**, only if that whole-call measurement remains above 48 KiB after
-   Frontend reductions, owns reducing layout recursion cost or refactoring the
-   recursive walk. Lowering a depth cap is acceptable only with
-   `LAY_TRUNC_DEPTH`, readable partial output, and the same whole-call re-test.
+2. **QA** measures from real browser entry through fetch, DOM, CSS, and layout
+   on a target-like guarded 64 KiB stack. Run both `-t` and the 900x620 GUI
+   load; the maximum must be at most 49,152 bytes and the guard must survive.
+3. **Production static evidence** separately sums the active reserved frames
+   from final-source `.su` files built with the exact userspace flags. A canary
+   reports bytes written, not every byte reserved by `rsp`, so neither result
+   substitutes for the other.
 
 QA generates one deterministic local fixture at test time (no external I/O):
 an embedded block-display stylesheet, 128 nested `<div>` elements, and a
@@ -178,6 +176,44 @@ deepest `STACK-DEEPEST` text link, all closed and below 8 KiB. This exceeds
 `LAY_MAX_DEPTH` without reaching DOM limits. The same bytes feed the isolated
 target-like harness and `/bin/browser`; a direct `lay_layout()` unit call does
 not satisfy this gate.
+
+### Final stack ruling
+
+The post-Frontend QA runner reports 47,296 bytes for text and 47,360 for GUI,
+with the guard intact. Those results satisfy the committed **target-like
+guarded real-browser-entry** wording and pass the 49,152-byte gate. They must
+be described as target-like, not exact Kestrel measurements: the host ABI/libc
+differ and the runner adds `-fno-omit-frame-pointer`, which production UCFLAGS
+do not.
+
+The final production `.su` active-chain estimate is about 48,449 bytes. It also
+passes, but by only 703 bytes. Wave 2 therefore uses both recorded results:
+the host run proves the real pipeline's dynamic high-water behavior, while
+production `.su` accounts for actual reserved frame sizes.
+
+An alternate tools-only renamed browser main and QA assembly canary on a
+Kestrel image is useful follow-up evidence, but is **not required for Wave 2
+acceptance**. A custom crt0 perturbs the entry path and a canary still measures
+touched rather than unwritten reserved bytes. If run later, it must use exact
+production flags in an isolated image and report touched and reserved totals
+separately; it cannot replace the production `.su` record.
+
+The 703-byte policy margin is smaller than the remaining ABI/startup and
+measurement uncertainty, so this ruling authorizes one proactive Backend
+safety adjustment before an observed failure:
+
+- change only `LAY_BLOCK_DEPTH_HEADROOM` from 8 to 12, an expected reduction
+  of about 1,984 bytes on the worst recursive path;
+- preserve `LAY_TRUNC_DEPTH` and readable partial layout for omitted
+  pathological tail content; QA owns the focused depth/truncation regression;
+- rerun the same text/GUI host harness and exact-production `.su` calculation
+  from the final source state. Both must remain below 49,152, the guard must
+  survive, and the static estimate must show the expected additional margin.
+
+This authorization does not extend to another blind cap reduction or a layout
+refactor. If the narrow change does not create margin, return to measurement
+and require the exact-target harness before further code changes. Renderer
+cleanup and full acceptance wait for this focused Backend/QA recheck.
 
 ### Build isolation while measuring
 
