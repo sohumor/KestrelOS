@@ -8,6 +8,8 @@ QEMU    := qemu-system-x86_64
 
 BUILD := build
 
+.DEFAULT_GOAL := all
+
 # Build configuration. `config` (repo root) generates kernel/include/config.h
 # and this fragment; it is included above the wildcards so the object and app
 # lists can be filtered. GNU make remakes an included file and restarts
