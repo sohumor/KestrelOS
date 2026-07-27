@@ -137,6 +137,7 @@ const char *lay_kind_name(int kind);
 #define LAYF_TABLE_ANON  0x00020000u /* anonymous table wrapper          */
 #define LAYF_LAST_LINE   0x00040000u /* last line box of its block       */
 #define LAYF_BR          0x00080000u /* the fragment came from <br>      */
+#define LAYF_REPLACED    0x00100000u /* an image or other replaced box   */
 
 /* ------------------------------------------------------------------ *
  * Rectangles
@@ -288,7 +289,7 @@ static inline lay_rect lay_clip_rect(const struct lay_box *b)
  * caller that has neither passes zeroes and gets sensible fallbacks.
  * ------------------------------------------------------------------ */
 
-/* Intrinsic size of an image. Return 1 and fill *w/*h, or 0 when the
+/* Intrinsic size of an image. Return 1 and fill the outputs, or 0 when the
  * image is not (yet) available - layout then falls back to the width and
  * height attributes, then to an alt-text sized placeholder. */
 typedef int (*lay_image_size_fn)(void *ctx, const char *url, int *w, int *h);

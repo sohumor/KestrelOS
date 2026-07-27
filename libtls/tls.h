@@ -33,11 +33,13 @@
  * Not audited. See the honest-ceiling section of docs/BROWSER-PLAN.md and
  * docs/tls.md.
  *
- * Memory: one connection is a single heap block of about 116 KiB (three
- * 16 KiB record buffers, a 64 KiB handshake reassembly buffer and a
- * ten-certificate chain). Nothing here recurses and no function uses more
- * than ~1 KiB of stack, because the user stack is 64 KiB. The trust store
- * is another 49 KiB and also lives on the heap.
+ * Memory, measured rather than guessed: one connection is a single heap
+ * block of 113,776 bytes -- three 16 KiB record buffers, a 48 KiB
+ * handshake reassembly buffer and a ten-certificate chain -- plus a
+ * short-lived copy of the server's certificate message that is freed when
+ * the handshake ends. The trust store is another 49,672 bytes and is also
+ * on the heap. Nothing here recurses, and the deepest stack frame is
+ * x509's chain verification at about 14 KiB, against a 64 KiB user stack.
  */
 
 #include <stdint.h>
@@ -103,7 +105,30 @@ struct tls_options {
     unsigned     suites;            /* 0 = TLS_S_ALL                       */
     uint32_t     now;               /* unix time for validity checks;
                                      * 0 = ask the operating system        */
+    int          rsa_only;          /* offer only RSA signature algorithms,
+                                     * so a server with both an ECDSA and
+                                     * an RSA certificate serves the RSA
+                                     * one -- see no_rsa_fallback          */
+    int          no_rsa_fallback;   /* 1 disables the automatic retry
+                                     * described below                     */
 };
+
+/* The automatic RSA fallback, and why it exists.
+ *
+ * ecc.h implements P-256 but not P-384, so a chain with a P-384 key
+ * anywhere in it cannot be verified. That is not a rare corner: several
+ * large CAs -- SSL.com, Google Trust Services, Let's Encrypt's ECDSA
+ * hierarchy -- issue ECDSA leaves under P-384 intermediates, and a server
+ * picks which of its certificates to send based on the client's
+ * signature_algorithms.
+ *
+ * So when tls_connect() fails verification and the chain contained a curve
+ * this build cannot verify, it reconnects once with the ECDSA algorithms
+ * removed from signature_algorithms. Servers that hold both certificate
+ * types then send the RSA chain, which does verify. Nothing is weakened:
+ * the second attempt is a full handshake with full verification, and if it
+ * also fails the error reported is the second one. Set no_rsa_fallback to
+ * turn it off; tls_info().rsa_fallback says whether it happened. */
 
 void tls_options_default(struct tls_options *o);
 
@@ -189,6 +214,7 @@ struct tls_info {
     char        alpn[32];           /* "" when none was selected     */
     int         verified;           /* 1 = the chain is trusted      */
     int         hello_retry;        /* 1 = a HelloRetryRequest happened */
+    int         rsa_fallback;       /* 1 = connected on the RSA retry */
     int         weak_entropy;       /* 1 = no hardware RNG was found */
     int         chain_len;
     char        subject[X509_MAX_CN];
@@ -202,6 +228,9 @@ struct tls_info {
 int tls_info(const struct tls_conn *c, struct tls_info *out);
 
 /* ---- trust store ----------------------------------------------------- */
+
+/* Extra roots are read from here when the file exists. */
+#define TLS_ROOTS_FILE "/etc/ssl/roots.pem"
 
 /* The process-wide store: the roots compiled into roots.c, plus every
  * certificate in /etc/ssl/roots.pem when that file exists. Built on first
@@ -246,6 +275,11 @@ int tls_entropy_is_weak(void);
  */
 int tls_transport_open(const char *host, int port, int timeout_ms,
                        void *user, struct tls_transport *out);
+
+/* http_fetch() can only pass a numeric code back, so the sentence
+ * explaining the most recent tls_transport_open() failure is kept here for
+ * the browser to show. */
+const char *tls_last_transport_error(void);
 
 #define TLS_REGISTER_HTTPS(opts)                                             \
     http_register_scheme("https",                                            \

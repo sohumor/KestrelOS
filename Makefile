@@ -194,6 +194,12 @@ $(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(BUILD)/apps/html.o $(CRT0) \
 	  $(LIBGUI_A) $(BUILD)/libweb.a $(BUILD)/libjs.a $(BUILD)/libimg.a \
 	  $(BUILD)/libtls.a $(BUILD)/libz.a $(LIBC_A)
 
+# tlstest is the only non-browser program that needs the TLS stack.
+$(BUILD)/apps/tlstest: $(BUILD)/apps/tlstest.o $(CRT0) $(LIBC_A) \
+                       $(LIBGUI_A) $(BUILD)/libtls.a apps/user.ld
+	$(USER_LINK) $(CRT0) $(BUILD)/apps/tlstest.o $(LIBGUI_A) \
+	  $(BUILD)/libtls.a $(LIBC_A)
+
 # ---------------- packages ----------------
 
 define PKG_PROG_RULE
