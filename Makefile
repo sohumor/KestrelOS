@@ -69,9 +69,7 @@ $(BUILD)/libweb/style.o: libweb/style.c
 	@mkdir -p $(dir $@)
 	$(CC) $(UCFLAGS) -DCSS_WITH_DOM -c $< -o $@
 
-# apps/html.c is the browser's rendering engine, not a program.
-APP_LIBS  := html
-APP_NAMES := $(filter-out $(APP_LIBS) $(CONFIG_APPS_EXCLUDE), \
+APP_NAMES := $(filter-out $(CONFIG_APPS_EXCLUDE), \
                $(patsubst apps/%.c,%,$(wildcard apps/*.c)))
 APP_BINS  := $(patsubst %,$(BUILD)/apps/%,$(APP_NAMES))
 
@@ -190,9 +188,9 @@ $(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
 # The browser also needs its rendering engine and the whole web stack.
 # Archive order matters: libweb calls libz/libtls/libimg/libjs, so those
 # follow it on the line, and libc is last because everything calls it.
-$(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(BUILD)/apps/html.o $(CRT0) \
-                       $(LIBC_A) $(LIBGUI_A) $(BROWSER_ARCHIVES) apps/user.ld
-	$(USER_LINK) $(CRT0) $(BUILD)/apps/browser.o $(BUILD)/apps/html.o \
+$(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(CRT0) $(LIBC_A) \
+                       $(LIBGUI_A) $(BROWSER_ARCHIVES) apps/user.ld
+	$(USER_LINK) $(CRT0) $(BUILD)/apps/browser.o \
 	  $(BUILD)/libweb.a $(BUILD)/libjs.a $(BUILD)/libimg.a \
 	  $(BUILD)/libtls.a $(BUILD)/libz.a $(LIBGUI_A) $(LIBC_A)
 
