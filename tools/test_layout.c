@@ -17,6 +17,9 @@
  *       -Ilibweb -Ilibgui -Ilibimg -o /tmp/tl tools/test_layout.c \
  *       libweb/layout.c libweb/paint.c libweb/dom.c libweb/html.c \
  *       libweb/entities.c libgui/font.c libgui/font_data.c
+ *
+ * Paint-order OOM gate: add -DLAYOUT_TEST_WRAP_ALLOC and
+ * -Wl,--wrap=malloc, then run /tmp/tl --paint-oom.
  */
 
 #include <stdio.h>
@@ -95,6 +98,55 @@ void css_style_initial(struct computed_style *cs)
 static long checks, failures;
 static const char *group = "";
 static int stack_gate_mode;
+
+#ifdef LAYOUT_TEST_WRAP_ALLOC
+/*
+ * Host-only malloc fault injection.  Tracking is armed immediately before
+ * lay_layout_node(), after the fixture and its styles have been allocated.
+ * A successful calibration run identifies the final four malloc calls:
+ * build_paint_order()'s positioned-box, key, scratch, and published-order
+ * arrays.  The fixed trace is allocation-free so it cannot perturb itself.
+ */
+#define OOM_TRACE_MAX 256
+static int oom_tracking;
+static unsigned long oom_calls;
+static unsigned long oom_fail_call;
+static unsigned long oom_failures;
+static size_t oom_sizes[OOM_TRACE_MAX];
+
+void *__real_malloc(size_t size);
+
+void *__wrap_malloc(size_t size)
+{
+    unsigned long call;
+
+    if (oom_tracking) {
+        call = ++oom_calls;
+        if (call <= OOM_TRACE_MAX)
+            oom_sizes[call - 1] = size;
+        if (oom_fail_call && call == oom_fail_call) {
+            oom_failures++;
+            return 0;
+        }
+    }
+    return __real_malloc(size);
+}
+
+static void oom_begin(unsigned long fail_call)
+{
+    memset(oom_sizes, 0, sizeof oom_sizes);
+    oom_calls = 0;
+    oom_fail_call = fail_call;
+    oom_failures = 0;
+    oom_tracking = 1;
+}
+
+static unsigned long oom_end(void)
+{
+    oom_tracking = 0;
+    return oom_calls;
+}
+#endif
 
 #define CHECK(cond) do {                                                \
         checks++;                                                       \
@@ -2323,6 +2375,89 @@ static struct dom_node *build_article(struct tctx *t)
     return b;
 }
 
+#ifdef LAYOUT_TEST_WRAP_ALLOC
+static void test_paint_order_oom(void)
+{
+    static const char *const allocation[4] = {
+        "positioned boxes", "paint keys", "sort scratch", "paint order"
+    };
+    struct tctx *t = tnew();
+    struct dom_node *b = build_article(t);
+    struct lay_document *L;
+    const struct lay_paint_item *items;
+    unsigned long total, first, call, seen;
+    unsigned long boxes;
+    int paints;
+    int i;
+
+    GROUP("paint order late-allocation OOM");
+
+    /* Calibrate only layout.c allocations on the exact fixture under test. */
+    oom_begin(0);
+    L = run(t, b, 760, 900);
+    total = oom_end();
+    CHECK(L != 0);
+    if (!L) {
+        tfree(t);
+        return;
+    }
+    boxes = lay_box_count(L);
+    items = 0;
+    paints = lay_paint_order(L, &items);
+    CHECK(boxes > 1);
+    CHECK(paints > 0);
+    CHECK(items != 0);
+    CHECK_EQ(lay_truncated(L), 0);
+    CHECK(total >= 4);
+    CHECK(total <= OOM_TRACE_MAX);
+    if (total < 4 || total > OOM_TRACE_MAX) {
+        lay_free(L);
+        tfree(t);
+        return;
+    }
+
+    first = total - 3;
+    CHECK_EQ(oom_sizes[first - 1], (boxes + 1) * sizeof(void *));
+    CHECK_EQ(oom_sizes[first], oom_sizes[first + 1]);
+    CHECK_EQ(oom_sizes[first + 2],
+             ((unsigned long)paints + 1) *
+                 sizeof(struct lay_paint_item));
+    printf("  calibrated: %lu mallocs, %lu boxes, %d paint items\n",
+           total, boxes, paints);
+    printf("  late ordinals: %lu..%lu, sizes %lu/%lu/%lu/%lu bytes\n",
+           first, total,
+           (unsigned long)oom_sizes[first - 1],
+           (unsigned long)oom_sizes[first],
+           (unsigned long)oom_sizes[first + 1],
+           (unsigned long)oom_sizes[first + 2]);
+    lay_free(L);
+
+    for (i = 0; i < 4; i++) {
+        call = first + (unsigned long)i;
+        items = (const struct lay_paint_item *)(uintptr_t)1;
+        oom_begin(call);
+        L = run(t, b, 760, 900);
+        seen = oom_end();
+
+        CHECK_EQ(oom_failures, 1);
+        CHECK(seen >= call);
+        CHECK(L != 0);
+        if (L) {
+            CHECK_EQ(lay_box_count(L), boxes);
+            CHECK_EQ(lay_paint_order(L, &items), 0);
+            CHECK(items == 0);
+            CHECK_EQ(lay_truncated(L), LAY_TRUNC_MEMORY);
+            lay_free(L);
+            L = 0;
+            lay_free(L);
+        }
+        printf("  injected %-16s at malloc %lu: %lu calls observed\n",
+               allocation[i], call, seen);
+    }
+    tfree(t);
+}
+#endif
+
 static void render_pages(void)
 {
     struct tctx *t = tnew();
@@ -2739,6 +2874,19 @@ int main(int argc, char **argv)
         test_table_row_boundary_runtime();
         printf("\n%ld checks, %ld failures\n", checks, failures);
         return failures ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--paint-oom") == 0) {
+#ifdef LAYOUT_TEST_WRAP_ALLOC
+        printf("layout paint-order OOM gate\n"
+               "===========================\n\n");
+        test_paint_order_oom();
+        printf("\n%ld checks, %ld failures\n", checks, failures);
+        return failures ? 1 : 0;
+#else
+        fprintf(stderr, "--paint-oom requires -DLAYOUT_TEST_WRAP_ALLOC "
+                        "and -Wl,--wrap=malloc\n");
+        return 2;
+#endif
     }
     if (argc > 1)
         fuzz_iters = atoi(argv[1]);
