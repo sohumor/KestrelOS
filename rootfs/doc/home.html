@@ -24,13 +24,18 @@ over its own TCP/IP stack. Nothing here was ported from anywhere.</p>
 line; in VirtualBox, an Intel PRO/1000 adapter.</p>
 
 <ul>
-  <li><a href="http://example.com">example.com</a></li>
-  <li><a href="http://neverssl.com">neverssl.com</a></li>
+  <li><a href="https://example.com/">example.com over verified HTTPS</a></li>
+  <li><a href="http://neverssl.com/">neverssl.com over plain HTTP</a></li>
 </ul>
 
-<p><b>There is no TLS</b>, so <code>https://</code> addresses are refused
-rather than half-supported. Most of the modern web is therefore out of
-reach; plain-HTTP pages work.</p>
+<p><b>TLS 1.3 is enabled with certificate verification required.</b>
+HTTPS, redirects, cookies, caching, chunked bodies and gzip decoding all run
+through KestrelOS's own libraries.</p>
+
+<p>The limits are real: there is no TLS 1.2 fallback, the JavaScript engine is
+not yet connected to page DOM objects, external stylesheets and images are not
+fetched in this release, and the from-scratch cryptography has not had a
+professional audit. Many complex sites will still degrade or fail.</p>
 
 <h2>Getting around</h2>
 

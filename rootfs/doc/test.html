@@ -3,14 +3,43 @@
 <head>
 <title>Kestrel Renderer Test</title>
 <style>
-  /* The renderer ignores CSS; this block is here so the parser has a
-     <style> element to skip instead of printing. */
-  body { color: #202020; }
+  /* This embedded author sheet must pass through parse, cascade, layout
+     and paint. The proof panel is intentionally obvious in screenshots. */
+  body {
+    color: #202020;
+    background-color: #f2f7ff;
+    padding: 16px;
+  }
+  h1 {
+    color: #123f8c;
+    border-bottom: 3px solid #4f78bd;
+    padding-bottom: 6px;
+  }
+  .css-proof {
+    color: #0b4f24;
+    background-color: #dff4d8;
+    border: 2px solid #2d8a4a;
+    padding: 10px;
+    margin: 12px 0;
+    font-weight: bold;
+  }
+  th {
+    color: white;
+    background-color: #315b9a;
+    padding: 4px;
+  }
+  td {
+    background-color: white;
+    padding: 4px;
+  }
 </style>
 </head>
 <body>
 
 <h1>Kestrel Renderer Test</h1>
+
+<p class="css-proof">CSS-AUTHOR-OK: this green bordered panel is styled by
+the document's embedded author stylesheet.</p>
 
 <p>RENDERER-OK: this paragraph is one run of plain body text, long
 enough that the layout engine has to wrap it across more than a single
