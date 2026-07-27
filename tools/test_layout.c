@@ -20,6 +20,7 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -478,6 +479,32 @@ static void test_percent_width(void)
     CHECK_EQ(bi->w, 200);
     CHECK_EQ(bi->pad[CSS_LEFT], 40);
     CHECK_EQ(bi->x, bo->x + 40);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_percent_height(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *outer = st_block(t), *inner = st_block(t);
+    struct dom_node *o, *i;
+    struct lay_document *L;
+
+    GROUP("box model: percentage height needs a definite containing height");
+
+    outer->height = LPX(200);
+    inner->height = LPCT(50);
+    o = el(t, 0, "div", outer);
+    i = el(t, o, "div", inner);
+    txt(t, i, "one line");
+
+    L = run(t, o, 400, 300);
+    CHECK_EQ(box_nth(L, i, 0)->h, 100);
+    lay_free(L);
+
+    outer->height = LAUTO();
+    L = run(t, o, 400, 300);
+    CHECK_EQ(box_nth(L, i, 0)->h, 16);
     lay_free(L);
     tfree(t);
 }
@@ -1237,6 +1264,46 @@ static void test_lists(void)
     tfree(t);
 }
 
+static struct lay_box *marker_for(struct lay_document *L,
+                                  struct dom_node *item)
+{
+    struct lay_box *b = box_nth(L, item, 0);
+    struct lay_box *m;
+
+    for (m = b ? b->first_child : 0;
+         m && m->kind != LAY_BOX_MARKER; m = m->next)
+        ;
+    return m;
+}
+
+static void test_list_value_continuation(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *ol = st_block(t), *li = st(t);
+    struct dom_node *list, *a, *b, *c, *d;
+    struct lay_document *L;
+
+    GROUP("lists: ordered numbering continues after an explicit li value");
+
+    li->display = CSS_DISPLAY_LIST_ITEM;
+    li->list_style_type = CSS_LISTSTYLE_DECIMAL;
+    list = el(t, 0, "ol", ol);
+    dom_set_attr(list, "start", "3");
+    a = el(t, list, "li", li);
+    b = el(t, list, "li", li);
+    dom_set_attr(b, "value", "10");
+    c = el(t, list, "li", li);
+    d = el(t, list, "li", li);
+
+    L = run(t, list, 400, 300);
+    CHECK(marker_for(L, a) && !strcmp(marker_for(L, a)->marker, "3."));
+    CHECK(marker_for(L, b) && !strcmp(marker_for(L, b)->marker, "10."));
+    CHECK(marker_for(L, c) && !strcmp(marker_for(L, c)->marker, "11."));
+    CHECK(marker_for(L, d) && !strcmp(marker_for(L, d)->marker, "12."));
+    lay_free(L);
+    tfree(t);
+}
+
 /* ================================================================== *
  * 6  tables
  * ================================================================== */
@@ -1401,6 +1468,14 @@ static void test_table_fixed(void)
     CHECK(count_lines(box_nth(L, c, 0)) > 1);
     lay_free(L);
     tfree(t);
+}
+
+static void test_table_row_index_capacity(void)
+{
+    GROUP("tables: configured row limit fits the public zero-based row index");
+
+    CHECK((unsigned long)LAY_MAX_ROWS <=
+          (unsigned long)UINT16_MAX + 1UL);
 }
 
 /* ================================================================== *
@@ -1606,6 +1681,39 @@ static void test_fixed_and_relative(void)
     bf = box_nth(L, df, 0);
     CHECK_EQ(br->x, 25);
     CHECK_EQ(br->y, -8);
+    CHECK_EQ(bf->x, 600 - 40);
+    CHECK_EQ(bf->y, 400 - 40);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_fixed_inside_relative(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *p = st_block(t), *r = st_block(t);
+    struct computed_style *fx = st_block(t);
+    struct dom_node *dp, *dr, *df;
+    struct lay_document *L;
+    struct lay_box *bf;
+
+    GROUP("positioning: fixed descendant ignores relative ancestor offset");
+
+    p->height = LPX(500);
+    r->position = CSS_POSITION_RELATIVE;
+    r->offset[CSS_LEFT] = LPX(25);
+    r->offset[CSS_TOP] = LPX(30);
+    r->height = LPX(20);
+    fx->position = CSS_POSITION_FIXED;
+    fx->offset[CSS_RIGHT] = LPX(0);
+    fx->offset[CSS_BOTTOM] = LPX(0);
+    fx->width = LPX(40);
+    fx->height = LPX(40);
+
+    dp = el(t, 0, "div", p);
+    dr = el(t, dp, "div", r);
+    df = el(t, dr, "div", fx);
+    L = run(t, dp, 600, 400);
+    bf = box_nth(L, df, 0);
     CHECK_EQ(bf->x, 600 - 40);
     CHECK_EQ(bf->y, 400 - 40);
     lay_free(L);
@@ -2572,6 +2680,16 @@ int main(int argc, char **argv)
         printf("\n%ld checks, %ld failures\n", checks, failures);
         return failures ? 1 : 0;
     }
+    if (argc > 1 && strcmp(argv[1], "--candidates") == 0) {
+        printf("layout focused regression candidates\n"
+               "====================================\n\n");
+        test_percent_height();
+        test_list_value_continuation();
+        test_table_row_index_capacity();
+        test_fixed_inside_relative();
+        printf("\n%ld checks, %ld failures\n", checks, failures);
+        return failures ? 1 : 0;
+    }
     if (argc > 1)
         fuzz_iters = atoi(argv[1]);
 
@@ -2581,6 +2699,7 @@ int main(int argc, char **argv)
     test_over_constrained();
     test_centred();
     test_percent_width();
+    test_percent_height();
     test_min_max();
 
     test_collapse_siblings();
@@ -2599,14 +2718,17 @@ int main(int argc, char **argv)
     test_floats();
     test_float_containment();
     test_lists();
+    test_list_value_continuation();
 
     test_table_auto();
     test_table_spacing_and_span();
     test_table_fixed();
+    test_table_row_index_capacity();
 
     test_replaced();
     test_absolute();
     test_fixed_and_relative();
+    test_fixed_inside_relative();
     test_zorder();
 
     test_overflow();
