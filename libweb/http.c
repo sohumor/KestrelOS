@@ -1606,6 +1606,7 @@ int http_fetch(struct http_client *c, const struct http_request *req,
     unsigned long seen[HTTP_REDIRECT_MAX + 2];
     const char *method;
     const char *cond_etag = 0, *cond_lm = 0;
+    char *final;
     int hops = 0, nseen = 0, rc, i;
     int maxhops;
     int cacheable_req, had_cache_entry = 0;
@@ -1652,11 +1653,16 @@ int http_fetch(struct http_client *c, const struct http_request *req,
             rc = http_cache_fill(c->cache, keybuf, res);
             if (rc == HTTP_OK) {
                 res->from_cache = 1;
-                res->final_url = malloc(strlen(urlbuf) + 1);
-                if (res->final_url)
-                    strcpy(res->final_url, urlbuf);
                 c->st.requests++;
                 c->st.cache_hits++;
+                final = malloc(strlen(urlbuf) + 1);
+                if (final == 0) {
+                    rc = HTTP_E_NOMEM;
+                    goto fail;
+                }
+                strcpy(final, urlbuf);
+                free(res->final_url);
+                res->final_url = final;
                 if (out.sink && res->body && res->body_len)
                     out.sink(out.sink_user, res->body, res->body_len);
                 hb_free(&out.mem);
@@ -1815,12 +1821,18 @@ int http_fetch(struct http_client *c, const struct http_request *req,
 
 finish:
     res->redirects = hops;
-    if (url_serialize(&cur, urlbuf, sizeof(urlbuf)) == URL_OK) {
-        free(res->final_url);
-        res->final_url = malloc(strlen(urlbuf) + 1);
-        if (res->final_url)
-            strcpy(res->final_url, urlbuf);
+    if (url_serialize(&cur, urlbuf, sizeof(urlbuf)) != URL_OK) {
+        rc = HTTP_E_URL;
+        goto fail;
     }
+    final = malloc(strlen(urlbuf) + 1);
+    if (final == 0) {
+        rc = HTTP_E_NOMEM;
+        goto fail;
+    }
+    strcpy(final, urlbuf);
+    free(res->final_url);
+    res->final_url = final;
     hb_free(&out.mem);
     hb_free(&out.tee);
     return HTTP_OK;
