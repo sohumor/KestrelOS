@@ -144,6 +144,80 @@ QA acceptance covers deterministic `-t` text order, hostile geometry without
 overflow, transport-specific TLS wording, worst-case quote escaping without
 truncation, transactional load/history rollback, and the blank-order OOM gate.
 
+## Integrated 64 KiB stack gate
+
+The prior 47,881-byte result is the deepest layout-internal `lay_run()` depth,
+not whole-process stack use. Current `-fstack-usage` reports include 9,744 bytes
+for `main` (with URL canonicalization inlined), 3,424 for `load_gui`, and 4,336
+for `page_load` before it enters layout. The apparent GUI chain is already
+65,385 bytes before ABI/callee overhead. It proves neither the 64 KiB safety
+limit nor the stricter 48 KiB integrated acceptance gate.
+
+This is a Wave 2 blocker with staged ownership:
+
+1. **Frontend** first shrinks persistent `apps/browser.c` frames. Put URL
+   canonicalization and other large-local phases in explicit non-inlined
+   helpers that return before page layout; split/heap-allocate large load and
+   GUI locals so they are not live across `lay_layout()`. Re-run
+   `-fstack-usage` with the real `-O2` userspace flags and publish the active
+   caller-chain sum. Moving a large frame to another still-live caller does not
+   count as a reduction.
+2. **QA** measures the watermark from the real browser entry through fetch,
+   DOM, CSS, and layout on a target-like guarded 64 KiB stack. Layout's internal
+   counter and `.su` files are supporting evidence, not the result. Run both
+   `-t` and the 900x620 GUI load; the maximum must be at most 49,152 bytes and
+   the guard/canary must remain untouched.
+3. **Backend**, only if that whole-call measurement remains above 48 KiB after
+   Frontend reductions, owns reducing layout recursion cost or refactoring the
+   recursive walk. Lowering a depth cap is acceptable only with
+   `LAY_TRUNC_DEPTH`, readable partial output, and the same whole-call re-test.
+
+QA generates one deterministic local fixture at test time (no external I/O):
+an embedded block-display stylesheet, 128 nested `<div>` elements, and a
+deepest `STACK-DEEPEST` text link, all closed and below 8 KiB. This exceeds
+`LAY_MAX_DEPTH` without reaching DOM limits. The same bytes feed the isolated
+target-like harness and `/bin/browser`; a direct `lay_layout()` unit call does
+not satisfy this gate.
+
+### Build isolation while measuring
+
+Until all code owners hand off, use file-scoped compiles and an isolated QA
+output directory such as `build/qa-wave2-stack/`. QA must not run top-level
+`make`, `make clean`, rewrite the shared image, or overlap QEMU/full-build work
+with Frontend or Backend. The Lead alone schedules the clean full WSL
+build/image and final E2E after those lanes are idle.
+
+## QA audit gaps before acceptance
+
+QA owns these missing assertions in `tools/e2e.py` or focused
+`tools/test_*.c`; a prompt or readable body alone is insufficient:
+
+- **Plain HTTP positive:** run `/bin/browser -t` against a controlled host HTTP
+  fixture, require its unique body marker and explicit status 0. This is
+  non-skippable and separate from the verified HTTPS case.
+- **Certificate-negative TLS:** pair the valid public HTTPS success with a
+  controlled TLS 1.3 server presenting a parseable self-signed or
+  hostname-mismatched certificate. Require a certificate/hostname diagnostic,
+  explicit nonzero exit, and absence of the server's body marker; a generic
+  connect/version failure is not verification proof. This controlled negative
+  is non-skippable.
+- **Local/home status:** issue each existing command followed by a shell status
+  marker (for example `; echo LOCAL-STATUS-$?`) and require zero for both
+  `/doc/test.html` and `/doc/home.html`.
+- **25-cycle leak and transaction measurement:** after warm-up, automate the
+  same two local linked pages through Link, Back, Forward, Reload, and return,
+  for 25 cycles. Record allocation/free or target-memory checkpoints every
+  five cycles and after close; page-owned allocations must return to the
+  post-warm-up baseline, target memory must plateau rather than lose memory per
+  page, and teardown must release the process allocation. Inject history/load
+  allocation failure separately and assert URL, page marker, history index,
+  Back, and Forward remain at the pre-failure transaction.
+
+QA publishes the commands, five checkpoint values, exit markers, and final
+transaction markers with the acceptance report. Any crash, guard damage,
+monotonic leak, false status zero, or history mutation is a Wave 2 blocker
+routed to the owning Frontend/Backend lane.
+
 ## Lead Makefile and cleanup duties
 
 The Lead owns these changes after Frontend has zero old-renderer references:
