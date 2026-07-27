@@ -125,10 +125,35 @@ int putchar(int c);
 int getchar(void);         /* raw blocking byte from fd 0; may return KEY_* */
 ```
 
-Format support: `%s %c %d %i %u %x %X %p %%` with `l`/`ll` length
-modifiers, field width, `0` and `-` flags. `snprintf`/`vsnprintf`
-always NUL-terminate when `size > 0` and return the length that would
-have been written.
+The formatter is deliberately smaller than ISO C `printf`. It supports
+`%s %c %d %i %u %x %X %p %%`, decimal field width, the `0` and `-`
+flags, and `l`/`ll` on integer conversions (both select a 64-bit value on
+x86-64). It does not support floating-point conversions or `*` field
+width.
+
+Precision has one supported formatting use: bounding a byte string.
+`%.Ns` takes a decimal literal limit, `%.*s` takes the limit from one
+`int` argument, and a bare `%.s` means zero. A negative `*` precision is
+treated as omitted. With a nonnegative precision, `%s` emits at most
+that many bytes, stopping earlier at NUL, and does not read beyond the
+limit; the input therefore need not be NUL-terminated within the
+counted slice. Precision counts bytes, not UTF-8 characters. Field width
+is applied to the bounded result, with space padding before it or, for
+`-`, after it.
+
+A NULL `%s` argument is rendered as `"(null)"`, and string precision
+applies to that replacement. Without precision, a non-NULL `%s`
+argument must be NUL-terminated. Precision on the supported integer
+conversions is parsed but has no formatting effect; a `*` precision is
+still consumed exactly once so later varargs remain aligned. No other
+precision semantics are promised.
+
+`snprintf` and `vsnprintf` always NUL-terminate when `size > 0` and
+return the number of bytes that would have been written, excluding the
+terminating NUL. They may be called with `buf == NULL` when `size == 0`;
+the format and arguments are still processed and the full count is
+returned without a write. A NULL buffer with nonzero size is outside the
+libc contract.
 
 ### `<stdlib.h>`
 
