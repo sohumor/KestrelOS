@@ -2539,6 +2539,14 @@ static int32_t layout_inline(struct lay_ctx *c, struct lay_box *block,
 #define LAY_MODE_SHRINK 1   /* shrink to fit: floats, inline-blocks     */
 #define LAY_MODE_FIXEDW 2   /* b->w has already been decided            */
 
+/* layout_block_box() uses about 512 bytes per recursive frame at -O2 and
+ * can reach larger inline/table helpers before unwinding. Keep eight of
+ * the public depth slots in reserve: about 4 KiB of headroom on the 64 KiB
+ * userspace stack, while the omitted tail still degrades through the
+ * normal LAY_TRUNC_DEPTH path. */
+#define LAY_BLOCK_DEPTH_HEADROOM 8
+#define LAY_BLOCK_MAX_DEPTH (LAY_MAX_DEPTH - LAY_BLOCK_DEPTH_HEADROOM)
+
 static void layout_table(struct lay_ctx *c, struct lay_box *t, int32_t cb_x,
                          int32_t cb_w, int32_t y, int mode, int depth);
 
@@ -2844,7 +2852,7 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
         c->stack_lo = (uintptr_t)&here;
     if (depth > c->depth_max)
         c->depth_max = depth;
-    if (depth >= LAY_MAX_DEPTH) {
+    if (depth >= LAY_BLOCK_MAX_DEPTH) {
         c->L->trunc |= LAY_TRUNC_DEPTH;
         *io_open = open_in;
         return y;
