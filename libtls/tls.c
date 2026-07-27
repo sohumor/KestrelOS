@@ -3144,6 +3144,7 @@ static struct tls_conn *client_run(const struct tls_transport *lower,
         free(c);
         return 0;
     }
+    c->own_lower = 1;
     return c;
 }
 
@@ -3176,7 +3177,6 @@ static struct tls_conn *connect_once(const char *host, int port,
         lower.close(lower.ctx);
         return 0;
     }
-    c->own_lower = 1;
     return c;
 }
 
