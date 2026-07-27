@@ -665,10 +665,13 @@ def t_kpkg_verify(h):
 
 
 def t_browser_text(h):
-    """The HTML renderer, run over a local page in text mode.
+    """The browser pipeline, run over a styled local page in text mode.
 
     rootfs/doc/test.html exercises headings, wrapped body text, inline
-    styles, entities, lists, <pre>, a table, links and an <img> alt.
+    styles, an author stylesheet, entities, lists, <pre>, a table, links
+    and an <img> alt.  Text mode cannot expose its color declaration, but
+    it does prove that the styled document remains readable and that both
+    relative and absolute links survive the shared pipeline.
     """
     h.send("browser -t -l /doc/test.html")
     h.expect("Kestrel Renderer Test", timeout=WALK_TIMEOUT)
@@ -679,7 +682,10 @@ def t_browser_text(h):
     h.expect("[ALT-TEXT]", timeout=WALK_TIMEOUT)
     h.expect("END-OF-PAGE", timeout=WALK_TIMEOUT)
     # -l resolves every href against the page URL
-    h.expect(r"\n *\[\d+\] /doc/welcome\.md\n", regex=True,
+    h.expect(r"\n *\[1\] /doc/welcome\.md\n", regex=True,
+             timeout=WALK_TIMEOUT)
+    # The previous match consumed the newline shared by these two lines.
+    h.expect(r" *\[2\] http://example\.com/\n", regex=True,
              timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
@@ -700,6 +706,33 @@ def t_browser_home(h):
     h.expect("Local pages", timeout=WALK_TIMEOUT)
     h.expect("no TLS", timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_browser_https(h):
+    """The browser itself must fetch and verify a public HTTPS page.
+
+    This is deliberately not a SKIP-on-network-failure probe: verified
+    HTTPS through /bin/browser is a Wave 2 acceptance requirement.  Watch
+    for an error as well as the success marker so a readable fast failure
+    is reported immediately instead of burning the whole timeout.
+    """
+    success = r"\n[^\n]*Example Domain[^\n]*\n"
+    error = (r"(?i)\n(?:browser:|cannot load page|tls(?: |:)|"
+             r"certificate(?: |:)|network unavailable|dns lookup failed|"
+             r"cannot connect)[^\n]*\n")
+    nonzero = r"\n\[exit [1-9]\d*\][^\n]*\n"
+
+    h.send("/bin/browser -t https://example.com/")
+    got = h.expect_any([success, error, nonzero],
+                       timeout=NET_TIMEOUT, regex=True)
+    if got != success:
+        raise TimeoutError("browser HTTPS fetch failed: matched %r" % got)
+
+    # A success marker followed by an error is still a failed navigation.
+    got = h.expect_any([SHELL_PROMPT, error, nonzero],
+                       timeout=NET_TIMEOUT, regex=True)
+    if got != SHELL_PROMPT:
+        raise TimeoutError("browser HTTPS fetch ended with error: %r" % got)
 
 
 def t_tcp_curl(h):
@@ -760,6 +793,7 @@ TESTS = [
     ("permissions", t_permissions),
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
+    ("browser-https", t_browser_https),
     ("kpkg-list", t_kpkg_list),
     ("kpkg-install", t_kpkg_install),
     ("pkg-hello", t_pkg_hello),
