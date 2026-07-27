@@ -3,7 +3,10 @@
 /* KestrelOS libc: formatted console I/O (freestanding).
  *
  * printf family supports: %s %c %d %i %u %x %X %p %lu %ld %lx %llu %lld
- * %llx %% with field width and '0'/'-' flags. Output goes to fd 1.
+ * %llx %% with field width and '0'/'-' flags. %s also supports byte
+ * precision .N and .* (bare . is zero; a negative * means omitted).
+ * Precision on other supported conversions is consumed but otherwise
+ * ignored. Output goes to fd 1.
  */
 
 #include <stdarg.h>

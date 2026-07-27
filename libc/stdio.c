@@ -6,7 +6,8 @@
  * write(1, ...), so printf output length is unbounded.
  *
  * Supported: %s %c %d %i %u %x %X %p %% with '0'/'-' flags, field
- * width and l/ll length modifiers (both mean 64-bit here).
+ * width and l/ll length modifiers (both mean 64-bit here). Strings also
+ * support a byte precision written as .N or .* (a bare . means zero).
  */
 
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include <kestrel.h>
 
 #define PRINTF_CHUNK 512
+#define PRINTF_INT_MAX 2147483647
 
 struct fmt_sink {
     char *buf;              /* chunk buffer (fd mode) or output string  */
@@ -73,6 +75,19 @@ static void sink_str(struct fmt_sink *s, const char *str, int len,
         sink_pad(s, ' ', pad);
 }
 
+/* A precision makes %s safe for length-delimited byte strings: do not inspect
+ * even one byte beyond the requested limit. */
+static int string_len(const char *str, int precision)
+{
+    int len = 0;
+
+    if (precision < 0)
+        return (int)strlen(str);
+    while (len < precision && str[len] != '\0')
+        len++;
+    return len;
+}
+
 /* Emit an unsigned value in the given base, honouring sign, width and
  * the '0'/'-' flags. Zero padding goes between the sign and digits. */
 static void sink_num(struct fmt_sink *s, unsigned long long v, unsigned base,
@@ -120,7 +135,7 @@ static void sink_num(struct fmt_sink *s, unsigned long long v, unsigned base,
 static void format_core(struct fmt_sink *s, const char *fmt, va_list ap)
 {
     while (*fmt) {
-        int zero = 0, left = 0, width = 0, longs = 0;
+        int zero = 0, left = 0, width = 0, precision = -1, longs = 0;
         char conv;
 
         if (*fmt != '%') {
@@ -148,6 +163,30 @@ static void format_core(struct fmt_sink *s, const char *fmt, va_list ap)
             fmt++;
         }
 
+        /* Precision. Only %s applies it today, but parse and consume it for
+         * every supported conversion so a .* cannot misalign later args. */
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;                 /* a bare '.' means zero */
+            if (*fmt == '*') {
+                precision = va_arg(ap, int);
+                fmt++;
+                if (precision < 0)
+                    precision = -1;         /* negative means omitted */
+            } else {
+                while (*fmt >= '0' && *fmt <= '9') {
+                    int digit = *fmt - '0';
+
+                    if (precision >
+                        (PRINTF_INT_MAX - digit) / 10)
+                        precision = PRINTF_INT_MAX;
+                    else
+                        precision = precision * 10 + digit;
+                    fmt++;
+                }
+            }
+        }
+
         /* length: l / ll (both 64-bit on x86-64) */
         while (*fmt == 'l') {
             longs++;
@@ -164,7 +203,7 @@ static void format_core(struct fmt_sink *s, const char *fmt, va_list ap)
             const char *str = va_arg(ap, const char *);
             if (str == 0)
                 str = "(null)";
-            sink_str(s, str, (int)strlen(str), width, left);
+            sink_str(s, str, string_len(str, precision), width, left);
             break;
         }
         case 'c': {
