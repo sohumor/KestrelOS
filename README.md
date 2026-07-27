@@ -1,6 +1,6 @@
 # KestrelOS
 
-A test to see how good Claude Fable 5 is, this took around 5-6 hours, over 120 agents and around 6 million tokens. Thanks to Marcy for giving me the idea, much love. 
+A test to see how good Claude Fable 5 is, this took around 5-6 hours, over 120 sub-agents and around 6 million tokens. Thanks to Marcy for giving me the idea, much love. 
 
 An operating system written from scratch: no third-party code, no GRUB, no
 ported libc, no borrowed drivers. Every byte from the boot sector to the
