@@ -1478,6 +1478,49 @@ static void test_table_row_index_capacity(void)
           (unsigned long)UINT16_MAX + 1UL);
 }
 
+static void test_table_row_boundary_runtime(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *tb = st_disp(t, CSS_DISPLAY_TABLE);
+    struct computed_style *tr = st_disp(t, CSS_DISPLAY_TABLE_ROW);
+    struct dom_node *tab, *overflow = 0;
+    struct lay_document *L;
+    struct lay_box *bt, *g, *r;
+    int i, rows = 0, exact = 1;
+
+    GROUP("tables: row indices remain unique through the uint16 boundary");
+
+    tab = el(t, 0, "table", tb);
+    for (i = 0; i <= LAY_MAX_ROWS; i++) {
+        struct dom_node *n = el(t, tab, "tr", tr);
+
+        if (i == LAY_MAX_ROWS)
+            overflow = n;
+    }
+
+    L = run(t, tab, 100, 100);
+    CHECK(L != 0);
+    bt = L ? box_nth(L, tab, 0) : 0;
+    for (g = bt ? bt->first_child : 0; g; g = g->next) {
+        if (g->kind != LAY_BOX_TABLE_ROWGROUP)
+            continue;
+        for (r = g->first_child; r; r = r->next) {
+            if (r->kind != LAY_BOX_TABLE_ROW)
+                continue;
+            if (rows > (int)UINT16_MAX || r->row != (uint16_t)rows)
+                exact = 0;
+            rows++;
+        }
+    }
+    CHECK_EQ(rows, LAY_MAX_ROWS);
+    CHECK(exact);
+    CHECK(L && (lay_truncated(L) & LAY_TRUNC_TABLE));
+    CHECK(L && box_nth(L, overflow, 0) == 0);
+    if (L)
+        lay_free(L);
+    tfree(t);
+}
+
 /* ================================================================== *
  * 7  replaced elements
  * ================================================================== */
@@ -2687,6 +2730,13 @@ int main(int argc, char **argv)
         test_list_value_continuation();
         test_table_row_index_capacity();
         test_fixed_inside_relative();
+        printf("\n%ld checks, %ld failures\n", checks, failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "--row-boundary") == 0) {
+        printf("layout table row-boundary gate\n"
+               "==============================\n\n");
+        test_table_row_boundary_runtime();
         printf("\n%ld checks, %ld failures\n", checks, failures);
         return failures ? 1 : 0;
     }
