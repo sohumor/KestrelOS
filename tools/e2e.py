@@ -818,8 +818,8 @@ def t_browser_text(h):
     h.send("browser -t -l /doc/test.html; "
            "echo BROWSER-LOCAL-STATUS-$?")
     h.expect("Kestrel Renderer Test", timeout=WALK_TIMEOUT)
-    h.expect("RENDERER-OK", timeout=WALK_TIMEOUT)
     h.expect("CSS-AUTHOR-OK", timeout=WALK_TIMEOUT)
+    h.expect("RENDERER-OK", timeout=WALK_TIMEOUT)
     h.expect("bullet-alpha", timeout=WALK_TIMEOUT)
     h.expect("PRE-BLOCK", timeout=WALK_TIMEOUT)
     h.expect("cell-body-b", timeout=WALK_TIMEOUT)
