@@ -831,7 +831,7 @@ def t_browser_text(h):
     # The previous match consumed the newline shared by these two lines.
     h.expect(r" *\[2\] http://example\.com/\n", regex=True,
              timeout=WALK_TIMEOUT)
-    h.expect(r"\nBROWSER-LOCAL-STATUS-0\n", regex=True,
+    h.expect(r"(?:^|\n)BROWSER-LOCAL-STATUS-0\n", regex=True,
              timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
@@ -851,7 +851,7 @@ def t_browser_home(h):
     h.expect("HTML parser", timeout=WALK_TIMEOUT)
     h.expect("Local pages", timeout=WALK_TIMEOUT)
     h.expect("TLS 1.3", timeout=WALK_TIMEOUT)
-    h.expect(r"\nBROWSER-HOME-STATUS-0\n", regex=True,
+    h.expect(r"(?:^|\n)BROWSER-HOME-STATUS-0\n", regex=True,
              timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
@@ -866,7 +866,7 @@ def t_browser_http_controlled(h):
     block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
     if HTTP_BODY_MARKER not in block:
         raise TimeoutError("controlled HTTP body marker was absent")
-    if not re.search(r"\nBROWSER-HTTP-STATUS-0\n", block):
+    if not re.search(r"(?:^|\n)BROWSER-HTTP-STATUS-0\n", block):
         raise TimeoutError("controlled HTTP did not report explicit status 0")
     wait_prompt(h, timeout=NET_TIMEOUT)
 
@@ -881,7 +881,8 @@ def t_browser_tls_certificate_negative(h):
     block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
     if TLS_NEGATIVE_BODY_MARKER in block:
         raise TimeoutError("certificate-negative server body was rendered")
-    if not re.search(r"\nBROWSER-TLS-NEG-STATUS-[1-9]\d*\n", block):
+    if not re.search(
+            r"(?:^|\n)BROWSER-TLS-NEG-STATUS-[1-9]\d*\n", block):
         raise TimeoutError("certificate-negative fetch did not exit nonzero")
     if not re.search(
             r"(?i)(certificate|trusted root|hostname|self[- ]signed|"
@@ -901,10 +902,11 @@ def t_browser_https(h):
     h.send("/bin/browser -t https://example.com/; "
            "echo BROWSER-HTTPS-STATUS-$?")
     block = h.capture_until(
-        r"\nBROWSER-HTTPS-STATUS-\d+\n", timeout=NET_TIMEOUT, regex=True)
+        r"(?:^|\n)BROWSER-HTTPS-STATUS-\d+\n",
+        timeout=NET_TIMEOUT, regex=True)
     if "Example Domain" not in block:
         raise TimeoutError("browser HTTPS success marker was absent")
-    if not re.search(r"\nBROWSER-HTTPS-STATUS-0\n", block):
+    if not re.search(r"(?:^|\n)BROWSER-HTTPS-STATUS-0\n", block):
         raise TimeoutError("browser HTTPS did not report explicit status 0")
     if re.search(r"(?i)\n(?:browser:|cannot load page|"
                  r"certificate(?: |:)|network unavailable|"
@@ -1057,6 +1059,35 @@ def selftest():
         return False
     finally:
         h.kill()
+
+    # A prior consuming assertion can eat the newline shared with the next
+    # standalone status line.  The status contract must accept both that
+    # buffer-start case and the ordinary newline-delimited case, while
+    # rejecting the same marker embedded in the shell's echoed command.
+    status = r"(?:^|\n)BROWSER-SELFTEST-STATUS-0\n"
+
+    at_start = Harness([])
+    at_start.buf = "preceding-line\nBROWSER-SELFTEST-STATUS-0\n"
+    at_start.expect("preceding-line\n", timeout=0)
+    at_start.expect(status, timeout=0, regex=True)
+
+    after_newline = Harness([])
+    after_newline.buf = "unconsumed-line\nBROWSER-SELFTEST-STATUS-0\n"
+    after_newline.expect(status, timeout=0, regex=True)
+
+    echoed = Harness([])
+    echoed.buf = (
+        "kestrel:/$ echo BROWSER-SELFTEST-STATUS-0\n"
+        "kestrel:/$ "
+    )
+    try:
+        echoed.expect(status, timeout=0, regex=True)
+    except TimeoutError:
+        pass
+    else:
+        print("FAIL selftest: browser status matched echoed command text")
+        return False
+
     print("PASS selftest")
     return True
 
