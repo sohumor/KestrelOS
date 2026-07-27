@@ -2,8 +2,10 @@
  *
  * Build and run (from the repo root, on Linux/WSL):
  *
- *   gcc -Wall -Wextra -O2 -fsanitize=address,undefined -Ilibweb \
- *       -DHTTP_HOST -o /tmp/test_http \
+ *   gcc -Wall -Wextra -Werror -O2 -g \
+ *       -fsanitize=address,undefined -fno-omit-frame-pointer -Ilibweb \
+ *       -DHTTP_HOST -DHTTP_TEST_WRAP_ALLOC -Wl,--wrap=malloc \
+ *       -o /tmp/test_http \
  *       tools/test_http.c libweb/http.c libweb/url.c libweb/cookie.c \
  *       libweb/cache.c && /tmp/test_http
  *
@@ -44,6 +46,41 @@
 
 static int g_checks, g_fails;
 static int g_port;
+
+#ifdef HTTP_TEST_WRAP_ALLOC
+/*
+ * Host-only, one-shot malloc fault injection.  The size filter and the
+ * number of allocations observed while armed make the selected allocation
+ * explicit; production needs no allocator hook or public test seam.
+ */
+void *__real_malloc(size_t size);
+
+static size_t g_fail_malloc_size;
+static unsigned long g_fail_malloc_seen;
+static int g_fail_malloc_armed;
+static int g_fail_malloc_fired;
+
+void *__wrap_malloc(size_t size)
+{
+    if (g_fail_malloc_armed) {
+        g_fail_malloc_seen++;
+        if (size == g_fail_malloc_size) {
+            g_fail_malloc_armed = 0;
+            g_fail_malloc_fired++;
+            return 0;
+        }
+    }
+    return __real_malloc(size);
+}
+
+static void fail_malloc_once(size_t size)
+{
+    g_fail_malloc_size = size;
+    g_fail_malloc_seen = 0;
+    g_fail_malloc_fired = 0;
+    g_fail_malloc_armed = 1;
+}
+#endif
 
 #define T(cond, msg)                                                          \
     do {                                                                      \
@@ -1777,16 +1814,105 @@ static void test_streaming(void)
     http_client_free(c);
 }
 
+#ifdef HTTP_TEST_WRAP_ALLOC
+static int arm_final_url_failure(void *u, const struct http_response *r)
+{
+    (void)r;
+    fail_malloc_once(*(const size_t *)u);
+    return 0;
+}
+#endif
+
+static void test_final_url_contract(void)
+{
+    struct http_client *c = http_client_new();
+    struct http_response r;
+    struct http_request rq;
+    char live[URL_MAX], fresh[URL_MAX];
+#ifdef HTTP_TEST_WRAP_ALLOC
+    int rc;
+#endif
+
+    section("final_url success and allocation-failure contract");
+
+    snprintf(live, sizeof(live),
+             "http://final-url-live-allocation-contract.test:%d/len", g_port);
+    memset(&rq, 0, sizeof(rq));
+    rq.url = live;
+    rq.flags = HTTP_F_NO_CACHE;
+    TI(http_fetch(c, &rq, &r), HTTP_OK,
+       "ordinary response completes successfully");
+    TS(r.final_url, live, "ordinary response owns the exact final URL");
+    http_response_free(&r);
+
+    snprintf(fresh, sizeof(fresh),
+             "http://final-url-cache-allocation-contract.test:%d/fresh",
+             g_port);
+    TI(http_get_url(c, fresh, &r), HTTP_OK, "fresh response populates cache");
+    TI(r.from_cache, 0, "cache seed came from the network");
+    TS(r.final_url, fresh, "cache seed owns the exact final URL");
+    http_response_free(&r);
+
+    TI(http_get_url(c, fresh, &r), HTTP_OK, "fresh cache lookup succeeds");
+    TI(r.from_cache, 1, "second response came from the fresh cache");
+    TS(r.final_url, fresh, "fresh-cache response owns the exact final URL");
+    http_response_free(&r);
+
+#ifdef HTTP_TEST_WRAP_ALLOC
+    {
+        size_t final_size = strlen(live) + 1;
+
+        memset(&rq, 0, sizeof(rq));
+        rq.url = live;
+        rq.flags = HTTP_F_NO_CACHE;
+        rq.on_headers = arm_final_url_failure;
+        rq.headers_user = &final_size;
+        rc = http_fetch(c, &rq, &r);
+        TI(g_fail_malloc_fired, 1,
+           "ordinary path injected one final-URL allocation failure");
+        TI(g_fail_malloc_seen, 1,
+           "ordinary final URL was the first malloc after headers");
+        TI(rc, HTTP_E_NOMEM, "ordinary final-URL OOM reports HTTP_E_NOMEM");
+        T(r.final_url == 0 && r.body == 0 && r.headers == 0,
+          "ordinary final-URL OOM releases the partial response");
+        http_response_free(&r);
+        T(r.final_url == 0 && r.body == 0 && r.headers == 0,
+          "ordinary failed response is safe to free again");
+    }
+
+    fail_malloc_once(strlen(fresh) + 1);
+    rc = http_get_url(c, fresh, &r);
+    TI(g_fail_malloc_fired, 1,
+       "cache path injected one final-URL allocation failure");
+    TI(g_fail_malloc_seen, 5,
+       "cache fill made four allocations before the final URL");
+    TI(rc, HTTP_E_NOMEM, "fresh-cache final-URL OOM reports HTTP_E_NOMEM");
+    T(r.final_url == 0 && r.body == 0 && r.headers == 0,
+      "fresh-cache final-URL OOM releases the filled response");
+    http_response_free(&r);
+    T(r.final_url == 0 && r.body == 0 && r.headers == 0,
+      "fresh-cache failed response is safe to free again");
+#else
+    printf("  allocation-failure checks require HTTP_TEST_WRAP_ALLOC\n");
+#endif
+
+    http_client_free(c);
+}
+
 /* ===================================================================== */
 
-int main(void)
+int main(int argc, char **argv)
 {
+    int final_url_only = argc > 1 && strcmp(argv[1], "--final-url") == 0;
+
     printf("libweb HTTP/URL/cookie/cache test harness\n");
 
-    test_url_basics();
-    test_url_encode();
-    test_url_rfc3986();
-    test_cookies_unit();
+    if (!final_url_only) {
+        test_url_basics();
+        test_url_encode();
+        test_url_rfc3986();
+        test_cookies_unit();
+    }
 
     if (start_server() != 0) {
         printf("\ncould not start the python3 test server; "
@@ -1799,17 +1925,22 @@ int main(void)
     http_register_scheme("http", sock_factory, 0);
     http_set_inflate(test_inflate);
 
-    test_framing();
-    test_errors();
-    test_redirects();
-    test_post();
-    test_encoding();
-    test_keepalive();
-    test_stale_pool();
-    test_request_options();
-    test_cookies_wire();
-    test_cache();
-    test_streaming();
+    if (final_url_only) {
+        test_final_url_contract();
+    } else {
+        test_framing();
+        test_errors();
+        test_redirects();
+        test_post();
+        test_encoding();
+        test_keepalive();
+        test_stale_pool();
+        test_request_options();
+        test_cookies_wire();
+        test_cache();
+        test_streaming();
+        test_final_url_contract();
+    }
 
     stop_server();
 
