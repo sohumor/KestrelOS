@@ -26,10 +26,15 @@ Usage:
 import atexit
 import argparse
 import collections
+import http.client
+import http.server
 import os
 import re
+import shutil
+import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -55,6 +60,12 @@ PKG_TIMEOUT = 90
 # handshake to the outside world still has to be given time to fail.
 NET_TIMEOUT = 45
 TAIL_LINES = 40
+
+# QEMU user networking exposes the host-side slirp endpoint here.  Browser
+# transport tests bind ephemeral host ports and reach them through this IP.
+QEMU_HOST = "10.0.2.2"
+HTTP_BODY_MARKER = "CONTROLLED-HTTP-BODY-OK"
+TLS_NEGATIVE_BODY_MARKER = "TLS-NEGATIVE-BODY-MUST-NOT-APPEAR"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
 # An escape sequence the current chunk ends in the middle of. QEMU hands us
@@ -169,6 +180,24 @@ class Harness:
                         % (patterns, self.eof))
                 self.cond.wait(min(remaining, 0.5))
 
+    def capture_until(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
+        """Consume through pattern and return the complete consumed block."""
+        rx = re.compile(pattern if regex else re.escape(pattern))
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while True:
+                m = rx.search(self.buf)
+                if m:
+                    block = self.buf[:m.end()]
+                    self.buf = self.buf[m.end():]
+                    return block
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self.eof:
+                    raise TimeoutError(
+                        "timeout capturing through %r (eof=%s)"
+                        % (pattern, self.eof))
+                self.cond.wait(min(remaining, 0.5))
+
     def send(self, line):
         self.send_raw(line + "\n")
 
@@ -199,6 +228,118 @@ class Harness:
                 pass
 
 
+class _QuietHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        # The certificate-negative client deliberately aborts during the
+        # handshake.  That expected TLS close is not a harness failure.
+        del request, client_address
+
+
+def _marker_handler(marker):
+    body = (
+        "<!doctype html><html><head><title>Kestrel controlled fixture</title>"
+        "</head><body><h1>%s</h1></body></html>" % marker
+    ).encode("ascii")
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=us-ascii")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            del fmt, args
+
+    return Handler
+
+
+class BrowserFixtureServers:
+    """Controlled plain HTTP and certificate-negative TLS 1.3 endpoints."""
+
+    def __init__(self):
+        self.temp = None
+        self.http = None
+        self.https = None
+        self.threads = []
+        self.http_url = None
+        self.https_url = None
+
+    @staticmethod
+    def _serve(server):
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return thread
+
+    def start(self):
+        openssl = shutil.which("openssl")
+        if not openssl:
+            raise RuntimeError("openssl is required for browser TLS E2E")
+
+        self.temp = tempfile.TemporaryDirectory(
+            prefix="kestrel-browser-e2e-")
+        cert = os.path.join(self.temp.name, "negative-cert.pem")
+        key = os.path.join(self.temp.name, "negative-key.pem")
+        cmd = [
+            openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-sha256", "-days", "2", "-set_serial", "1",
+            "-subj", "/CN=kestrel-negative.invalid",
+            "-addext", "subjectAltName=DNS:kestrel-negative.invalid",
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
+            "-keyout", key, "-out", cert,
+        ]
+        made = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True)
+        if made.returncode != 0:
+            raise RuntimeError("cannot generate negative TLS certificate: %s"
+                               % made.stderr.strip())
+
+        self.http = _QuietHTTPServer(
+            ("0.0.0.0", 0), _marker_handler(HTTP_BODY_MARKER))
+        self.https = _QuietHTTPServer(
+            ("0.0.0.0", 0), _marker_handler(TLS_NEGATIVE_BODY_MARKER))
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_3
+        context.maximum_version = ssl.TLSVersion.TLSv1_3
+        context.load_cert_chain(cert, key)
+        self.https.socket = context.wrap_socket(
+            self.https.socket, server_side=True)
+
+        self.threads.append(self._serve(self.http))
+        self.threads.append(self._serve(self.https))
+        self.http_url = "http://%s:%d/plain" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.https_url = "https://%s:%d/negative" % (
+            QEMU_HOST, self.https.server_address[1])
+        print("browser fixtures: plain=%s tls13-negative=%s "
+              "cert-cn=kestrel-negative.invalid"
+              % (self.http_url, self.https_url))
+        return self
+
+    def close(self):
+        for server in (self.http, self.https):
+            if server:
+                server.shutdown()
+                server.server_close()
+        for thread in self.threads:
+            thread.join(timeout=5)
+        self.threads = []
+        self.http = None
+        self.https = None
+        if self.temp:
+            self.temp.cleanup()
+            self.temp = None
+
+
 PROMPT = "kestrel:"
 DOTTED_QUAD = r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"
 
@@ -214,6 +355,7 @@ MAX_LOGIN_TRIES = 3
 # The shell grew redirection before it grew pipes, so the tests that need
 # one have to ask rather than assume.
 have_pipes = False
+browser_fixtures = None
 
 
 def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
@@ -673,9 +815,11 @@ def t_browser_text(h):
     it does prove that the styled document remains readable and that both
     relative and absolute links survive the shared pipeline.
     """
-    h.send("browser -t -l /doc/test.html")
+    h.send("browser -t -l /doc/test.html; "
+           "echo BROWSER-LOCAL-STATUS-$?")
     h.expect("Kestrel Renderer Test", timeout=WALK_TIMEOUT)
     h.expect("RENDERER-OK", timeout=WALK_TIMEOUT)
+    h.expect("CSS-AUTHOR-OK", timeout=WALK_TIMEOUT)
     h.expect("bullet-alpha", timeout=WALK_TIMEOUT)
     h.expect("PRE-BLOCK", timeout=WALK_TIMEOUT)
     h.expect("cell-body-b", timeout=WALK_TIMEOUT)
@@ -686,6 +830,8 @@ def t_browser_text(h):
              timeout=WALK_TIMEOUT)
     # The previous match consumed the newline shared by these two lines.
     h.expect(r" *\[2\] http://example\.com/\n", regex=True,
+             timeout=WALK_TIMEOUT)
+    h.expect(r"\nBROWSER-LOCAL-STATUS-0\n", regex=True,
              timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
@@ -700,12 +846,48 @@ def t_browser_home(h):
     """
     # Short phrases only: the renderer wraps at 78 columns, so anything
     # long enough to straddle a line break would match nothing.
-    h.send("browser -t /doc/home.html")
+    h.send("browser -t /doc/home.html; echo BROWSER-HOME-STATUS-$?")
     h.expect("KestrelOS", timeout=WALK_TIMEOUT)
     h.expect("HTML parser", timeout=WALK_TIMEOUT)
     h.expect("Local pages", timeout=WALK_TIMEOUT)
-    h.expect("no TLS", timeout=WALK_TIMEOUT)
+    h.expect("TLS 1.3", timeout=WALK_TIMEOUT)
+    h.expect(r"\nBROWSER-HOME-STATUS-0\n", regex=True,
+             timeout=WALK_TIMEOUT)
     wait_prompt(h, timeout=WALK_TIMEOUT)
+
+
+def t_browser_http_controlled(h):
+    """Plain HTTP through /bin/browser against a deterministic host page."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    end = "BROWSER-HTTP-END"
+    h.send("/bin/browser -t %s; echo BROWSER-HTTP-STATUS-$?; echo %s"
+           % (browser_fixtures.http_url, end))
+    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
+    if HTTP_BODY_MARKER not in block:
+        raise TimeoutError("controlled HTTP body marker was absent")
+    if not re.search(r"\nBROWSER-HTTP-STATUS-0\n", block):
+        raise TimeoutError("controlled HTTP did not report explicit status 0")
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+
+def t_browser_tls_certificate_negative(h):
+    """A parseable self-signed TLS 1.3 certificate must be rejected."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    end = "BROWSER-TLS-NEG-END"
+    h.send("/bin/browser -t %s; echo BROWSER-TLS-NEG-STATUS-$?; echo %s"
+           % (browser_fixtures.https_url, end))
+    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
+    if TLS_NEGATIVE_BODY_MARKER in block:
+        raise TimeoutError("certificate-negative server body was rendered")
+    if not re.search(r"\nBROWSER-TLS-NEG-STATUS-[1-9]\d*\n", block):
+        raise TimeoutError("certificate-negative fetch did not exit nonzero")
+    if not re.search(
+            r"(?i)(certificate|trusted root|hostname|self[- ]signed|"
+            r"does not match)", block):
+        raise TimeoutError("TLS failure was not certificate/hostname-specific")
+    wait_prompt(h, timeout=NET_TIMEOUT)
 
 
 def t_browser_https(h):
@@ -716,23 +898,19 @@ def t_browser_https(h):
     for an error as well as the success marker so a readable fast failure
     is reported immediately instead of burning the whole timeout.
     """
-    success = r"\n[^\n]*Example Domain[^\n]*\n"
-    error = (r"(?i)\n(?:browser:|cannot load page|tls(?: |:)|"
-             r"certificate(?: |:)|network unavailable|dns lookup failed|"
-             r"cannot connect)[^\n]*\n")
-    nonzero = r"\n\[exit [1-9]\d*\][^\n]*\n"
-
-    h.send("/bin/browser -t https://example.com/")
-    got = h.expect_any([success, error, nonzero],
-                       timeout=NET_TIMEOUT, regex=True)
-    if got != success:
-        raise TimeoutError("browser HTTPS fetch failed: matched %r" % got)
-
-    # A success marker followed by an error is still a failed navigation.
-    got = h.expect_any([SHELL_PROMPT, error, nonzero],
-                       timeout=NET_TIMEOUT, regex=True)
-    if got != SHELL_PROMPT:
-        raise TimeoutError("browser HTTPS fetch ended with error: %r" % got)
+    h.send("/bin/browser -t https://example.com/; "
+           "echo BROWSER-HTTPS-STATUS-$?")
+    block = h.capture_until(
+        r"\nBROWSER-HTTPS-STATUS-\d+\n", timeout=NET_TIMEOUT, regex=True)
+    if "Example Domain" not in block:
+        raise TimeoutError("browser HTTPS success marker was absent")
+    if not re.search(r"\nBROWSER-HTTPS-STATUS-0\n", block):
+        raise TimeoutError("browser HTTPS did not report explicit status 0")
+    if re.search(r"(?i)\n(?:browser:|cannot load page|"
+                 r"certificate(?: |:)|network unavailable|"
+                 r"dns lookup failed|cannot connect)[^\n]*\n", block):
+        raise TimeoutError("browser HTTPS output also contained a load error")
+    wait_prompt(h, timeout=NET_TIMEOUT)
 
 
 def t_tcp_curl(h):
@@ -793,6 +971,8 @@ TESTS = [
     ("permissions", t_permissions),
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
+    ("browser-http-controlled", t_browser_http_controlled),
+    ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),
     ("kpkg-list", t_kpkg_list),
     ("kpkg-install", t_kpkg_install),
@@ -865,6 +1045,11 @@ def selftest():
         h.send("echo hello world")
         h.expect("hello world", timeout=10)
         h.expect_any([r"kestrel:[^\n]*\$"], timeout=10, regex=True)
+        h.send("echo capture-marker")
+        block = h.capture_until(r"capture-marker\n", timeout=10, regex=True)
+        if "capture-marker" not in block:
+            raise TimeoutError("capture_until lost the matched output")
+        h.expect_any([r"kestrel:[^\n]*\$"], timeout=10, regex=True)
         h.send("quit")
     except TimeoutError as e:
         print("FAIL selftest: %s" % e)
@@ -876,7 +1061,54 @@ def selftest():
     return True
 
 
+def fixture_selftest():
+    """Prove both controlled browser endpoints without booting an image."""
+    fixtures = None
+    try:
+        fixtures = BrowserFixtureServers()
+        fixtures.start()
+        plain = http.client.HTTPConnection(
+            "127.0.0.1", fixtures.http.server_address[1], timeout=5)
+        plain.request("GET", "/plain")
+        body = plain.getresponse().read().decode("ascii")
+        plain.close()
+        if HTTP_BODY_MARKER not in body:
+            raise RuntimeError("plain HTTP marker missing")
+
+        strict = http.client.HTTPSConnection(
+            "127.0.0.1", fixtures.https.server_address[1], timeout=5)
+        try:
+            strict.request("GET", "/negative")
+            strict.getresponse().read()
+        except ssl.SSLCertVerificationError:
+            pass
+        else:
+            raise RuntimeError("strict TLS accepted the self-signed cert")
+        finally:
+            strict.close()
+
+        insecure = http.client.HTTPSConnection(
+            "127.0.0.1", fixtures.https.server_address[1], timeout=5,
+            context=ssl._create_unverified_context())
+        insecure.request("GET", "/negative")
+        body = insecure.getresponse().read().decode("ascii")
+        insecure.close()
+        if TLS_NEGATIVE_BODY_MARKER not in body:
+            raise RuntimeError("TLS negative body marker missing")
+    except (OSError, RuntimeError, ssl.SSLError) as e:
+        print("FAIL fixture-selftest: %s" % e)
+        return False
+    finally:
+        if fixtures:
+            fixtures.close()
+    print("PASS fixture-selftest: HTTP marker served; TLS 1.3 strict "
+          "verification rejected; insecure control body served")
+    return True
+
+
 def main():
+    global browser_fixtures
+
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
                     help="run boot + prompt tests only")
@@ -884,6 +1116,8 @@ def main():
                     help="list tests and exit")
     ap.add_argument("--selftest", action="store_true",
                     help="test harness plumbing without an OS image")
+    ap.add_argument("--fixtures-selftest", action="store_true",
+                    help="test controlled HTTP/TLS servers without an image")
     args = ap.parse_args()
 
     if args.list:
@@ -893,22 +1127,42 @@ def main():
 
     if args.selftest:
         return 0 if selftest() else 1
+    if args.fixtures_selftest:
+        return 0 if fixture_selftest() else 1
 
     if not os.path.exists("build/os.img"):
         print("error: build/os.img not found (run make first)")
         return 1
 
     tests = TESTS[:SMOKE_TESTS] if args.smoke else TESTS
+    fixtures = None
+    if not args.smoke:
+        try:
+            fixtures = BrowserFixtureServers()
+            fixtures.start()
+            browser_fixtures = fixtures
+        except (OSError, RuntimeError, ssl.SSLError) as e:
+            print("error: cannot start controlled browser fixtures: %s" % e)
+            if fixtures:
+                fixtures.close()
+            return 1
+
     h = Harness(QEMU_CMD)
     try:
         h.start()
     except FileNotFoundError:
         print("error: qemu-system-x86_64 not found in PATH")
+        if fixtures:
+            fixtures.close()
+            browser_fixtures = None
         return 1
     try:
         results = run_tests(h, tests)
     finally:
         h.kill()
+        if fixtures:
+            fixtures.close()
+            browser_fixtures = None
     return 0 if summarize(results) else 1
 
 
