@@ -193,8 +193,8 @@ $(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
 $(BUILD)/apps/browser: $(BUILD)/apps/browser.o $(BUILD)/apps/html.o $(CRT0) \
                        $(LIBC_A) $(LIBGUI_A) $(BROWSER_ARCHIVES) apps/user.ld
 	$(USER_LINK) $(CRT0) $(BUILD)/apps/browser.o $(BUILD)/apps/html.o \
-	  $(LIBGUI_A) $(BUILD)/libweb.a $(BUILD)/libjs.a $(BUILD)/libimg.a \
-	  $(BUILD)/libtls.a $(BUILD)/libz.a $(LIBC_A)
+	  $(BUILD)/libweb.a $(BUILD)/libjs.a $(BUILD)/libimg.a \
+	  $(BUILD)/libtls.a $(BUILD)/libz.a $(LIBGUI_A) $(LIBC_A)
 
 # tlstest is the only non-browser program that needs the TLS stack.
 $(BUILD)/apps/tlstest: $(BUILD)/apps/tlstest.o $(CRT0) $(LIBC_A) \
@@ -290,4 +290,6 @@ clean:
 
 -include $(wildcard $(BUILD)/modules/*.d) \
          $(wildcard $(BUILD)/kernel/*.d) $(wildcard $(BUILD)/libc/*.d) \
+         $(wildcard $(BUILD)/libgui/*.d) \
+         $(foreach l,$(BROWSER_LIBS),$(wildcard $(BUILD)/$(l)/*.d)) \
          $(wildcard $(BUILD)/apps/*.d)
