@@ -80,6 +80,81 @@ translated/relatively positioned ancestors. Backend may edit only
 a failing focused case. Frontend has no ownership in this triage unless QA
 isolates an error in `libweb/paint.c` or `libweb/paint.h`.
 
+## Triage decision 2: layout fixtures and target stack
+
+The first layout/paint build passed GCC 15.2 `-Werror`. Its ASan/UBSan run
+completed 3,000 randomized documents with zero sanitizer and leak findings,
+but exited 1 with 255 checks and five assertion failures. Those failures are
+not permission for production edits.
+
+QA's focused reduction classifies four assertions as harness/spec errors:
+
+- The left-float fixture supplies only 47 body-font characters
+  (376 measured pixels). With a 100-pixel float in a 400-pixel block, the
+  remaining 300-pixel line width produces two 16-pixel lines, not the three
+  needed to reach `y = 48`. A null “line below the float” is therefore
+  expected for that input.
+- An ordinary following block may begin at `y = 32` while the float still
+  exists; the block box is laid out normally and its line content avoids the
+  float. Only `clear: left` requires the block itself to begin at `y = 48`.
+- In the right-float case the parent itself establishes the inline formatting
+  context, so an extra anonymous block wrapper is not required.
+- The paint fixture's first child's top margin collapses through its
+  borderless, padding-free parent. Pixel `(5,5)` therefore remains the
+  explicitly white canvas; it is not evidence that paint dropped the parent's
+  background.
+
+The rendered-article fixture has a related content-box error: a body with
+`width: 100%` plus horizontal padding is wider than the viewport, so its own
+right-side clipping/overflow cannot be used to reject layout or paint. QA must
+use an auto content width (or otherwise account for the padding in the content
+box) before visual acceptance.
+
+Ownership and order are exact:
+
+1. **QA alone edits `tools/test_layout.c`.** It corrects the four
+   spec-invalid fixtures/assertions without deleting their coverage:
+   float tests must still prove shortened line widths, content avoidance,
+   full width below the float, right-float placement, and explicit `clear`;
+   paint tests must isolate background painting from margin collapse, while a
+   separate assertion retains the collapse behavior. QA also corrects the
+   article body width-plus-padding fixture and regenerates both wide and
+   narrow artifacts.
+2. QA reruns the 3,000-document ASan/UBSan suite. Done means zero functional
+   failures, zero ASan findings, zero UBSan findings, zero leaks, and the
+   original geometry/paint coverage replaced with equivalent spec-grounded
+   checks rather than weakened or removed.
+3. Stack safety uses a **separate target-like non-ASan run**. Addresses of
+   local `char here` probes are not contiguous under ASan fake-stack/redzone
+   instrumentation, so the reported 936,976-byte pathological and
+   1,095,696-byte large-page figures are invalid as literal target stack use.
+   The non-ASan exact `-O2` measurement is 49,193 bytes for the capped
+   pathological case and 1,577 bytes for the large page. QA owns the separate
+   mode and reports both its command and result. The sanitizer run remains the
+   memory-safety gate but does not assert its address-difference stack figure.
+   Compiler `-fstack-usage` evidence is retained alongside the dynamic result;
+   its observed largest static frame is 2,080 bytes.
+4. The 48 KiB target gate remains strict. If QA's corrected, repeatable
+   non-ASan mode still reports 49,193 bytes, **Backend alone may edit
+   `libweb/layout.c`** to reduce at least the 41-byte overage with reasonable
+   headroom, or reduce the capped recursion depth with documented degradation.
+   Backend does not edit the harness, headers, arena, or paint for this fix.
+   Done means the focused pathological case stays safely truncated
+   (`LAY_TRUNC_DEPTH`, 97 or fewer generated boxes), measures below 49,152
+   bytes, and the complete sanitizer and non-sanitizer suites both pass.
+5. **Frontend makes no production edit in this triage.** `libweb/paint.c` and
+   `libweb/paint.h` stay frozen. Frontend visually reviews QA's regenerated
+   wide and narrow PPMs. Only a product defect that remains after the
+   corrected non-collapsing background fixture and is reproduced by QA can
+   open a later frontend-owned paint change.
+
+The accepted baseline numbers remain recorded for comparison: 11,002 nodes to
+26,562 boxes, 8,991 KiB layout memory, 58.2 ms layout, 8.5 ms full paint,
+3,000 fuzz documents with a worst case of 526 boxes in 0.99 seconds, and a
+4,000-deep input degrading with truncation `0x02` to 97 boxes. These are
+evidence, not acceptance while corrected assertions or the strict stack gate
+remain outstanding.
+
 ## Contracts
 
 ### TLS and HTTP transport
