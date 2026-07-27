@@ -949,29 +949,38 @@ static void m_record(struct mock *m, int type, const uint8_t *data,
     m_send(m, out, 5 + body);
 }
 
+static int m_read_more(struct mock *m)
+{
+    size_t off;
+    ssize_t n;
+
+    if (m->rlen < 0)
+        return -1;
+    off = (size_t)m->rlen;
+    if (off >= sizeof(m->rbuf))
+        return -1;
+    n = read(m->fd, m->rbuf + off, sizeof(m->rbuf) - off);
+    if (n <= 0)
+        return -1;
+    m->rlen += (int)n;
+    return 0;
+}
+
 /* Read one record from the client into m->pt. Returns 0 or -1. */
 static int m_read_record(struct mock *m)
 {
     for (;;) {
         int len, type;
-        while (m->rlen < 5) {
-            ssize_t n = read(m->fd, m->rbuf + m->rlen,
-                             sizeof(m->rbuf) - (size_t)m->rlen);
-            if (n <= 0)
+        while (m->rlen < 5)
+            if (m_read_more(m) < 0)
                 return -1;
-            m->rlen += (int)n;
-        }
         type = m->rbuf[0];
         len = (m->rbuf[3] << 8) | m->rbuf[4];
         if (len < 0 || len > 18000)
             return -1;
-        while (m->rlen < 5 + len) {
-            ssize_t n = read(m->fd, m->rbuf + m->rlen,
-                             sizeof(m->rbuf) - (size_t)m->rlen);
-            if (n <= 0)
+        while (m->rlen < 5 + len)
+            if (m_read_more(m) < 0)
                 return -1;
-            m->rlen += (int)n;
-        }
         if (type == M_CT_CCS) {
             memmove(m->rbuf, m->rbuf + 5 + len, (size_t)(m->rlen - 5 - len));
             m->rlen -= 5 + len;
@@ -2384,22 +2393,144 @@ static void test_transport_factory(void)
     printf("  transport failure message: %s\n", tls_last_transport_error());
 }
 
+struct counted_lower {
+    int fd;
+    int closes;
+};
+
+static int counted_lower_read(void *ctx, void *buf, int len)
+{
+    struct counted_lower *p = ctx;
+    ssize_t n = read(p->fd, buf, (size_t)len);
+
+    return n < 0 ? -1 : (int)n;
+}
+
+static int counted_lower_write(void *ctx, const void *buf, int len)
+{
+    struct counted_lower *p = ctx;
+    ssize_t n = write(p->fd, buf, (size_t)len);
+
+    return n < 0 ? -1 : (int)n;
+}
+
+static void counted_lower_close(void *ctx)
+{
+    struct counted_lower *p = ctx;
+
+    p->closes++;
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+}
+
+static pid_t counted_lower_mock(const struct mock_cfg *cfg,
+                                struct counted_lower *p)
+{
+    int fd[2];
+    pid_t pid;
+
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, fd) < 0)
+        return -1;
+    pid = fork();
+    if (pid == 0) {
+        close(fd[0]);
+        mock_server(fd[1], cfg);
+        close(fd[1]);
+        _exit(0);
+    }
+    if (pid < 0) {
+        close(fd[0]);
+        close(fd[1]);
+        return -1;
+    }
+    close(fd[1]);
+    p->fd = fd[0];
+    p->closes = 0;
+    return pid;
+}
+
+static void counted_lower_reap(pid_t pid, struct counted_lower *p)
+{
+    if (p->fd >= 0) {
+        close(p->fd);
+        p->fd = -1;
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, 0, 0);
+}
+
+/* tls_client borrows a caller-opened lower transport during the handshake.
+ * A successful connection takes ownership and closes it exactly once;
+ * a failed handshake must leave it open for its caller. */
+static void test_client_transport_ownership(void)
+{
+    struct mock_cfg cfg;
+    struct tls_options o;
+    struct tls_transport t;
+    struct tls_error err;
+    struct tls_conn *c;
+    struct counted_lower p;
+    pid_t pid;
+
+    section("tls_client lower-transport ownership");
+    opt_defaults(&o);
+    memset(&t, 0, sizeof(t));
+    t.ctx = &p;
+    t.read = counted_lower_read;
+    t.write = counted_lower_write;
+    t.close = counted_lower_close;
+
+    mock_defaults(&cfg);
+    cfg.reply_app = 0;
+    pid = counted_lower_mock(&cfg, &p);
+    T(pid > 0, "the successful ownership mock started");
+    if (pid > 0) {
+        c = tls_client(&t, "localhost", &o, &err);
+        T(c != 0, "tls_client completed over a caller transport");
+        if (c) {
+            TI(p.closes, 0, "the lower stays open while TLS is live");
+            tls_close(c);
+            TI(p.closes, 1, "tls_close closes the owned lower exactly once");
+        }
+        counted_lower_reap(pid, &p);
+    }
+
+    mock_defaults(&cfg);
+    cfg.reply_app = 0;
+    cfg.corrupt_finished = 1;
+    pid = counted_lower_mock(&cfg, &p);
+    T(pid > 0, "the failing ownership mock started");
+    if (pid > 0) {
+        c = tls_client(&t, "localhost", &o, &err);
+        T(c == 0, "tls_client rejected the bad handshake");
+        if (c)
+            tls_close(c);
+        TI(p.closes, 0, "a failed handshake leaves the lower caller-owned");
+        counted_lower_reap(pid, &p);
+    }
+}
+
 /* ===================================================================== *
  * main                                                                  *
  * ===================================================================== */
 
 static void usage(void)
 {
-    printf("usage: test_tls [-v] [fetch <host> [port] [path]]\n");
+    printf("usage: test_tls [-v] [ownership|fetch <host> [port] [path]]\n");
 }
 
 int main(int argc, char **argv)
 {
     int i;
+    int ownership_only = 0;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) {
             g_verbose = 1;
+        } else if (strcmp(argv[i], "ownership") == 0) {
+            ownership_only = 1;
         } else if (strcmp(argv[i], "fetch") == 0) {
             const char *host = i + 1 < argc ? argv[i + 1] : "example.com";
             int port = i + 2 < argc ? atoi(argv[i + 2]) : 443;
@@ -2443,6 +2574,23 @@ int main(int argc, char **argv)
         g_have_openssl = 0;
     }
 
+    if (ownership_only) {
+        if (!g_have_openssl) {
+            printf("openssl is required for the ownership test\n");
+            return 1;
+        }
+        g_ca = store_from(WORK "/ca.pem");
+        if (!g_ca) {
+            printf("could not build a trust store from the test CA\n");
+            return 1;
+        }
+        test_client_transport_ownership();
+        store_free(g_ca);
+        tls_default_store_free();
+        printf("\n%d checks, %d failures\n", g_checks, g_fails);
+        return g_fails ? 1 : 0;
+    }
+
     test_misc();
     if (g_have_openssl) {
         g_ca = store_from(WORK "/ca.pem");
@@ -2457,6 +2605,7 @@ int main(int argc, char **argv)
         test_negative_protocol();
         test_negative_certs();
         test_transport_factory();
+        test_client_transport_ownership();
         test_fuzz();
         store_free(g_ca);
     } else {
