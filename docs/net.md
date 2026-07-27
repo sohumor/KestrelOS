@@ -13,7 +13,9 @@ resolver.
 | `kernel/rtl8139.c`, `kernel/include/rtl8139.h` | RTL8139 driver: reset, RX ring, 4 TX descriptors, IRQ + polling |
 | `kernel/e1000.c`, `kernel/include/e1000.h` | Intel 8254x ("e1000") driver: MMIO registers, RX/TX descriptor rings, IRQ + polling |
 | `kernel/net.c`, `kernel/include/net.h` | Ethernet demux, ARP (cache + resolve + reply), IPv4 build/parse, ICMP echo both directions |
+| `kernel/dhcp.c`, `kernel/include/dhcp.h` | One-shot DHCP client: DISCOVER/OFFER/REQUEST/ACK auto-configuration |
 | `kernel/udp.c` | UDP send/recv, 16 port bindings with 8-packet queues |
+| `kernel/tcp.c`, `kernel/include/tcp.h` | TCP state machine, retransmission, sliding window, HTTP client foundation |
 | `kernel/dns.c` | A-record resolver (compression-pointer aware) + dotted-quad parsing |
 
 ## Architecture
@@ -88,9 +90,7 @@ disabled ("net: no NIC found").
 
 ## Configuration
 
-Static, set in `net_init()` to the QEMU user-mode ("slirp") defaults:
-
-* IP `10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`
+Dynamic DHCP configuration on boot with fallback to QEMU / VirtualBox NAT static defaults (`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`).
 
 All addresses in the API are big-endian (network order) `uint32_t`.
 
@@ -115,15 +115,16 @@ ping/UDP/DNS works out of the box.
 ## What works
 
 * PCI bus scan with device log at boot
+* RTL8139 and Intel e1000 (82540EM) NIC support (QEMU & VirtualBox)
+* Automatic IP configuration via DHCP with static fallback
 * Outbound ICMP ping (`icmp_ping`) to the gateway/DNS or beyond
 * Answering inbound ICMP echo requests and ARP requests
 * UDP send/recv with port queues
-* DNS A-record resolution against 10.0.2.3
+* DNS A-record resolution
+* Full client TCP stack and HTTP/1.1 client
 
 ## Limits
 
-* No TCP.
-* No DHCP — addressing is hardcoded to QEMU slirp defaults.
 * No IP fragmentation/reassembly; frames limited to a 1500-byte MTU.
 * No checksum on transmitted UDP (checksum 0 — allowed for IPv4).
 * One NIC, one IP; RTL8139 or e1000 (RTL8139 wins if both are present).

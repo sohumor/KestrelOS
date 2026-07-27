@@ -66,6 +66,22 @@ TAIL_LINES = 40
 QEMU_HOST = "10.0.2.2"
 HTTP_BODY_MARKER = "CONTROLLED-HTTP-BODY-OK"
 TLS_NEGATIVE_BODY_MARKER = "TLS-NEGATIVE-BODY-MUST-NOT-APPEAR"
+TLS_NEGATIVE_REPETITIONS = 10
+
+TLS_NEGATIVE_EXIT_RE = re.compile(r"(?m)^\[exit (-?\d+)\]$")
+TLS_NEGATIVE_STATUS_RE = re.compile(
+    r"(?m)^BROWSER-TLS-NEG-STATUS-(-?\d+)$")
+TLS_NEGATIVE_DIAGNOSTIC_RE = re.compile(
+    r"(?i)(certificate|host ?name|trusted root|self[- ]signed|"
+    r"does not match)")
+TLS_NEGATIVE_REASON_RE = re.compile(
+    r"(?i)(kestrel-negative\.invalid|trusted root|self[- ]signed|"
+    r"untrusted|not trusted|unknown issuer|"
+    r"certificate chain[^\n]{0,48}(?:trust|root|issuer))")
+TLS_NEGATIVE_FORBIDDEN_RE = re.compile(
+    r"(?i)(uproc:|\bfault\b|\bexception\b|kernel[ -]+panic|"
+    r"\bpanic\b|\[exit -1\]|BROWSER-TLS-NEG-STATUS--1|"
+    r"\bno error\b)")
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
 # An escape sequence the current chunk ends in the middle of. QEMU hands us
@@ -232,6 +248,20 @@ class _QuietHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    def __init__(self, *args, **kwargs):
+        self._get_count = 0
+        self._get_count_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    def record_get(self):
+        with self._get_count_lock:
+            self._get_count += 1
+
+    @property
+    def get_count(self):
+        with self._get_count_lock:
+            return self._get_count
+
     def handle_error(self, request, client_address):
         # The certificate-negative client deliberately aborts during the
         # handshake.  That expected TLS close is not a harness failure.
@@ -248,6 +278,7 @@ def _marker_handler(marker):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
+            self.server.record_get()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=us-ascii")
             self.send_header("Content-Length", str(len(body)))
@@ -806,6 +837,41 @@ def t_kpkg_verify(h):
 # ---- browser ----------------------------------------------------------
 
 
+def _validate_tls_negative_block(block, attempt):
+    """Validate one complete controlled certificate-rejection transcript."""
+    if TLS_NEGATIVE_BODY_MARKER in block:
+        raise TimeoutError(
+            "certificate-negative attempt %d rendered the server body"
+            % attempt)
+
+    forbidden = TLS_NEGATIVE_FORBIDDEN_RE.search(block)
+    if forbidden:
+        raise TimeoutError(
+            "certificate-negative attempt %d contained forbidden output %r"
+            % (attempt, forbidden.group(0)))
+
+    exits = TLS_NEGATIVE_EXIT_RE.findall(block)
+    if exits != ["1"]:
+        raise TimeoutError(
+            "certificate-negative attempt %d shell exits were %r, not ['1']"
+            % (attempt, exits))
+
+    statuses = TLS_NEGATIVE_STATUS_RE.findall(block)
+    if statuses != ["1"]:
+        raise TimeoutError(
+            "certificate-negative attempt %d status lines were %r, "
+            "not ['1']" % (attempt, statuses))
+
+    for line in block.splitlines():
+        if (TLS_NEGATIVE_DIAGNOSTIC_RE.search(line) and
+                TLS_NEGATIVE_REASON_RE.search(line)):
+            return line.strip()
+    raise TimeoutError(
+        "certificate-negative attempt %d lacked a certificate/hostname "
+        "diagnostic containing the SAN or an equivalent trust reason"
+        % attempt)
+
+
 def t_browser_text(h):
     """The browser pipeline, run over a styled local page in text mode.
 
@@ -866,29 +932,80 @@ def t_browser_http_controlled(h):
     block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
     if HTTP_BODY_MARKER not in block:
         raise TimeoutError("controlled HTTP body marker was absent")
-    if not re.search(r"(?:^|\n)BROWSER-HTTP-STATUS-0\n", block):
-        raise TimeoutError("controlled HTTP did not report explicit status 0")
+    statuses = re.findall(
+        r"(?m)^BROWSER-HTTP-STATUS-(-?\d+)$", block)
+    if statuses != ["0"]:
+        raise TimeoutError(
+            "controlled HTTP status lines were %r, not ['0']" % statuses)
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
 def t_browser_tls_certificate_negative(h):
-    """A parseable self-signed TLS 1.3 certificate must be rejected."""
+    """Reject a parseable self-signed TLS 1.3 certificate ten times."""
     if not browser_fixtures:
         raise TimeoutError("controlled browser servers were not started")
-    end = "BROWSER-TLS-NEG-END"
-    h.send("/bin/browser -t %s; echo BROWSER-TLS-NEG-STATUS-$?; echo %s"
-           % (browser_fixtures.https_url, end))
-    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
-    if TLS_NEGATIVE_BODY_MARKER in block:
-        raise TimeoutError("certificate-negative server body was rendered")
-    if not re.search(
-            r"(?:^|\n)BROWSER-TLS-NEG-STATUS-[1-9]\d*\n", block):
-        raise TimeoutError("certificate-negative fetch did not exit nonzero")
-    if not re.search(
-            r"(?i)(certificate|trusted root|hostname|self[- ]signed|"
-            r"does not match)", block):
-        raise TimeoutError("TLS failure was not certificate/hostname-specific")
-    wait_prompt(h, timeout=NET_TIMEOUT)
+    initial_gets = browser_fixtures.https.get_count
+    if initial_gets != 0:
+        raise TimeoutError(
+            "certificate-negative HTTPS handler began with %d GET requests"
+            % initial_gets)
+
+    for attempt in range(1, TLS_NEGATIVE_REPETITIONS + 1):
+        begin = "BROWSER-TLS-NEG-BEGIN-%02d" % attempt
+        end = "BROWSER-TLS-NEG-END-%02d" % attempt
+        h.send("echo %s; /bin/browser -t %s; "
+               "echo BROWSER-TLS-NEG-STATUS-$?; echo %s"
+               % (begin, browser_fixtures.https_url, end))
+        block = h.capture_until(
+            r"\n%s\n" % re.escape(end),
+            timeout=NET_TIMEOUT, regex=True)
+        # Capture rather than merely consume the prompt so a late process or
+        # kernel fault between the end marker and prompt is also inspected.
+        block += h.capture_until(
+            SHELL_PROMPT, timeout=NET_TIMEOUT, regex=True)
+
+        begins = list(re.finditer(
+            r"(?m)^%s$" % re.escape(begin), block))
+        ends = re.findall(r"(?m)^%s$" % re.escape(end), block)
+        if len(begins) != 1 or len(ends) != 1:
+            raise TimeoutError(
+                "certificate-negative attempt %d did not produce one "
+                "standalone begin/end marker" % attempt)
+        # Inspect the entire capture for safety signatures, including output
+        # that arrived just before this attempt's begin marker.  Keep status
+        # and diagnostic matching bounded to the unique attempt below.
+        if TLS_NEGATIVE_BODY_MARKER in block:
+            raise TimeoutError(
+                "certificate-negative attempt %d capture contained the "
+                "server body" % attempt)
+        forbidden = TLS_NEGATIVE_FORBIDDEN_RE.search(block)
+        if forbidden:
+            raise TimeoutError(
+                "certificate-negative attempt %d capture contained "
+                "forbidden output %r" % (attempt, forbidden.group(0)))
+        attempt_block = block[begins[0].end():]
+        diagnostic = _validate_tls_negative_block(attempt_block, attempt)
+
+        current_gets = browser_fixtures.https.get_count
+        if current_gets != initial_gets or current_gets != 0:
+            raise TimeoutError(
+                "certificate-negative HTTPS handler received %d GET "
+                "requests by attempt %d" % (current_gets, attempt))
+        print("  TLS negative %02d/%02d: [exit 1], "
+              "BROWSER-TLS-NEG-STATUS-1, HTTPS GETs=0; %s"
+              % (attempt, TLS_NEGATIVE_REPETITIONS, diagnostic))
+
+    # Give a worker released by the final connection a scheduling turn, then
+    # take the sequence-wide snapshot used in the acceptance record.
+    time.sleep(0.05)
+    final_gets = browser_fixtures.https.get_count
+    if final_gets != initial_gets or final_gets != 0:
+        raise TimeoutError(
+            "certificate-negative HTTPS handler GET count changed from "
+            "%d to %d" % (initial_gets, final_gets))
+    print("  TLS negative summary: %d/%d rejected; HTTPS handler GETs=%d"
+          % (TLS_NEGATIVE_REPETITIONS, TLS_NEGATIVE_REPETITIONS,
+             final_gets))
 
 
 def t_browser_https(h):
@@ -1088,6 +1205,62 @@ def selftest():
         print("FAIL selftest: browser status matched echoed command text")
         return False
 
+    valid_tls_negative = (
+        "BROWSER-TLS-NEG-BEGIN-01\n"
+        "browser: the certificate is for 'kestrel-negative.invalid', "
+        "not '10.0.2.2'\n"
+        "[exit 1]\n"
+        "BROWSER-TLS-NEG-STATUS-1\n"
+        "BROWSER-TLS-NEG-END-01\n"
+        "kestrel:/$"
+    )
+    try:
+        _validate_tls_negative_block(valid_tls_negative, 1)
+        _validate_tls_negative_block(
+            "browser: no trusted root certificate issued 'fixture'\n"
+            "[exit 1]\n"
+            "BROWSER-TLS-NEG-STATUS-1\n", 2)
+    except TimeoutError as e:
+        print("FAIL selftest: valid TLS negative transcript rejected: %s" % e)
+        return False
+
+    invalid_tls_negative = [
+        ("body marker", valid_tls_negative.replace(
+            "[exit 1]\n", TLS_NEGATIVE_BODY_MARKER + "\n[exit 1]\n")),
+        ("uproc", valid_tls_negative.replace(
+            "[exit 1]\n", "uproc: pid 7 terminated\n[exit 1]\n")),
+        ("fault", valid_tls_negative.replace(
+            "[exit 1]\n", "page fault at 0x18\n[exit 1]\n")),
+        ("exception", valid_tls_negative.replace(
+            "[exit 1]\n", "exception 14\n[exit 1]\n")),
+        ("kernel panic", valid_tls_negative.replace(
+            "[exit 1]\n", "kernel panic\n[exit 1]\n")),
+        ("exit -1", valid_tls_negative.replace("[exit 1]", "[exit -1]")),
+        ("status -1", valid_tls_negative.replace(
+            "BROWSER-TLS-NEG-STATUS-1",
+            "BROWSER-TLS-NEG-STATUS--1")),
+        ("generic no error", valid_tls_negative.replace(
+            "[exit 1]\n", "browser: no error\n[exit 1]\n")),
+        ("generic certificate text", valid_tls_negative.replace(
+            "the certificate is for 'kestrel-negative.invalid', "
+            "not '10.0.2.2'",
+            "certificate verification failed")),
+        ("non-standalone exit", valid_tls_negative.replace(
+            "[exit 1]", "shell said [exit 1]")),
+        ("wrong positive status", valid_tls_negative.replace(
+            "BROWSER-TLS-NEG-STATUS-1",
+            "BROWSER-TLS-NEG-STATUS-2")),
+    ]
+    for name, transcript in invalid_tls_negative:
+        try:
+            _validate_tls_negative_block(transcript, 99)
+        except TimeoutError:
+            continue
+        print("FAIL selftest: TLS negative validator accepted %s" % name)
+        return False
+    print("PASS selftest: TLS negative validator accepted 2 valid and "
+          "rejected %d invalid transcripts" % len(invalid_tls_negative))
+
     print("PASS selftest")
     return True
 
@@ -1098,6 +1271,9 @@ def fixture_selftest():
     try:
         fixtures = BrowserFixtureServers()
         fixtures.start()
+        if fixtures.http.get_count != 0 or fixtures.https.get_count != 0:
+            raise RuntimeError("fixture GET counters did not start at zero")
+
         plain = http.client.HTTPConnection(
             "127.0.0.1", fixtures.http.server_address[1], timeout=5)
         plain.request("GET", "/plain")
@@ -1105,6 +1281,11 @@ def fixture_selftest():
         plain.close()
         if HTTP_BODY_MARKER not in body:
             raise RuntimeError("plain HTTP marker missing")
+        if fixtures.http.get_count != 1:
+            raise RuntimeError("plain HTTP GET count is %d, expected 1"
+                               % fixtures.http.get_count)
+        if fixtures.https.get_count != 0:
+            raise RuntimeError("HTTPS GET count changed before TLS test")
 
         strict = http.client.HTTPSConnection(
             "127.0.0.1", fixtures.https.server_address[1], timeout=5)
@@ -1117,6 +1298,10 @@ def fixture_selftest():
             raise RuntimeError("strict TLS accepted the self-signed cert")
         finally:
             strict.close()
+        if fixtures.https.get_count != 0:
+            raise RuntimeError(
+                "strict certificate rejection reached HTTPS handler "
+                "(GET count %d)" % fixtures.https.get_count)
 
         insecure = http.client.HTTPSConnection(
             "127.0.0.1", fixtures.https.server_address[1], timeout=5,
@@ -1126,14 +1311,17 @@ def fixture_selftest():
         insecure.close()
         if TLS_NEGATIVE_BODY_MARKER not in body:
             raise RuntimeError("TLS negative body marker missing")
+        if fixtures.https.get_count != 1:
+            raise RuntimeError("insecure HTTPS GET count is %d, expected 1"
+                               % fixtures.https.get_count)
     except (OSError, RuntimeError, ssl.SSLError) as e:
         print("FAIL fixture-selftest: %s" % e)
         return False
     finally:
         if fixtures:
             fixtures.close()
-    print("PASS fixture-selftest: HTTP marker served; TLS 1.3 strict "
-          "verification rejected; insecure control body served")
+    print("PASS fixture-selftest: HTTP GETs=1; TLS 1.3 strict rejection "
+          "GETs=0; insecure HTTPS GETs=1 and body marker served")
     return True
 
 

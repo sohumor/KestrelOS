@@ -41,6 +41,7 @@ param(
     [switch]$Headless,
     [string]$Image,
     [string]$Memory = '256M',
+    [string]$Nic = 'rtl8139',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -102,7 +103,7 @@ $qemuArgs = @(
     '-drive', "file=$Image,format=raw",
     '-m', $Memory,
     '-no-reboot',
-    '-device', 'rtl8139,netdev=n0',
+    '-device', "$Nic,netdev=n0",
     '-netdev', 'user,id=n0',
     '-serial', 'stdio'
 )

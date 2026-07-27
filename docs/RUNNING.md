@@ -167,9 +167,9 @@ Settings that matter:
 - Storage: attach `kestrel.vdi` to the **IDE** controller as the primary
   master. The disk driver is ATA PIO on the primary bus (`kernel/ata.c`)
   and will not find a SATA/AHCI or NVMe disk.
-- Network: **VirtualBox does not emulate an RTL8139.** Everything except
-  networking works; `ping`, `nslookup` and `udp` will report that the
-  network is unavailable.
+- Network: Select **Intel PRO/1000 MT (82540EM)** as the network adapter.
+  The kernel's `e1000` driver will initialize the device and use DHCP to configure
+  networking automatically.
 
 ## Running in VMware
 
@@ -397,13 +397,12 @@ understands the ANSI sequences the libc `term_*` helpers emit.
 
 ### No network / `ping` and `nslookup` fail
 
-- **The hypervisor has no RTL8139.** Look for
-  `net: no rtl8139 found, networking disabled` in the boot log. Only QEMU
-  is known to provide one (`-device rtl8139,netdev=n0 -netdev user,id=n0`).
-  VirtualBox, VMware and Bochs do not, and networking is simply absent
-  there.
-- **The addresses are static.** `kernel/net.c` hard-codes 10.0.2.15/24,
-  gateway 10.0.2.2, DNS 10.0.2.3 — the QEMU user-networking defaults.
+- **No supported NIC found.** Look for
+  `net: no NIC found, networking disabled` in the boot log. Ensure the hypervisor
+  is configured to use either an RTL8139 (QEMU default) or Intel PRO/1000 MT / 82540EM
+  (VirtualBox default `e1000`).
+- **DHCP configuration.** `kernel/net.c` attempts DHCP auto-configuration at boot and falls
+  back to standard static defaults (`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`).
   Any other network topology needs those constants changed. There is no
   DHCP client.
 - **`ping` to an outside host times out.** QEMU user-mode networking does

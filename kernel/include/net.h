@@ -35,6 +35,7 @@ static inline uint32_t ntohl(uint32_t v)
 void net_init(void);
 bool net_ready(void);
 void net_get_info(struct k_netinfo *out);
+void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns);
 
 /* Resolve a hostname (or dotted quad) to an IPv4 address. 0 / -1. */
 int  dns_resolve(const char *name, uint32_t *ip_be);

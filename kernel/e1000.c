@@ -54,6 +54,8 @@ static const uint16_t e1000_devices[] = { 0x100E, 0x100F, 0x10D3, 0x153A };
 #define REG_RAH    0x5404
 
 #define CTRL_SLU   (1u << 6)      /* set link up */
+#define CTRL_RST   (1u << 26)     /* device reset */
+#define STATUS_LU  (1u << 1)      /* link up status */
 
 #define ICR_LSC    (1u << 2)
 #define ICR_RXDMT0 (1u << 4)
@@ -309,6 +311,13 @@ bool e1000_init(void)
                      mmio_phys + off, PTE_W | PTE_PCD);
     mmio = (volatile uint32_t *)E1000_MMIO_VA;
 
+    /* Device reset: set CTRL.RST and wait for hardware auto-clear. */
+    reg_write(REG_CTRL, reg_read(REG_CTRL) | CTRL_RST);
+    for (int spin = 0; spin < 10000; spin++) {
+        if (!(reg_read(REG_CTRL) & CTRL_RST))
+            break;
+    }
+
     reg_write(REG_IMC, 0xFFFFFFFFu);   /* mask + ack everything */
     (void)reg_read(REG_ICR);
 
@@ -324,6 +333,12 @@ bool e1000_init(void)
         reg_write(REG_MTA + i * 4, 0);
 
     reg_write(REG_CTRL, reg_read(REG_CTRL) | CTRL_SLU);
+
+    /* Wait briefly for link-up status */
+    for (int spin = 0; spin < 10000; spin++) {
+        if (reg_read(REG_STATUS) & STATUS_LU)
+            break;
+    }
 
     /* Rings + buffers: physically contiguous, zeroed, < 4 GiB. */
     uint64_t rx_ring_phys = pmm_alloc_contig(1);
@@ -365,7 +380,9 @@ bool e1000_init(void)
         pic_clear_mask(irq);
         if (irq >= 8)
             pic_clear_mask(2);   /* cascade */
+        (void)reg_read(REG_ICR); /* ack pending before enabling IMS */
         reg_write(REG_IMS, ICR_RXT0 | ICR_RXO | ICR_RXDMT0 | ICR_LSC);
+        (void)reg_read(REG_ICR); /* flush ICR again */
     } else {
         kprintf("e1000: no usable irq line (%d), polling only\n", irq);
     }

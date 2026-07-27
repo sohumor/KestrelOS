@@ -7,6 +7,7 @@
 #include "rtl8139.h"
 #include "e1000.h"
 #include "net.h"
+#include "dhcp.h"
 #include "tcp.h"
 
 /* Ethernet / ARP / IPv4 / ICMP core.
@@ -479,6 +480,14 @@ void net_rx(const uint8_t *frame, int len)
         ipv4_input(eh, payload, plen);
 }
 
+void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
+{
+    cfg_ip = ip;
+    cfg_mask = mask;
+    cfg_gw = gw;
+    cfg_dns = dns;
+}
+
 /* ---- init ---- */
 
 void net_init(void)
@@ -489,19 +498,32 @@ void net_init(void)
         return;
     }
 
-    /* Static QEMU user-mode networking defaults. */
-    cfg_ip = htonl(0x0A00020F);      /* 10.0.2.15 */
-    cfg_mask = htonl(0xFFFFFF00);    /* 255.255.255.0 */
-    cfg_gw = htonl(0x0A000202);      /* 10.0.2.2 */
-    cfg_dns = htonl(0x0A000203);     /* 10.0.2.3 */
-
     udp_init();
     ready = true;
 
-    const uint8_t *m = netdev_current()->mac;
-    kprintf("net: up, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
-            m[0], m[1], m[2], m[3], m[4], m[5]);
-    kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static)\n");
+    if (dhcp_discover() == 0) {
+        const uint8_t *m = netdev_current()->mac;
+        uint32_t ip = ntohl(cfg_ip);
+        uint32_t gw = ntohl(cfg_gw);
+        uint32_t dns = ntohl(cfg_dns);
+        kprintf("net: up, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+                m[0], m[1], m[2], m[3], m[4], m[5]);
+        kprintf("net: ip %u.%u.%u.%u gw %u.%u.%u.%u dns %u.%u.%u.%u (dhcp)\n",
+                (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF,
+                (gw >> 24) & 0xFF, (gw >> 16) & 0xFF, (gw >> 8) & 0xFF, gw & 0xFF,
+                (dns >> 24) & 0xFF, (dns >> 16) & 0xFF, (dns >> 8) & 0xFF, dns & 0xFF);
+    } else {
+        /* Static QEMU / VirtualBox user-mode networking defaults fallback. */
+        cfg_ip = htonl(0x0A00020F);      /* 10.0.2.15 */
+        cfg_mask = htonl(0xFFFFFF00);    /* 255.255.255.0 */
+        cfg_gw = htonl(0x0A000202);      /* 10.0.2.2 */
+        cfg_dns = htonl(0x0A000203);     /* 10.0.2.3 */
+
+        const uint8_t *m = netdev_current()->mac;
+        kprintf("net: up, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
+                m[0], m[1], m[2], m[3], m[4], m[5]);
+        kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static fallback)\n");
+    }
 }
 
 void net_get_info(struct k_netinfo *out)
