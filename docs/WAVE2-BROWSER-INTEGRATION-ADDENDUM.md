@@ -70,6 +70,80 @@ Post-Wave-2 hardening should add a cap-aware HTTP inflater seam backed by
 `inflate_buf_limit()`, passing the request's remaining decoded budget rather
 than the global 64 MiB default.
 
+### Missing paint order after OOM: Wave 2 blocker
+
+`lay_layout()` can currently return a nontrivial document after paint-order
+allocation fails, while `lay_truncated()` does not report
+`LAY_TRUNC_MEMORY`. `lay_paint_order()` then returns zero and the browser can
+mistake a blank page for a successful load.
+
+This is a Wave 2 blocker because allocation failure must be readable and a
+styled nonempty document must never pass acceptance as blank:
+
+1. Backend owns the focused `libweb` fix. A failed paint-order allocation must
+   set `LAY_TRUNC_MEMORY`; retain the documented late-failure/partial-layout
+   contract rather than silently returning an apparently complete document.
+2. Frontend owns a defensive boundary in `apps/browser.c`: if
+   `lay_box_count(layout) > 1` but `lay_paint_order(layout, ...) == 0`, reject
+   the candidate page as OOM before history/state commit. This remains useful
+   against an older library and is not a substitute for the backend signal.
+3. QA owns a focused allocation-failure regression in `tools/test_*.c` plus an
+   application assertion that the failure is visible and non-successful.
+
+Acceptance requires paint order greater than zero for the nontrivial styled
+fixture; an injected order-allocation failure must set `LAY_TRUNC_MEMORY`,
+produce a readable load error, and leave the prior page/history transaction
+intact. Old-renderer cleanup waits for this gate.
+
+### Fixed-position paint/hit seam: later CSS hardening
+
+Painting currently applies global scroll to `LAYF_FIXED` boxes. The public hit
+APIs accept only document coordinates and have no viewport/scroll context, so
+they cannot independently keep a fixed box at viewport coordinates. Fixed
+elements therefore scroll with the document.
+
+This is deferred, not a Wave 2 blocker: it is incorrect fixed-position CSS,
+but it is bounded, does not create a memory-safety failure, and the current
+shared document translation keeps ordinary painted and clicked content
+aligned. A painter-only special case is forbidden because it would make a
+visible fixed link disagree with hit testing.
+
+The later fix belongs to Backend across the `libweb` paint/layout/hit contract,
+with Frontend adopting the new viewport-aware hit seam and QA adding a test
+that a fixed link remains at the same window point and clickable across scroll.
+Wave 2 still requires the normal scrolled-link click acceptance case. Promote
+fixed positioning to a blocker only if scoped testing exposes a crash or an
+actual paint/hit mismatch, not merely that fixed content scrolls.
+
+## Routed Frontend P1/P2 fixes
+
+All items below belong exclusively to Frontend in `apps/browser.c`; QA owns
+their focused assertions. Priority controls integration order, not whether
+they are required before final acceptance.
+
+- **P1 — text order:** project text with a nonrecursive layout-box DFS, not
+  paint order or numeric `order`. Absolute/fixed DOM-first text may be painted
+  after normal flow; `-t` must remain DOM/layout order and must respect the
+  64 KiB stack limit.
+- **P1 — hostile geometry arithmetic:** use checked 64-bit intermediates and
+  clamp conversions for text `box->x * cols` and scrollbar products. Large CSS
+  geometry must not trigger signed overflow or an out-of-range draw/hit value.
+- **P2 — TLS diagnostics:** append `tls_last_transport_error()` only for the
+  HTTPS transport-open failure it describes, and never display literal
+  `"no error"` on unrelated HTTP failures.
+- **P2 — generated HTML sizing:** plain-text and error-page wrapping must
+  budget the full worst-case six-byte quote escape, rather than a five-times
+  buffer that can silently truncate.
+- **P2 — transactional navigation:** Back, Forward, new-history allocation,
+  and fatal candidate-load failures must roll back index/history/page state;
+  failed loads never consume or invent a navigation entry.
+- **P2 — blank-order defense:** retain the nontrivial-layout/zero-paint-order
+  check described above until and after the Backend truncation fix.
+
+QA acceptance covers deterministic `-t` text order, hostile geometry without
+overflow, transport-specific TLS wording, worst-case quote escaping without
+truncation, transactional load/history rollback, and the blank-order OOM gate.
+
 ## Lead Makefile and cleanup duties
 
 The Lead owns these changes after Frontend has zero old-renderer references:
