@@ -124,6 +124,7 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 | [docs/ABI.md](docs/ABI.md) | syscall table, memory map, libc surface |
 | [docs/kfs.md](docs/kfs.md) | the KFS on-disk format |
 | [docs/net.md](docs/net.md) | network stack and NIC drivers |
+| [docs/tls.md](docs/tls.md) | TLS 1.3 client, verification, testing and limits |
 | [docs/users.md](docs/users.md) | accounts, password hashing, and its limits |
 | [docs/packages.md](docs/packages.md) | the .kpkg format and the package manager |
 | [docs/browser.md](docs/browser.md) | the HTML engine and what it does not do |
@@ -133,7 +134,10 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 
 Single CPU (no SMP), no swap or demand paging, no signals, no dynamic linking,
 no journal in the filesystem, TCP does not reassemble out-of-order segments,
-and there is no TLS — so `https://` URLs are refused rather than half-supported.
+and TLS supports 1.3 only. The from-scratch TLS code is unaudited, and its
+entropy is weak on a CPU without a hardware random source. `libtls` and
+`tlstest` can make verified HTTPS requests, but the graphical browser still
+uses the old flat renderer and is not wired to the new TLS/HTTP/web stack yet.
 The password hashing is honest about being non-cryptographic, because the
 random number generator behind the salts is not.
 

@@ -1,13 +1,69 @@
 # Browser Step 1: verification gate
 
-Status: published before implementation. Baseline commit:
-`2322387bf38a44d08fd4b9af8cf9db8bf1806125`.
+Status: **ACCEPTED** on 2026-07-26. Baseline commit:
+`2322387bf38a44d08fd4b9af8cf9db8bf1806125`. Accepted HEAD:
+`b8c788847586b28e0a3240c56f35650894ac00c0`.
 
-This wave proves or rejects the newly landed TLS 1.3 client and the
-layout/painter. They are untrusted until QA reports the measurements below.
-It does not rewrite the browser, add DOM bindings, or add browser chrome.
+This step proved the newly landed TLS 1.3 client and layout/painter against
+the gates below. It did not rewrite the browser, add DOM bindings, or add
+browser chrome.
 The pre-existing `.gitignore` modification is user-owned and outside this
 wave.
+
+## Final evidence and ship decision
+
+**Ship decision: accept Step 1.** TLS, layout, and paint meet the published
+host, sanitizer, interoperability, stack, freestanding-build, target, and
+regression gates. This accepts the libraries, not a finished browser:
+`apps/browser.c` still uses the old flat `apps/html.c` renderer and has not yet
+registered TLS with the new HTTP pipeline. The TLS implementation remains
+unaudited, implements TLS 1.3 rather than TLS 1.2, and reported weak entropy in
+the test VM.
+
+| Gate | Measured result |
+|---|---|
+| TLS host harness | 129 checks, 0 failures; ASan/UBSan/leaks 0 |
+| OpenSSL interoperability | 10 interop cases, 0 skips; 12/12 traffic secrets matched OpenSSL key logs |
+| TLS hostile input | 500 mutated flights, 0 accepted; 200 random server streams, no crash |
+| Public host fetch | `example.com`: verified 1, HTTP 200, 869 response bytes |
+| Focused layout regressions | 9/9 checks |
+| Full layout, default style | 273/273 checks; 3,000 fuzz documents; worst 526 boxes; ASan/UBSan/leaks 0 |
+| Full layout, real CSS | 273/273 checks; 3,000 fuzz documents; worst 526 boxes; ASan/UBSan/leaks 0 |
+| Target-like stack | 47,881 bytes, 1,271 bytes below the 48 KiB gate |
+| Row boundary | 65,537-row input, 5/5 checks; bounded truncation without 16-bit aliasing |
+| Visual review | Wide 760x900 and narrow 360x1100 renders accepted by frontend |
+| Freestanding archives | libz 98,320 B; libimg 193,432 B; libweb 1,594,882 B; libjs 1,264,898 B; libtls 944,392 B |
+| WSL target build | `make` succeeded after restoring the full image as the default goal |
+| VM HTTPS | 18 roots; verified TLS 1.3 to `example.com`; ChaCha20-Poly1305/X25519; ALPN `http/1.1`; chain 4; 160 ms handshake; HTTP 200; 268 header bytes |
+| End-to-end | 46 passed, 0 failed, 1 skipped (`ls \| wc -l`), 47 total |
+
+The accepted render hashes are:
+
+- wide `article.ppm`:
+  `cbfb9e67a9dec2ef02833a97122d025df9093b019832e04f585996a97587a217`
+- narrow `article-narrow.ppm`:
+  `e7bb31191d8fa1fe9d97fa63277462f79f3fb08d9555fd296fde2ede25e83b06`
+
+The VM explicitly disclosed weak entropy because its emulated CPU exposed no
+hardware random source. Encryption and certificate verification succeeded,
+but this is a security limitation, not a passing quality claim.
+
+### Accepted commit chain
+
+The evaluated range, in order, is:
+
+- `2322387bf38a44d08fd4b9af8cf9db8bf1806125` — browser: TLS 1.3 client and the layout/paint engine (in progress)
+- `a78d8a040d7abbfdf0cadb91bd9633c551764768` — docs: define the browser verification gate
+- `3a8c274b91621e4f8a31919667a1f8a8946d825a` — test(tls): harden mock records and verify transport ownership
+- `9da2a0f4ba88e4976c248025db7edec62c9aec4e` — tls: transfer lower transport ownership after handshake
+- `a7d7457ed51df7236ac2d8df6d4d89a48871e377` — docs: triage the browser verification baselines
+- `643880b14265d66bbe7b30dc0e736e1c81f3fdd9` — test(layout): correct fixtures and measure target stack
+- `eb416657a329d925a95ee713bfc8cb10ac1d3c80` — layout: reserve stack headroom at the recursion cap
+- `b3b95e827e7da0d26709e0fcff44d780c6795d09` — test(layout): expose four browser layout gaps
+- `e2887e0c64db77b800c006268d4b33fc11530898` — docs: assign proven layout defects
+- `7946fa11eb0484f5e830dcda838c40d8e6f4fcf9` — test(layout): exercise the table row index boundary
+- `8d2804a506cd34d9e93e369a44e27307fda9eefb` — layout: fix proven CSS and table invariants
+- `b8c788847586b28e0a3240c56f35650894ac00c0` — build: keep the full image as make's default goal
 
 ## Ownership
 
