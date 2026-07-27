@@ -155,6 +155,53 @@ The accepted baseline numbers remain recorded for comparison: 11,002 nodes to
 evidence, not acceptance while corrected assertions or the strict stack gate
 remain outstanding.
 
+## Triage decision 3: four proven layout defects
+
+QA's focused candidate suite now produces nine checks and seven failures
+against current production, with zero sanitizer diagnostics. The four
+observations are therefore backend defects rather than inspection candidates.
+
+File ownership for this fix is disjoint:
+
+- **QA alone owns `tools/test_layout.c`** and the focused/full result logs.
+  It freezes the failing reproductions before backend integration.
+- **Backend alone owns `libweb/layout.c`**, plus the single
+  `LAY_MAX_ROWS` constant in `libweb/layout.h`. No other header/API change is
+  authorized.
+- `libweb/layout_arena.h`, `libweb/paint.c`, and `libweb/paint.h` are frozen.
+  Frontend has no implementation work in this fix.
+
+The backend contracts and done criteria are:
+
+1. A percentage height resolves against a containing block only when that
+   height is definite. In QA's cases, a 50% child in a definite 200-pixel
+   parent is 100 pixels; the same declaration in an auto-height parent behaves
+   as `auto` and takes its 16-pixel content height. Backend must carry
+   definiteness separately from a convenient numeric fallback.
+2. An ordered-list item's explicit `value` resets that list's current counter
+   for following siblings. The frozen sequence must render `3`, explicit
+   `10`, then `11`, then `12`; markers may not repeat the pre-reset counter or
+   the explicit value.
+3. `struct lay_box.row` is a zero-based `uint16_t`, so it represents rows
+   0 through 65,535: at most 65,536 rows. The lightweight fix is confirmed as
+   changing `LAY_MAX_ROWS` in `libweb/layout.h` from 100,000 to **65,536**,
+   not widening the public box field. At and beyond the boundary, layout must
+   set `LAY_TRUNC_TABLE`, avoid row-index wrap/aliasing, and remain within
+   allocation bounds.
+4. A fixed-position descendant is positioned against the initial containing
+   block and must not inherit translation from a relatively positioned
+   ancestor. QA's viewport-relative result is exactly `(560,360)`, not the
+   translated `(585,390)`. Relative translation must continue to apply to
+   non-fixed descendants.
+
+Backend may begin after QA records the focused failing test revision and raw
+baseline; the files are disjoint, so QA may run read-only deterministic
+reductions in parallel. No full build runs during edits. Acceptance requires
+the focused suite at 9/9 with zero sanitizer findings, the corrected
+273-check/3,000-document suite at zero failures and zero sanitizer/leak
+findings, the separate non-ASan stack gate below 48 KiB, and no regression in
+the generated wide/narrow layouts. QA, not backend, declares the fix done.
+
 ## Contracts
 
 ### TLS and HTTP transport
