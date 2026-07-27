@@ -652,7 +652,7 @@ static int32_t list_ordinal(struct dom_node *li)
 {
     struct dom_node *p, *s;
     const char *a;
-    int32_t base = 1, n = 0;
+    int32_t next = 1;
 
     if (!li)
         return 1;
@@ -663,27 +663,26 @@ static int32_t list_ordinal(struct dom_node *li)
     if (p) {
         a = dom_get_attr(p, "start");
         if (a && *a)
-            base = (int32_t)atol(a);
+            next = (int32_t)atol(a);
     }
     for (s = p ? p->first_child : 0; s && s != li; s = s->next_sibling) {
         const struct computed_style *cs;
+        int is_item;
 
         if (s->type != DOM_ELEMENT)
             continue;
         cs = (const struct computed_style *)s->style;
-        if (cs) {
-            if (cs->display == CSS_DISPLAY_LIST_ITEM)
-                n++;
-        } else if (s->tag_id == HTAG_LI) {
-            n++;
-        }
+        is_item = cs ? cs->display == CSS_DISPLAY_LIST_ITEM
+                     : s->tag_id == HTAG_LI;
+        if (!is_item)
+            continue;
         a = dom_get_attr(s, "value");
-        if (a && *a) {
-            base = (int32_t)atol(a);
-            n = 0;
-        }
+        if (a && *a)
+            next = (int32_t)atol(a);
+        if (next < 0x7fffffff)
+            next++;
     }
-    return base + n;
+    return next;
 }
 
 /* Marker text, or 0 when the marker is a glyph the painter draws (disc,
@@ -1577,6 +1576,39 @@ static void translate_subtree(struct lay_box *b, int32_t dx, int32_t dy)
         n->ink_x += dx;
         n->ink_y += dy;
         if (n->first_child) {
+            n = n->first_child;
+            continue;
+        }
+        while (n != b && !n->next)
+            n = n->parent;
+        if (n == b)
+            break;
+        n = n->next;
+    }
+}
+
+/* A relative offset moves the box and its descendants, except for a fixed
+ * descendant: that box is anchored to the viewport, and its whole subtree
+ * must remain together at that viewport-relative position. */
+static void translate_relative_subtree(struct lay_box *b,
+                                       int32_t dx, int32_t dy)
+{
+    struct lay_box *n = b;
+
+    if (!dx && !dy)
+        return;
+    for (;;) {
+        int fixed_boundary = n != b && (n->flags & LAYF_FIXED);
+
+        if (!fixed_boundary) {
+            n->x += dx;
+            n->y += dy;
+            n->clip_x += dx;
+            n->clip_y += dy;
+            n->ink_x += dx;
+            n->ink_y += dy;
+        }
+        if (!fixed_boundary && n->first_child) {
             n = n->first_child;
             continue;
         }
@@ -2845,6 +2877,7 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
     struct lay_bfc mine;
     struct lay_box *ch, *nx, *marker = 0;
     int32_t btop, content_y, flow, h_children = 0, used_h, bb_h;
+    int32_t definite_h = -1;
     int first = 1, has_lines = 0, can_skip, auto_h, through = 0;
     char here;
 
@@ -2892,6 +2925,13 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
     }
 
     resolve_horizontal(c, b, cb_w, mode, depth);
+    auto_h = len_is_auto(cs->height) ||
+             (cs->height.type == CSS_LEN_PCT && cb_h < 0);
+    if (!auto_h) {
+        definite_h = used_len(cs->height, cb_h, 0);
+        definite_h = clamp_height(definite_h, cs, cb_h);
+        b->h = definite_h;
+    }
     ctop = skip_top ? marg_of(0) : collapsed_top(b, cb_w);
     btop = y + (skip_top ? 0 : marg_value(marg_collapse(open_in, ctop)));
     btop = clear_past(c, bfc, cs->clear, btop);
@@ -2960,7 +3000,7 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
                 continue;
             }
             flow = layout_block_box(c, ch, b->x, b->w,
-                                    len_is_auto(cs->height) ? cb_h : b->h,
+                                    auto_h ? -1 : definite_h,
                                     flow, &mine, &open,
                                     first && can_skip, LAY_MODE_FLOW,
                                     depth + 1);
@@ -2969,8 +3009,6 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
         h_children = flow - content_y;
     }
 
-    auto_h = len_is_auto(cs->height) ||
-             (cs->height.type == CSS_LEN_PCT && cb_h < 0);
     mbot = marg_of(len_is_auto(cs->margin[CSS_BOTTOM])
                    ? 0 : used_len(cs->margin[CSS_BOTTOM], cb_w, 0));
     b->marg[CSS_TOP] = len_is_auto(cs->margin[CSS_TOP])
@@ -2978,7 +3016,7 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
     b->marg[CSS_BOTTOM] = mbot.pos + mbot.neg;
 
     if (!auto_h) {
-        used_h = used_len(cs->height, cb_h, 0);
+        used_h = definite_h;
         outgoing = mbot;
     } else if (b->flags & LAYF_BFC) {
         int32_t fl = float_lowest(c, &mine);
@@ -3075,7 +3113,7 @@ static int32_t table_spacing(const struct lay_box *t)
 static int table_build_grid(struct lay_ctx *c, struct lay_box *t, int *nrows)
 {
     int32_t *occ;
-    struct lay_box *g, *r, *cell;
+    struct lay_box *g, *r, *rnext, *cell;
     int ncols = 0, rows = 0, i;
 
     occ = (int32_t *)lay_arena_alloc(c->L, sizeof(int32_t) * LAY_MAX_COLUMNS);
@@ -3088,16 +3126,19 @@ static int table_build_grid(struct lay_ctx *c, struct lay_box *t, int *nrows)
     for (g = t->first_child; g; g = g->next) {
         if (g->kind != LAY_BOX_TABLE_ROWGROUP)
             continue;
-        for (r = g->first_child; r; r = r->next) {
+        for (r = g->first_child; r; r = rnext) {
             int col = 0;
 
+            rnext = r->next;
             if (r->kind != LAY_BOX_TABLE_ROW)
                 continue;
-            if (rows >= LAY_MAX_ROWS) {
+            if (rows >= LAY_MAX_ROWS ||
+                (unsigned long)rows > (unsigned long)UINT16_MAX) {
                 c->L->trunc |= LAY_TRUNC_TABLE;
-                break;
+                box_unlink(r);
+                continue;
             }
-            r->row = (uint16_t)(rows > 65534 ? 65534 : rows);
+            r->row = (uint16_t)rows;
             for (cell = r->first_child; cell; cell = cell->next) {
                 int span, k;
 
@@ -3113,7 +3154,7 @@ static int table_build_grid(struct lay_ctx *c, struct lay_box *t, int *nrows)
                 if (col + span > LAY_MAX_COLUMNS)
                     span = LAY_MAX_COLUMNS - col;
                 cell->col = (uint16_t)col;
-                cell->row = (uint16_t)(rows > 65534 ? 65534 : rows);
+                cell->row = (uint16_t)rows;
                 cell->colspan = (uint16_t)(span < 1 ? 1 : span);
                 for (k = 0; k < span; k++)
                     occ[col + k] = cell->rowspan < 1 ? 1 : cell->rowspan;
@@ -3825,7 +3866,7 @@ static void apply_relative(struct lay_document *L)
                 dy = used_len(cs->offset[CSS_TOP], cbh, 0);
             else if (!len_is_auto(cs->offset[CSS_BOTTOM]))
                 dy = -used_len(cs->offset[CSS_BOTTOM], cbh, 0);
-            translate_subtree(n, dx, dy);
+            translate_relative_subtree(n, dx, dy);
         }
         if (n->first_child) {
             n = n->first_child;

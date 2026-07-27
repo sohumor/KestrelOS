@@ -72,7 +72,7 @@ struct font;
 #define LAY_MAX_INLINE_NEST  48      /* nested inline boxes on one line */
 #define LAY_MAX_FRAGS        8192    /* fragments in one line box       */
 #define LAY_MAX_COLUMNS      512     /* columns in one table            */
-#define LAY_MAX_ROWS         100000  /* rows in one table               */
+#define LAY_MAX_ROWS         65536   /* rows in one table               */
 #define LAY_MAX_POSITIONED   16384   /* out-of-flow boxes per document  */
 #define LAY_MAX_ARENA        (192UL * 1024UL * 1024UL)
 #define LAY_MAX_ADJOIN       32      /* depth of one adjoining-margin
