@@ -4106,16 +4106,20 @@ static int posn_less(const struct lay_box *a, const struct lay_box *b)
 
 static void build_paint_order(struct lay_document *L)
 {
-    struct lay_box **pos;
-    struct pkey *keys, *tmp;
+    struct lay_box **pos = 0;
+    struct pkey *keys = 0, *tmp = 0;
+    struct lay_paint_item *paint = 0;
     struct lay_box *n;
     unsigned long np = 0, nk = 0, cap;
     unsigned long i;
 
+    L->paint = 0;
+    L->npaint = 0;
+
     /* Collect positioned boxes and rank them by (z-index, tree order). */
     pos = (struct lay_box **)malloc((L->nboxes + 1) * sizeof *pos);
     if (!pos)
-        return;
+        goto oom;
     n = L->icb;
     for (;;) {
         if ((n->flags & LAYF_POSITIONED) && n != L->icb)
@@ -4150,13 +4154,11 @@ static void build_paint_order(struct lay_document *L)
 
     cap = L->nboxes * 2 + 8;
     keys = (struct pkey *)malloc(cap * sizeof *keys);
+    if (!keys)
+        goto oom;
     tmp = (struct pkey *)malloc(cap * sizeof *tmp);
-    if (!keys || !tmp) {
-        free(pos);
-        free(keys);
-        free(tmp);
-        return;
-    }
+    if (!tmp)
+        goto oom;
 
     n = L->icb;
     for (;;) {
@@ -4207,18 +4209,29 @@ static void build_paint_order(struct lay_document *L)
     }
     pkey_sort(keys, tmp, (int)nk);
 
-    L->paint = (struct lay_paint_item *)malloc(
+    paint = (struct lay_paint_item *)malloc(
         (nk + 1) * sizeof(struct lay_paint_item));
-    if (L->paint) {
-        for (i = 0; i < nk; i++) {
-            L->paint[i].box = keys[i].box;
-            L->paint[i].phase = keys[i].phase;
-        }
-        L->npaint = (int)nk;
+    if (!paint)
+        goto oom;
+    for (i = 0; i < nk; i++) {
+        paint[i].box = keys[i].box;
+        paint[i].phase = keys[i].phase;
     }
+    L->paint = paint;
+    L->npaint = (int)nk;
     free(pos);
     free(keys);
     free(tmp);
+    return;
+
+oom:
+    L->trunc |= LAY_TRUNC_MEMORY;
+    L->paint = 0;
+    L->npaint = 0;
+    free(pos);
+    free(keys);
+    free(tmp);
+    free(paint);
 }
 
 /* ================================================================== *
