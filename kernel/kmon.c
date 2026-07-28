@@ -61,12 +61,13 @@ static int split(char *line, char *argv[], int max)
     return argc;
 }
 
-static const char *state_name(enum task_state s)
+static const char *state_name(int s)
 {
     switch (s) {
     case TASK_RUNNING:  return "running";
     case TASK_RUNNABLE: return "ready";
     case TASK_SLEEPING: return "sleeping";
+    case TASK_STOPPED:  return "stopped";
     case TASK_ZOMBIE:   return "zombie";
     default:            return "?";
     }
@@ -83,9 +84,11 @@ static void cmd_mem(void)
 
 static void cmd_ps(void)
 {
+    struct k_psinfo pi;
     kprintf("  PID  STATE     NAME\n");
-    for (struct task *t = task_all_list(); t; t = t->allnext)
-        kprintf("  %3d  %-8s  %s\n", t->pid, state_name(t->state), t->name);
+    for (uint64_t i = 0; task_psinfo(i, &pi) == 0; i++)
+        kprintf("  %3d  %-8s  %s\n",
+                pi.pid, state_name(pi.state), pi.name);
 }
 
 static void cmd_ls(const char *path)

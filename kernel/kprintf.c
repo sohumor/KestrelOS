@@ -3,7 +3,9 @@
 #include "serial.h"
 #include "string.h"
 #include "klog.h"
+#include "spinlock.h"
 
+static spinlock_t print_lock = SPINLOCK_INIT;
 static void kputc(char c)
 {
     console_putc(c);
@@ -67,6 +69,7 @@ static void print_str(const char *s, int width, bool left)
 
 void kvprintf(const char *fmt, va_list ap)
 {
+    uint64_t flags = spin_lock_irqsave(&print_lock);
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
             kputc(*fmt);
@@ -146,6 +149,7 @@ void kvprintf(const char *fmt, va_list ap)
             kputc(*fmt);
         }
     }
+    spin_unlock_irqrestore(&print_lock, flags);
 }
 
 void kprintf(const char *fmt, ...)

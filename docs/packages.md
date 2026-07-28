@@ -218,23 +218,22 @@ corrupt one or two packages claiming the same name.
 | `/etc/kpkg.conf` | configuration (optional) |
 | `/var/pkg/repo/` | the local repository shipped in the image |
 | `/var/pkg/repo/index.kpi` | its index |
-| `/var/pkg/cache/` | packages downloaded over HTTP |
-| `/var/pkg/index.kpi` | the index fetched by `kpkg update` (HTTP repos only) |
+| `/var/pkg/cache/` | packages downloaded over HTTP or HTTPS |
+| `/var/pkg/index.kpi` | the index fetched by `kpkg update` |
 | `/var/pkg/db/<name>/meta` | the package's metadata block plus `installed: <unix time>` |
 | `/var/pkg/db/<name>/files` | one line per installed path |
 
 `/etc/kpkg.conf` is `key = value` (a `:` works too), `#` comments:
 
 ```
-# Where packages come from. A path, or an http:// URL.
+# Where packages come from. A path, or an http:// or https:// URL.
 repo = /var/pkg/repo
 cache = /var/pkg/cache
 ```
 
 Without the file the defaults above apply, so `kpkg` works on an image
-with no network at all. `https://` is refused with
-"https is not supported (KestrelOS has no TLS)" rather than a confusing
-connection error.
+with no network at all. HTTPS repositories use TLS 1.3 with certificate
+and hostname verification.
 
 ### The installed-file database
 
@@ -303,9 +302,9 @@ empty, because `SYS_UNLINK` refuses a non-empty one.
 `MODIFIED` (content or size), `UNREAD`, or `CHANGED` (mode or owner
 drifted from what was installed).
 
-**update** fetches `<repo>/index.kpi` over HTTP into `/var/pkg/index.kpi`.
-For a local repository there is nothing to fetch, so it just reports how
-many packages the index lists.
+**update** fetches `<repo>/index.kpi` over HTTP or verified HTTPS into
+`/var/pkg/index.kpi`. For a local repository there is nothing to fetch,
+so it just reports how many packages the index lists.
 
 ### Dependencies of the implementation
 
@@ -358,7 +357,8 @@ kpkg: everything matches
 ## 7. The HTTP client
 
 `libc/http.c` / `<http.h>` is a GET-only HTTP/1.1 client over
-`SYS_TCP_CONNECT/SEND/RECV/CLOSE` and `SYS_DNS`.
+`SYS_TCP_CONNECT/SEND/RECV/CLOSE` and `SYS_DNS`. HTTPS connections use
+`libtls` and the same verified TLS 1.3 policy as the browser.
 
 ```c
 int http_get(const char *url, char **body, unsigned long *len, int *status);
@@ -370,10 +370,11 @@ const char *http_status_text(int status);
 parsed - **including 404 and other error statuses** - so callers must
 check `*status` too. `*body` is a `malloc`ed buffer of `*len` bytes with
 a NUL past the end; the caller frees it. Negative returns are
-`HTTP_EURL`, `HTTP_EHTTPS`, `HTTP_ESCHEME`, `HTTP_EDNS`,
+`HTTP_EURL`, `HTTP_ESCHEME`, `HTTP_EDNS`,
 `HTTP_ECONNECT`, `HTTP_ESEND`, `HTTP_ERECV`, `HTTP_EPROTO`,
-`HTTP_ETOOBIG`, `HTTP_EREDIR` and `HTTP_ENOMEM`; `http_strerror()`
-turns each into a sentence.
+`HTTP_ETOOBIG`, `HTTP_EREDIR`, `HTTP_ENOMEM` and `HTTP_ETLS`;
+`http_strerror()` turns each into a sentence and preserves the direct
+TLS verification error for `HTTP_ETLS`.
 
 It handles `host`, `:port` and a path (query strings kept, fragments
 dropped), sends `Host:`, `User-Agent:`, `Accept:` and
@@ -383,8 +384,8 @@ transfer-encoding (trailers included) or up to connection close. It
 follows up to 3 redirects, resolving an absolute, root-relative or
 path-relative `Location:`. Bodies are capped at 8 MiB
 (`HTTP_MAX_BODY`), past which it fails with `HTTP_ETOOBIG` rather than
-eating the heap. There is no TLS: an `https://` URL fails immediately
-with `HTTP_EHTTPS`.
+eating the heap. Redirects may cross between HTTP and HTTPS, but an
+HTTPS failure never downgrades or retries in plaintext.
 
 `apps/wget.c` is the command-line front end:
 

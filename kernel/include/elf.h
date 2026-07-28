@@ -10,6 +10,9 @@
 #define ELF_ET_EXEC    2
 #define ELF_EM_X86_64  62
 #define ELF_PT_LOAD    1
+#define ELF_PF_W       2
+
+struct task;
 
 struct elf64_ehdr {
     uint8_t  e_ident[16];
@@ -39,10 +42,9 @@ struct elf64_phdr {
     uint64_t p_align;
 } __attribute__((packed));
 
-/* Load a static ELF64 executable image (already fully in kernel memory)
- * into the user half of `pml4`. Returns 0 on success (entry point in
- * *entry_out, page-aligned end of the highest segment in *brk_out) or -1
- * on any malformed input. Never panics. On failure the caller is expected
- * to vmm_destroy_user(pml4), which frees any pages mapped so far. */
-int elf_load(uint64_t *pml4, const void *image, size_t size,
+/* Validate a static ELF64 image and register its PT_LOAD records as lazy,
+ * file-backed VM areas on `task`. No executable page is allocated here. */
+struct file;
+int elf_load(struct task *task, struct file *backing,
+             const void *image, size_t size,
              uint64_t *entry_out, uint64_t *brk_out);

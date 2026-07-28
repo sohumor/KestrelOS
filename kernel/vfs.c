@@ -10,6 +10,7 @@
 #include "timer.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
 /* The VFS. All paths are absolute.
  *
@@ -32,16 +33,17 @@
  * in between: the PIT is exact enough over a minute, and mtime only has
  * one-second resolution anyway.
  *
- * The cache is read and written from preemptible syscall context, so the
- * three fields are updated together under irq_save(). rtc_read() itself is
- * deliberately called with interrupts on and with no filesystem lock held
- * (see the locking rule at the top of kfs.c). */
+ * The cache is read and written from preemptible syscall context on any CPU,
+ * so the three fields are updated together under a spin lock. rtc_read()
+ * itself is deliberately called with interrupts on and with no filesystem
+ * lock held (see the locking rule at the top of kfs.c). */
 
 #define CLK_REFRESH_TICKS ((uint64_t)TIMER_HZ * 60)
 
 static uint32_t clk_base;       /* Unix seconds sampled at clk_tick */
 static uint64_t clk_tick;       /* timer_ticks() when clk_base was taken */
 static int clk_valid;
+static spinlock_t clk_lock = SPINLOCK_INIT;
 
 static int is_leap(uint32_t y)
 {
@@ -102,11 +104,11 @@ uint32_t rtc_unix_time(void)
     int valid;
     uint64_t f;
 
-    f = irq_save();
+    f = spin_lock_irqsave(&clk_lock);
     valid = clk_valid;
     base = clk_base;
     tick = clk_tick;
-    irq_restore(f);
+    spin_unlock_irqrestore(&clk_lock, f);
 
     if (valid && now - tick < CLK_REFRESH_TICKS)
         return clk_extrapolate(base, tick, now);
@@ -118,11 +120,11 @@ uint32_t rtc_unix_time(void)
     }
     secs = rtc_to_unix(&t);
 
-    f = irq_save();
+    f = spin_lock_irqsave(&clk_lock);
     clk_base = secs;
     clk_tick = timer_ticks();
     clk_valid = 1;
-    irq_restore(f);
+    spin_unlock_irqrestore(&clk_lock, f);
     return secs;
 }
 
@@ -355,15 +357,12 @@ void vfs_close(struct file *f)
 {
     const struct fs_ops *ops;
     int gone;
-    uint64_t fl;
 
     if (f == NULL)
         return;
     /* fds are shared by dup2 and by spawn, and either holder may close on
      * a different CPU slice, so the refcount drop has to be atomic. */
-    fl = irq_save();
-    gone = (--f->refs <= 0);
-    irq_restore(fl);
+    gone = (__atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) <= 0);
     if (!gone)
         return;
 

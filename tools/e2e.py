@@ -57,8 +57,10 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic):
+def qemu_command(nic, cpus):
     return QEMU_BASE_CMD + [
+        "-m", "128M",
+        "-smp", str(cpus),
         "-device", "%s,netdev=n0" % QEMU_NICS[nic],
         "-netdev", "user,id=n0",
     ]
@@ -494,6 +496,31 @@ def t_ps(h):
 def t_free(h):
     h.send("free")
     h.expect_any(["MiB", "KiB"])
+    wait_prompt(h)
+
+
+def t_rng(h):
+    h.send("rngtest")
+    h.expect("rngtest: getrandom + random devices verified")
+    wait_prompt(h)
+
+
+def t_demand_paging(h):
+    h.send("vmstress 8")
+    h.expect("vmstress: demand paging verified across 8 MiB",
+             timeout=PKG_TIMEOUT)
+    wait_prompt(h, timeout=PKG_TIMEOUT)
+
+
+def t_signals(h):
+    h.send("sigtest")
+    h.expect("sigtest: handlers + masks + sigreturn verified")
+    wait_prompt(h)
+
+
+def t_dynamic_linking(h):
+    h.send("dynhello")
+    h.expect("dynhello: DT_NEEDED library returned 42")
     wait_prompt(h)
 
 
@@ -1129,6 +1156,21 @@ def t_browser_https(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def t_curl_https(h):
+    """The shared libc HTTP client must negotiate and verify HTTPS too."""
+    h.send("curl -s https://example.com/; echo CURL-HTTPS-STATUS-$?")
+    block = h.capture_until(
+        r"(?:^|\n)CURL-HTTPS-STATUS-\d+\n",
+        timeout=NET_TIMEOUT, regex=True)
+    if "Example Domain" not in block:
+        raise TimeoutError("curl HTTPS success marker was absent")
+    if not re.search(r"(?:^|\n)CURL-HTTPS-STATUS-0\n", block):
+        raise TimeoutError("curl HTTPS did not report explicit status 0")
+    if re.search(r"(?i)\ncurl:.*(?:certificate|TLS|connect|resolve)", block):
+        raise TimeoutError("curl HTTPS output also contained a load error")
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+
 def t_tcp_curl(h):
     """A real TCP fetch. SKIPs like the other network tests: the host may
     have no route out, and that is not a KestrelOS bug."""
@@ -1147,6 +1189,14 @@ def t_tcp_curl(h):
         return "SKIP"
 
 
+def t_smp(h):
+    h.send("nproc")
+    h.expect(r"nproc: [2-9][0-9]* CPUs online "
+             r"\([2-9][0-9]* discovered\), running on CPU [0-9]+",
+             regex=True)
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("login", t_login),
@@ -1158,6 +1208,11 @@ TESTS = [
     ("fs-roundtrip", t_fs_roundtrip),
     ("ps", t_ps),
     ("free", t_free),
+    ("smp", t_smp),
+    ("rng", t_rng),
+    ("demand-paging", t_demand_paging),
+    ("signals", t_signals),
+    ("dynamic-linking", t_dynamic_linking),
     ("ping", t_ping),
     ("nslookup", t_nslookup),
     ("uptime", t_uptime),
@@ -1191,6 +1246,7 @@ TESTS = [
     ("browser-http-controlled", t_browser_http_controlled),
     ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),
+    ("curl-https", t_curl_https),
     ("kpkg-list", t_kpkg_list),
     ("kpkg-install", t_kpkg_install),
     ("pkg-hello", t_pkg_hello),
@@ -1437,7 +1493,11 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
+    ap.add_argument("--cpus", type=int, default=2,
+                    help="virtual CPU count (default: 2)")
     args = ap.parse_args()
+    if args.cpus < 1 or args.cpus > 16:
+        ap.error("--cpus must be between 1 and 16")
 
     if args.list:
         for name, _ in TESTS:
@@ -1466,7 +1526,7 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic))
+    h = Harness(qemu_command(args.nic, args.cpus))
     try:
         h.start()
     except FileNotFoundError:

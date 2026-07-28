@@ -7,9 +7,10 @@
 #include "proc.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
-/* KFS driver, on-disk format v3. Regular file data is write-through and
- * metadata is committed through a fixed checksummed redo journal. A handful
+/* KFS driver, on-disk format v3. File data and metadata are committed
+ * together through a fixed checksummed redo journal. A handful
  * of static scratch blocks stand in for a buffer cache; they are carefully
  * assigned so no code path aliases two uses of the same buffer.
  *
@@ -66,34 +67,33 @@ static struct kfs_fs instances[KFS_MAX_MOUNTS];
  * is exactly one thread of control and `current` is NULL, so the wait loop
  * must never be entered then -- hence the sched_active guard. */
 static struct task *fs_owner;
-static int fs_held;
+static volatile int fs_held;
 static int fs_depth;
+static spinlock_t kfs_meta_lock = SPINLOCK_INIT;
 
 static void fs_lock(void)
 {
-    uint64_t f = irq_save();
-    while (fs_held && fs_owner != current) {
-        if (!sched_active)
-            break;              /* no other task can exist yet */
-        irq_restore(f);
-        task_sleep_ticks(1);
-        f = irq_save();
+    if (__atomic_load_n(&fs_owner, __ATOMIC_ACQUIRE) == current) {
+        fs_depth++;
+        return;
     }
-    fs_held = 1;
+    while (__atomic_exchange_n(&fs_held, 1, __ATOMIC_ACQUIRE)) {
+        if (sched_active)
+            task_sleep_ticks(1);
+        else
+            __asm__ volatile("pause");
+    }
     fs_owner = current;
-    fs_depth++;
-    irq_restore(f);
+    fs_depth = 1;
 }
 
 static void fs_unlock(void)
 {
-    uint64_t f = irq_save();
     if (--fs_depth <= 0) {
         fs_depth = 0;
-        fs_held = 0;
         fs_owner = NULL;
+        __atomic_store_n(&fs_held, 0, __ATOMIC_RELEASE);
     }
-    irq_restore(f);
 }
 
 static uint8_t sb_block[KFS_BLOCK_SIZE];  /* raw block 0 for writeback */
@@ -110,7 +110,7 @@ struct journal_entry {
 };
 
 /* There is one transaction globally because the whole-driver mutex admits
- * only one mutator. Entries coalesce repeated writes to the same metadata
+ * only one mutator. Entries coalesce repeated writes to the same home
  * block, so even truncating the largest file needs only a bitmap block, the
  * superblock, one inode block and one indirect block on the default image. */
 static struct {
@@ -354,7 +354,7 @@ static int journal_commit(struct kfs_fs *fs)
         goto out;
     }
 
-    /* Ordered-data redo protocol:
+    /* Full-data redo protocol:
      *   payloads -> committed header -> home blocks -> clean header.
      * A crash before the header exposes nothing; a crash after it replays
      * every home block idempotently at the next mount. */
@@ -505,7 +505,8 @@ static uint32_t balloc(struct kfs_fs *fs)
                 fs->sb.free_blocks--;
                 sb_sync(fs);
                 memset(zero_buf, 0, KFS_BLOCK_SIZE);
-                bwrite(fs, blk, zero_buf);
+                if (journal_stage(fs, blk, zero_buf) < 0)
+                    return 0;
                 return blk;
             }
         }
@@ -710,9 +711,11 @@ static long writei(struct kfs_fs *fs, uint32_t ino, uint32_t off,
                 break;
         }
         memcpy(data_buf + boff, (const uint8_t *)buf + done, chunk);
-        if ((ip.type == KFS_TYPE_DIR
-                 ? journal_stage(fs, b, data_buf)
-                 : bwrite(fs, b, data_buf)) < 0)
+        /* Regular data shares the same transaction as size, timestamp,
+         * allocation bitmap and pointer updates. A committed replay
+         * therefore installs either the whole 512-byte syscall write or
+         * none of it, including in-place overwrites. */
+        if (journal_stage(fs, b, data_buf) < 0)
             break;
         done += chunk;
         if (pos + chunk > ip.size) {
@@ -1281,14 +1284,14 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         return -1;
     }
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
     for (int i = 0; i < KFS_MAX_MOUNTS; i++) {
         /* Two instances of one device would each keep their own copy of
          * the superblock and write both back, so the block bitmap would
          * diverge on the first allocation. Refuse instead. */
         if (instances[i].used && instances[i].mounted &&
             instances[i].bd == bd) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&kfs_meta_lock, f);
             kprintf("kfs: %s is already mounted\n", bd->name);
             return -1;
         }
@@ -1301,7 +1304,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&kfs_meta_lock, f);
     if (fs == NULL) {
         kprintf("kfs: no free mount slot\n");
         return -1;
@@ -1339,9 +1342,9 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
     fs_unlock();
 
     if (!ok) {
-        f = irq_save();
+        f = spin_lock_irqsave(&kfs_meta_lock);
         fs->used = 0;
-        irq_restore(f);
+        spin_unlock_irqrestore(&kfs_meta_lock, f);
         return -1;
     }
 
@@ -1357,10 +1360,10 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
  * close releases it, so a struct file never points at a recycled slot. */
 static void instance_release(struct kfs_fs *fs)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
     if (!fs->mounted && fs->handles == 0)
         fs->used = 0;
-    irq_restore(f);
+    spin_unlock_irqrestore(&kfs_meta_lock, f);
 }
 
 static void kfs_type_unmount(void *fs_priv)
@@ -1394,33 +1397,33 @@ static struct {
 static int inode_ref(struct kfs_fs *fs, uint32_t inum)
 {
     int slot = -1;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
     for (int i = 0; i < KFS_OPEN_INODES; i++) {
         if (open_inodes[i].count > 0 && open_inodes[i].fs == fs &&
             open_inodes[i].inum == inum) {
             open_inodes[i].count++;
             fs->handles++;
-            irq_restore(f);
+            spin_unlock_irqrestore(&kfs_meta_lock, f);
             return 0;
         }
         if (open_inodes[i].count == 0 && slot < 0)
             slot = i;
     }
     if (slot < 0) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&kfs_meta_lock, f);
         return -1;                  /* too many distinct inodes open */
     }
     open_inodes[slot].fs = fs;
     open_inodes[slot].inum = inum;
     open_inodes[slot].count = 1;
     fs->handles++;
-    irq_restore(f);
+    spin_unlock_irqrestore(&kfs_meta_lock, f);
     return 0;
 }
 
 static void inode_unref(struct kfs_fs *fs, uint32_t inum)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
     for (int i = 0; i < KFS_OPEN_INODES; i++) {
         if (open_inodes[i].count > 0 && open_inodes[i].fs == fs &&
             open_inodes[i].inum == inum) {
@@ -1430,13 +1433,13 @@ static void inode_unref(struct kfs_fs *fs, uint32_t inum)
     }
     if (fs->handles > 0)
         fs->handles--;
-    irq_restore(f);
+    spin_unlock_irqrestore(&kfs_meta_lock, f);
 }
 
 static int inode_is_open(struct kfs_fs *fs, uint32_t inum)
 {
     int open = 0;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
     for (int i = 0; i < KFS_OPEN_INODES; i++) {
         if (open_inodes[i].count > 0 && open_inodes[i].fs == fs &&
             open_inodes[i].inum == inum) {
@@ -1444,7 +1447,7 @@ static int inode_is_open(struct kfs_fs *fs, uint32_t inum)
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&kfs_meta_lock, f);
     return open;
 }
 

@@ -10,6 +10,11 @@ struct tcp_reassembly {
     uint8_t present[(TCP_RXBUF + 7) / 8];
 };
 
+struct tcp_sack_block {
+    uint32_t left;                 /* inclusive sequence number */
+    uint32_t right;                /* exclusive sequence number */
+};
+
 void tcp_reassembly_reset(struct tcp_reassembly *r);
 
 /* Insert one segment into the receive ring.
@@ -31,3 +36,10 @@ int tcp_reassembly_accept(struct tcp_reassembly *r, uint8_t *ring,
  * end of the peer's byte stream before an earlier hole has arrived. */
 void tcp_reassembly_discard_from(struct tcp_reassembly *r, int head,
                                  int contiguous, uint32_t next, uint32_t seq);
+
+/* Describe up to `max_blocks` disjoint out-of-order ranges for a TCP SACK
+ * option. Blocks are returned in ascending sequence order. */
+int tcp_reassembly_sack_blocks(const struct tcp_reassembly *r, int head,
+                               int contiguous, uint32_t next,
+                               struct tcp_sack_block *blocks,
+                               int max_blocks);

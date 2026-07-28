@@ -1309,11 +1309,7 @@ static int install_by_name(struct instate *st, const char *name)
         printf("kpkg: %s: not in the repository index\n", name);
         return -1;
     }
-    if (repo_is_https()) {
-        printf("kpkg: %s\n", http_strerror(HTTP_EHTTPS));
-        return -1;
-    }
-    if (repo_is_http()) {
+    if (repo_is_http() || repo_is_https()) {
         if (fetch_to_cache(e.file, file, sizeof(file)) < 0)
             return -1;
     } else {
@@ -1693,11 +1689,7 @@ static int cmd_update(void)
     if (need_root("update") < 0)
         return 1;
 
-    if (repo_is_https()) {
-        printf("kpkg: %s\n", http_strerror(HTTP_EHTTPS));
-        return 1;
-    }
-    if (!repo_is_http()) {
+    if (!repo_is_http() && !repo_is_https()) {
         index_path(path, sizeof(path));
         if (!exists(path)) {
             printf("kpkg: local repository %s has no %s\n", g_conf.repo,

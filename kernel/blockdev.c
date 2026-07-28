@@ -2,16 +2,18 @@
 #include "blockdev.h"
 #include "proc.h"
 #include "string.h"
+#include "spinlock.h"
 
 /* The block device registry. See blockdev.h for the contract.
  *
  * The table is a fixed array of pointers to descriptors the drivers own.
  * Registration happens at driver init and, once modules exist, at insmod
  * time -- both preemptible contexts -- while lookups happen from mount
- * and from /dev, so every walk of the table runs under irq_save(). There
- * is one CPU, so masking interrupts is a full mutex. */
+ * and from /dev, so every walk of the table runs under an IRQ-safe spin
+ * lock shared by all CPUs. */
 
 static struct blockdev *devices[BLOCKDEV_MAX];
+static spinlock_t blockdev_lock = SPINLOCK_INIT;
 
 int blockdev_register(struct blockdev *bd)
 {
@@ -26,7 +28,7 @@ int blockdev_register(struct blockdev *bd)
     if (bd->name[BLOCKDEV_NAME_MAX - 1] != '\0')
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
     for (int i = 0; i < BLOCKDEV_MAX; i++) {
         if (devices[i] == NULL) {
             if (slot < 0)
@@ -34,18 +36,18 @@ int blockdev_register(struct blockdev *bd)
             continue;
         }
         if (strcmp(devices[i]->name, bd->name) == 0) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&blockdev_lock, f);
             kprintf("blockdev: %s already registered\n", bd->name);
             return -1;
         }
     }
     if (slot < 0) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&blockdev_lock, f);
         kprintf("blockdev: table full, cannot add %s\n", bd->name);
         return -1;
     }
     devices[slot] = bd;
-    irq_restore(f);
+    spin_unlock_irqrestore(&blockdev_lock, f);
 
     kprintf("blockdev: %s registered, %u-byte blocks, %lu blocks (%lu MiB)\n",
             bd->name, bd->block_size, (unsigned long)bd->blocks,
@@ -57,14 +59,14 @@ void blockdev_unregister(struct blockdev *bd)
 {
     if (bd == NULL)
         return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
     for (int i = 0; i < BLOCKDEV_MAX; i++) {
         if (devices[i] == bd) {
             devices[i] = NULL;
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&blockdev_lock, f);
 }
 
 struct blockdev *blockdev_find(const char *name)
@@ -74,14 +76,14 @@ struct blockdev *blockdev_find(const char *name)
     if (name == NULL || name[0] == '\0')
         return NULL;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
     for (int i = 0; i < BLOCKDEV_MAX; i++) {
         if (devices[i] != NULL && strcmp(devices[i]->name, name) == 0) {
             found = devices[i];
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&blockdev_lock, f);
     return found;
 }
 
@@ -93,7 +95,7 @@ int blockdev_list(int index, struct blockdev **out)
     if (index < 0 || out == NULL)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
     for (int i = 0; i < BLOCKDEV_MAX; i++) {
         if (devices[i] == NULL)
             continue;
@@ -104,7 +106,7 @@ int blockdev_list(int index, struct blockdev **out)
         }
         seen++;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&blockdev_lock, f);
     return r;
 }
 

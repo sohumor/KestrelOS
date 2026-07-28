@@ -11,7 +11,7 @@
  *   offset  8  u32 fb_height
  *   offset 12  u32 fb_pitch      (bytes per scanline)
  *   offset 16  u32 fb_bpp
- *   offset 20  u32 reserved
+ *   offset 20  u32 boot_seed     (mixed timing seed; not trusted alone)
  *   offset 24  u64 fb_phys       (linear framebuffer physical address)
  *   offset 32  e820 entries, 24 bytes each
  */
@@ -37,7 +37,7 @@ struct bootinfo {
     uint32_t fb_height;
     uint32_t fb_pitch;
     uint32_t fb_bpp;
-    uint32_t _reserved;
+    uint32_t boot_seed;
     uint64_t fb_phys;
     struct e820_entry e820[];
 } __attribute__((packed));

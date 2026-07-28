@@ -4,6 +4,7 @@
 #include "io.h"
 #include "fb.h"
 #include "font.h"
+#include "spinlock.h"
 
 /* System console: an ANSI/VT100 subset (CSI 2J/H/f/K/m/A-D and ?25l/h)
  * on top of one of two backends.
@@ -67,6 +68,7 @@ static int esc_params[ESC_MAX_PARAMS];
 static int esc_nparams;
 static int esc_have_digit;
 static int esc_private;     /* saw '?' after CSI */
+static spinlock_t console_lock = SPINLOCK_INIT;
 
 /* ANSI color index (0-7) -> VGA color */
 static const uint8_t ansi_to_vga[8] = { 0, 4, 2, 6, 1, 5, 3, 7 };
@@ -452,8 +454,11 @@ static int esc_consume(char c)
 
 void console_putc(char c)
 {
-    if (esc_consume(c))
+    uint64_t flags = spin_lock_irqsave(&console_lock);
+    if (esc_consume(c)) {
+        spin_unlock_irqrestore(&console_lock, flags);
         return;
+    }
 
     switch (c) {
     case '\n':
@@ -488,6 +493,7 @@ void console_putc(char c)
         scroll();
     update_cursor();
     fb_sync();
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_write(const char *s)

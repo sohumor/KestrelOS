@@ -28,6 +28,9 @@
 #include "wm.h"
 #include "initcall.h"
 #include "device.h"
+#include "random.h"
+#include "vm.h"
+#include "smp.h"
 
 struct bootinfo *boot_info;
 
@@ -82,6 +85,12 @@ void kmain(uint64_t bootinfo_phys)
     kprintf("  from-scratch kernel booted in long mode\n\n");
 
     boot_info = P2V(bootinfo_phys);
+    random_init(boot_info->boot_seed);
+    entropy_pool_add(ENTROPY_BOOT, boot_info,
+                     sizeof(*boot_info) +
+                         (size_t)boot_info->e820_count *
+                             sizeof(struct e820_entry),
+                     0);
 
     uint64_t usable = 0;
     for (int i = 0; i < boot_info->e820_count; i++)
@@ -103,6 +112,7 @@ void kmain(uint64_t bootinfo_phys)
     fpu_init();
     pmm_init(boot_info);
     vmm_init();
+    smp_init(boot_info);
     kheap_init();
     kprintf("mem: pmm %lu pages free, paging rebuilt, heap ready\n",
             pmm_free_pages());
@@ -122,6 +132,7 @@ void kmain(uint64_t bootinfo_phys)
     initcall_run_level(INITCALL_CORE);
 
     ata_init();
+    swap_init();
     vfs_init();              /* reports success or failure itself */
     devfs_init();
 
@@ -137,6 +148,7 @@ void kmain(uint64_t bootinfo_phys)
     wm_init();
     syscall_init();
     initcall_run_level(INITCALL_LATE);
+    smp_start_aps();
 
     char when[40];
     if (rtc_format(when, sizeof(when)) == 0)

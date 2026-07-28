@@ -215,7 +215,7 @@ struct tls_info {
     int         verified;           /* 1 = the chain is trusted      */
     int         hello_retry;        /* 1 = a HelloRetryRequest happened */
     int         rsa_fallback;       /* 1 = connected on the RSA retry */
-    int         weak_entropy;       /* 1 = no hardware RNG was found */
+    int         weak_entropy;       /* 1 = strong system seed unavailable */
     int         chain_len;
     char        subject[X509_MAX_CN];
     char        issuer[X509_MAX_CN];
@@ -250,12 +250,11 @@ const char *tls_builtin_root_name(int i);   /* NULL when i is out of range */
 
 /* ---- entropy --------------------------------------------------------- */
 
-/* Stir extra entropy into the DRBG. The browser should feed it mouse and
- * key timings; it is never harmful and the on-target sources are thin. */
+/* Stir process-local observations into the TLS DRBG in addition to the
+ * kernel CSPRNG seed. */
 void tls_add_entropy(const void *data, unsigned long len);
 
-/* 1 when no hardware random source was found and the DRBG is seeded only
- * from timers and addresses. Callers that care should say so out loud. */
+/* 1 only when a strong system seed could not be obtained. */
 int tls_entropy_is_weak(void);
 
 /* ---- plugging into libweb's HTTP client ------------------------------ *

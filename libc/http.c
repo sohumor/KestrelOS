@@ -1,4 +1,4 @@
-/* KestrelOS libc: a minimal HTTP/1.1 client over the TCP syscalls.
+/* KestrelOS libc: a minimal HTTP/1.1 client over TCP or verified TLS 1.3.
  *
  * Deliberately small: GET only, one request per connection
  * (Connection: close), an in-memory body with a hard cap. It speaks
@@ -6,8 +6,7 @@
  * redirects, case-insensitive headers, Content-Length, chunked
  * transfer-encoding, and bodies delimited by connection close.
  *
- * The TCP and DNS wrappers are issued through syscall() directly so
- * this file does not depend on anything beyond <kestrel.h>.
+ * Plain transport uses the TCP syscalls; https:// uses libtls.
  */
 
 #include <http.h>
@@ -15,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <tls.h>
 
 #define HTTP_HOST_MAX     256
 #define HTTP_PATH_MAX     768
@@ -25,6 +25,8 @@
  * so there is no point asking for more than that in one call. */
 #define HTTP_SEGMENT      1400
 #define HTTP_BODY_START   8192
+
+static char g_http_tls_error[160];
 
 /* Internal: fetch_once() wants to be redirected. Positive so it can
  * never be confused with a public HTTP_E* code. */
@@ -119,25 +121,28 @@ static unsigned long parse_hex(const char *s, int *ok)
 
 /* ---- URL splitting -------------------------------------------------- */
 
-/* Split "http://host[:port][/path]" into its parts. Returns HTTP_OK, or
- * HTTP_EHTTPS / HTTP_ESCHEME / HTTP_EURL. */
+/* Split "http[s]://host[:port][/path]" into its parts. */
 static int url_split(const char *url, char *host, unsigned long hostsz,
-                     uint16_t *port, char *path, unsigned long pathsz)
+                     uint16_t *port, int *secure,
+                     char *path, unsigned long pathsz)
 {
     const char *p, *h;
     unsigned long n;
 
     if (url == 0)
         return HTTP_EURL;
-    if (ci_prefix(url, "https://"))
-        return HTTP_EHTTPS;
-    if (!ci_prefix(url, "http://")) {
+    if (ci_prefix(url, "https://")) {
+        *secure = 1;
+        h = url + 8;
+    } else if (ci_prefix(url, "http://")) {
+        *secure = 0;
+        h = url + 7;
+    } else {
         /* Anything with a "scheme://" is a scheme we do not speak; a URL
          * with no scheme at all is simply malformed. */
         return strstr(url, "://") ? HTTP_ESCHEME : HTTP_EURL;
     }
 
-    h = url + 7;
     p = h;
     while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#')
         p++;
@@ -147,7 +152,7 @@ static int url_split(const char *url, char *host, unsigned long hostsz,
     memcpy(host, h, n);
     host[n] = '\0';
 
-    *port = 80;
+    *port = *secure ? 443 : 80;
     if (*p == ':') {
         int ok;
         unsigned long v = parse_ulong(p + 1, &ok);
@@ -250,6 +255,8 @@ static void hb_free(struct hbuf *b)
 
 struct hconn {
     int handle;
+    struct tls_conn *tls;
+    int secure;
     int len;
     int pos;
     int eof;                       /* peer closed cleanly */
@@ -266,8 +273,13 @@ static int hc_fill(struct hconn *c)
         return 1;
     if (c->eof || c->err)
         return 0;
-    n = syscall(SYS_TCP_RECV, c->handle, (long)c->buf,
-                (long)sizeof(c->buf), HTTP_RECV_MS);
+    if (c->secure) {
+        tls_set_timeout(c->tls, HTTP_RECV_MS);
+        n = tls_read(c->tls, c->buf, (int)sizeof(c->buf));
+    } else {
+        n = syscall(SYS_TCP_RECV, c->handle, (long)c->buf,
+                    (long)sizeof(c->buf), HTTP_RECV_MS);
+    }
     if (n == 0) {
         c->eof = 1;
         return 0;
@@ -330,7 +342,18 @@ static long hc_read(struct hconn *c, void *dst, unsigned long max)
 
 /* ---- request/response ------------------------------------------------ */
 
-static int send_all(int handle, const char *buf, unsigned long len)
+static void hc_close(struct hconn *c)
+{
+    if (c->secure && c->tls) {
+        tls_close(c->tls);
+        c->tls = 0;
+    } else if (c->handle >= 0) {
+        syscall(SYS_TCP_CLOSE, c->handle, 0, 0, 0);
+        c->handle = -1;
+    }
+}
+
+static int send_all(struct hconn *c, const char *buf, unsigned long len)
 {
     unsigned long done = 0;
 
@@ -339,7 +362,11 @@ static int send_all(int handle, const char *buf, unsigned long len)
         long n;
         if (chunk > HTTP_SEGMENT)
             chunk = HTTP_SEGMENT;
-        n = syscall(SYS_TCP_SEND, handle, (long)(buf + done), (long)chunk, 0);
+        if (c->secure)
+            n = tls_write(c->tls, buf + done, (int)chunk);
+        else
+            n = syscall(SYS_TCP_SEND, c->handle, (long)(buf + done),
+                        (long)chunk, 0);
         if (n <= 0)
             return HTTP_ESEND;
         done += (unsigned long)n;
@@ -430,19 +457,18 @@ static int read_body_chunked(struct hconn *c, struct hbuf *b)
     return HTTP_OK;
 }
 
-/* Turn a Location: value into an absolute http:// URL in `out`, using
+/* Turn a Location: value into an absolute URL in `out`, using
  * the request it came from as the base. */
 static int resolve_location(const char *loc, const char *host, uint16_t port,
-                            const char *path, char *out, unsigned long outsz)
+                            int secure, const char *path,
+                            char *out, unsigned long outsz)
 {
     char base[HTTP_HOST_MAX + 16];
     int n;
 
     if (loc[0] == '\0')
         return HTTP_EREDIR;
-    if (ci_prefix(loc, "https://"))
-        return HTTP_EHTTPS;
-    if (ci_prefix(loc, "http://")) {
+    if (ci_prefix(loc, "https://") || ci_prefix(loc, "http://")) {
         if (strlen(loc) + 1 > outsz)
             return HTTP_EURL;
         strcpy(out, loc);
@@ -451,11 +477,12 @@ static int resolve_location(const char *loc, const char *host, uint16_t port,
     if (strstr(loc, "://"))
         return HTTP_ESCHEME;
 
-    if (port == 80)
-        n = snprintf(base, sizeof(base), "http://%s", host);
+    if ((!secure && port == 80) || (secure && port == 443))
+        n = snprintf(base, sizeof(base), "%s://%s",
+                     secure ? "https" : "http", host);
     else
-        n = snprintf(base, sizeof(base), "http://%s:%u", host,
-                     (unsigned)port);
+        n = snprintf(base, sizeof(base), "%s://%s:%u",
+                     secure ? "https" : "http", host, (unsigned)port);
     if (n < 0 || (unsigned long)n >= sizeof(base))
         return HTTP_EURL;
 
@@ -493,26 +520,47 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
     char location[HTTP_LINE_MAX];
     struct hconn c;
     uint16_t port = 80;
+    int secure = 0;
     uint32_t ip = 0;
     unsigned long clen = 0;
     int have_clen = 0, chunked = 0, have_loc = 0;
-    int code = 0, handle, rc, n;
+    int code = 0, rc, n;
 
-    rc = url_split(url, host, sizeof(host), &port, path, sizeof(path));
+    memset(&c, 0, sizeof(c));
+    c.handle = -1;
+
+    rc = url_split(url, host, sizeof(host), &port, &secure,
+                   path, sizeof(path));
     if (rc != HTTP_OK)
         return rc;
 
-    ip = ip_aton(host);
-    if (ip == 0 && dns_resolve(host, &ip) < 0)
-        return HTTP_EDNS;
-    if (ip == 0)
-        return HTTP_EDNS;
+    if (secure) {
+        struct tls_options options;
+        struct tls_error error;
+        tls_options_default(&options);
+        options.alpn = "http/1.1";
+        options.timeout_ms = HTTP_CONNECT_MS;
+        c.tls = tls_connect(host, port, &options, &error);
+        if (!c.tls) {
+            snprintf(g_http_tls_error, sizeof(g_http_tls_error), "%s",
+                     error.msg[0] ? error.msg : "TLS handshake failed");
+            return HTTP_ETLS;
+        }
+        g_http_tls_error[0] = '\0';
+        c.secure = 1;
+    } else {
+        ip = ip_aton(host);
+        if (ip == 0 && dns_resolve(host, &ip) < 0)
+            return HTTP_EDNS;
+        if (ip == 0)
+            return HTTP_EDNS;
+        c.handle = (int)syscall(SYS_TCP_CONNECT, (long)ip, port,
+                                HTTP_CONNECT_MS, 0);
+        if (c.handle < 0)
+            return HTTP_ECONNECT;
+    }
 
-    handle = (int)syscall(SYS_TCP_CONNECT, (long)ip, port, HTTP_CONNECT_MS, 0);
-    if (handle < 0)
-        return HTTP_ECONNECT;
-
-    if (port == 80)
+    if ((!secure && port == 80) || (secure && port == 443))
         n = snprintf(req, sizeof(req),
                      "GET %s HTTP/1.1\r\n"
                      "Host: %s\r\n"
@@ -529,41 +577,39 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
                      "Connection: close\r\n\r\n",
                      path, host, (unsigned)port);
     if (n < 0 || (unsigned long)n >= sizeof(req)) {
-        syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+        hc_close(&c);
         return HTTP_EURL;
     }
 
-    rc = send_all(handle, req, (unsigned long)n);
+    rc = send_all(&c, req, (unsigned long)n);
     if (rc != HTTP_OK) {
-        syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+        hc_close(&c);
         return rc;
     }
 
-    memset(&c, 0, sizeof(c));
-    c.handle = handle;
     location[0] = '\0';
 
     /* Status line: "HTTP/1.x <code> <reason>". */
     if (hc_line(&c, line, sizeof(line)) < 0) {
-        syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+        hc_close(&c);
         return c.err ? HTTP_ERECV : HTTP_EPROTO;
     }
     if (!ci_prefix(line, "HTTP/1.")) {
-        syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+        hc_close(&c);
         return HTTP_EPROTO;
     }
     {
         const char *sp = strchr(line, ' ');
         int ok;
         if (sp == 0) {
-            syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+            hc_close(&c);
             return HTTP_EPROTO;
         }
         while (*sp == ' ')
             sp++;
         code = (int)parse_ulong(sp, &ok);
         if (!ok || code < 100 || code > 599) {
-            syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+            hc_close(&c);
             return HTTP_EPROTO;
         }
     }
@@ -572,11 +618,11 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
     for (;;) {
         long ln = hc_line(&c, line, sizeof(line));
         if (ln == -2) {                 /* absurd header: give up cleanly */
-            syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+            hc_close(&c);
             return HTTP_EPROTO;
         }
         if (ln < 0) {
-            syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+            hc_close(&c);
             return HTTP_ERECV;
         }
         if (ln == 0)
@@ -601,8 +647,9 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
 
     if ((code == 301 || code == 302 || code == 303 ||
          code == 307 || code == 308) && have_loc) {
-        rc = resolve_location(location, host, port, path, next, nextsz);
-        syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+        rc = resolve_location(location, host, port, secure, path,
+                              next, nextsz);
+        hc_close(&c);
         return rc == HTTP_OK ? HTTP_REDIRECT : rc;
     }
 
@@ -616,7 +663,7 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
     else
         rc = read_body_close(&c, body);
 
-    syscall(SYS_TCP_CLOSE, handle, 0, 0, 0);
+    hc_close(&c);
     if (rc != HTTP_OK)
         return rc;
     if (status)
@@ -678,8 +725,8 @@ const char *http_strerror(int err)
     switch (err) {
     case HTTP_OK:       return "ok";
     case HTTP_EURL:     return "malformed URL";
-    case HTTP_EHTTPS:   return "https is not supported (KestrelOS has no TLS)";
-    case HTTP_ESCHEME:  return "unsupported URL scheme (only http:// works)";
+    case HTTP_EHTTPS:   return "legacy HTTPS capability error";
+    case HTTP_ESCHEME:  return "unsupported URL scheme (use http:// or https://)";
     case HTTP_EDNS:     return "host name did not resolve";
     case HTTP_ECONNECT: return "could not connect";
     case HTTP_ESEND:    return "could not send the request";
@@ -688,6 +735,8 @@ const char *http_strerror(int err)
     case HTTP_ETOOBIG:  return "response body larger than 8 MiB";
     case HTTP_EREDIR:   return "too many redirects";
     case HTTP_ENOMEM:   return "out of memory";
+    case HTTP_ETLS:     return g_http_tls_error[0]
+                              ? g_http_tls_error : "TLS handshake failed";
     default:            return "unknown error";
     }
 }

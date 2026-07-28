@@ -1,9 +1,12 @@
 #include "serial.h"
 #include "input.h"
+#include "random.h"
 #include "interrupts.h"
 #include "io.h"
+#include "spinlock.h"
 
 #define COM1 0x3F8
+static spinlock_t serial_lock = SPINLOCK_INIT;
 
 void serial_init(void)
 {
@@ -16,13 +19,20 @@ void serial_init(void)
     outb(COM1 + 4, 0x0B);    /* DTR | RTS | OUT2 */
 }
 
-void serial_putc(char c)
+static void serial_emit(char c)
 {
-    if (c == '\n')
-        serial_putc('\r');
     while (!(inb(COM1 + 5) & 0x20))
         ;
     outb(COM1, c);
+}
+
+void serial_putc(char c)
+{
+    uint64_t flags = spin_lock_irqsave(&serial_lock);
+    if (c == '\n')
+        serial_emit('\r');
+    serial_emit(c);
+    spin_unlock_irqrestore(&serial_lock, flags);
 }
 
 void serial_write(const char *s)
@@ -116,8 +126,11 @@ static void serial_handle_byte(uint8_t b)
 static void serial_irq(struct regs *r)
 {
     (void)r;
-    while (inb(COM1 + 5) & 1)
-        serial_handle_byte(inb(COM1));
+    while (inb(COM1 + 5) & 1) {
+        uint8_t byte = inb(COM1);
+        entropy_pool_add_interrupt(ENTROPY_SERIAL, byte);
+        serial_handle_byte(byte);
+    }
 }
 
 void serial_init_irq(void)

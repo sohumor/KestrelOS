@@ -3,6 +3,7 @@
 #include "proc.h"
 #include "string.h"
 #include "io.h"
+#include "spinlock.h"
 
 /* CMOS/RTC (MC146818). Index register 0x70, data register 0x71.
  *
@@ -12,9 +13,9 @@
  * The index/data pair is global mutable hardware state and syscalls run
  * preemptible, so a task switch between the index write and the data read
  * would hand back a different register's contents. Every access sequence
- * below therefore runs under irq_save(). The critical sections are a
- * handful of port reads; the unbounded UIP spin deliberately sits outside
- * them so we never hold interrupts off for long. */
+ * below therefore runs under an IRQ-safe spin lock. The critical sections
+ * are a handful of port reads; the unbounded UIP spin deliberately sits
+ * outside them so we never hold the lock for long. */
 
 #define CMOS_INDEX      0x70
 #define CMOS_DATA       0x71
@@ -39,6 +40,7 @@
 /* Bounded so a dead or emulated-away chip can never wedge the kernel. */
 #define UIP_SPINS       1000000
 #define SETTLE_TRIES    16
+static spinlock_t rtc_lock = SPINLOCK_INIT;
 
 /* Caller must hold interrupts off (see cmos_read_locked). */
 static uint8_t cmos_read_raw(uint8_t reg)
@@ -50,9 +52,9 @@ static uint8_t cmos_read_raw(uint8_t reg)
 
 static uint8_t cmos_read_locked(uint8_t reg)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&rtc_lock);
     uint8_t v = cmos_read_raw(reg);
-    irq_restore(f);
+    spin_unlock_irqrestore(&rtc_lock, f);
     return v;
 }
 
@@ -119,7 +121,7 @@ static void read_raw(struct raw_time *r)
 
     /* One indivisible sweep: an update cannot start mid-read, and no other
      * task can steal the index register out from under us. */
-    f = irq_save();
+    f = spin_lock_irqsave(&rtc_lock);
     r->sec     = cmos_read_raw(RTC_SEC);
     r->min     = cmos_read_raw(RTC_MIN);
     r->hour    = cmos_read_raw(RTC_HOUR);
@@ -127,7 +129,7 @@ static void read_raw(struct raw_time *r)
     r->mon     = cmos_read_raw(RTC_MON);
     r->year    = cmos_read_raw(RTC_YEAR);
     r->century = cmos_read_raw(RTC_CENTURY);
-    irq_restore(f);
+    spin_unlock_irqrestore(&rtc_lock, f);
 }
 
 int rtc_read(struct k_rtc *out)

@@ -14,6 +14,7 @@ struct regs {
 typedef void (*irq_handler_t)(struct regs *r);
 
 void idt_init(void);
+void idt_load(void);
 void irq_install_handler(int irq, irq_handler_t handler);
 
 void pic_init(void);

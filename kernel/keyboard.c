@@ -2,6 +2,7 @@
 #include "input.h"
 #include "interrupts.h"
 #include "io.h"
+#include "random.h"
 
 /* US QWERTY, scancode set 1 */
 static const char map_normal[0x40] = {
@@ -26,6 +27,7 @@ static void kbd_irq(struct regs *r)
 {
     (void)r;
     uint8_t sc = inb(0x60);
+    entropy_pool_add_interrupt(ENTROPY_KEYBOARD, sc);
 
     if (sc == 0xE0) {
         ext = true;

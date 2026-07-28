@@ -8,15 +8,14 @@
 /* Anonymous pipes.
  *
  * The ring buffer and the two reference counts are plain memory touched by
- * two preemptible tasks, so every inspection or update of head/tail/count/
- * readers/writers runs under irq_save() -- there is one CPU, so masking
- * interrupts is a full mutex. The critical sections only ever contain a
- * bounded memcpy of at most PIPE_BUF_SIZE bytes; blocking is always done
- * with interrupts restored, by sleeping a tick and re-checking. None of
- * this runs in IRQ context, so kmalloc() here is fine.
+ * tasks on different CPUs, so every inspection or update of head/tail/
+ * count/readers/writers runs under the pipe's IRQ-safe spin lock. The
+ * critical sections only contain a bounded copy; blocking is always done
+ * with the lock dropped, by sleeping a tick and re-checking. None of this
+ * runs in IRQ context, so kmalloc() here is fine.
  *
- * There are no signals in KestrelOS, so writing to a pipe with no readers
- * simply fails instead of raising SIGPIPE. */
+ * Writing to a pipe with no readers currently returns an error; SIGPIPE is
+ * not yet wired into this VFS operation. */
 
 int pipe_create(struct file **read_end, struct file **write_end)
 {
@@ -120,17 +119,17 @@ long pipe_read(struct file *f, void *buf, unsigned long n)
         return 0;
 
     for (;;) {
-        fl = irq_save();
+        fl = spin_lock_irqsave(&p->lock);
         if (p->count > 0) {
             got = ring_take(p, (uint8_t *)buf, n);
-            irq_restore(fl);
+            spin_unlock_irqrestore(&p->lock, fl);
             return (long)got;
         }
         if (p->writers <= 0) {
-            irq_restore(fl);
+            spin_unlock_irqrestore(&p->lock, fl);
             return 0;           /* EOF: last writer closed */
         }
-        irq_restore(fl);
+        spin_unlock_irqrestore(&p->lock, fl);
         /* Empty but still writable: wait. task_sleep_ticks() is safe here
          * because the pipe holds no lock of its own. */
         task_sleep_ticks(1);
@@ -152,19 +151,19 @@ long pipe_write(struct file *f, const void *buf, unsigned long n)
         return 0;
 
     while (done < n) {
-        fl = irq_save();
+        fl = spin_lock_irqsave(&p->lock);
         if (p->readers <= 0) {
-            irq_restore(fl);
+            spin_unlock_irqrestore(&p->lock, fl);
             /* No signals here, so a broken pipe is just an error. Bytes
              * already handed over still count. */
             return done ? (long)done : -1;
         }
         if (p->count < PIPE_BUF_SIZE) {
             done += ring_put(p, (const uint8_t *)buf + done, n - done);
-            irq_restore(fl);
+            spin_unlock_irqrestore(&p->lock, fl);
             continue;
         }
-        irq_restore(fl);
+        spin_unlock_irqrestore(&p->lock, fl);
         task_sleep_ticks(1);    /* full: wait for the reader to drain it */
     }
     return (long)done;
@@ -180,7 +179,7 @@ void pipe_close(struct file *f)
         return;
     p = f->pipe;
 
-    fl = irq_save();
+    fl = spin_lock_irqsave(&p->lock);
     if (f->writable) {
         if (p->writers > 0)
             p->writers--;
@@ -191,7 +190,7 @@ void pipe_close(struct file *f)
     if (p->readers <= 0 && p->writers <= 0)
         dead = 1;
     f->pipe = NULL;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
 
     if (dead) {
         /* Both ends are gone, so no other task can still reach *p. */

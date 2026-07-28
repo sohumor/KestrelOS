@@ -6,6 +6,7 @@
 #include "net.h"
 #include "tcp.h"
 #include "tcp_reassembly.h"
+#include "spinlock.h"
 
 /* TCP (client side).
  *
@@ -20,9 +21,10 @@
  *                retransmissions, FIN, and the ACKs that tcp_input asked
  *                for by setting need_ack.
  *
- * Everything touched by both contexts is guarded with irq_save/irq_restore.
- * Buffers are kmalloc'd once per slot in task context and kept for reuse,
- * so the IRQ path never allocates.
+ * Everything touched by both contexts is guarded by tcp_lock. Merely
+ * disabling local interrupts is insufficient once tasks can run on other
+ * CPUs. Buffers are kmalloc'd once per slot in task context and kept for
+ * reuse, so the IRQ path never allocates.
  */
 
 #define IP_PROTO_TCP  6
@@ -32,6 +34,13 @@
 #define TCP_RST  0x04
 #define TCP_PSH  0x08
 #define TCP_ACK  0x10
+
+#define TCP_OPT_END            0
+#define TCP_OPT_NOP            1
+#define TCP_OPT_MSS            2
+#define TCP_OPT_SACK_PERMITTED 4
+#define TCP_OPT_SACK           5
+#define TCP_MAX_SACK_BLOCKS    4
 
 #define TCP_RTO_MIN     50      /* ticks, 100 Hz -> 500 ms */
 #define TCP_RTO_MAX     800     /* ticks -> 8 s */
@@ -80,10 +89,16 @@ struct tcp_conn {
     uint32_t iss;
     uint32_t snd_una;      /* oldest unacknowledged sequence number */
     uint32_t snd_nxt;      /* next sequence number to transmit */
+    uint32_t snd_max;      /* highest sequence ever transmitted */
     uint32_t snd_wnd;      /* peer's advertised window */
     uint8_t *txbuf;        /* ring, holds tx_len bytes starting at snd_una */
     int      tx_head;
     int      tx_len;
+    struct tcp_sack_block tx_sack[TCP_MAX_SACK_BLOCKS];
+    int      tx_sack_count;
+    int      dup_acks;
+    bool     fast_retransmit;
+    bool     sack_enabled;
     bool     fin_pending;  /* application asked to close */
     bool     fin_sent;
     uint32_t fin_seq;      /* sequence number our FIN occupies */
@@ -111,6 +126,7 @@ struct tcp_conn {
 
 static struct tcp_conn conns[TCP_CONNS];
 static uint16_t port_next = TCP_PORT_FIRST;
+static spinlock_t tcp_lock = SPINLOCK_INIT;
 
 /* ---- sequence arithmetic ----
  * Sequence numbers wrap at 2^32; raw unsigned comparison is wrong across
@@ -132,9 +148,9 @@ static inline bool seq_leq(uint32_t a, uint32_t b)
 /* Free space in the receive ring, i.e. the window we advertise. */
 static uint16_t rcv_window(struct tcp_conn *c)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
     int freebytes = TCP_RXBUF - c->rx_len;
-    irq_restore(f);
+    spin_unlock_irqrestore(&tcp_lock, f);
     if (freebytes < 0)
         freebytes = 0;
     if (freebytes > 65535)
@@ -142,42 +158,84 @@ static uint16_t rcv_window(struct tcp_conn *c)
     return (uint16_t)freebytes;
 }
 
-/* Task context only (net_ip_send may block in ARP).
- * txoff/dlen name a window into the send ring measured from tx_head. */
+/* Task context only (net_ip_send may block in ARP). For a data segment,
+ * derive the ring offset from the latest cumulative ACK while holding the
+ * lock; an ACK may advance tx_head between the pump's plan and this copy. */
 static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
-                    int txoff, int dlen, bool with_mss)
+                    int dlen, bool syn_options)
 {
-    uint8_t pkt[sizeof(struct tcp_hdr) + 4 + TCP_MSS];
+    uint8_t pkt[sizeof(struct tcp_hdr) + 40 + TCP_MSS];
     struct tcp_hdr *th = (struct tcp_hdr *)pkt;
-    int hlen = (int)sizeof(*th) + (with_mss ? 4 : 0);
-    uint8_t *payload = pkt + hlen;
+    int optlen = 0;
 
     if (dlen < 0 || dlen > TCP_MSS)
         return -1;
 
+    if (syn_options) {
+        /* MSS, SACK-Permitted, then two NOPs to align the header. */
+        pkt[sizeof(*th) + optlen++] = TCP_OPT_MSS;
+        pkt[sizeof(*th) + optlen++] = 4;
+        pkt[sizeof(*th) + optlen++] = (uint8_t)(TCP_MSS >> 8);
+        pkt[sizeof(*th) + optlen++] = (uint8_t)(TCP_MSS & 0xFF);
+        pkt[sizeof(*th) + optlen++] = TCP_OPT_SACK_PERMITTED;
+        pkt[sizeof(*th) + optlen++] = 2;
+        pkt[sizeof(*th) + optlen++] = TCP_OPT_NOP;
+        pkt[sizeof(*th) + optlen++] = TCP_OPT_NOP;
+    } else if ((flags & TCP_ACK) && c->sack_enabled) {
+        struct tcp_sack_block blocks[TCP_MAX_SACK_BLOCKS];
+        uint64_t sf = spin_lock_irqsave(&tcp_lock);
+        int n = tcp_reassembly_sack_blocks(&c->reassembly, c->rx_head,
+                                           c->rx_len, c->rcv_nxt, blocks,
+                                           TCP_MAX_SACK_BLOCKS);
+        spin_unlock_irqrestore(&tcp_lock, sf);
+        if (n > 0) {
+            /* Two NOPs make 2 + (2 + 8*n) a 32-bit multiple. */
+            pkt[sizeof(*th) + optlen++] = TCP_OPT_NOP;
+            pkt[sizeof(*th) + optlen++] = TCP_OPT_NOP;
+            pkt[sizeof(*th) + optlen++] = TCP_OPT_SACK;
+            pkt[sizeof(*th) + optlen++] = (uint8_t)(2 + n * 8);
+            for (int i = 0; i < n; i++) {
+                uint32_t left = htonl(blocks[i].left);
+                uint32_t right = htonl(blocks[i].right);
+                memcpy(pkt + sizeof(*th) + optlen, &left, 4);
+                optlen += 4;
+                memcpy(pkt + sizeof(*th) + optlen, &right, 4);
+                optlen += 4;
+            }
+        }
+    }
+
+    int hlen = (int)sizeof(*th) + optlen;
+    uint8_t *payload = pkt + hlen;
+
     th->sport = htons(c->local_port);
     th->dport = htons(c->peer_port);
-    th->seq = htonl(seq);
     th->off = (uint8_t)((hlen / 4) << 4);
     th->flags = flags;
     th->win = htons(rcv_window(c));
     th->csum = 0;
     th->urg = 0;
 
-    if (with_mss) {
-        /* kind 2, length 4, MSS 1460 -- exactly one 32-bit word, no pad. */
-        pkt[sizeof(*th) + 0] = 2;
-        pkt[sizeof(*th) + 1] = 4;
-        pkt[sizeof(*th) + 2] = (uint8_t)(TCP_MSS >> 8);
-        pkt[sizeof(*th) + 3] = (uint8_t)(TCP_MSS & 0xFF);
-    }
-
     /* Snapshot the ring with interrupts masked: an ACK arriving mid-copy
      * would advance tx_head and let a concurrent tcp_send() overwrite the
      * bytes we are still reading. At most one MSS, so the window is short. */
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
+    if (dlen > 0 && seq_lt(seq, c->snd_una)) {
+        uint32_t already_acked = c->snd_una - seq;
+        if (already_acked >= (uint32_t)dlen) {
+            spin_unlock_irqrestore(&tcp_lock, f);
+            return 0;
+        }
+        seq += already_acked;
+        dlen -= (int)already_acked;
+    }
     th->ack = (flags & TCP_ACK) ? htonl(c->rcv_nxt) : 0;
     if (dlen > 0) {
+        int txoff = (int)(seq - c->snd_una);
+        if (txoff < 0 || txoff + dlen > c->tx_len) {
+            spin_unlock_irqrestore(&tcp_lock, f);
+            return -1;
+        }
         int pos = (c->tx_head + txoff) % TCP_TXBUF;
         int first = TCP_TXBUF - pos;
         if (first > dlen)
@@ -186,7 +244,8 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
         if (dlen > first)
             memcpy(payload + first, c->txbuf, (size_t)(dlen - first));
     }
-    irq_restore(f);
+    th->seq = htonl(seq);
+    spin_unlock_irqrestore(&tcp_lock, f);
 
     th->csum = net_transport_checksum(net_ip_addr(), c->peer_ip,
                                       IP_PROTO_TCP, pkt, hlen + dlen);
@@ -195,9 +254,8 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
 
 /* Task context. Buffers are deliberately kept for reuse by the next
  * connection so that the IRQ path never has to allocate. */
-static void conn_release(struct tcp_conn *c)
+static void conn_release_locked(struct tcp_conn *c)
 {
-    uint64_t f = irq_save();
     c->used = false;
     c->detached = false;
     c->state = TCP_CLOSED;
@@ -206,12 +264,25 @@ static void conn_release(struct tcp_conn *c)
     c->peer_port = 0;
     c->local_port = 0;
     c->tx_head = c->tx_len = 0;
+    c->tx_sack_count = c->dup_acks = 0;
+    c->fast_retransmit = c->sack_enabled = false;
     c->rx_head = c->rx_len = 0;
     c->fin_pending = c->fin_sent = false;
     c->peer_fin = c->fin_queued = c->need_ack = c->reset = false;
     c->rto_deadline = 0;
     c->retries = 0;
-    irq_restore(f);
+}
+
+static void conn_release(struct tcp_conn *c)
+{
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
+    if (c->pumping) {
+        c->detached = true;
+        c->state = TCP_CLOSED;
+    } else {
+        conn_release_locked(c);
+    }
+    spin_unlock_irqrestore(&tcp_lock, f);
 }
 
 static bool port_in_use(uint16_t p)
@@ -252,21 +323,41 @@ static struct tcp_conn *conn_get(int handle)
 {
     if (handle < 0 || handle >= TCP_CONNS)
         return 0;
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
     struct tcp_conn *c = &conns[handle];
-    if (!c->used || c->detached)
+    if (!c->used || c->detached) {
+        spin_unlock_irqrestore(&tcp_lock, f);
         return 0;
-    if (c->owner_pid > 0 && current && current->pid != c->owner_pid)
+    }
+    if (c->owner_pid > 0 && current && current->pid != c->owner_pid) {
+        spin_unlock_irqrestore(&tcp_lock, f);
         return 0;
+    }
+    spin_unlock_irqrestore(&tcp_lock, f);
     return c;
 }
 
 /* ---- IRQ side ---- */
 
+static void sack_prune(struct tcp_conn *c, uint32_t ack)
+{
+    int out = 0;
+    for (int i = 0; i < c->tx_sack_count; i++) {
+        struct tcp_sack_block b = c->tx_sack[i];
+        if (seq_leq(b.right, ack))
+            continue;
+        if (seq_lt(b.left, ack))
+            b.left = ack;
+        c->tx_sack[out++] = b;
+    }
+    c->tx_sack_count = out;
+}
+
 static void process_ack(struct tcp_conn *c, uint32_t ack, uint16_t win)
 {
     c->snd_wnd = win;
 
-    if (seq_leq(ack, c->snd_una) || seq_lt(c->snd_nxt, ack))
+    if (seq_leq(ack, c->snd_una) || seq_lt(c->snd_max, ack))
         return;                       /* duplicate, or beyond what we sent */
 
     uint32_t acked = ack - c->snd_una;
@@ -281,10 +372,15 @@ static void process_ack(struct tcp_conn *c, uint32_t ack, uint16_t win)
     c->tx_head = (c->tx_head + (int)dacked) % TCP_TXBUF;
     c->tx_len -= (int)dacked;
     c->snd_una = ack;
+    if (seq_lt(c->snd_nxt, ack))
+        c->snd_nxt = ack;
+    sack_prune(c, ack);
+    c->dup_acks = 0;
+    c->fast_retransmit = false;
 
     c->retries = 0;
     c->rto_ticks = TCP_RTO_MIN;
-    c->rto_deadline = (c->snd_una != c->snd_nxt)
+    c->rto_deadline = (c->snd_una != c->snd_max)
                           ? timer_ticks() + c->rto_ticks : 0;
 
     if (fin_acked) {
@@ -298,6 +394,105 @@ static void process_ack(struct tcp_conn *c, uint32_t ack, uint16_t win)
         if (c->state == TCP_TIME_WAIT)
             c->tw_deadline = timer_ticks() + TCP_TW_TICKS;
     }
+}
+
+static int parse_options(const uint8_t *seg, int hlen,
+                         int *sack_permitted,
+                         struct tcp_sack_block *blocks, int max_blocks)
+{
+    int count = 0;
+    int off = (int)sizeof(struct tcp_hdr);
+    if (sack_permitted)
+        *sack_permitted = 0;
+
+    while (off < hlen) {
+        uint8_t kind = seg[off];
+        if (kind == TCP_OPT_END)
+            break;
+        if (kind == TCP_OPT_NOP) {
+            off++;
+            continue;
+        }
+        if (off + 2 > hlen)
+            break;
+        int olen = seg[off + 1];
+        if (olen < 2 || off + olen > hlen)
+            break;
+        if (kind == TCP_OPT_SACK_PERMITTED && olen == 2 &&
+            sack_permitted)
+            *sack_permitted = 1;
+        if (kind == TCP_OPT_SACK && olen >= 10 &&
+            ((olen - 2) % 8) == 0 && blocks) {
+            for (int p = off + 2; p + 7 < off + olen &&
+                                      count < max_blocks; p += 8) {
+                uint32_t left, right;
+                memcpy(&left, seg + p, 4);
+                memcpy(&right, seg + p + 4, 4);
+                blocks[count].left = ntohl(left);
+                blocks[count].right = ntohl(right);
+                count++;
+            }
+        }
+        off += olen;
+    }
+    return count;
+}
+
+static void process_sack(struct tcp_conn *c, uint32_t ack,
+                         const struct tcp_sack_block *blocks, int count)
+{
+    c->tx_sack_count = 0;
+    if (!c->sack_enabled || seq_lt(ack, c->snd_una) ||
+        seq_lt(c->snd_max, ack))
+        return;
+
+    for (int i = 0; i < count; i++) {
+        uint32_t left = blocks[i].left;
+        uint32_t right = blocks[i].right;
+        if (!seq_lt(left, right) || seq_lt(left, ack) ||
+            seq_lt(c->snd_max, right))
+            continue;
+        int pos = c->tx_sack_count;
+        while (pos > 0 && seq_lt(left, c->tx_sack[pos - 1].left)) {
+            c->tx_sack[pos] = c->tx_sack[pos - 1];
+            pos--;
+        }
+        c->tx_sack[pos].left = left;
+        c->tx_sack[pos].right = right;
+        if (c->tx_sack_count < TCP_MAX_SACK_BLOCKS)
+            c->tx_sack_count++;
+    }
+
+    /* Three duplicate cumulative ACKs with a SACK range beyond the hole
+     * trigger selective fast retransmission from snd_una. */
+    if (ack == c->snd_una && c->tx_sack_count > 0) {
+        if (++c->dup_acks >= 3) {
+            c->fast_retransmit = true;
+            c->dup_acks = 0;
+        }
+    }
+}
+
+static uint32_t skip_sacked(struct tcp_conn *c, uint32_t seq)
+{
+    for (int i = 0; i < c->tx_sack_count; i++)
+        if (!seq_lt(seq, c->tx_sack[i].left) &&
+            seq_lt(seq, c->tx_sack[i].right))
+            return c->tx_sack[i].right;
+    return seq;
+}
+
+static int bytes_before_sack(struct tcp_conn *c, uint32_t seq, int n)
+{
+    for (int i = 0; i < c->tx_sack_count; i++) {
+        if (seq_lt(seq, c->tx_sack[i].left)) {
+            uint32_t gap = c->tx_sack[i].left - seq;
+            if (gap < (uint32_t)n)
+                return (int)gap;
+            break;
+        }
+    }
+    return n;
 }
 
 static void accept_data(struct tcp_conn *c, uint32_t seq,
@@ -352,10 +547,11 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
                                seg, len) != 0)
         return;
 
+    uint64_t lock_flags = spin_lock_irqsave(&tcp_lock);
     struct tcp_conn *c = conn_lookup(src_ip_be, ntohs(th->sport),
                                      ntohs(th->dport));
     if (!c || !c->rxbuf)
-        return;
+        goto out;
 
     uint32_t seq = ntohl(th->seq);
     uint32_t ack = ntohl(th->ack);
@@ -366,34 +562,44 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
     if (fl & TCP_RST) {
         /* An unacknowledged RST during the handshake is not for us. */
         if (c->state == TCP_SYN_SENT && !(fl & TCP_ACK))
-            return;
+            goto out;
         c->reset = true;
         c->state = TCP_CLOSED;
-        return;
+        goto out;
     }
 
     if (c->state == TCP_SYN_SENT) {
         if ((fl & (TCP_SYN | TCP_ACK)) != (TCP_SYN | TCP_ACK))
-            return;
+            goto out;
         if (ack != c->snd_nxt)        /* not the ACK of our SYN */
-            return;
+            goto out;
         c->irs = seq;
         c->rcv_nxt = seq + 1;         /* the SYN consumes one number */
         c->snd_una = ack;
+        c->snd_nxt = ack;
+        c->snd_max = ack;
         c->snd_wnd = ntohs(th->win);
+        int permitted = 0;
+        parse_options(seg, hlen, &permitted, NULL, 0);
+        c->sack_enabled = permitted != 0;
         c->state = TCP_ESTABLISHED;
         c->need_ack = true;
         c->retries = 0;
         c->rto_ticks = TCP_RTO_MIN;
         c->rto_deadline = 0;
-        return;                       /* data on a SYN|ACK is not accepted */
+        goto out;                     /* data on a SYN|ACK is not accepted */
     }
 
     if (fl & TCP_SYN)                 /* stray SYN on a live connection */
-        return;
+        goto out;
 
-    if (fl & TCP_ACK)
+    if (fl & TCP_ACK) {
+        struct tcp_sack_block blocks[TCP_MAX_SACK_BLOCKS];
+        int nsack = parse_options(seg, hlen, NULL, blocks,
+                                  TCP_MAX_SACK_BLOCKS);
         process_ack(c, ack, ntohs(th->win));
+        process_sack(c, ack, blocks, nsack);
+    }
 
     /* Remember an in-window FIN even when data in front of it is missing.
      * A later segment which fills the hole can then complete the close
@@ -417,155 +623,231 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
 
     if (c->fin_queued && c->fin_rcv_seq == c->rcv_nxt)
         accept_peer_fin(c);
+
+out:
+    spin_unlock_irqrestore(&tcp_lock, lock_flags);
 }
 
 /* ---- task side: the transmit pump ---- */
 
 static void conn_pump(struct tcp_conn *c)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
     if (!c->used || c->pumping) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&tcp_lock, f);
         return;
     }
     c->pumping = true;
-    irq_restore(f);
+    spin_unlock_irqrestore(&tcp_lock, f);
 
     uint64_t now = timer_ticks();
+    bool syn_send = false;
+    bool timed_out = false;
+    uint16_t timeout_port = 0;
+    int timeout_retries = 0;
+    uint32_t syn_seq = 0;
 
-    if (c->reset || c->state == TCP_CLOSED)
+    f = spin_lock_irqsave(&tcp_lock);
+    if (c->reset || c->state == TCP_CLOSED) {
+        spin_unlock_irqrestore(&tcp_lock, f);
         goto out;
+    }
 
     if (c->state == TCP_TIME_WAIT) {
         if (now >= c->tw_deadline)
             c->state = TCP_CLOSED;
+        spin_unlock_irqrestore(&tcp_lock, f);
         goto out;
     }
 
     if (c->state == TCP_SYN_SENT) {
         if (c->rto_deadline && now >= c->rto_deadline) {
             if (c->retries >= TCP_MAX_TRIES) {
-                kprintf("tcp: connect to port %u timed out\n", c->peer_port);
+                timeout_port = c->peer_port;
                 c->reset = true;
                 c->state = TCP_CLOSED;
-                goto out;
+                timed_out = true;
+            } else {
+                c->retries++;
+                if (c->rto_ticks < TCP_RTO_MAX)
+                    c->rto_ticks *= 2;
+                c->rto_deadline = timer_ticks() + c->rto_ticks;
+                syn_seq = c->iss;
+                syn_send = true;
             }
-            c->retries++;
-            if (c->rto_ticks < TCP_RTO_MAX)
-                c->rto_ticks *= 2;
-            c->rto_deadline = timer_ticks() + c->rto_ticks;
-            seg_send(c, TCP_SYN, c->iss, 0, 0, true);
         }
+        spin_unlock_irqrestore(&tcp_lock, f);
+        if (timed_out)
+            kprintf("tcp: connect to port %u timed out\n", timeout_port);
+        else if (syn_send)
+            seg_send(c, TCP_SYN, syn_seq, 0, true);
         goto out;
     }
 
-    /* Retransmission: go back to snd_una and resend from there. The receive
-     * side reassembles reordered data, but the send side uses cumulative
-     * ACKs and deliberately stays with simple go-back-N. */
-    if (c->snd_una != c->snd_nxt && c->rto_deadline && now >= c->rto_deadline) {
+    /* Fast/RTO retransmission walks from snd_una but skips every range the
+     * peer has reported in SACK blocks. */
+    if (c->fast_retransmit) {
+        c->snd_nxt = c->snd_una;
+        c->fast_retransmit = false;
+        c->rto_deadline = timer_ticks() + c->rto_ticks;
+    } else if (c->snd_una != c->snd_max && c->rto_deadline &&
+               now >= c->rto_deadline) {
         if (c->retries >= TCP_MAX_TRIES) {
-            kprintf("tcp: giving up after %d retransmits\n", c->retries);
+            timeout_retries = c->retries;
             c->reset = true;
             c->state = TCP_CLOSED;
-            goto out;
+            timed_out = true;
+        } else {
+            c->retries++;
+            if (c->rto_ticks < TCP_RTO_MAX)
+                c->rto_ticks *= 2;
+            c->snd_nxt = c->snd_una;  /* fin_seq is unchanged by this */
+            c->rto_deadline = timer_ticks() + c->rto_ticks;
         }
-        c->retries++;
-        if (c->rto_ticks < TCP_RTO_MAX)
-            c->rto_ticks *= 2;
-        f = irq_save();
-        c->snd_nxt = c->snd_una;      /* fin_seq is unchanged by this */
-        c->rto_deadline = timer_ticks() + c->rto_ticks;
-        irq_restore(f);
+    }
+    spin_unlock_irqrestore(&tcp_lock, f);
+    if (timed_out) {
+        kprintf("tcp: giving up after %d retransmits\n", timeout_retries);
+        goto out;
     }
 
     bool sent_any = false;
 
     for (int i = 0; i < 8; i++) {
-        f = irq_save();
+        f = spin_lock_irqsave(&tcp_lock);
         uint32_t una = c->snd_una;
         uint32_t nxt = c->snd_nxt;
+        uint32_t skipped = skip_sacked(c, nxt);
+        if (skipped != nxt) {
+            c->snd_nxt = skipped;
+            nxt = skipped;
+        }
         int off = (int)(nxt - una);
         int avail = c->tx_len - off;
         int allow = (int)c->snd_wnd - off;
-        irq_restore(f);
-
-        if (avail <= 0)
-            break;
+        int n = 0;
+        bool stop = avail <= 0;
         if (allow <= 0) {
             /* Zero window. Probe with a single byte once per RTO so the
              * peer's window update cannot be lost silently. */
             if (c->rto_deadline && now < c->rto_deadline)
-                break;
-            allow = 1;
+                stop = true;
+            else
+                allow = 1;
         }
 
-        int n = avail < allow ? avail : allow;
-        if (n > TCP_MSS)
-            n = TCP_MSS;
-        if (seg_send(c, TCP_ACK | TCP_PSH, nxt, off, n, false) < 0)
-            break;
+        if (!stop) {
+            n = avail < allow ? avail : allow;
+            if (n > TCP_MSS)
+                n = TCP_MSS;
+            /* A four-block SACK option consumes 36 TCP option bytes. Keep
+             * the whole IP packet within the Ethernet MTU even when SACK
+             * information is piggybacked on data. */
+            if (c->sack_enabled && n > TCP_MSS - 36)
+                n = TCP_MSS - 36;
+            n = bytes_before_sack(c, nxt, n);
+        }
+        if (n > 0) {
+            /* Publish the sequence range before ringing the NIC doorbell:
+             * another CPU may process its ACK immediately. */
+            c->snd_nxt = nxt + (uint32_t)n;
+            if (seq_lt(c->snd_max, c->snd_nxt))
+                c->snd_max = c->snd_nxt;
+            c->need_ack = false;
+            if (una == nxt)
+                c->rto_deadline = timer_ticks() + c->rto_ticks;
+        }
+        spin_unlock_irqrestore(&tcp_lock, f);
 
-        f = irq_save();
-        c->snd_nxt = nxt + (uint32_t)n;
-        c->need_ack = false;
-        if (una == nxt)               /* nothing was in flight: arm the RTO */
-            c->rto_deadline = timer_ticks() + c->rto_ticks;
-        irq_restore(f);
+        if (stop)
+            break;
+        if (n <= 0)
+            continue;
+        if (seg_send(c, TCP_ACK | TCP_PSH, nxt, n, false) < 0) {
+            f = spin_lock_irqsave(&tcp_lock);
+            c->need_ack = true;
+            spin_unlock_irqrestore(&tcp_lock, f);
+            break;
+        }
         sent_any = true;
     }
 
     /* The FIN goes out only once every queued byte has been transmitted;
      * fin_seq is snd_una + tx_len, which an ACK never changes, so a
      * retransmitted FIN always carries the same sequence number. */
-    f = irq_save();
+    f = spin_lock_irqsave(&tcp_lock);
     uint32_t fseq = c->snd_nxt;
     bool fin_now = c->fin_pending &&
                    c->snd_nxt == c->snd_una + (uint32_t)c->tx_len;
-    irq_restore(f);
-
-    if (fin_now && seg_send(c, TCP_ACK | TCP_FIN, fseq, 0, 0, false) >= 0) {
-        f = irq_save();
+    if (fin_now) {
         c->fin_seq = fseq;
         c->fin_sent = true;
         c->snd_nxt = fseq + 1;
+        if (seq_lt(c->snd_max, c->snd_nxt))
+            c->snd_max = c->snd_nxt;
         c->need_ack = false;
         c->rto_deadline = timer_ticks() + c->rto_ticks;
-        irq_restore(f);
-        sent_any = true;
+    }
+    spin_unlock_irqrestore(&tcp_lock, f);
+
+    if (fin_now) {
+        if (seg_send(c, TCP_ACK | TCP_FIN, fseq, 0, false) < 0) {
+            f = spin_lock_irqsave(&tcp_lock);
+            c->need_ack = true;
+            spin_unlock_irqrestore(&tcp_lock, f);
+        } else {
+            sent_any = true;
+        }
     }
 
-    if (!sent_any && c->need_ack) {
-        if (seg_send(c, TCP_ACK, c->snd_nxt, 0, 0, false) >= 0)
-            c->need_ack = false;
+    f = spin_lock_irqsave(&tcp_lock);
+    bool ack_now = !sent_any && c->need_ack;
+    uint32_t ack_seq = c->snd_nxt;
+    if (ack_now)
+        c->need_ack = false;
+    spin_unlock_irqrestore(&tcp_lock, f);
+    if (ack_now && seg_send(c, TCP_ACK, ack_seq, 0, false) < 0) {
+        f = spin_lock_irqsave(&tcp_lock);
+        c->need_ack = true;
+        spin_unlock_irqrestore(&tcp_lock, f);
     }
 
 out:
+    f = spin_lock_irqsave(&tcp_lock);
     c->pumping = false;
     if (c->detached && (c->state == TCP_CLOSED || c->reset))
-        conn_release(c);
+        conn_release_locked(c);
+    spin_unlock_irqrestore(&tcp_lock, f);
 }
 
 void tcp_tick(void)
 {
     for (int i = 0; i < TCP_CONNS; i++) {
         struct tcp_conn *c = &conns[i];
-        if (!c->used)
+        uint64_t f = spin_lock_irqsave(&tcp_lock);
+        bool used = c->used;
+        bool detached = c->detached;
+        int owner = c->owner_pid;
+        spin_unlock_irqrestore(&tcp_lock, f);
+        if (!used)
             continue;
 
         /* Reclaim connections whose owning task died without closing. */
-        if (!c->detached && c->owner_pid > 0 && !task_find(c->owner_pid)) {
-            uint64_t f = irq_save();
-            c->detached = true;
-            if (c->state == TCP_ESTABLISHED) {
-                c->fin_pending = true;
-                c->state = TCP_FIN_WAIT_1;
-            } else if (c->state == TCP_CLOSE_WAIT) {
-                c->fin_pending = true;
-                c->state = TCP_LAST_ACK;
-            } else if (c->state == TCP_SYN_SENT) {
-                c->state = TCP_CLOSED;
+        if (!detached && owner > 0 && !task_exists(owner)) {
+            f = spin_lock_irqsave(&tcp_lock);
+            if (c->used && !c->detached && c->owner_pid == owner) {
+                c->detached = true;
+                if (c->state == TCP_ESTABLISHED) {
+                    c->fin_pending = true;
+                    c->state = TCP_FIN_WAIT_1;
+                } else if (c->state == TCP_CLOSE_WAIT) {
+                    c->fin_pending = true;
+                    c->state = TCP_LAST_ACK;
+                } else if (c->state == TCP_SYN_SENT) {
+                    c->state = TCP_CLOSED;
+                }
             }
-            irq_restore(f);
+            spin_unlock_irqrestore(&tcp_lock, f);
         }
 
         conn_pump(c);
@@ -597,14 +879,25 @@ static void conn_gc(void)
 {
     for (int i = 0; i < TCP_CONNS; i++) {
         struct tcp_conn *c = &conns[i];
-        if (!c->used)
+        uint64_t f = spin_lock_irqsave(&tcp_lock);
+        bool used = c->used;
+        int owner = c->owner_pid;
+        spin_unlock_irqrestore(&tcp_lock, f);
+        if (!used)
             continue;
-        if (c->state == TCP_TIME_WAIT && timer_ticks() >= c->tw_deadline)
-            c->state = TCP_CLOSED;
-        if (c->owner_pid > 0 && !task_find(c->owner_pid))
-            c->detached = true;
-        if (c->detached && (c->state == TCP_CLOSED || c->reset))
-            conn_release(c);
+        bool owner_dead = owner > 0 && !task_exists(owner);
+        f = spin_lock_irqsave(&tcp_lock);
+        if (c->used && c->owner_pid == owner) {
+            if (c->state == TCP_TIME_WAIT &&
+                timer_ticks() >= c->tw_deadline)
+                c->state = TCP_CLOSED;
+            if (owner_dead)
+                c->detached = true;
+            if (!c->pumping && c->detached &&
+                (c->state == TCP_CLOSED || c->reset))
+                conn_release_locked(c);
+        }
+        spin_unlock_irqrestore(&tcp_lock, f);
     }
 }
 
@@ -620,13 +913,20 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
 
     conn_gc();
 
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
     for (int i = 0; i < TCP_CONNS; i++) {
         if (!conns[i].used) {
             c = &conns[i];
             handle = i;
+            c->used = true;       /* reserve before allocation can sleep */
+            c->detached = false;
+            c->pumping = false;
+            c->state = TCP_CLOSED;
+            c->owner_pid = current ? current->pid : 0;
             break;
         }
     }
+    spin_unlock_irqrestore(&tcp_lock, f);
     if (!c) {
         kprintf("tcp: no free connection slot\n");
         return -1;
@@ -638,19 +938,24 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
         c->txbuf = kmalloc(TCP_TXBUF);
     if (!c->rxbuf || !c->txbuf) {
         kprintf("tcp: out of memory for connection buffers\n");
+        conn_release(c);
         return -1;
     }
 
+    f = spin_lock_irqsave(&tcp_lock);
     uint16_t lport = port_alloc();
-    if (lport == 0)
+    spin_unlock_irqrestore(&tcp_lock, f);
+    if (lport == 0) {
+        conn_release(c);
         return -1;
+    }
 
     /* ISN from the tick counter mixed with the local port: enough to keep
      * two connections on the same port pair from sharing a sequence space. */
     uint32_t isn = (uint32_t)(timer_ticks() * 62500u) ^
                    (((uint32_t)lport << 16) | (uint32_t)lport);
 
-    uint64_t f = irq_save();
+    f = spin_lock_irqsave(&tcp_lock);
     c->state = TCP_SYN_SENT;
     c->detached = false;
     c->pumping = false;
@@ -661,8 +966,12 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
     c->iss = isn;
     c->snd_una = isn;
     c->snd_nxt = isn + 1;             /* the SYN consumes one number */
+    c->snd_max = c->snd_nxt;
     c->snd_wnd = TCP_MSS;             /* replaced by the SYN|ACK window */
     c->tx_head = c->tx_len = 0;
+    c->tx_sack_count = c->dup_acks = 0;
+    c->fast_retransmit = false;
+    c->sack_enabled = false;
     c->fin_pending = c->fin_sent = false;
     c->fin_seq = 0;
     c->irs = c->rcv_nxt = 0;
@@ -673,24 +982,29 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
     c->rto_deadline = 0;
     c->retries = 0;
     c->tw_deadline = 0;
-    c->used = true;
-    irq_restore(f);
+    spin_unlock_irqrestore(&tcp_lock, f);
 
-    if (seg_send(c, TCP_SYN, isn, 0, 0, true) < 0) {
+    if (seg_send(c, TCP_SYN, isn, 0, true) < 0) {
         conn_release(c);
         return -1;
     }
 
     /* Start the clock only now: seg_send() can spend seconds in ARP. */
+    f = spin_lock_irqsave(&tcp_lock);
     c->rto_deadline = timer_ticks() + c->rto_ticks;
+    spin_unlock_irqrestore(&tcp_lock, f);
     uint64_t deadline = timer_ticks() + (uint64_t)(timeout_ms + 9) / 10;
 
     for (;;) {
-        if (c->state == TCP_ESTABLISHED) {
+        f = spin_lock_irqsave(&tcp_lock);
+        int state = c->state;
+        bool reset = c->reset;
+        spin_unlock_irqrestore(&tcp_lock, f);
+        if (state == TCP_ESTABLISHED) {
             conn_pump(c);             /* flush the handshake ACK */
             return handle;
         }
-        if (c->reset || c->state == TCP_CLOSED)
+        if (reset || state == TCP_CLOSED)
             break;
         if (timer_ticks() >= deadline)
             break;
@@ -698,8 +1012,12 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
         net_wait_tick();
     }
 
-    if (c->used && !c->reset)
-        seg_send(c, TCP_RST, c->snd_nxt, 0, 0, false);
+    f = spin_lock_irqsave(&tcp_lock);
+    bool send_reset = c->used && !c->reset;
+    uint32_t reset_seq = c->snd_nxt;
+    spin_unlock_irqrestore(&tcp_lock, f);
+    if (send_reset)
+        seg_send(c, TCP_RST, reset_seq, 0, false);
     conn_release(c);
     return -1;
 }
@@ -714,25 +1032,28 @@ int tcp_send(int handle, const void *buf, int len)
         return -1;
     if (len == 0)
         return 0;
-    if (c->reset || c->fin_pending)
-        return -1;
-    if (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT)
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
+    bool unavailable = c->reset || c->fin_pending ||
+                       (c->state != TCP_ESTABLISHED &&
+                        c->state != TCP_CLOSE_WAIT);
+    spin_unlock_irqrestore(&tcp_lock, f);
+    if (unavailable)
         return -1;
 
     uint64_t deadline = timer_ticks() + TCP_SEND_TICKS;
 
     while (done < len) {
-        if (c->reset || (c->state != TCP_ESTABLISHED &&
-                         c->state != TCP_CLOSE_WAIT))
-            return done > 0 ? done : -1;
-
         /* tx_head + tx_len is invariant under acknowledgement (head moves
          * up exactly as much as len shrinks), so the append position is
          * stable even if an ACK lands during the copy below. */
-        uint64_t f = irq_save();
+        f = spin_lock_irqsave(&tcp_lock);
+        bool stopped = c->reset || (c->state != TCP_ESTABLISHED &&
+                                    c->state != TCP_CLOSE_WAIT);
         int head = c->tx_head;
         int used = c->tx_len;
-        irq_restore(f);
+        spin_unlock_irqrestore(&tcp_lock, f);
+        if (stopped)
+            return done > 0 ? done : -1;
 
         int room = TCP_TXBUF - used;
         if (room > 0) {
@@ -747,9 +1068,9 @@ int tcp_send(int handle, const void *buf, int len)
             if (n > first)
                 memcpy(c->txbuf, src + done + first, (size_t)(n - first));
 
-            f = irq_save();
+            f = spin_lock_irqsave(&tcp_lock);
             c->tx_len += n;
-            irq_restore(f);
+            spin_unlock_irqrestore(&tcp_lock, f);
             done += n;
             conn_pump(c);
             continue;
@@ -778,13 +1099,13 @@ int tcp_recv(int handle, void *buf, int max, int timeout_ms)
     uint64_t deadline = timer_ticks() + (uint64_t)(timeout_ms + 9) / 10;
 
     for (;;) {
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&tcp_lock);
         int avail = c->rx_len;
         int head = c->rx_head;
         bool fin = c->peer_fin;
         bool rst = c->reset;
         int state = c->state;
-        irq_restore(f);
+        spin_unlock_irqrestore(&tcp_lock, f);
 
         if (avail > 0) {
             /* Safe to copy without masking: the IRQ producer only ever
@@ -797,11 +1118,11 @@ int tcp_recv(int handle, void *buf, int max, int timeout_ms)
             if (n > first)
                 memcpy((uint8_t *)buf + first, c->rxbuf, (size_t)(n - first));
 
-            f = irq_save();
+            f = spin_lock_irqsave(&tcp_lock);
             c->rx_head = (head + n) % TCP_RXBUF;
             c->rx_len -= n;
             c->need_ack = true;       /* window update */
-            irq_restore(f);
+            spin_unlock_irqrestore(&tcp_lock, f);
             return n;
         }
 
@@ -823,7 +1144,7 @@ int tcp_close(int handle)
     if (!c)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
     c->detached = true;
     if (c->state == TCP_ESTABLISHED) {
         c->fin_pending = true;
@@ -834,29 +1155,32 @@ int tcp_close(int handle)
     } else if (c->state == TCP_SYN_SENT) {
         c->state = TCP_CLOSED;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&tcp_lock, f);
 
     /* Push the FIN out and wait briefly for the handshake to finish. What
      * is left (TIME_WAIT in particular) is reaped by tcp_tick/conn_gc. */
     uint64_t deadline = timer_ticks() + TCP_CLOSE_TICKS;
     while (timer_ticks() < deadline) {
         conn_pump(c);
-        f = irq_save();
+        f = spin_lock_irqsave(&tcp_lock);
         bool done = !c->used || c->reset || c->state == TCP_CLOSED ||
                     c->state == TCP_TIME_WAIT;
-        irq_restore(f);
+        spin_unlock_irqrestore(&tcp_lock, f);
         if (done)
             break;
         net_wait_tick();
     }
 
-    f = irq_save();
+    f = spin_lock_irqsave(&tcp_lock);
     bool stuck = c->used && c->detached && !c->reset &&
                  c->state != TCP_CLOSED && c->state != TCP_TIME_WAIT;
-    irq_restore(f);
+    spin_unlock_irqrestore(&tcp_lock, f);
     if (stuck) {
         /* The peer never answered our FIN: tear it down hard. */
-        seg_send(c, TCP_RST, c->snd_nxt, 0, 0, false);
+        f = spin_lock_irqsave(&tcp_lock);
+        uint32_t reset_seq = c->snd_nxt;
+        spin_unlock_irqrestore(&tcp_lock, f);
+        seg_send(c, TCP_RST, reset_seq, 0, false);
         conn_release(c);
     }
     return 0;

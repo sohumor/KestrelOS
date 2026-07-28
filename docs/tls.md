@@ -204,15 +204,14 @@ behind Cloudflare reachable.
 - **No OCSP, no CRLs, no certificate transparency, no name constraints** —
   those are `x509.c`'s stated gaps, and they are inherited. A revoked
   certificate will be accepted.
-- **Entropy is the weakest link on the target.** The DRBG is HMAC-DRBG
-  over SHA-256, seeded from RDSEED/RDRAND when the CPU has them, the time
-  stamp counter sampled repeatedly, the wall clock, the process id and a
-  few addresses. `/dev/random` is stirred in but the kernel says plainly
-  it is not cryptographic. **If the CPU has no RDRAND, the only real
-  entropy is timer jitter, and the keys are only as unpredictable as
-  that.** `tls_entropy_is_weak()` and `tls_info().weak_entropy` report it
-  so the UI can say so out loud, and `tls_add_entropy()` lets the browser
-  stir in mouse and key timings. Do not paper over this.
+- **Entropy still deserves scrutiny.** TLS draws from the kernel
+  `getrandom()`/device path: RDSEED or RDRAND, the bootloader seed, and
+  timer/keyboard/mouse/disk/network/serial timings feed a SHA-256 pool and
+  ChaCha20 CSPRNG with a 128-bit readiness threshold. Without a hardware
+  source, unpredictability depends on collected interrupt jitter.
+  `tls_entropy_is_weak()` and `tls_info().weak_entropy` surface that case,
+  and `tls_add_entropy()` can add application-observed timings. See
+  `docs/random.md`; neither layer has had an external cryptographic audit.
 - **The `signature_algorithms` list advertises exactly what can be
   verified** and nothing else, so servers do not pick chains that then
   have to be rejected.

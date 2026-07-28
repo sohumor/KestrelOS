@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "kheap.h"
 #include "net.h"
+#include "spinlock.h"
 
 /* UDP: port bindings with small per-port receive queues.
  *
@@ -39,13 +40,19 @@ struct udp_bind {
 };
 
 static struct udp_bind binds[UDP_PORTS];
+static spinlock_t udp_lock = SPINLOCK_INIT;
 
 void udp_init(void)
 {
     memset(binds, 0, sizeof(binds));
+    /* Keep allocation out of the IRQ receive path. The buffers persist for
+     * the lifetime of the network stack and are recycled between owners. */
+    for (int i = 0; i < UDP_PORTS; i++)
+        for (int j = 0; j < UDP_QUEUE; j++)
+            binds[i].q[j].data = kmalloc(NET_UDP_MAX);
 }
 
-static struct udp_bind *bind_find(uint16_t port)
+static struct udp_bind *bind_find_locked(uint16_t port)
 {
     for (int i = 0; i < UDP_PORTS; i++)
         if (binds[i].used && binds[i].port == port)
@@ -60,15 +67,19 @@ static struct udp_bind *bind_find(uint16_t port)
 static void bind_gc(void)
 {
     for (int i = 0; i < UDP_PORTS; i++) {
-        if (!binds[i].used || binds[i].owner_pid <= 0)
+        uint64_t f = spin_lock_irqsave(&udp_lock);
+        int owner = binds[i].used ? binds[i].owner_pid : 0;
+        spin_unlock_irqrestore(&udp_lock, f);
+        if (owner <= 0 || task_exists(owner))
             continue;
-        if (task_find(binds[i].owner_pid))
-            continue;
-        uint64_t f = irq_save();
-        binds[i].used = false;
-        binds[i].head = 0;
-        binds[i].count = 0;
-        irq_restore(f);
+        f = spin_lock_irqsave(&udp_lock);
+        if (binds[i].used && binds[i].owner_pid == owner) {
+            binds[i].used = false;
+            binds[i].owner_pid = 0;
+            binds[i].head = 0;
+            binds[i].count = 0;
+        }
+        spin_unlock_irqrestore(&udp_lock, f);
     }
 }
 
@@ -77,55 +88,53 @@ static void bind_gc(void)
 static struct udp_bind *bind_get(uint16_t port)
 {
     int pid = current ? current->pid : 0;
-    struct udp_bind *b = bind_find(port);
+    bind_gc();
 
+    uint64_t f = spin_lock_irqsave(&udp_lock);
+    struct udp_bind *b = bind_find_locked(port);
     if (b) {
-        /* A new owner must not inherit datagrams queued for the old one. */
-        if (b->owner_pid != pid) {
-            uint64_t f = irq_save();
-            b->owner_pid = pid;
-            b->head = 0;
-            b->count = 0;
-            irq_restore(f);
-        }
+        if (b->owner_pid != pid)
+            b = NULL;
+        spin_unlock_irqrestore(&udp_lock, f);
         return b;
     }
-
-    bind_gc();
 
     for (int i = 0; i < UDP_PORTS; i++) {
         if (binds[i].used)
             continue;
         b = &binds[i];
         for (int j = 0; j < UDP_QUEUE; j++) {
-            if (!b->q[j].data)
-                b->q[j].data = kmalloc(NET_UDP_MAX);
-            if (!b->q[j].data)
+            if (!b->q[j].data) {
+                spin_unlock_irqrestore(&udp_lock, f);
                 return 0;
+            }
         }
-        uint64_t f = irq_save();
         b->port = port;
         b->owner_pid = pid;
         b->head = 0;
         b->count = 0;
         b->used = true;
-        irq_restore(f);
+        spin_unlock_irqrestore(&udp_lock, f);
         return b;
     }
+    spin_unlock_irqrestore(&udp_lock, f);
     return 0;
 }
 
 void udp_unbind(uint16_t port)
 {
-    struct udp_bind *b = bind_find(port);
+    uint64_t f = spin_lock_irqsave(&udp_lock);
+    struct udp_bind *b = bind_find_locked(port);
     if (!b)
+    {
+        spin_unlock_irqrestore(&udp_lock, f);
         return;
-    uint64_t f = irq_save();
+    }
     b->used = false;
     b->owner_pid = 0;
     b->head = 0;
     b->count = 0;
-    irq_restore(f);
+    spin_unlock_irqrestore(&udp_lock, f);
 }
 
 /* IRQ context: parse a UDP segment and queue it on its binding. */
@@ -146,18 +155,24 @@ void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
     if (plen > NET_UDP_MAX)
         return;
 
-    struct udp_bind *b = bind_find(ntohs(uh->dport));
-    if (!b || b->count >= UDP_QUEUE)
+    uint64_t f = spin_lock_irqsave(&udp_lock);
+    struct udp_bind *b = bind_find_locked(ntohs(uh->dport));
+    if (!b || b->count >= UDP_QUEUE) {
+        spin_unlock_irqrestore(&udp_lock, f);
         return;                          /* unbound or full: drop */
+    }
 
     struct udp_slot *s = &b->q[(b->head + b->count) % UDP_QUEUE];
-    if (!s->data)
+    if (!s->data) {
+        spin_unlock_irqrestore(&udp_lock, f);
         return;
+    }
     memcpy(s->data, seg + sizeof(*uh), plen);
     s->len = plen;
     s->src_ip = src_ip_be;
     s->src_port = ntohs(uh->sport);
     b->count++;
+    spin_unlock_irqrestore(&udp_lock, f);
 }
 
 int udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
@@ -194,17 +209,17 @@ int udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms)
 
     uint64_t deadline = timer_ticks() + (uint64_t)(timeout_ms + 9) / 10;
     for (;;) {
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&udp_lock);
         if (b->count > 0) {
             struct udp_slot *s = &b->q[b->head];
             int n = s->len < maxlen ? s->len : maxlen;
             memcpy(buf, s->data, n);
             b->head = (b->head + 1) % UDP_QUEUE;
             b->count--;
-            irq_restore(f);
+            spin_unlock_irqrestore(&udp_lock, f);
             return n;
         }
-        irq_restore(f);
+        spin_unlock_irqrestore(&udp_lock, f);
         if (timer_ticks() >= deadline)
             return -1;
         net_wait_tick();

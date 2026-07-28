@@ -59,6 +59,34 @@ def inode_mtime(image, inode_start):
     return struct.unpack_from("<I", image, inode_start * BLOCK + 16)[0]
 
 
+def inode_record(image, inode_start, ino):
+    off = inode_start * BLOCK + (ino - 1) * 64
+    fields = struct.unpack_from("<HHIIII10II", image, off)
+    return {
+        "type": fields[0],
+        "size": fields[2],
+        "direct": fields[6:16],
+        "indirect": fields[16],
+    }
+
+
+def dir_lookup(image, inode_start, dir_ino, name):
+    inode = inode_record(image, inode_start, dir_ino)
+    remaining = inode["size"]
+    for bno in inode["direct"]:
+        if not bno or remaining <= 0:
+            break
+        raw = block(image, bno)
+        take = min(remaining, BLOCK)
+        for off in range(0, take, 64):
+            ino = struct.unpack_from("<I", raw, off)[0]
+            entry = raw[off + 4:off + 64].split(b"\0", 1)[0]
+            if ino and entry.decode("utf-8") == name:
+                return ino
+        remaining -= take
+    raise RuntimeError("directory entry %r was not found" % name)
+
+
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     mkfs = os.path.join(root, "tools", "mkfs.py")
@@ -73,6 +101,11 @@ def main():
         sb = struct.unpack_from("<13I", image, 0)
         journal_start = sb[4]
         inode_start = sb[6]
+        etc_ino = dir_lookup(image, inode_start, 1, "etc")
+        motd_ino = dir_lookup(image, inode_start, etc_ino, "motd")
+        file_data_block = inode_record(image, inode_start, motd_ino)["direct"][0]
+        if not file_data_block:
+            raise RuntimeError("/etc/motd has no data block")
 
         desired = bytearray(block(image, inode_start))
         struct.pack_into("<I", desired, 16, 123456789)
@@ -123,6 +156,22 @@ def main():
         if "unsafe/duplicate target" not in output:
             raise RuntimeError("unsafe journal target was not refused")
         checks += 1
+
+        # The same replay machinery covers regular file-data home blocks,
+        # not just inode/bitmap metadata.
+        image = read_image(image_path)
+        old_data = block(image, file_data_block)
+        desired_data = bytearray(old_data)
+        desired_data[137:149] = b"journal-data"
+        inject(image, journal_start, 46, file_data_block, desired_data)
+        write_image(image_path, image)
+        output = run([sys.executable, kfsck, "--recover", image_path])
+        if "replayed journal transaction 46" not in output:
+            raise RuntimeError("file-data transaction was not replayed")
+        image = read_image(image_path)
+        if block(image, file_data_block) != bytes(desired_data):
+            raise RuntimeError("replay did not install file-data block")
+        checks += 2
 
     print("PASS: %d KFS journal crash-recovery checks" % checks)
     return 0

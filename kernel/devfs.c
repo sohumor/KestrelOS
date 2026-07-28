@@ -11,7 +11,9 @@
 #include "serial.h"
 #include "input.h"
 #include "timer.h"
+#include "random.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -55,6 +57,7 @@ static const struct devdesc devtab[] = {
     { "full",    DEV_FULL,    0666 },
     { "console", DEV_CONSOLE, 0622 },
     { "random",  DEV_RANDOM,  0444 },
+    { "urandom", DEV_URANDOM, 0444 },
     { "klog",    DEV_KLOG,    0644 },
     { "mounts",  DEV_MOUNTS,  0444 },
     { "blocks",  DEV_BLOCKS,  0444 },
@@ -70,54 +73,14 @@ static const struct devdesc devtab[] = {
 
 static bool devfs_ready;
 
-/* --- PRNG -------------------------------------------------------------
- * xorshift64* written from scratch: fast, decent equidistribution, and
- * emphatically NOT cryptographic. The state is seeded from the timer tick
- * count and the RTC, both of which an attacker can guess, and the output
- * is trivially invertible from 64 bits of observed stream. /dev/random is
- * here for shuffling and test data, never for keys. */
-
-static uint64_t rng_state;
-
-static void rng_seed(void)
-{
-    uint64_t s = 0x9E3779B97F4A7C15ULL;
-
-    s ^= timer_ticks() * 0x2545F4914F6CDD1DULL;
-    s ^= (uint64_t)rtc_unix_time() * 0xBF58476D1CE4E5B9ULL;
-    s ^= (uint64_t)(uintptr_t)&rng_state;
-    if (s == 0)
-        s = 0x0123456789ABCDEFULL;
-    rng_state = s;
-}
-
 uint32_t devfs_random32(void)
 {
-    uint64_t x;
-
-    uint64_t f = irq_save();
-    if (rng_state == 0)
-        rng_seed();
-    x = rng_state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    rng_state = x;
-    irq_restore(f);
-
-    return (uint32_t)((x * 0x2545F4914F6CDD1DULL) >> 32);
+    return random_u32();
 }
 
 void devfs_random_fill(void *buf, unsigned long n)
 {
-    uint8_t *p = buf;
-    unsigned long i = 0;
-
-    while (i < n) {
-        uint32_t v = devfs_random32();
-        for (int b = 0; b < 4 && i < n; b++, i++)
-            p[i] = (uint8_t)(v >> (b * 8));
-    }
+    (void)random_get_bytes(buf, n, 0);
 }
 
 /* --- path handling ----------------------------------------------------
@@ -303,31 +266,32 @@ static uint32_t dev_size(int id)
  * by the ops vector the VFS stamps on the handle. */
 
 static struct devfile *open_handles[DEVFS_MAX_OPEN];
+static spinlock_t handle_lock = SPINLOCK_INIT;
 
 static int handle_register(struct devfile *df)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&handle_lock);
     for (int i = 0; i < DEVFS_MAX_OPEN; i++) {
         if (open_handles[i] == NULL) {
             open_handles[i] = df;
-            irq_restore(f);
+            spin_unlock_irqrestore(&handle_lock, f);
             return 0;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&handle_lock, f);
     return -1;
 }
 
 static void handle_unregister(struct devfile *df)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&handle_lock);
     for (int i = 0; i < DEVFS_MAX_OPEN; i++) {
         if (open_handles[i] == df) {
             open_handles[i] = NULL;
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&handle_lock, f);
 }
 
 /* --- open / close ------------------------------------------------------ */
@@ -540,7 +504,13 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
         df->f.pos += (uint32_t)n;
         return (long)n;
     case DEV_RANDOM:
-        devfs_random_fill(buf, n);
+        if (random_get_bytes(buf, n, RANDOM_STRONG) < 0)
+            return -1;
+        df->f.pos += (uint32_t)n;
+        return (long)n;
+    case DEV_URANDOM:
+        if (random_get_bytes(buf, n, 0) < 0)
+            return -1;
         df->f.pos += (uint32_t)n;
         return (long)n;
     case DEV_CONSOLE:
@@ -829,7 +799,6 @@ void devfs_init(void)
         return;
     for (int i = 0; i < DEVFS_MAX_OPEN; i++)
         open_handles[i] = NULL;
-    rng_seed();
     devfs_ready = true;
     fs_register(&devfs_type);
 }

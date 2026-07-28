@@ -2,8 +2,10 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "string.h"
+#include "spinlock.h"
 
 static uint64_t *kernel_pml4;   /* virtual (direct-map) pointer */
+static spinlock_t page_table_lock = SPINLOCK_INIT;
 
 static void write_cr3(uint64_t phys)
 {
@@ -31,6 +33,7 @@ static uint64_t *walk_create(uint64_t *table, int idx, uint64_t flags)
 
 void vmm_map_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    uint64_t irq = spin_lock_irqsave(&page_table_lock);
     int i4 = (virt >> 39) & 511;
     int i3 = (virt >> 30) & 511;
     int i2 = (virt >> 21) & 511;
@@ -41,6 +44,7 @@ void vmm_map_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
     uint64_t *pt = walk_create(pd, i2, flags);
     pt[i1] = phys | flags | PTE_P;
     invlpg(virt);
+    spin_unlock_irqrestore(&page_table_lock, irq);
 }
 
 static void map_2mb(uint64_t *pml4, uint64_t virt, uint64_t phys,
@@ -71,6 +75,63 @@ uint64_t vmm_virt_to_phys(uint64_t *pml4, uint64_t virt)
         t = P2V(PTE_ADDR(e));
     }
     return 0;
+}
+
+uint64_t *vmm_get_pte(uint64_t *pml4, uint64_t virt, int create)
+{
+    uint64_t *table = pml4;
+    int idx[4] = { (int)((virt >> 39) & 511), (int)((virt >> 30) & 511),
+                   (int)((virt >> 21) & 511), (int)((virt >> 12) & 511) };
+
+    for (int level = 0; level < 3; level++) {
+        uint64_t e = table[idx[level]];
+        if (!(e & PTE_P)) {
+            if (!create)
+                return NULL;
+            table = walk_create(table, idx[level], PTE_U);
+            continue;
+        }
+        if (e & PTE_PS)
+            return NULL;
+        if (create)
+            table[idx[level]] |= PTE_U;
+        table = P2V(PTE_ADDR(e));
+    }
+    return &table[idx[3]];
+}
+
+/* Walk allocated user page tables only. The callback may rewrite leaf PTEs
+ * and returns non-zero to stop early. This is used by swap without exposing
+ * the page-table hierarchy outside this module. */
+void vmm_for_each_user_pte(uint64_t *pml4,
+                           int (*visit)(uint64_t, uint64_t *, void *),
+                           void *arg)
+{
+    if (!pml4 || !visit)
+        return;
+    for (uint64_t i4 = 0; i4 < 256; i4++) {
+        if (!(pml4[i4] & PTE_P) || (pml4[i4] & PTE_PS))
+            continue;
+        uint64_t *pdpt = P2V(PTE_ADDR(pml4[i4]));
+        for (uint64_t i3 = 0; i3 < 512; i3++) {
+            if (!(pdpt[i3] & PTE_P) || (pdpt[i3] & PTE_PS))
+                continue;
+            uint64_t *pd = P2V(PTE_ADDR(pdpt[i3]));
+            for (uint64_t i2 = 0; i2 < 512; i2++) {
+                if (!(pd[i2] & PTE_P) || (pd[i2] & PTE_PS))
+                    continue;
+                uint64_t *pt = P2V(PTE_ADDR(pd[i2]));
+                for (uint64_t i1 = 0; i1 < 512; i1++) {
+                    if (pt[i1] == 0)
+                        continue;
+                    uint64_t va = (i4 << 39) | (i3 << 30) |
+                                  (i2 << 21) | (i1 << 12);
+                    if (visit(va, &pt[i1], arg))
+                        return;
+                }
+            }
+        }
+    }
 }
 
 void vmm_init(void)

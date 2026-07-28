@@ -5,9 +5,11 @@
 #include "vfs.h"
 #include "vmm.h"
 #include "pmm.h"
+#include "vm.h"
 #include "kheap.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
 extern void enter_usermode(uint64_t entry, uint64_t user_rsp,
                            uint64_t argc, uint64_t argv)
@@ -23,10 +25,6 @@ struct uproc_pkg {
     struct k_spawn_io io;
 };
 
-/* Frames kept in reserve so a failing user allocation degrades into a
- * killed process instead of a kernel-wide "out of memory" panic. */
-#define UPROC_PMM_RESERVE 512
-
 /* copy_str_from_user's "no NUL within max" result; the destination still
  * holds a NUL-terminated prefix. Mirrors COPY_STR_TRUNC in syscall.c. */
 #define UPROC_COPY_TRUNC (-2)
@@ -40,27 +38,28 @@ static struct {
     long code;
 } exit_ring[EXIT_RING];
 static int exit_head;
+static spinlock_t exit_lock = SPINLOCK_INIT;
 
 void uproc_record_exit(int pid, long code)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&exit_lock);
     exit_ring[exit_head].pid = pid;
     exit_ring[exit_head].code = code;
     exit_head = (exit_head + 1) % EXIT_RING;
-    irq_restore(f);
+    spin_unlock_irqrestore(&exit_lock, f);
 }
 
 static int exit_lookup(int pid, long *code)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&exit_lock);
     for (int i = 0; i < EXIT_RING; i++) {
         if (exit_ring[i].pid == pid && pid > 0) {
             *code = exit_ring[i].code;
-            irq_restore(f);
+            spin_unlock_irqrestore(&exit_lock, f);
             return 1;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&exit_lock, f);
     return 0;
 }
 
@@ -72,16 +71,12 @@ long uproc_waitpid(int pid)
         long code;
         int alive, done;
 
-        /* Both observations must come from the same instant: the child can
-         * exit, be recorded and be reaped between them, which would other-
-         * wise report -1 for a process that finished normally. Masking also
-         * keeps task_find off a list reap() may be unlinking from. */
-        uint64_t f = irq_save();
-        alive = task_find(pid) != NULL;
         done = exit_lookup(pid, &code);
-        irq_restore(f);
 
         if (done)
+            return code;
+        alive = task_exists(pid);
+        if (!alive && exit_lookup(pid, &code))
             return code;
         if (!alive)
             return -1;             /* never existed, or record overwritten */
@@ -96,21 +91,19 @@ long uproc_waitany(int *pid_out)
 {
     *pid_out = 0;
     for (;;) {
-        int children = 0;
+        int child_pids[64];
+        int children = task_child_pids(current->pid, child_pids,
+                                       (int)(sizeof(child_pids) /
+                                             sizeof(child_pids[0])));
         int found_pid = 0;
         long code = -1;
 
-        uint64_t f = irq_save();
-        for (struct task *t = task_all_list(); t; t = t->allnext) {
-            if (t->parent != current || t == current)
-                continue;
-            children++;
-            if (exit_lookup(t->pid, &code)) {
-                found_pid = t->pid;
+        for (int i = 0; i < children; i++) {
+            if (exit_lookup(child_pids[i], &code)) {
+                found_pid = child_pids[i];
                 break;
             }
         }
-        irq_restore(f);
 
         if (found_pid) {
             *pid_out = found_pid;
@@ -193,6 +186,7 @@ static void user_task_thunk(void *arg)
     struct uproc_pkg *pkg = arg;
     uint64_t *pml4 = NULL;
     uint8_t *buf;
+    struct file *backing = NULL;
     uint32_t fsize = 0;
     uint64_t entry, brk, argv_user, rsp, f;
     int argc;
@@ -204,20 +198,29 @@ static void user_task_thunk(void *arg)
     }
 
     pml4 = vmm_new_pml4();
-    if (elf_load(pml4, buf, fsize, &entry, &brk) < 0) {
-        kprintf("uproc: %s is not a valid ELF64 executable\n", pkg->path);
+    backing = vfs_open(pkg->path, O_RDONLY);
+    if (!backing) {
+        kprintf("uproc: cannot keep %s open for demand paging\n", pkg->path);
         goto fail;
     }
 
-    /* pmm_alloc() panics on exhaustion, so refuse to start a mapping that
-     * would drain the last frames: kill this process, not the kernel. */
-    if (pmm_free_pages() < USER_STACK_PAGES + UPROC_PMM_RESERVE) {
-        kprintf("uproc: out of memory, cannot start %s\n", pkg->path);
-        goto fail;
+    /* Dynamic relocation targets are populated through the same demand
+     * fault path as normal execution, so make the new address space live
+     * before asking the ELF loader to finish the image. */
+    f = irq_save();
+    current->pml4 = pml4;
+    current->user = true;
+    current->vm_files[0] = backing;
+    current->vm_file_count = 1;
+    vmm_switch(pml4);
+    irq_restore(f);
+    backing = NULL;                    /* task now owns the handle */
+
+    if (elf_load(current, current->vm_files[0], buf, fsize,
+                 &entry, &brk) < 0) {
+        kprintf("uproc: %s is not a valid ELF64 executable\n", pkg->path);
+        goto live_fail;
     }
-    for (int i = 0; i < USER_STACK_PAGES; i++)
-        vmm_map_page(pml4, USER_STACK_TOP - (uint64_t)(i + 1) * PAGE_SIZE,
-                     pmm_alloc(), PTE_U | PTE_W);
 
     /* Redirected stdio (SYS_SPAWN_IO). A NULL files[0]/files[1] means
      * the console, so only a named path installs a file; fd 2 always
@@ -229,7 +232,7 @@ static void user_task_thunk(void *arg)
         if (!current->files[0]) {
             kprintf("uproc: %s: cannot open %s for stdin\n",
                     pkg->path, pkg->io.in_path);
-            goto fail;
+            goto live_fail;
         }
     }
     if (pkg->io.out_path[0]) {
@@ -239,19 +242,23 @@ static void user_task_thunk(void *arg)
         if (!current->files[1]) {
             kprintf("uproc: %s: cannot open %s for stdout\n",
                     pkg->path, pkg->io.out_path);
-            goto fail;
+            goto live_fail;
         }
     }
 
-    /* Adopt the new address space. From here on the process page tables
-     * are live, so the user stack is directly addressable. */
-    f = irq_save();
-    current->pml4 = pml4;
-    current->user = true;
+    current->user_heap_start = brk;
     current->user_brk = brk;
-    vmm_switch(pml4);
-    irq_restore(f);
 
+    /* argv can occupy just over one page at the ABI limits. Populate only
+     * the stack pages it needs; the remainder of the 16-page reservation
+     * remains lazy. */
+    size_t stack_need = (size_t)pkg->argc * (UPROC_ARG_MAX + sizeof(uint64_t))
+                        + 64;
+    if (vm_fault_in_range(current, USER_STACK_TOP - stack_need,
+                          stack_need, 1) < 0) {
+        kprintf("uproc: cannot allocate initial stack for %s\n", pkg->path);
+        goto live_fail;
+    }
     rsp = build_user_stack(pkg, &argv_user);
     argc = pkg->argc;
 
@@ -259,12 +266,20 @@ static void user_task_thunk(void *arg)
     kfree(buf);
     enter_usermode(entry, rsp, (uint64_t)argc, argv_user);
 
+live_fail:
+    kfree(pkg);
+    kfree(buf);
+    uproc_record_exit(current->pid, -1);
+    task_exit(-1);
+
 fail:
     /* Still on the kernel pml4: the address-space switch never happened.
      * Any files[] entry the redirection setup installed is closed by
      * task_exit's descriptor sweep. */
     if (pml4)
         vmm_destroy_user(pml4);
+    if (backing)
+        vfs_close(backing);
     if (buf)
         kfree(buf);
     kfree(pkg);
@@ -314,12 +329,11 @@ int uproc_spawn_io(const char *path, char *const argv[], int argc,
     name = strrchr(path, '/');
     name = name ? name + 1 : path;
 
-    /* Keep the child unschedulable until its pid has been read: once it is
-     * runnable it can run to completion and be reaped, freeing *t. */
-    uint64_t f = irq_save();
-    t = kthread_create(user_task_thunk, pkg, name);
-    int pid = t ? t->pid : -1;
-    irq_restore(f);
+    /* The scheduler publishes the PID through pid_out before it releases
+     * its cross-CPU run-queue lock. The child may complete immediately
+     * after publication without leaving us to dereference a freed task. */
+    int pid = -1;
+    t = kthread_create_with_pid(user_task_thunk, pkg, name, &pid);
 
     if (!t) {
         kfree(pkg);

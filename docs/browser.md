@@ -112,8 +112,9 @@ Real pages are broken, so the parser assumes they are:
 * **Floats, positioning, columns, frames, iframes.** No.
 * **In-page anchors.** `#fragment` is stripped from URLs and a link to
   one reloads the same page.
-* **HTTPS.** There is no TLS in the network stack, so `https://` is
-  refused rather than silently downgraded.
+* **HTTPS.** TLS 1.3 is supported with certificate-chain, hostname,
+  validity-period and signature verification. TLS 1.2 and client
+  certificates are not implemented.
 * **Non-breaking space semantics.** `&nbsp;` decodes to a real space
   that does not collapse with its neighbours (so runs of them still
   indent) but it *does* allow a line break.
@@ -173,6 +174,8 @@ browser [-t] [-w cols] [-l] [-v] <url|file>
 ### 2.1 What it can load
 
 * `http://host[:port]/path` through `http_get()` in `libc/http.c`.
+* `https://host[:port]/path` through the same client and `libtls`;
+  port 443 is the default and verification is mandatory.
 * `file:///path`, an absolute path, or a path relative to the shell's cwd
   (the `--cwd=` argument is honoured, as in `cat`). A path that exists
   wins over the "it must be a hostname" guess, so `browser -t index.html`
@@ -203,7 +206,8 @@ browser.
 | page over 1 MiB | truncated, with `[page truncated at 1048576 bytes]` |
 | too many elements / too deeply nested | `[part of the page was dropped: ...]` |
 | missing file, a directory, unreadable file | named explicitly |
-| `https://`, `ftp://` | `unsupported scheme "x" (only http and file)` |
+| TLS certificate or handshake failure | names the verification or protocol failure; plaintext fallback is never attempted |
+| `ftp://` and other network schemes | `unsupported scheme "x" (only http, https and file)` |
 | `mailto:`, `javascript:`, `tel:`, `data:` links | refused with the link text shown, never followed |
 
 ### 2.3 The window

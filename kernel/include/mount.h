@@ -14,8 +14,8 @@
  * root filesystem.
  *
  * Everything here is called from preemptible syscall context. The table
- * itself is walked under irq_save(); the operations below are not, and
- * must do their own locking (see the whole-filesystem lock in kfs.c). */
+ * itself is walked under an IRQ-safe spin lock; the operations below are
+ * called with it dropped and must do their own locking (see kfs.c). */
 
 struct blockdev;
 struct file;

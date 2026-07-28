@@ -1,12 +1,11 @@
-/* wget.c - download an http:// URL to a file or to stdout.
+/* wget.c - download an http:// or https:// URL to a file or stdout.
  *
  *   wget <url>              save as the last path component
  *   wget -O <file> <url>    save under a given name
  *   wget -O - <url>         write the body to stdout
  *   wget -q <url>           only errors
  *
- * There is no TLS in KestrelOS, so https:// URLs are refused with a
- * plain message rather than a confusing connection failure.
+ * HTTPS uses libtls with certificate and hostname verification.
  */
 
 #include <kestrel.h>

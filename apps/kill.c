@@ -103,7 +103,7 @@ int main(int argc, char **argv)
             rc = 1;
             continue;
         }
-        if (syscall(SYS_KILL, pid, 0, 0, 0) < 0) {
+        if (syscall(SYS_KILL, pid, SIGTERM, 0, 0) < 0) {
             printf("kill: %d (%s): the kernel refused the request\n", pid,
                    pi.name);
             rc = 1;

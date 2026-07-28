@@ -10,6 +10,7 @@ static const char *state_name(int s)
     case K_STATE_RUNNING:  return "running";
     case K_STATE_SLEEPING: return "sleeping";
     case K_STATE_ZOMBIE:   return "zombie";
+    case K_STATE_STOPPED:  return "stopped";
     }
     return "?";
 }

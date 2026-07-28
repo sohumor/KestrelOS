@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include "spinlock.h"
 
 /* Anonymous pipes. A pipe is a 4 KiB ring buffer shared by two struct
  * file ends (see vfs.h): one read end and one write end, each of which
@@ -11,6 +12,7 @@
 struct file;
 
 struct pipe {
+    spinlock_t lock;
     uint8_t *buf;               /* PIPE_BUF_SIZE bytes */
     uint32_t head;              /* next byte to read */
     uint32_t tail;              /* next byte to write */

@@ -369,17 +369,10 @@ static int rvec16(struct rbuf *r, const uint8_t **out, unsigned long *outlen)
 /* ===================================================================== *
  * Entropy and the DRBG                                                  *
  *                                                                       *
- * HMAC-DRBG (NIST SP 800-90A) over SHA-256. The seed is everything the   *
- * machine will give us: RDSEED/RDRAND when the CPU has them, the time    *
- * stamp counter sampled repeatedly (its low bits jitter), the wall       *
- * clock, the process id, a few addresses, and /dev/urandom on the host   *
- * build.                                                                *
- *                                                                       *
- * Stated plainly: on the target, /dev/random is the kernel's xorshift    *
- * and is NOT cryptographic (kernel/devfs.c says so itself), so if the    *
- * CPU has no RDRAND the only real entropy is timer jitter. That is       *
- * weak. tls_entropy_is_weak() reports it and struct tls_info carries it  *
- * so the browser can say so out loud instead of pretending.             *
+ * HMAC-DRBG (NIST SP 800-90A) over SHA-256. On KestrelOS it is seeded    *
+ * through getrandom(), whose kernel side is a SHA-256 mixing pool fed by  *
+ * RDSEED/RDRAND and device timing, followed by a ChaCha20 CSPRNG. The     *
+ * host build uses /dev/urandom plus the local timing inputs below.        *
  * ===================================================================== */
 
 static uint8_t g_drbg_k[32];
@@ -498,16 +491,14 @@ static unsigned long entropy_gather(uint8_t *buf, unsigned long cap)
     }
 #else
     {
-        /* Not cryptographic -- see the comment above -- but it is one more
-         * thing an attacker has to get right, so stir it in anyway. */
-        int fd = open("/dev/random", O_RDONLY);
-        if (fd >= 0) {
-            uint8_t b[32];
-            long n = read(fd, b, sizeof(b));
-            close(fd);
-            if (n == (long)sizeof(b))
-                wbytes(&w, b, sizeof(b));
+        uint8_t b[64];
+        long n = getrandom(b, sizeof(b), GRND_RANDOM);
+
+        if (n == (long)sizeof(b)) {
+            wbytes(&w, b, sizeof(b));
+            hw = 1;  /* kernel pool crossed its initialization threshold */
         }
+        wipe(b, sizeof(b));
         t = (uint64_t)getpid();
         wbytes(&w, &t, sizeof(t));
         t = uptime_ms();

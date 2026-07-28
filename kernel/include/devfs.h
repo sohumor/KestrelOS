@@ -11,7 +11,8 @@
  * filesystem without anyone special-casing the path.
  *
  * What it publishes:
- *   the character devices below (null, zero, full, console, random, klog);
+ *   the character devices below (null, zero, full, console, random,
+ *     urandom, klog);
  *   one entry per registered block device (hda, ...), readable and
  *     writable at any byte offset, so `hexdump /dev/hda` shows the boot
  *     sector;
@@ -26,14 +27,15 @@
 #define DEV_FULL     3
 #define DEV_CONSOLE  4
 #define DEV_RANDOM   5
-#define DEV_KLOG     6
-#define DEV_MOUNTS   7
-#define DEV_BLOCKS   8
-#define DEV_BLOCKDEV 9          /* any registered struct blockdev */
+#define DEV_URANDOM  6
+#define DEV_KLOG     7
+#define DEV_MOUNTS   8
+#define DEV_BLOCKS   9
+#define DEV_BLOCKDEV 10         /* any registered struct blockdev */
 
-/* Register the "devfs" filesystem type and seed the PRNG. Idempotent. */
+/* Register the "devfs" filesystem type. Idempotent. */
 void devfs_init(void);
 
-/* Non-cryptographic PRNG behind /dev/random. Do NOT use for keys. */
+/* Compatibility helpers backed by the kernel ChaCha20 CSPRNG. */
 uint32_t devfs_random32(void);
 void devfs_random_fill(void *buf, unsigned long n);

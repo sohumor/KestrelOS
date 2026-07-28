@@ -40,20 +40,24 @@ exceptions, PIC, PIT, PS/2 keyboard and mouse, CMOS clock, power control, a
 kernel log ring, and an in-kernel rescue console for when userspace can't start.
 
 **Memory** — a bitmap physical allocator driven by the E820 map, 4-level paging
-with a full direct map, per-process address spaces, and a kernel heap.
+with a full direct map, per-process address spaces, lazy executable/heap/stack
+faults, page eviction to a raw swap extent, and a kernel heap.
 
-**Processes** — preemptive scheduling, kernel threads, ring-3 processes with
-per-task FPU state and credentials, an ELF64 loader, pipes, I/O redirection,
-process control, and a 50-plus call syscall interface.
+**Processes** — ACPI/xAPIC SMP startup and preemptive scheduling across up to
+16 CPUs, kernel threads, ring-3 processes with per-task FPU state and
+credentials, traditional signals, static and dynamically linked ELF64
+programs, pipes, I/O redirection, process control, and a 60-plus call syscall
+interface.
 
 **Storage** — an ATA driver and **KFS**, a custom filesystem with a checksummed
-metadata redo journal, directories, indirect blocks, and per-file ownership,
+file-data redo journal, directories, indirect blocks, and per-file ownership,
 permissions and timestamps, enforced by the VFS against each task's
 credentials. Plus `/dev` with real device files.
 
 **Networking** — PCI enumeration, two NIC drivers (RTL8139 and Intel e1000)
 behind a common interface, and a from-scratch stack: Ethernet, ARP, IPv4, ICMP,
-UDP, **TCP** and DNS, with an HTTP/1.1 client on top.
+UDP, DNS, and **TCP with selective acknowledgements**, with HTTP/1.1 and
+verified TLS 1.3 HTTPS clients on top.
 
 **Desktop** — a kernel compositor where each window is an object whose pixel
 buffer is mapped into the owning process, with stacking, focus, draggable title
@@ -64,7 +68,9 @@ taskbar, a graphical terminal, file manager, clock, paint program and browser.
 (written from the specification), a service-supervising init with readiness,
 hard dependencies, restart policies and backoff, a package manager with
 dependency resolution and integrity verification, and around 70 userspace
-programs.
+programs. Kernel randomness uses RDSEED/RDRAND and interrupt timing inputs,
+a SHA-256 mixing pool, and a ChaCha20 CSPRNG exposed through `getrandom()`,
+`/dev/random`, and `/dev/urandom`.
 
 ## Building
 
@@ -92,7 +98,8 @@ exactly how weak its security guarantees are.
 
 ```bash
 qemu-system-x86_64 -drive file=build/os.img,format=raw -m 512M \
-  -device VGA,vgamem_mb=32 -device e1000,netdev=n0 -netdev user,id=n0
+  -smp 4 -device VGA,vgamem_mb=32 \
+  -device e1000,netdev=n0 -netdev user,id=n0
 ```
 
 **VirtualBox** — `make vm-images`, create an "Other/Unknown (64-bit)" VM,
@@ -123,6 +130,8 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 | Document | Contents |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | how the whole system fits together |
+| [docs/smp.md](docs/smp.md) | CPU discovery, AP startup and scheduler locking |
+| [docs/random.md](docs/random.md) | entropy collection, pool mixing and the kernel CSPRNG |
 | [docs/MODULARITY.md](docs/MODULARITY.md) | the module system and driver model |
 | [docs/DESIGN-desktop.md](docs/DESIGN-desktop.md) | why the desktop is built the way it is |
 | [docs/ABI.md](docs/ABI.md) | syscall table, memory map, libc surface |
@@ -136,12 +145,14 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 
 ## Known limitations
 
-Single CPU (no SMP), no swap or demand paging, no signals, no dynamic linking,
-metadata-only journaling (not file-data journaling or checksums), no TCP
-selective acknowledgements, and TLS 1.3 only. The from-scratch TLS code is
-unaudited, and its entropy is weak on a CPU without a hardware random source.
-The password hashing is honest about being non-cryptographic, because the
-random number generator behind the salts is not.
+SMP currently uses xAPIC and the legacy PIC: external hardware interrupts land
+on the BSP, while reschedule IPIs distribute runnable work. Swap is one fixed
+raw extent with a simple local second-chance policy, not a general block-backed
+pager. The dynamic linker supports the relocation set emitted by this tree,
+not arbitrary System V binaries. Signals are the traditional non-realtime
+subset. KFS transactions are capped at 32 full blocks, networking is IPv4-only,
+and TLS is 1.3-only. The from-scratch TLS, CSPRNG, and filesystem code are
+educational implementations and have not had a professional security audit.
 
 **This cannot run Chrome, and never will.** Chrome needs the Linux syscall ABI,
 glibc, X11 or Wayland, GPU drivers and a JIT — far more work than this entire

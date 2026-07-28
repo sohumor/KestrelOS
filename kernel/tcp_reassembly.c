@@ -94,3 +94,35 @@ void tcp_reassembly_discard_from(struct tcp_reassembly *r, int head,
     for (int off = delta; off < window; off++)
         bit_clear(r, (tail + off) % TCP_RXBUF);
 }
+
+int tcp_reassembly_sack_blocks(const struct tcp_reassembly *r, int head,
+                               int contiguous, uint32_t next,
+                               struct tcp_sack_block *blocks,
+                               int max_blocks)
+{
+    if (!r || !blocks || max_blocks <= 0 ||
+        head < 0 || head >= TCP_RXBUF ||
+        contiguous < 0 || contiguous > TCP_RXBUF)
+        return 0;
+
+    int count = 0;
+    int tail = (head + contiguous) % TCP_RXBUF;
+    int window = TCP_RXBUF - contiguous;
+    int off = 0;
+
+    while (off < window && count < max_blocks) {
+        while (off < window &&
+               !bit_test(r, (tail + off) % TCP_RXBUF))
+            off++;
+        if (off >= window)
+            break;
+        int first = off;
+        while (off < window &&
+               bit_test(r, (tail + off) % TCP_RXBUF))
+            off++;
+        blocks[count].left = next + (uint32_t)first;
+        blocks[count].right = next + (uint32_t)off;
+        count++;
+    }
+    return count;
+}

@@ -28,19 +28,20 @@ long syscall(long n, long a, long b, long c, long d);
 
 ### Program entry
 
-Binaries are static ELF64 linked with `apps/user.ld`, entry symbol
-`_start`, loaded at `USER_LOAD_BASE` (0x400000). At `_start` the kernel
-provides `rdi = argc` and `rsi = argv` (a NUL-terminated array of
-`char *` copied onto the user stack, `argv[argc] == 0`). crt0 calls
+Binaries may be static ELF64 images linked at `USER_LOAD_BASE` (`0x400000`)
+or Kestrel ET_DYN images with `DT_NEEDED` dependencies. The kernel records
+lazy `PT_LOAD` areas, resolves the supported dynamic relocations, and enters
+`_start`. It provides `rdi = argc` and `rsi = argv` (a NUL-terminated
+`char *` array on the user stack, `argv[argc] == 0`). crt0 calls
 `main(argc, argv)` and passes its return value to `SYS_EXIT`.
 
 ## Memory map (per process)
 
 | region | address |
 |---|---|
-| program image (`.text/.rodata/.data/.bss`) | `0x400000` (`USER_LOAD_BASE`), 4 KiB-aligned sections |
-| heap | starts at end of `.bss`, grows up via `SYS_BRK` |
-| stack | top at `0x00007FFFFFFFE000` (`USER_STACK_TOP`), 16 pages (`USER_STACK_PAGES`), grows down |
+| program/dependency images | static base `0x400000` or assigned ET_DYN bases; pages populated lazily |
+| heap | starts after the image, grows via `SYS_BRK`, populated on fault |
+| stack | top at `0x00007FFFFFFFE000`; 16-page lazy range |
 | kernel | `0xFFFF800000000000` and above; never user-accessible |
 
 ## Syscall table
@@ -74,6 +75,44 @@ Numbers, argument registers in order (rdi, rsi, rdx, r10).
 | 22 | `SYS_NETINFO` | `struct k_netinfo *` | 0, or -1 if no NIC |
 | 23 | `SYS_SEEK` | fd, off, whence (0=SET 1=CUR 2=END) | new pos / -1 |
 | 24 | `SYS_READ_NB` | fd, buf, len | bytes read, 0 if none ready |
+| 25 | `SYS_RTC` | `struct k_rtc *` | 0 / -1 |
+| 26 | `SYS_POWER` | action | does not return on success |
+| 27 | `SYS_SPAWN_IO` | path, argv, `struct k_spawn_io *` | pid / -1 |
+| 28 | `SYS_PIPE` | `int fd[2]` | 0 / -1 |
+| 29 | `SYS_DUP2` | oldfd, newfd | newfd / -1 |
+| 30 | `SYS_KILL` | pid, signal | 0 / -1 |
+| 31 | `SYS_WAITANY` | `int *pid_out` | exit code / -1 |
+| 32 | `SYS_EXEC` | path, argv | no return on success |
+| 33 | `SYS_GETUID` | — | uid |
+| 34 | `SYS_GETGID` | — | gid |
+| 35 | `SYS_SETUID` | uid | 0 / -1 |
+| 36 | `SYS_CHMOD` | path, mode | 0 / -1 |
+| 37 | `SYS_CHOWN` | path, uid, gid | 0 / -1 |
+| 38 | `SYS_TIME` | — | Unix seconds |
+| 39 | `SYS_LOG` | level, message | 0 / -1 |
+| 40 | `SYS_LOGREAD` | index, `struct k_logent *` | 0 / -1 |
+| 41 | `SYS_FBINFO` | `struct k_fbinfo *` | 0 / -1 |
+| 42 | `SYS_MOUSE` | `struct k_mouse *` | 0 / -1 |
+| 43–47 | `SYS_WIN_*` | create/destroy/flush/event/move arguments | operation result |
+| 48 | `SYS_TCP_CONNECT` | ip, port, timeout_ms | handle / -1 |
+| 49 | `SYS_TCP_SEND` | handle, buf, len | bytes / -1 |
+| 50 | `SYS_TCP_RECV` | handle, buf, max, timeout_ms | bytes, 0 closed, -1 |
+| 51 | `SYS_TCP_CLOSE` | handle | 0 / -1 |
+| 52 | `SYS_SYNC` | — | 0 / -1 |
+| 53 | `SYS_INSMOD` | path | 0 / -1 |
+| 54 | `SYS_RMMOD` | name | 0 / -1 |
+| 55 | `SYS_MODLIST` | index, `struct k_modinfo *` | 0 / -1 |
+| 56 | `SYS_MOUNT` | path, type, device | 0 / -1 |
+| 57 | `SYS_UMOUNT` | path | 0 / -1 |
+| 58 | `SYS_BLKLIST` | index, `struct k_blkinfo *` | 0 / -1 |
+| 59 | `SYS_DEVLIST` | index, `struct k_devinfo *` | 0 / -1 |
+| 60 | `SYS_MOUNTLIST` | index, `struct k_mountinfo *` | 0 / -1 |
+| 61 | `SYS_GETRANDOM` | buf, len, flags | bytes / -1 |
+| 62 | `SYS_SWAPINFO` | `u64 *total_kb`, `u64 *used_kb` | 0 / -1 |
+| 63 | `SYS_SIGACTION` | sig, action, old action | 0 / -1 |
+| 64 | `SYS_SIGPROCMASK` | how, mask, old mask | 0 / -1 |
+| 65 | `SYS_SIGRETURN` | internal restorer | restores interrupted frame |
+| 66 | `SYS_CPUINFO` | `struct k_cpuinfo *` | 0 / -1 |
 
 `open()` flags: `O_RDONLY 0x000`, `O_WRONLY 0x001`, `O_RDWR 0x002`,
 `O_CREAT 0x040`, `O_TRUNC 0x200`, `O_APPEND 0x400`.
@@ -97,9 +136,20 @@ discipline or echo; `readline()` in libc implements both.
 Defined in `abi/kestrel_abi.h`:
 
 ```c
-struct k_stat   { uint32_t size; uint32_t is_dir; };
-struct k_dirent { char name[60]; uint32_t size; uint32_t is_dir; };
-struct k_psinfo { int32_t pid; char name[32]; int32_t state; };
+struct k_stat {
+    uint32_t size, is_dir, mode, uid, gid, mtime;
+};
+struct k_dirent {
+    char name[60];
+    uint32_t size, is_dir, mode, uid, gid, mtime;
+};
+struct k_psinfo {
+    int32_t pid; char name[32]; int32_t state;
+    uint32_t uid; int32_t ppid;
+};
+struct k_cpuinfo {
+    uint32_t online, discovered, current_cpu, apic_id;
+};
 struct k_netinfo {
     uint32_t ip, netmask, gateway, dns;  /* big-endian */
     uint8_t mac[6];
@@ -109,7 +159,7 @@ struct k_netinfo {
 ```
 
 `k_psinfo.state`: `K_STATE_RUNNABLE 0`, `K_STATE_RUNNING 1`,
-`K_STATE_SLEEPING 2`, `K_STATE_ZOMBIE 3`.
+`K_STATE_SLEEPING 2`, `K_STATE_ZOMBIE 3`, `K_STATE_STOPPED 4`.
 
 ## libc surface
 

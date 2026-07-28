@@ -20,8 +20,9 @@
  * v2 added mode / uid / gid / mtime to the inode and dropped nlink (KFS has
  * never supported hard links). The inode stayed 64 bytes by giving up two
  * direct block pointers, so the maximum file size shrank slightly.
- * v3 reserves a checksummed, fixed-size redo journal for atomic metadata
- * transactions. The inode layout is unchanged from v2.
+ * v3 reserves a checksummed, fixed-size redo journal. Kestrel now journals
+ * regular file data in the same transaction as its metadata; the on-disk
+ * geometry and inode layout are unchanged.
  */
 
 #define KFS_MAGIC             0x3353464B  /* "KFS3" little-endian */

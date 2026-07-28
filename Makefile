@@ -72,6 +72,9 @@ $(BUILD)/libweb/style.o: libweb/style.c
 APP_NAMES := $(filter-out $(CONFIG_APPS_EXCLUDE), \
                $(patsubst apps/%.c,%,$(wildcard apps/*.c)))
 APP_BINS  := $(patsubst %,$(BUILD)/apps/%,$(APP_NAMES))
+DYNAMIC_APP := $(BUILD)/apps/dynhello
+DYNAMIC_LIB := $(BUILD)/lib/libgreet.so
+APP_BINS += $(DYNAMIC_APP)
 
 # Packages are built like apps but staged into .kpkg archives instead of /bin.
 PKG_NAMES := $(notdir $(wildcard packages/*))
@@ -83,10 +86,11 @@ PKG_DATA  := $(shell find packages -path '*/root/*' -type f 2>/dev/null)
 
 ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 
-QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot \
+QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
+        test-random \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -186,6 +190,26 @@ USER_LINK = $(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $@
 $(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
 	$(USER_LINK) $(CRT0) $< $(LIBGUI_A) $(LIBC_A)
 
+# Minimal ELF64 dynamic-linking fixture. The executable is ET_DYN and carries
+# DT_NEEDED=libgreet.so plus eager PLT relocations; it intentionally links no
+# static libc, so a successful run proves that the dependency was mapped and
+# its symbols resolved.
+DYN_CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector \
+              -fPIC -fPIE -mno-red-zone -Wall -Wextra -O2 -g
+
+$(BUILD)/dynamic/%.o: dynamic/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(DYN_CFLAGS) -c $< -o $@
+
+$(DYNAMIC_LIB): $(BUILD)/dynamic/libgreet.o
+	@mkdir -p $(dir $@)
+	$(LD) -shared --hash-style=sysv -soname libgreet.so -o $@ $<
+
+$(DYNAMIC_APP): $(BUILD)/dynamic/dynhello.o $(DYNAMIC_LIB)
+	@mkdir -p $(dir $@)
+	$(LD) -pie --hash-style=sysv -e _start -L$(BUILD)/lib \
+	  -o $@ $(BUILD)/dynamic/dynhello.o -lgreet
+
 # The browser also needs its rendering engine and the whole web stack.
 # Archive order matters: libweb calls libz/libtls/libimg/libjs, so those
 # follow it on the line, and libc is last because everything calls it.
@@ -200,6 +224,19 @@ $(BUILD)/apps/tlstest: $(BUILD)/apps/tlstest.o $(CRT0) $(LIBC_A) \
                        $(LIBGUI_A) $(BUILD)/libtls.a apps/user.ld
 	$(USER_LINK) $(CRT0) $(BUILD)/apps/tlstest.o $(LIBGUI_A) \
 	  $(BUILD)/libtls.a $(LIBC_A)
+
+# libc/http.c supports both TCP and verified TLS. These clients pull that
+# object from libc.a, so resolve the intentional libc<->libtls references
+# as one archive group.
+HTTP_TLS_APPS := curl wget kpkg
+define HTTP_TLS_APP_RULE
+$(BUILD)/apps/$(1): $(BUILD)/apps/$(1).o $(CRT0) $(LIBC_A) \
+                    $(LIBGUI_A) $(BUILD)/libtls.a apps/user.ld
+	$(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $$@ \
+	  $(CRT0) $(BUILD)/apps/$(1).o $(LIBGUI_A) \
+	  --start-group $(LIBC_A) $(BUILD)/libtls.a --end-group
+endef
+$(foreach a,$(HTTP_TLS_APPS),$(eval $(call HTTP_TLS_APP_RULE,$(a))))
 
 # ---------------- packages ----------------
 
@@ -228,7 +265,7 @@ $(BUILD)/repo/index.kpi: $(KPKGS) tools/mkrepo.py
 
 # ---------------- filesystem image ----------------
 
-$(BUILD)/fs.img: $(APP_BINS) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
+$(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
                  $(BUILD)/repo/index.kpi
 	rm -rf $(BUILD)/rootfs
 	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run \
@@ -238,6 +275,7 @@ $(BUILD)/fs.img: $(APP_BINS) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
 	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
+	cp $(DYNAMIC_LIB) $(BUILD)/rootfs/lib/
 	cp $(MOD_BINS) $(BUILD)/rootfs/lib/modules/
 	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
 	$(PY) tools/mkfs.py --mode /etc/shadow:0600 --mode /var/pkg/db:0700 \
@@ -271,6 +309,9 @@ test-checksum:
 
 test-net: test-tcp test-checksum
 
+test-random:
+	sh tools/run-random-tests.sh
+
 test-kfs-journal:
 	$(PY) tools/test_kfs_journal.py
 
@@ -303,6 +344,7 @@ help:
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
 	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
 	@echo "  make test-net   run host TCP + network checksum tests"
+	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
 	@echo "  make test-kfs-boot-recovery   boot a committed journal through recovery"
 	@echo "  make test-kfs   run both KFS recovery suites"

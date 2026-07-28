@@ -84,10 +84,12 @@ honest equivalent is to write our own browser: HTTP/1.1 over our own TCP, our ow
 HTML tokenizer and layout, rendered in a window by our own compositor. That is
 what `browser` is.
 
-## Deliberately out of scope
+## Deliberately bounded
 
-Single CPU (no SMP or per-CPU locking), cooperative-ish kernel preemption rather
-than fully reentrant kernel paths, no swap or demand paging from disk, no
-signals (process termination is a direct kill), no dynamic linking, no file-data
-journaling or checksums, and no cryptography beyond a password hash — nothing
-here should be relied on for secrecy.
+The implementation now includes xAPIC SMP, demand paging and a raw swap extent,
+traditional signals, a small dynamic linker, file-data journaling, TCP SACK,
+verified HTTPS, and a kernel CSPRNG. Its boundaries remain intentional:
+legacy-PIC IRQ routing is BSP-centric, the scheduler uses one global run queue,
+the dynamic loader accepts only Kestrel's supported ABI/relocations, KFS has a
+fixed transaction budget, networking is IPv4-only, and none of the security
+code has had a professional audit.

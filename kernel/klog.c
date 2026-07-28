@@ -5,6 +5,7 @@
 #include "string.h"
 #include "proc.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
 /* Kernel message ring. See klog.h for the contract. */
 
@@ -18,6 +19,7 @@ static uint32_t log_total;          /* entries ever written */
 static bool log_ready;
 static bool log_mirror;
 static bool log_in_sink;            /* re-entrancy guard for the kprintf hook */
+static spinlock_t log_lock = SPINLOCK_INIT;
 
 void (*klog_kprintf_sink)(char c);
 
@@ -210,12 +212,12 @@ const char *klog_level_name(int level)
 
 void klog_init(void)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&log_lock);
     memset(ring, 0, sizeof(ring));
     log_total = 0;
     log_mirror = false;
     log_ready = true;
-    irq_restore(f);
+    spin_unlock_irqrestore(&log_lock, f);
     klog_write(K_LOG_INFO, "klog", "kernel log ring online");
 }
 
@@ -226,18 +228,18 @@ void klog_set_console(bool on)
 
 uint32_t klog_count(void)
 {
-    return log_total;
+    return __atomic_load_n(&log_total, __ATOMIC_RELAXED);
 }
 
 uint32_t klog_retained(void)
 {
-    uint32_t t = log_total;
+    uint32_t t = __atomic_load_n(&log_total, __ATOMIC_RELAXED);
     return t < KLOG_RING_ENTRIES ? t : (uint32_t)KLOG_RING_ENTRIES;
 }
 
 uint32_t klog_oldest_seq(void)
 {
-    uint32_t t = log_total;
+    uint32_t t = __atomic_load_n(&log_total, __ATOMIC_RELAXED);
     return t > KLOG_RING_ENTRIES ? t - KLOG_RING_ENTRIES : 0;
 }
 
@@ -272,7 +274,7 @@ void klog_write(int level, const char *tag, const char *msg)
     if (level < K_LOG_DEBUG || level > K_LOG_ERR)
         level = K_LOG_INFO;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&log_lock);
 
     struct k_logent *e = &ring[log_total % KLOG_RING_ENTRIES];
     memset(e, 0, sizeof(*e));
@@ -288,7 +290,7 @@ void klog_write(int level, const char *tag, const char *msg)
     if (mirror)
         snapshot = *e;
 
-    irq_restore(f);
+    spin_unlock_irqrestore(&log_lock, f);
 
     if (mirror)
         mirror_entry(&snapshot);
@@ -310,15 +312,15 @@ int klog_read(uint32_t index, struct k_logent *out)
     if (out == NULL)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&log_lock);
     uint32_t retained = klog_retained();
     if (index >= retained) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&log_lock, f);
         return -1;
     }
     uint32_t seq = klog_oldest_seq() + index;
     *out = ring[seq % KLOG_RING_ENTRIES];
-    irq_restore(f);
+    spin_unlock_irqrestore(&log_lock, f);
 
     /* The slot may have been recycled between the bounds check and the
      * copy on another CPU; on this uniprocessor kernel interrupts are off

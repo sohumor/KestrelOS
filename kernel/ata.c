@@ -3,6 +3,8 @@
 #include "blockdev.h"
 #include "io.h"
 #include "string.h"
+#include "random.h"
+#include "spinlock.h"
 
 /* ATA PIO driver: primary bus, master drive, 28-bit LBA, polling.
  *
@@ -37,6 +39,7 @@
 
 static int ata_present;
 static struct blockdev ata_bdev;
+static spinlock_t ata_lock = SPINLOCK_INIT;
 
 /* >= 400ns settle time after a drive select. */
 static void ata_delay_400ns(void)
@@ -126,6 +129,8 @@ static int ata_rw_chunk(uint32_t lba, uint32_t count, void *buf, int write)
         if (inb(ATA_REG_STATUS) & (ATA_SR_ERR | ATA_SR_DF))
             return -1;
     }
+    entropy_pool_add_interrupt(ENTROPY_DISK,
+                               (lba << 9) ^ count ^ (write ? 0x80000000u : 0));
     return 0;
 }
 
@@ -133,14 +138,18 @@ static int ata_rw(uint32_t lba, uint32_t count, void *buf, int write)
 {
     if (!ata_present)
         return -1;
+    uint64_t flags = spin_lock_irqsave(&ata_lock);
     while (count > 0) {
         uint32_t chunk = count > 256 ? 256 : count;
-        if (ata_rw_chunk(lba, chunk, buf, write) < 0)
+        if (ata_rw_chunk(lba, chunk, buf, write) < 0) {
+            spin_unlock_irqrestore(&ata_lock, flags);
             return -1;
+        }
         lba += chunk;
         count -= chunk;
         buf = (uint8_t *)buf + chunk * 512;
     }
+    spin_unlock_irqrestore(&ata_lock, flags);
     return 0;
 }
 

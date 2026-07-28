@@ -2,7 +2,7 @@
 #include "fpu.h"
 #include "string.h"
 
-void fpu_init(void)
+static void fpu_enable_cpu(void)
 {
     uint64_t cr0, cr4;
 
@@ -19,7 +19,17 @@ void fpu_init(void)
     cr4 |= (1ULL << 10);        /* OSXMMEXCPT: #XF for SSE exceptions */
     __asm__ volatile("mov %0, %%cr4" : : "r"(cr4));
 
+}
+
+void fpu_init(void)
+{
+    fpu_enable_cpu();
     kprintf("fpu: x87 + SSE enabled (FXSAVE state per task)\n");
+}
+
+void fpu_init_ap(void)
+{
+    fpu_enable_cpu();
 }
 
 void fpu_state_init(void *area)

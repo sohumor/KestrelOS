@@ -182,9 +182,7 @@ int main(int argc, char *argv[])
                "authenticated\n");
     }
     if (info.weak_entropy)
-        printf("  entropy    WEAK: no hardware random source was found, so "
-               "the keys\n             are only as unpredictable as the "
-               "system timers\n");
+        printf("  entropy    WEAK: the kernel entropy pool was not ready\n");
 
     snprintf(req, sizeof(req),
              "%s %s HTTP/1.1\r\nHost: %s\r\n"

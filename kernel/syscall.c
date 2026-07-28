@@ -21,8 +21,12 @@
 #include "mount.h"
 #include "blockdev.h"
 #include "device.h"
+#include "random.h"
+#include "vm.h"
+#include "signal.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "smp.h"
 
 /* Hooks exported by idt.c. */
 extern void (*syscall_entry_hook)(struct regs *r);
@@ -54,23 +58,12 @@ int user_range_ok(const void *uptr, size_t len)
     return 1;
 }
 
-/* We execute syscalls on the process page tables, so user memory is
- * directly addressable — but only touch it after proving every page is
- * mapped, so a bad pointer becomes -1 instead of a kernel page fault. */
-static int user_pages_mapped(uint64_t a, size_t len)
-{
-    uint64_t end = a + len;
-    for (uint64_t p = a & ~(PAGE_SIZE - 1); p < end; p += PAGE_SIZE)
-        if (!vmm_virt_to_phys(current->pml4, p))
-            return 0;
-    return 1;
-}
-
 int copy_from_user(void *dst, const void *usrc, size_t len)
 {
     if (len == 0)
         return 0;
-    if (!user_range_ok(usrc, len) || !user_pages_mapped((uint64_t)usrc, len))
+    if (!user_range_ok(usrc, len) ||
+        vm_fault_in_range(current, (uint64_t)usrc, len, 0) < 0)
         return -1;
     memcpy(dst, usrc, len);
     return 0;
@@ -80,7 +73,8 @@ int copy_to_user(void *udst, const void *src, size_t len)
 {
     if (len == 0)
         return 0;
-    if (!user_range_ok(udst, len) || !user_pages_mapped((uint64_t)udst, len))
+    if (!user_range_ok(udst, len) ||
+        vm_fault_in_range(current, (uint64_t)udst, len, 1) < 0)
         return -1;
     memcpy(udst, src, len);
     return 0;
@@ -95,7 +89,7 @@ long copy_str_from_user(char *dst, const void *usrc, size_t max)
         if (a >= USER_VA_LIMIT)
             return -1;
         if ((i == 0 || (a & (PAGE_SIZE - 1)) == 0) &&
-            !vmm_virt_to_phys(current->pml4, a))
+            vm_fault_in_range(current, a, 1, 0) < 0)
             return -1;
         dst[i] = *(const char *)a;
         if (dst[i] == '\0')
@@ -299,27 +293,11 @@ static long sys_brk(uint64_t new_brk)
     if (new_brk < old || new_brk > BRK_CEILING)
         return (long)old;            /* rejected: break unchanged */
 
-    uint64_t lo = old & ~(PAGE_SIZE - 1);
-    uint64_t hi = (new_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    /* BRK_CEILING is a ~128 TiB *virtual* bound, so it says nothing about
-     * whether the frames exist. pmm_alloc() panics when they do not, which
-     * would let any ring-3 process halt the kernel with a malloc loop.
-     * Refuse the whole request up front — libc's heap_grow() already
-     * treats an unchanged break as "out of memory". */
-    if ((hi - lo) / PAGE_SIZE > BRK_MAX_GROW)
+    /* Reserve address space only. Pages are committed on first touch and
+     * may later move transparently to swap. Keep a per-call virtual-growth
+     * cap so a corrupt length cannot reserve most of the user half. */
+    if ((new_brk - old + PAGE_SIZE - 1) / PAGE_SIZE > BRK_MAX_GROW)
         return (long)old;
-
-    uint64_t need = 0;
-    for (uint64_t p = lo; p < hi; p += PAGE_SIZE)
-        if (!vmm_virt_to_phys(current->pml4, p))
-            need++;
-    if (need + PMM_RESERVE > pmm_free_pages())
-        return (long)old;            /* keeps the page-table frames too */
-
-    for (uint64_t p = lo; p < hi; p += PAGE_SIZE)
-        if (!vmm_virt_to_phys(current->pml4, p))
-            vmm_map_page(current->pml4, p, pmm_alloc(), PTE_U | PTE_W);
 
     current->user_brk = new_brk;
     return (long)new_brk;
@@ -336,27 +314,21 @@ static long sys_meminfo(uint64_t utotal, uint64_t ufree)
     return 0;
 }
 
+static long sys_cpuinfo(uint64_t uinfo)
+{
+    struct k_cpuinfo info;
+    info.online = smp_cpu_count();
+    info.discovered = smp_cpu_discovered();
+    info.current_cpu = smp_cpu_index();
+    info.apic_id = smp_cpu_apic_id(info.current_cpu);
+    return copy_to_user((void *)uinfo, &info, sizeof(info));
+}
+
 static long sys_psinfo(uint64_t index, uint64_t upi)
 {
-    struct task *t = task_all_list();
-    for (uint64_t i = 0; t && i < index; i++)
-        t = t->allnext;
-    if (!t)
-        return -1;
-
     struct k_psinfo pi;
-    memset(&pi, 0, sizeof(pi));
-    pi.pid = t->pid;
-    pi.uid = t->uid;
-    pi.ppid = t->parent ? t->parent->pid : 0;
-    strncpy(pi.name, t->name, sizeof(pi.name) - 1);
-    switch (t->state) {
-    case TASK_RUNNABLE: pi.state = K_STATE_RUNNABLE; break;
-    case TASK_RUNNING:  pi.state = K_STATE_RUNNING;  break;
-    case TASK_SLEEPING: pi.state = K_STATE_SLEEPING; break;
-    case TASK_ZOMBIE:   pi.state = K_STATE_ZOMBIE;   break;
-    default:            pi.state = K_STATE_ZOMBIE;   break;
-    }
+    if (task_psinfo(index, &pi) < 0)
+        return -1;
     return copy_to_user((void *)upi, &pi, sizeof(pi));
 }
 
@@ -488,9 +460,7 @@ static long sys_dup2(uint64_t oldfd, uint64_t newfd)
     if (oldfd == newfd)
         return (long)newfd;
 
-    uint64_t flags = irq_save();
-    f->refs++;
-    irq_restore(flags);
+    __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_REL);
 
     struct file *old = current->files[newfd];
     current->files[newfd] = f;
@@ -720,15 +690,16 @@ static long sys_tcp_recv(uint64_t h, uint64_t ubuf, uint64_t max,
 
 /* --- process control --------------------------------------------------- */
 
-static long sys_kill(uint64_t pid)
+static long sys_kill(uint64_t pid, uint64_t sig)
 {
-    struct task *t = task_find((int)pid);
-    if (!t || t->pid <= 1)
+    if ((int)pid <= 1)
         return -1;                   /* never the kernel task or init */
-    if (current->uid != 0 && current->uid != t->uid)
+    if (sig == 0)
+        return task_signal_pid((int)pid, 0, current->uid, true) == -1
+                   ? -1 : 0;         /* permission/existence probe */
+    if (sig >= K_NSIG)
         return -1;
-    uproc_record_exit(t->pid, -1);
-    return task_kill(t);
+    return task_signal_pid((int)pid, (int)sig, current->uid, true);
 }
 
 static long sys_waitany(uint64_t upid)
@@ -740,6 +711,41 @@ static long sys_waitany(uint64_t upid)
     if (copy_to_user((void *)upid, &pid, sizeof(pid)) < 0)
         return -1;
     return code;
+}
+
+static long sys_getrandom(uint64_t ubuf, uint64_t len, uint64_t flags)
+{
+    uint8_t chunk[FILE_CHUNK];
+    uint64_t done = 0;
+    unsigned rflags = 0;
+
+    if (flags & ~(uint64_t)(GRND_NONBLOCK | GRND_RANDOM))
+        return -1;
+    if (flags & GRND_NONBLOCK)
+        rflags |= RANDOM_NONBLOCK;
+    if (flags & GRND_RANDOM)
+        rflags |= RANDOM_STRONG;
+    while (done < len) {
+        size_t take = len - done > sizeof(chunk)
+                          ? sizeof(chunk) : (size_t)(len - done);
+        if (random_get_bytes(chunk, take, rflags) < 0)
+            return done ? (long)done : -1;
+        if (copy_to_user((void *)(ubuf + done), chunk, take) < 0)
+            return done ? (long)done : -1;
+        done += take;
+    }
+    memset(chunk, 0, sizeof(chunk));
+    return (long)done;
+}
+
+static long sys_swapinfo(uint64_t utotal, uint64_t uused)
+{
+    uint64_t total_kb = swap_total_pages() * (PAGE_SIZE / 1024);
+    uint64_t used_kb = swap_used_pages() * (PAGE_SIZE / 1024);
+    if (copy_to_user((void *)utotal, &total_kb, sizeof(total_kb)) < 0 ||
+        copy_to_user((void *)uused, &used_kb, sizeof(used_kb)) < 0)
+        return -1;
+    return 0;
 }
 
 /* --- dispatcher ------------------------------------------------------- */
@@ -853,7 +859,7 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_dup2(a1, a2);
         break;
     case SYS_KILL:
-        ret = sys_kill(a1);
+        ret = sys_kill(a1, a2);
         break;
     case SYS_WAITANY:
         ret = sys_waitany(a1);
@@ -914,6 +920,27 @@ static void syscall_dispatch(struct regs *r)
     case SYS_MOUNTLIST:
         ret = sys_mountlist(a1, a2);
         break;
+    case SYS_GETRANDOM:
+        ret = sys_getrandom(a1, a2, a3);
+        break;
+    case SYS_SWAPINFO:
+        ret = sys_swapinfo(a1, a2);
+        break;
+    case SYS_SIGACTION:
+        ret = signal_sys_sigaction(a1, a2, a3);
+        break;
+    case SYS_SIGPROCMASK:
+        ret = signal_sys_sigprocmask(a1, a2, a3);
+        break;
+    case SYS_SIGRETURN:
+        if (signal_sigreturn(current, r) < 0) {
+            uproc_record_exit(current->pid, 128 + SIGSEGV);
+            task_exit(128 + SIGSEGV);
+        }
+        return;
+    case SYS_CPUINFO:
+        ret = sys_cpuinfo(a1);
+        break;
     case SYS_BLKLIST:
         ret = sys_blklist(a1, a2);
         break;
@@ -972,19 +999,22 @@ static void syscall_dispatch(struct regs *r)
      * syscall, so this return checkpoint is what makes the pending kill
      * take effect before any more ring-3 code can run. */
     task_check_kill();
+    signal_deliver_pending(current, r);
 }
 
 /* Ring-3 CPU exception: kill the process, never the kernel. */
 static void user_fault(struct regs *r)
 {
-    kprintf("uproc: %s (pid %d) killed: exception %lu err=%lx rip=%016lx\n",
+    if (r->vector == 14 &&
+        vm_handle_page_fault(current, read_cr2(), r->err) == 0)
+        return;
+    kprintf("uproc: %s (pid %d): exception %lu err=%lx rip=%016lx\n",
             current->name, current->pid, (unsigned long)r->vector,
             (unsigned long)r->err, (unsigned long)r->rip);
     if (r->vector == 14)
         kprintf("uproc: fault address %016lx\n",
                 (unsigned long)read_cr2());
-    uproc_record_exit(current->pid, -1);
-    task_exit(-1);
+    signal_user_exception(current, r);
 }
 
 void syscall_init(void)

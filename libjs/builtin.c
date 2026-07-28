@@ -2013,7 +2013,7 @@ static int regexp_exec(js_ctx *ctx, js_object *ro, js_string *s, js_value *ret)
 static int bi_regexp_exec(js_ctx *ctx, js_value t, int argc, js_value *argv,
                           js_value *ret)
 {
-    js_object *ro;
+    js_object *ro = 0;
     js_value s;
 
     if (this_regexp(ctx, t, &ro) != JS_OK) return JS_THROW;
@@ -2034,7 +2034,7 @@ static int bi_regexp_test(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_regexp_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
                               js_value *ret)
 {
-    js_object *ro;
+    js_object *ro = 0;
     js_sbuf b;
 
     (void)argc; (void)argv;
@@ -2052,7 +2052,7 @@ static int bi_regexp_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
 
 static int re_getter(js_ctx *ctx, js_value t, js_value *ret, int which)
 {
-    js_object *ro;
+    js_object *ro = 0;
 
     if (this_regexp(ctx, t, &ro) != JS_OK) return JS_THROW;
     switch (which) {
@@ -2150,7 +2150,7 @@ static int bi_string_charat(js_ctx *ctx, js_value t, int argc, js_value *argv,
                             js_value *ret)
 {
     js_string *s;
-    double d;
+    double d = 0;
 
     if (this_string(ctx, t, &s) != JS_OK) return JS_THROW;
     if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
@@ -2163,7 +2163,7 @@ static int bi_string_charcodeat(js_ctx *ctx, js_value t, int argc,
                                 js_value *argv, js_value *ret)
 {
     js_string *s;
-    double d;
+    double d = 0;
 
     if (this_string(ctx, t, &s) != JS_OK) return JS_THROW;
     if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
@@ -2709,7 +2709,7 @@ static int bi_number_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_number_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
                               js_value *ret)
 {
-    double d;
+    double d = 0;
     char buf[80];
     double r = 10;
 
@@ -2726,7 +2726,7 @@ static int bi_number_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_number_valueof(js_ctx *ctx, js_value t, int argc, js_value *argv,
                              js_value *ret)
 {
-    double d;
+    double d = 0;
     (void)argc; (void)argv;
     if (this_number(ctx, t, &d) != JS_OK) return JS_THROW;
     *ret = js_number(d);
@@ -2736,7 +2736,7 @@ static int bi_number_valueof(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_number_tofixed(js_ctx *ctx, js_value t, int argc, js_value *argv,
                              js_value *ret)
 {
-    double d, f = 0;
+    double d = 0, f = 0;
     char buf[128];
 
     if (this_number(ctx, t, &d) != JS_OK) return JS_THROW;
@@ -2751,7 +2751,7 @@ static int bi_number_tofixed(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_number_toprecision(js_ctx *ctx, js_value t, int argc,
                                  js_value *argv, js_value *ret)
 {
-    double d, p;
+    double d = 0, p = 0;
     char buf[128];
 
     if (this_number(ctx, t, &d) != JS_OK) return JS_THROW;
@@ -2770,7 +2770,7 @@ static int bi_number_toprecision(js_ctx *ctx, js_value t, int argc,
 static int bi_number_toexponential(js_ctx *ctx, js_value t, int argc,
                                    js_value *argv, js_value *ret)
 {
-    double d, f = -1;
+    double d = 0, f = -1;
     char buf[128];
 
     if (this_number(ctx, t, &d) != JS_OK) return JS_THROW;
@@ -2810,7 +2810,7 @@ static int this_bool(js_ctx *ctx, js_value t, int *out)
 static int bi_bool_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
                             js_value *ret)
 {
-    int b;
+    int b = 0;
     (void)argc; (void)argv;
     if (this_bool(ctx, t, &b) != JS_OK) return JS_THROW;
     *ret = js_string_value(b ? ctx->s_true : ctx->s_false);
@@ -2820,7 +2820,7 @@ static int bi_bool_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_bool_valueof(js_ctx *ctx, js_value t, int argc, js_value *argv,
                            js_value *ret)
 {
-    int b;
+    int b = 0;
     (void)argc; (void)argv;
     if (this_bool(ctx, t, &b) != JS_OK) return JS_THROW;
     *ret = js_bool(b);
@@ -3566,7 +3566,7 @@ static int bi_date_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
                         js_value *ret)
 {
     js_object *o;
-    double tv;
+    double tv = 0;
 
     (void)t;
     if (!ctx->new_target) {
@@ -3647,7 +3647,7 @@ enum { D_TIME, D_YEAR, D_MONTH, D_DATE, D_DAY, D_HOURS, D_MIN, D_SEC, D_MS, D_TZ
 
 static int date_field(js_ctx *ctx, js_value t, js_value *ret, int which)
 {
-    double tv;
+    double tv = 0;
     long y, mo, d, wd;
     int h, mi, s, ms;
 
@@ -3693,7 +3693,7 @@ static int bi_date_settime(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_date_toiso(js_ctx *ctx, js_value t, int argc, js_value *argv,
                          js_value *ret)
 {
-    double tv;
+    double tv = 0;
     long y, mo, d, wd;
     int h, mi, s, ms;
     char buf[64];
@@ -3718,7 +3718,7 @@ static int bi_date_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
     static const char *wdn[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
     static const char *mon[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    double tv;
+    double tv = 0;
     long y, mo, d, wd;
     int h, mi, s, ms;
     char buf[80];

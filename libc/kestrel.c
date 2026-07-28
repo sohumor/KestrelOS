@@ -114,6 +114,55 @@ void *brk_(void *addr)
     return (void *)syscall(SYS_BRK, (long)addr, 0, 0, 0);
 }
 
+long getrandom(void *buf, unsigned long len, unsigned flags)
+{
+    return syscall(SYS_GETRANDOM, (long)buf, (long)len, (long)flags, 0);
+}
+
+int swapinfo(uint64_t *total_kb, uint64_t *used_kb)
+{
+    return (int)syscall(SYS_SWAPINFO, (long)total_kb, (long)used_kb, 0, 0);
+}
+
+/* ---- signals ---- */
+
+extern void __kestrel_sigreturn(void);
+
+int kill(int pid, int sig)
+{
+    return (int)syscall(SYS_KILL, pid, sig, 0, 0);
+}
+
+int sigaction_(int sig, const struct k_sigaction *act,
+               struct k_sigaction *oldact)
+{
+    struct k_sigaction fixed;
+    if (act) {
+        fixed = *act;
+        if (fixed.handler != SIG_DFL && fixed.handler != SIG_IGN &&
+            fixed.restorer == 0)
+            fixed.restorer = (uint64_t)__kestrel_sigreturn;
+        act = &fixed;
+    }
+    return (int)syscall(SYS_SIGACTION, sig, (long)act, (long)oldact, 0);
+}
+
+int sigprocmask_(int how, const uint64_t *set, uint64_t *oldset)
+{
+    return (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
+}
+
+sighandler_t signal(int sig, sighandler_t handler)
+{
+    struct k_sigaction action, old;
+    memset(&action, 0, sizeof(action));
+    action.handler = (uint64_t)handler;
+    action.flags = SA_RESTART;
+    if (sigaction_(sig, &action, &old) < 0)
+        return (sighandler_t)-1;
+    return (sighandler_t)old.handler;
+}
+
 /* ---- system info ---- */
 
 unsigned long uptime_ms(void)
@@ -129,6 +178,11 @@ int meminfo(uint64_t *total_kb, uint64_t *free_kb)
 int psinfo(int index, struct k_psinfo *out)
 {
     return (int)syscall(SYS_PSINFO, index, (long)out, 0, 0);
+}
+
+int cpuinfo(struct k_cpuinfo *out)
+{
+    return (int)syscall(SYS_CPUINFO, (long)out, 0, 0, 0);
 }
 
 /* ---- network ---- */

@@ -3,14 +3,15 @@
 #include "blockdev.h"
 #include "proc.h"
 #include "string.h"
+#include "spinlock.h"
 
 /* Filesystem registry and mount table. See mount.h for the contract.
  *
  * Both tables are fixed arrays of descriptors owned by their registrants
  * (fs types) or by this file (mounts). Registration and mounting run in
  * preemptible context and lookups happen on every path syscall, so every
- * walk of either table is done under irq_save() -- one CPU, so masking
- * interrupts is a full mutex.
+ * walk of either table is done under an IRQ-safe spin lock shared by all
+ * CPUs.
  *
  * The type's mount()/unmount() callbacks do real disk I/O, so they are
  * deliberately called with interrupts on and the table lock dropped. The
@@ -19,6 +20,7 @@
 
 static struct fs_type *types[FS_TYPE_MAX];
 static struct mount mounts[MOUNT_MAX];
+static spinlock_t mount_lock = SPINLOCK_INIT;
 
 /* ---------- filesystem registry ---------- */
 
@@ -31,7 +33,7 @@ int fs_register(struct fs_type *t)
     if (t->name[FS_TYPE_NAME_MAX - 1] != '\0')
         return -1;              /* an unterminated name breaks every strcmp */
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < FS_TYPE_MAX; i++) {
         if (types[i] == NULL) {
             if (slot < 0)
@@ -39,17 +41,17 @@ int fs_register(struct fs_type *t)
             continue;
         }
         if (strcmp(types[i]->name, t->name) == 0) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&mount_lock, f);
             return -1;          /* already registered */
         }
     }
     if (slot < 0) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&mount_lock, f);
         kprintf("fs: type table full, cannot add %s\n", t->name);
         return -1;
     }
     types[slot] = t;
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
     kprintf("fs: filesystem type '%s' registered\n", t->name);
     return 0;
 }
@@ -58,14 +60,14 @@ void fs_unregister(struct fs_type *t)
 {
     if (t == NULL)
         return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < FS_TYPE_MAX; i++) {
         if (types[i] == t) {
             types[i] = NULL;
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
 }
 
 struct fs_type *fs_find(const char *name)
@@ -75,14 +77,14 @@ struct fs_type *fs_find(const char *name)
     if (name == NULL || name[0] == '\0')
         return NULL;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < FS_TYPE_MAX; i++) {
         if (types[i] != NULL && strcmp(types[i]->name, name) == 0) {
             found = types[i];
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
     return found;
 }
 
@@ -94,7 +96,7 @@ int fs_list(int index, struct fs_type **out)
     if (index < 0 || out == NULL)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < FS_TYPE_MAX; i++) {
         if (types[i] == NULL)
             continue;
@@ -105,7 +107,7 @@ int fs_list(int index, struct fs_type **out)
         }
         seen++;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
     return r;
 }
 
@@ -157,7 +159,7 @@ struct mount *mount_resolve(const char *path, const char **rel_out)
     if (path == NULL || path[0] != '/')
         return NULL;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
         size_t mplen;
         if (!mounts[i].used || mounts[i].priv == NULL)
@@ -169,7 +171,7 @@ struct mount *mount_resolve(const char *path, const char **rel_out)
             bestlen = mplen;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
 
     if (best == NULL)
         return NULL;
@@ -189,7 +191,7 @@ int mount_list(int index, struct mount **out)
     if (index < 0 || out == NULL)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
         if (!mounts[i].used || mounts[i].priv == NULL)
             continue;           /* a slot mid-mount is not usable yet */
@@ -200,7 +202,7 @@ int mount_list(int index, struct mount **out)
         }
         seen++;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
     return r;
 }
 
@@ -230,10 +232,10 @@ int mount_add(const char *path, const char *fstype, const char *devname)
 
     /* Reserve the slot with priv still NULL: mount_resolve() skips such
      * a slot, so nothing can traverse a half-built mount. */
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
         if (mounts[i].used && strcmp(mounts[i].path, mp) == 0) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&mount_lock, f);
             kprintf("mount: %s is already a mount point\n", mp);
             return -1;
         }
@@ -245,7 +247,7 @@ int mount_add(const char *path, const char *fstype, const char *devname)
         }
     }
     if (m == NULL) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&mount_lock, f);
         kprintf("mount: table full\n");
         return -1;
     }
@@ -255,19 +257,19 @@ int mount_add(const char *path, const char *fstype, const char *devname)
     m->bd = bd;
     m->priv = NULL;
     m->used = 1;
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
 
     /* Real disk I/O: interrupts on, table lock dropped. */
     if (type->mount(bd, &priv) < 0 || priv == NULL) {
-        f = irq_save();
+        f = spin_lock_irqsave(&mount_lock);
         memset(m, 0, sizeof(*m));
-        irq_restore(f);
+        spin_unlock_irqrestore(&mount_lock, f);
         return -1;
     }
 
-    f = irq_save();
+    f = spin_lock_irqsave(&mount_lock);
     m->priv = priv;
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
     return 0;
 }
 
@@ -283,7 +285,7 @@ int mount_remove(const char *path)
     if (strcmp(mp, "/") == 0)
         return -1;              /* the root mount is not removable */
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
         if (mounts[i].used && strcmp(mounts[i].path, mp) == 0) {
             m = &mounts[i];
@@ -291,7 +293,7 @@ int mount_remove(const char *path)
         }
     }
     if (m == NULL || m->priv == NULL) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&mount_lock, f);
         return -1;
     }
     /* Detach first: from here no new path can resolve into it, so the
@@ -300,7 +302,7 @@ int mount_remove(const char *path)
     type = m->type;
     priv = m->priv;
     memset(m, 0, sizeof(*m));
-    irq_restore(f);
+    spin_unlock_irqrestore(&mount_lock, f);
 
     if (type->unmount != NULL)
         type->unmount(priv);

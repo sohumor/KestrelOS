@@ -181,6 +181,39 @@ static void test_fin_boundary_discard(void)
           "discarded ring slots can be reused");
 }
 
+static void test_sack_blocks(void)
+{
+    struct tcp_reassembly r;
+    struct tcp_sack_block blocks[4];
+    uint8_t ring[TCP_RXBUF];
+    int len = 0;
+    uint32_t next = 8000;
+
+    fresh(&r, ring);
+    tcp_reassembly_accept(&r, ring, 0, &len, &next, 8003,
+                          (const uint8_t *)"def", 3);
+    tcp_reassembly_accept(&r, ring, 0, &len, &next, 8008,
+                          (const uint8_t *)"ij", 2);
+    int n = tcp_reassembly_sack_blocks(&r, 0, len, next, blocks, 4);
+    CHECK(n == 2, "two disjoint SACK blocks reported");
+    CHECK(blocks[0].left == 8003 && blocks[0].right == 8006,
+          "first SACK range");
+    CHECK(blocks[1].left == 8008 && blocks[1].right == 8010,
+          "second SACK range");
+
+    tcp_reassembly_accept(&r, ring, 0, &len, &next, 8006,
+                          (const uint8_t *)"gh", 2);
+    n = tcp_reassembly_sack_blocks(&r, 0, len, next, blocks, 1);
+    CHECK(n == 1 && blocks[0].left == 8003 && blocks[0].right == 8010,
+          "adjacent out-of-order data merges into one SACK range");
+
+    tcp_reassembly_accept(&r, ring, 0, &len, &next, 8000,
+                          (const uint8_t *)"abc", 3);
+    n = tcp_reassembly_sack_blocks(&r, 0, len, next, blocks, 4);
+    CHECK(n == 0 && len == 10 && next == 8010,
+          "SACK ranges vanish after cumulative hole fill");
+}
+
 int main(void)
 {
     test_in_order();
@@ -190,6 +223,7 @@ int main(void)
     test_sequence_wrap();
     test_rejections();
     test_fin_boundary_discard();
+    test_sack_blocks();
 
     if (failures) {
         fprintf(stderr, "%d/%d TCP reassembly checks failed\n",

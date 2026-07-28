@@ -141,7 +141,7 @@ running for at least one second** is a normal end of life, not a crash.
 It restarts immediately and does not count towards the window. Without
 that, leaving the console with ctrl-D five times in half a minute would
 permanently cost you your shell. Anything that exits non-zero, is killed
-(`SYS_KILL` records exit `-1`), or dies within its first second still
+(`SYS_KILL` records `128 + signal`), or dies within its first second still
 counts — which is exactly what a crash loop looks like.
 
 Unit states, as reported in the state file and by `service`:

@@ -17,6 +17,7 @@
 #include "kernel.h"
 #include "interrupts.h"
 #include "io.h"
+#include "random.h"
 
 #define PS2_DATA   0x60
 #define PS2_STAT   0x64
@@ -198,6 +199,8 @@ static void handle_packet(void)
 static void mouse_irq(struct regs *r)
 {
     (void)r;
+    entropy_pool_add_interrupt(ENTROPY_MOUSE,
+                               ((uint32_t)ms.index << 16) | ms.buttons);
 
     /* Drain everything the controller has for us; one IRQ can cover
      * several bytes. */

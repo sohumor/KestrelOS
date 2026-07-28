@@ -2,6 +2,7 @@
 #include "interrupts.h"
 #include "gdt.h"
 #include "console.h"
+#include "smp.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -59,6 +60,11 @@ void idt_init(void)
 
     idtr.limit = sizeof(idt) - 1;
     idtr.base = (uint64_t)idt;
+    idt_load();
+}
+
+void idt_load(void)
+{
     __asm__ volatile("lidt %0" : : "m"(idtr));
 }
 
@@ -120,6 +126,13 @@ void isr_dispatch(struct regs *r)
             syscall_entry_hook(r);
         else
             kprintf("[syscall with no handler installed]\n");
+        return;
+    }
+
+    if (r->vector == SMP_RESCHEDULE_VECTOR) {
+        smp_handle_reschedule();
+        if (irq_preempt_hook)
+            irq_preempt_hook(r);
         return;
     }
 

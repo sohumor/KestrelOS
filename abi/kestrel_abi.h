@@ -41,7 +41,7 @@
 /* --- descriptors and processes --- */
 #define SYS_PIPE      28  /* (int fd[2]) -> 0/-1; fd[0] read, fd[1] write */
 #define SYS_DUP2      29  /* (oldfd, newfd) -> newfd/-1 */
-#define SYS_KILL      30  /* (pid) -> 0/-1; terminates the target */
+#define SYS_KILL      30  /* (pid, sig) -> 0/-1; sig 0 probes permission */
 #define SYS_WAITANY   31  /* (int *pid_out) -> exit code, blocks */
 #define SYS_EXEC      32  /* (path, argv) -> does not return on success */
 
@@ -84,6 +84,69 @@
 #define SYS_BLKLIST     58 /* (index, struct k_blkinfo*) -> 0 / -1 at end */
 #define SYS_DEVLIST     59 /* (index, struct k_devinfo*) -> 0 / -1 at end */
 #define SYS_MOUNTLIST   60 /* (index, struct k_mountinfo*) -> 0 / -1 at end */
+#define SYS_GETRANDOM   61 /* (buf, len, flags) -> bytes/-1 */
+#define SYS_SWAPINFO    62 /* (u64* total_kb, u64* used_kb) -> 0/-1 */
+#define SYS_SIGACTION   63 /* (sig, act, oldact) -> 0/-1 */
+#define SYS_SIGPROCMASK 64 /* (how, set, oldset) -> 0/-1 */
+#define SYS_SIGRETURN   65 /* internal signal restorer; no ordinary return */
+#define SYS_CPUINFO     66 /* (struct k_cpuinfo*) -> 0/-1 */
+
+/* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
+ * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
+#define GRND_NONBLOCK 0x01
+#define GRND_RANDOM   0x02
+
+/* Signals. Masks use bit (signal_number - 1). Kestrel supports the
+ * traditional 1..31 range; pending signals coalesce. */
+#define K_NSIG   32
+#define SIGHUP    1
+#define SIGINT    2
+#define SIGQUIT   3
+#define SIGILL    4
+#define SIGTRAP   5
+#define SIGABRT   6
+#define SIGBUS    7
+#define SIGFPE    8
+#define SIGKILL   9
+#define SIGUSR1  10
+#define SIGSEGV  11
+#define SIGUSR2  12
+#define SIGPIPE  13
+#define SIGALRM  14
+#define SIGTERM  15
+#define SIGCHLD  17
+#define SIGCONT  18
+#define SIGSTOP  19
+#define SIGTSTP  20
+#define SIGTTIN  21
+#define SIGTTOU  22
+#define SIGURG   23
+#define SIGXCPU  24
+#define SIGXFSZ  25
+#define SIGVTALRM 26
+#define SIGPROF  27
+#define SIGWINCH 28
+#define SIGIO    29
+#define SIGSYS   31
+
+#define SIG_DFL 0ULL
+#define SIG_IGN 1ULL
+
+#define SIG_BLOCK   0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+
+#define SA_NODEFER   0x01ULL
+#define SA_RESETHAND 0x02ULL
+#define SA_RESTART   0x04ULL /* accepted; blocking calls are not restarted yet */
+
+struct k_sigaction {
+    uint64_t handler;
+    uint64_t mask;
+    uint64_t flags;
+    uint64_t restorer;
+};
+
 /* open() flags */
 #define O_RDONLY 0x000
 #define O_WRONLY 0x001
@@ -97,6 +160,7 @@
 #define K_STATE_RUNNING  1
 #define K_STATE_SLEEPING 2
 #define K_STATE_ZOMBIE   3
+#define K_STATE_STOPPED  4
 
 /* File mode bits (permission bits only; there is no setuid bit). */
 #define K_IRUSR 0400
@@ -134,6 +198,13 @@ struct k_psinfo {
     int32_t state;
     uint32_t uid;
     int32_t ppid;
+};
+
+struct k_cpuinfo {
+    uint32_t online;
+    uint32_t discovered;
+    uint32_t current_cpu;
+    uint32_t apic_id;
 };
 
 /* SYS_SPAWN_IO: where the child's stdin (fd 0) and stdout (fd 1) go.

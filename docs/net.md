@@ -122,14 +122,17 @@ ping/UDP/DNS works out of the box.
 * Answering inbound ICMP echo requests and ARP requests
 * UDP send/recv with port queues
 * DNS A-record resolution
-* Client TCP with bounded out-of-order receive reassembly
-* HTTP/1.1 client
+* Client TCP with bounded out-of-order receive reassembly and negotiated SACK
+* HTTP/1.1 plus verified TLS 1.3 HTTPS clients
 
 ## Limits
 
 * No IP fragmentation/reassembly; frames limited to a 1500-byte MTU.
 * One NIC, one IP; RTL8139 or e1000 (RTL8139 wins if both are present).
-* TCP uses cumulative ACKs and go-back-N retransmission; no SACK support.
+* TCP is client-side only. It advertises SACK-Permitted, emits up to four
+  receive SACK blocks, prunes acknowledged transmit blocks, and selectively
+  retransmits holes; it does not implement congestion-control algorithms
+  beyond the bounded window/retransmission logic in `tcp.c`.
 * ARP cache entries never expire (fine for slirp's static world).
 * On an RX ring error the receiver is reset and any queued frames in the
   ring are lost (never observed under QEMU in practice).

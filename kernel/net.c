@@ -9,6 +9,7 @@
 #include "net.h"
 #include "dhcp.h"
 #include "tcp.h"
+#include "spinlock.h"
 
 /* Ethernet / ARP / IPv4 / ICMP core.
  *
@@ -152,15 +153,18 @@ struct arp_entry {
 
 static struct arp_entry arp_cache[ARP_CACHE_SIZE];
 static int arp_next;
+static spinlock_t arp_lock = SPINLOCK_INIT;
 
 /* Called from IRQ context only (rx path). */
 static void arp_learn(uint32_t ip, const uint8_t *mac)
 {
     if (ip == 0)
         return;
+    uint64_t f = spin_lock_irqsave(&arp_lock);
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip) {
             memcpy(arp_cache[i].mac, mac, 6);
+            spin_unlock_irqrestore(&arp_lock, f);
             return;
         }
     }
@@ -170,19 +174,20 @@ static void arp_learn(uint32_t ip, const uint8_t *mac)
     e->ip = ip;
     memcpy(e->mac, mac, 6);
     e->valid = true;
+    spin_unlock_irqrestore(&arp_lock, f);
 }
 
 static bool arp_lookup(uint32_t ip, uint8_t *mac_out)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&arp_lock);
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip) {
             memcpy(mac_out, arp_cache[i].mac, 6);
-            irq_restore(f);
+            spin_unlock_irqrestore(&arp_lock, f);
             return true;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&arp_lock, f);
     return false;
 }
 
@@ -274,7 +279,7 @@ static int ip_send_mac(const uint8_t *dst_mac, uint32_t dst_ip_be,
     ip->ver_ihl = 0x45;
     ip->tos = 0;
     ip->total_len = htons((uint16_t)(sizeof(*ip) + len));
-    ip->id = htons(++ip_id);
+    ip->id = htons(__atomic_add_fetch(&ip_id, 1, __ATOMIC_RELAXED));
     ip->frag = 0;
     ip->ttl = 64;
     ip->proto = proto;
@@ -308,6 +313,7 @@ static volatile bool ping_got;
 static volatile uint16_t ping_id, ping_seq;      /* host order */
 static volatile uint32_t ping_target;            /* network order */
 static volatile uint64_t ping_reply_ticks;
+static spinlock_t ping_lock = SPINLOCK_INIT;
 
 /* IRQ context. src_mac is the frame's sender, i.e. our next hop back. */
 static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
@@ -338,11 +344,13 @@ static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
 
     /* Match the address too: id is just a pid and seq is a small counter,
      * so without it any host on the segment can satisfy our wait. */
+    uint64_t f = spin_lock_irqsave(&ping_lock);
     if (ic->type == 0 && ping_waiting && src_ip == ping_target &&
         ntohs(ic->id) == ping_id && ntohs(ic->seq) == ping_seq) {
         ping_reply_ticks = timer_ticks();
         ping_got = true;
     }
+    spin_unlock_irqrestore(&ping_lock, f);
 }
 
 long icmp_ping(uint32_t ip_be, int timeout_ms)
@@ -358,9 +366,9 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
 
     /* The match state is a single set of globals, so a second concurrent
      * ping would steal the first one's reply. Refuse instead. */
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&ping_lock);
     if (ping_busy) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&ping_lock, f);
         return -1;
     }
     ping_busy = true;
@@ -371,7 +379,7 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
     ping_target = ip_be;
     ping_got = false;
     ping_waiting = true;
-    irq_restore(f);
+    spin_unlock_irqrestore(&ping_lock, f);
 
     ic->type = 8;
     ic->code = 0;
@@ -383,8 +391,10 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
     ic->csum = net_checksum(pkt, sizeof(pkt));
 
     if (net_ip_send(ip_be, IP_PROTO_ICMP, pkt, sizeof(pkt)) < 0) {
+        f = spin_lock_irqsave(&ping_lock);
         ping_waiting = false;
         ping_busy = false;
+        spin_unlock_irqrestore(&ping_lock, f);
         return -1;
     }
 
@@ -395,16 +405,22 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
     uint64_t start = timer_ticks();
     uint64_t deadline = start + (uint64_t)(timeout_ms + 9) / 10;
     while (timer_ticks() <= deadline) {
-        if (ping_got) {
-            uint64_t got = ping_reply_ticks;
+        f = spin_lock_irqsave(&ping_lock);
+        bool got_reply = ping_got;
+        uint64_t got = ping_reply_ticks;
+        if (got_reply) {
             ping_waiting = false;
             ping_busy = false;
+            spin_unlock_irqrestore(&ping_lock, f);
             return got > start ? (long)((got - start) * 10) : 0;
         }
+        spin_unlock_irqrestore(&ping_lock, f);
         net_wait_tick();
     }
+    f = spin_lock_irqsave(&ping_lock);
     ping_waiting = false;
     ping_busy = false;
+    spin_unlock_irqrestore(&ping_lock, f);
     return -1;
 }
 

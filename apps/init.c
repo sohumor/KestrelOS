@@ -830,7 +830,7 @@ static void unit_spawn(struct unit *u)
         }
         logf(K_LOG_ERR, "%s readiness timed out after %lu ms",
              u->name, u->start_timeout_ms);
-        syscall(SYS_KILL, pid, 0, 0, 0);
+        syscall(SYS_KILL, pid, SIGTERM, 0, 0);
         for (i = 0; i < 20 && pid_alive(pid); i++)
             sleep_ms(10);
         u->exit_code = waitpid(pid);
@@ -993,7 +993,7 @@ static void unit_stop(struct unit *u)
 {
     u->stopping = 1;
     if (u->pid > 0)
-        syscall(SYS_KILL, u->pid, 0, 0, 0);
+        syscall(SYS_KILL, u->pid, SIGTERM, 0, 0);
 }
 
 static int reload_service(struct unit *u)

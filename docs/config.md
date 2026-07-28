@@ -114,7 +114,7 @@ configuration does not force a full kernel rebuild.
 | ------ | ---- | ---------------- |
 | `CONFIG_MODULES` | y/n | The exported symbol table, the `ET_REL` relocating loader and `insmod`/`rmmod`/`lsmod`. Any option set to `m` needs this at `y`. |
 | `CONFIG_KLOG`    | y/n | The kernel log ring behind `klog_printf`, `dmesg` and `/dev/klog`. |
-| `CONFIG_DEVFS`   | y/n | `/dev`: `null`, `zero`, `full`, `console`, `random`, `klog`. Needs `CONFIG_KLOG`, because `/dev/klog` reads the ring directly. |
+| `CONFIG_DEVFS`   | y/n | `/dev`: `null`, `zero`, `full`, `console`, `random`, `urandom`, `klog`, and registry views. Needs `CONFIG_KLOG`, because `/dev/klog` reads the ring directly. |
 | `CONFIG_KMON`    | y/n | The in-kernel rescue console. With it off, a machine that cannot start `/bin/init` halts instead of dropping to a prompt. |
 
 ### Network

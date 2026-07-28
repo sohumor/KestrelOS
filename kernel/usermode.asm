@@ -18,7 +18,9 @@ enter_usermode:
     mov ds, ax
     mov es, ax
     mov fs, ax
-    mov gs, ax
+    ; Active GS is the kernel's per-CPU base. The paired interrupt path
+    ; uses SWAPGS, so exchange it for the zero user base before iretq.
+    swapgs
 
     push qword SEL_UDATA | 3        ; ss
     push rsi                        ; rsp

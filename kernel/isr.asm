@@ -39,6 +39,12 @@ isr_common:
     push rcx
     push rbx
     push rax
+    ; GS names the current CPU in ring 0 and has a zero user base in ring 3.
+    ; The saved CS is 144 bytes into struct regs at this point.
+    test byte [rsp + 144], 3
+    jz .kernel_entry
+    swapgs
+.kernel_entry:
     mov rdi, rsp
     cld
     call isr_dispatch
@@ -59,6 +65,11 @@ isr_return:
     pop r13
     pop r14
     pop r15
+    ; vector, err, rip, cs are now at rsp+0,+8,+16,+24.
+    test byte [rsp + 24], 3
+    jz .kernel_return
+    swapgs
+.kernel_return:
     add rsp, 16                  ; vector + error code
     iretq
 

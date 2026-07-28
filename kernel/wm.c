@@ -42,14 +42,11 @@
  * focus. When the last window goes away the compositor stands down and asks
  * wm_tick() to run console_init(), which repaints the text console.
  *
- * Locking. The window table, the z-order, the per-window event queues and
- * the damage list are touched from ordinary task context (syscalls) and from
- * the compositor thread, both preemptible, so every mutation of shared state
- * runs under irq_save()/irq_restore(). The compositing pass itself is far
- * too long to hold interrupts off, so it snapshots the damage list, sets
- * `compositing`, and any destroy that lands in that window is deferred: the
- * slot stays reserved (so it cannot be recycled under the painter) and the
- * frames are released at the end of the pass.
+ * Locking. No IRQ handler enters the window manager. A recursive sleepable
+ * mutex serializes its syscall and compositor entry points across CPUs,
+ * including the paint pass; contenders sleep rather than spinning while a
+ * frame is drawn. The small irq_save sections remain local atomicity guards.
+ * `compositing` still defers frame release until the end of the paint pass.
  */
 
 /* ------------------------------------------------------------ geometry */
@@ -169,6 +166,36 @@ static uint32_t tickno;
 
 static struct rect dmg[WM_MAX_DAMAGE];
 static int         ndmg;
+
+/* Whole-manager task-context mutex. Recursive entry is useful because the
+ * public paths call helpers such as damage(), focus, and destroy in layers. */
+static volatile int wm_held;
+static struct task *wm_owner;
+static int wm_depth;
+
+static void wm_lock(void)
+{
+    if (__atomic_load_n(&wm_owner, __ATOMIC_ACQUIRE) == current) {
+        wm_depth++;
+        return;
+    }
+    while (__atomic_exchange_n(&wm_held, 1, __ATOMIC_ACQUIRE)) {
+        if (sched_active)
+            task_sleep_ticks(1);
+        else
+            __asm__ volatile("pause");
+    }
+    __atomic_store_n(&wm_owner, current, __ATOMIC_RELEASE);
+    wm_depth = 1;
+}
+
+static void wm_unlock(void)
+{
+    if (--wm_depth == 0) {
+        __atomic_store_n(&wm_owner, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&wm_held, 0, __ATOMIC_RELEASE);
+    }
+}
 
 /* ------------------------------------------------------- rectangle math */
 
@@ -915,9 +942,7 @@ static void unmap_run(uint64_t *pml4, uint64_t va, int npages)
  * the test for "are these frames still ours to free". */
 static bool owner_space_alive(const struct window *win)
 {
-    struct task *t = task_find(win->pid);
-
-    return t && t->pml4 == win->pml4 && t->pml4 != vmm_kernel_pml4();
+    return task_address_space_matches(win->pid, win->pml4);
 }
 
 /* Slow half of a destroy: drop the user mapping, return the frames, free
@@ -1022,7 +1047,7 @@ void wm_init(void)
 
 bool wm_active(void)
 {
-    return active;
+    return __atomic_load_n(&active, __ATOMIC_ACQUIRE);
 }
 
 void wm_tick(void)
@@ -1030,6 +1055,8 @@ void wm_tick(void)
     struct rect todo[WM_MAX_DAMAGE];
     int ntodo;
     uint64_t f;
+
+    wm_lock();
 
     /* Standing down: the text console gets the screen back. Done here, on
      * a kernel thread, rather than inside the syscall that destroyed the
@@ -1043,11 +1070,14 @@ void wm_tick(void)
         irq_restore(f);
         reap_dying();
         console_init();
+        wm_unlock();
         return;
     }
 
-    if (!active || !fb_present())
+    if (!active || !fb_present()) {
+        wm_unlock();
         return;
+    }
 
     pump_mouse();
     pump_keyboard();
@@ -1072,6 +1102,7 @@ void wm_tick(void)
 
     if (ntodo == 0) {
         reap_dying();
+        wm_unlock();
         return;
     }
 
@@ -1082,13 +1113,16 @@ void wm_tick(void)
 
     compositing = false;
     reap_dying();
+    wm_unlock();
 }
 
 void wm_cleanup_task(int pid)
 {
+    wm_lock();
     for (int i = 0; i < WM_MAX_WINDOWS; i++)
         if (wins[i].used && !wins[i].dying && wins[i].pid == pid)
             win_destroy(&wins[i]);
+    wm_unlock();
 }
 
 /* ------------------------------------------------------------ syscalls */
@@ -1167,6 +1201,8 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     if (pmm_free_pages() < need)
         return -1;
 
+    wm_lock();
+
     /* Reserve the slot before the slow work so two concurrent creates
      * cannot land on the same wid (and the same user address). */
     f = irq_save();
@@ -1181,8 +1217,10 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
         }
     }
     irq_restore(f);
-    if (slot < 0)
+    if (slot < 0) {
+        wm_unlock();
         return -1;
+    }
 
     win = &wins[slot];
     win->pml4 = current->pml4;
@@ -1213,6 +1251,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
         win_unlink(win);
         irq_restore(f);
         win_release(win);
+        wm_unlock();
         return -1;
     }
 
@@ -1234,26 +1273,35 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     set_focus(slot);
     win_frame(win, &frame);
     damage(frame.x, frame.y, frame.w, frame.h);
+    wm_unlock();
     return 0;
 }
 
 long wm_sys_destroy(uint64_t wid)
 {
+    wm_lock();
     struct window *win = win_lookup(wid);
 
-    if (!win)
+    if (!win) {
+        wm_unlock();
         return -1;
+    }
     win_destroy(win);
+    wm_unlock();
     return 0;
 }
 
 long wm_sys_flush(uint64_t wid)
 {
+    wm_lock();
     struct window *win = win_lookup(wid);
 
-    if (!win)
+    if (!win) {
+        wm_unlock();
         return -1;
+    }
     damage(win->x, win->y, win->w, win->h);
+    wm_unlock();
     return 0;
 }
 
@@ -1262,7 +1310,10 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
     struct k_event ev;
     uint64_t deadline, ticks;
 
-    if (!win_lookup(wid))
+    wm_lock();
+    bool exists = win_lookup(wid) != NULL;
+    wm_unlock();
+    if (!exists)
         return -1;
     if (!user_range_ok((const void *)uevent, sizeof(ev)))
         return -1;
@@ -1277,15 +1328,20 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
     for (;;) {
         /* Re-resolve every round: the window can be destroyed while this
          * task sleeps, and the slot must not be followed after that. */
+        wm_lock();
         struct window *win = win_lookup(wid);
-        if (!win)
+        if (!win) {
+            wm_unlock();
             return -1;
+        }
 
         if (evq_pop(win, &ev)) {
+            wm_unlock();
             if (copy_to_user((void *)uevent, &ev, sizeof(ev)) < 0)
                 return -1;
             return 1;
         }
+        wm_unlock();
         if (timeout_ms == 0 || timer_ticks() >= deadline)
             return 0;
         /* A pending kill is only acted on when the task leaves a syscall,
@@ -1299,12 +1355,18 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
 
 long wm_sys_move(uint64_t wid, int x, int y)
 {
+    wm_lock();
     struct window *win = win_lookup(wid);
 
-    if (!win)
+    if (!win) {
+        wm_unlock();
         return -1;
-    if (win->flags & K_WIN_DESKTOP)
+    }
+    if (win->flags & K_WIN_DESKTOP) {
+        wm_unlock();
         return -1;                    /* the background layer does not move */
+    }
     move_window(win_index(win), x, y);
+    wm_unlock();
     return 0;
 }

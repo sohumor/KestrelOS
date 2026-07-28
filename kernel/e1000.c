@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "string.h"
+#include "random.h"
 #include "pci.h"
 #include "pmm.h"
 #include "vmm.h"
@@ -8,6 +9,7 @@
 #include "net.h"
 #include "netdev.h"
 #include "e1000.h"
+#include "spinlock.h"
 
 /* Intel 8254x-family "e1000" gigabit NIC (MMIO register file).
  *
@@ -113,6 +115,8 @@ static uint8_t *tx_buf;                         /* TX_NDESC x BUF_SIZE */
 static int rx_next;                             /* next descriptor to check */
 static int tx_next;                             /* next descriptor to fill */
 static bool tx_used[TX_NDESC];
+static spinlock_t rx_lock = SPINLOCK_INIT;
+static spinlock_t tx_lock = SPINLOCK_INIT;
 
 static uint32_t reg_read(uint32_t off)
 {
@@ -207,22 +211,27 @@ static void rx_drain(void)
 static void e1000_irq(struct regs *r)
 {
     (void)r;
+    uint64_t f = spin_lock_irqsave(&rx_lock);
     /* Reading ICR acks/clears it. PCI IRQs are level-triggered and can
      * be shared: ICR == 0 means the interrupt was not ours. */
     uint32_t icr = reg_read(REG_ICR);
-    if (!icr)
+    if (!icr) {
+        spin_unlock_irqrestore(&rx_lock, f);
         return;
+    }
+    entropy_pool_add_interrupt(ENTROPY_NETWORK, icr);
     rx_drain();
+    spin_unlock_irqrestore(&rx_lock, f);
 }
 
 static void e1000_poll(void)
 {
     if (!present)
         return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&rx_lock);
     (void)reg_read(REG_ICR);   /* ack anything pending */
     rx_drain();
-    irq_restore(f);
+    spin_unlock_irqrestore(&rx_lock, f);
 }
 
 /* ---- TX ---- */
@@ -232,7 +241,7 @@ static int e1000_send(const void *frame, int len)
     if (!present || len <= 0 || len > BUF_SIZE)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tx_lock);
 
     int i = tx_next;
     volatile struct e1000_tx_desc *d = &tx_ring[i];
@@ -243,7 +252,7 @@ static int e1000_send(const void *frame, int len)
         while (!(d->status & TXD_STAT_DD) && --spin > 0)
             ;
         if (spin == 0) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&tx_lock, f);
             kprintf("e1000: tx descriptor %d stuck\n", i);
             return -1;
         }
@@ -267,7 +276,7 @@ static int e1000_send(const void *frame, int len)
     tx_next = (tx_next + 1) % TX_NDESC;
     reg_write(REG_TDT, (uint32_t)tx_next);   /* doorbell starts the DMA */
 
-    irq_restore(f);
+    spin_unlock_irqrestore(&tx_lock, f);
     return len;
 }
 

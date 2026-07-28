@@ -6,6 +6,7 @@ Layout (512-byte sectors):
   LBA 1-63     stage 2
   LBA 64-2047  kernel flat binary (max 992 KiB)
   LBA 2048+    KFS filesystem (or zeros if no fs image given)
+  after KFS    16 MiB KSWAP01 extent (one header page + data pages)
 """
 import sys
 import os
@@ -15,6 +16,8 @@ STAGE2_SECTORS = 63
 KERNEL_LBA = 64
 FS_LBA = 2048
 DEFAULT_FS_SIZE = 32 * 1024 * 1024
+SWAP_SIZE = 16 * 1024 * 1024
+SWAP_HEADER_SIZE = 4096
 
 
 def main():
@@ -53,6 +56,14 @@ def main():
             img += f.read()
     else:
         img += b"\0" * DEFAULT_FS_SIZE
+
+    swap_pages = (SWAP_SIZE - SWAP_HEADER_SIZE) // 4096
+    header = bytearray(SWAP_HEADER_SIZE)
+    header[0:8] = b"KSWAP01\0"
+    header[8:12] = (1).to_bytes(4, "little")
+    header[12:16] = swap_pages.to_bytes(4, "little")
+    img += header
+    img += b"\0" * (swap_pages * 4096)
 
     with open(out_path, "wb") as f:
         f.write(img)

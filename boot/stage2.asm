@@ -33,7 +33,7 @@ ORG 0x7E00
 ; bootinfo layout (kernel/include/bootinfo.h):
 ;   +0  u16 e820_count   +2  u8 boot_drive   +3  u8 fb_present
 ;   +4  u32 fb_width     +8  u32 fb_height   +12 u32 fb_pitch
-;   +16 u32 fb_bpp       +20 u32 reserved    +24 u64 fb_phys
+;   +16 u32 fb_bpp       +20 u32 boot_seed   +24 u64 fb_phys
 ;   +32 e820 entries, 24 bytes each
 BOOTINFO     equ 0x6000
 E820_ENTRIES equ BOOTINFO + 32
@@ -61,6 +61,22 @@ start:
     mov di, BOOTINFO
     mov cx, 16                   ; 32 bytes: counts, drive, framebuffer
     rep stosw
+
+    ; ---------------- early boot entropy ----------------
+    ; This is an input to the kernel pool, never a claim of 32 secret bits.
+    ; Mix TSC phase, the BIOS tick counter, PIT phase and the boot drive so
+    ; otherwise-identical boots do not begin with the same software state.
+    rdtsc
+    xor eax, edx
+    xor eax, [0x046C]
+    mov ebx, eax
+    in  al, 0x40
+    movzx ecx, al
+    rol ebx, 9
+    xor ebx, ecx
+    movzx ecx, byte [boot_drive]
+    xor ebx, ecx
+    mov [BOOTINFO + 20], ebx
 
     ; ---------------- A20 via the fast gate (port 0x92) ----------------
     in  al, 0x92

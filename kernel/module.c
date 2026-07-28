@@ -24,6 +24,7 @@
 #include "proc.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "spinlock.h"
 
 /* --- ET_REL definitions -------------------------------------------------
  * kernel/include/elf.h covers the ET_EXEC program-header view and belongs
@@ -125,10 +126,11 @@ struct elf64_rela {
 static uint8_t  arena_used[MOD_ARENA_PAGES];
 static uint8_t  arena_mapped[MOD_ARENA_PAGES];
 static uint16_t arena_run[MOD_ARENA_PAGES];
+static spinlock_t arena_lock = SPINLOCK_INIT;
 
 /* The page bitmap is the only shared state, so claiming a run runs with
- * interrupts masked; mapping the frames and zeroing up to 4 MiB does not,
- * because the run belongs to this caller by then. */
+ * under the arena lock; mapping the frames and zeroing up to 4 MiB does
+ * not, because the run belongs to this caller by then. */
 static void *arena_alloc(unsigned long size)
 {
     unsigned long need = (size + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -138,7 +140,7 @@ static void *arena_alloc(unsigned long size)
     if (need == 0 || need > MOD_ARENA_PAGES)
         return NULL;
 
-    f = irq_save();
+    f = spin_lock_irqsave(&arena_lock);
     for (i = 0; i < MOD_ARENA_PAGES; i++) {
         if (arena_used[i]) {
             run = 0;
@@ -150,7 +152,7 @@ static void *arena_alloc(unsigned long size)
             break;
     }
     if (run != need) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&arena_lock, f);
         return NULL;
     }
 
@@ -161,7 +163,7 @@ static void *arena_alloc(unsigned long size)
         if (!arena_mapped[i])
             want++;
     if (want + MOD_PMM_RESERVE > pmm_free_pages()) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&arena_lock, f);
         return NULL;
     }
 
@@ -170,7 +172,7 @@ static void *arena_alloc(unsigned long size)
         arena_run[i] = 0;
     }
     arena_run[start] = (uint16_t)need;
-    irq_restore(f);
+    spin_unlock_irqrestore(&arena_lock, f);
 
     base = MOD_ARENA_BASE + (uint64_t)start * PAGE_SIZE;
     for (i = start; i < start + need; i++) {
@@ -198,16 +200,16 @@ static void arena_free(void *p)
         panic("module: arena_free(%p) outside the module window", p);
     idx = (unsigned long)((a - MOD_ARENA_BASE) / PAGE_SIZE);
 
-    f = irq_save();
+    f = spin_lock_irqsave(&arena_lock);
     n = arena_run[idx];
     if (n == 0) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&arena_lock, f);
         panic("module: arena_free(%p) is not an allocation start", p);
     }
     for (i = idx; i < idx + n; i++)
         arena_used[i] = 0;
     arena_run[idx] = 0;
-    irq_restore(f);
+    spin_unlock_irqrestore(&arena_lock, f);
 }
 
 /* --- loaded module registry -------------------------------------------- */
@@ -225,6 +227,7 @@ struct module {
 };
 
 static struct module *modules;      /* newest first */
+static spinlock_t module_registry_lock = SPINLOCK_INIT;
 
 /* insmod/rmmod are rare administrative operations, so one flag is enough
  * to keep two of them from interleaving arena allocation and the name
@@ -233,19 +236,15 @@ static volatile int module_busy;
 
 static int module_lock(void)
 {
-    uint64_t f = irq_save();
-    if (module_busy) {
-        irq_restore(f);
-        return 0;
-    }
-    module_busy = 1;
-    irq_restore(f);
-    return 1;
+    int expected = 0;
+    return __atomic_compare_exchange_n(&module_busy, &expected, 1, false,
+                                       __ATOMIC_ACQUIRE,
+                                       __ATOMIC_RELAXED);
 }
 
 static void module_unlock(void)
 {
-    module_busy = 0;
+    __atomic_store_n(&module_busy, 0, __ATOMIC_RELEASE);
 }
 
 static struct module *module_find(const char *name)
@@ -767,16 +766,16 @@ int module_load(const void *image, unsigned long size, const char *name)
     if (rc < 0)
         goto out;
 
-    f = irq_save();
+    f = spin_lock_irqsave(&module_registry_lock);
     if (module_find(m->name)) {
-        irq_restore(f);
+        spin_unlock_irqrestore(&module_registry_lock, f);
         kprintf("module: %s is already loaded\n", m->name);
         rc = MODERR_EXISTS;
         goto out;
     }
     m->next = modules;
     modules = m;
-    irq_restore(f);
+    spin_unlock_irqrestore(&module_registry_lock, f);
 
     /* The module is registered and visible before init runs, so that init
      * can hand out pointers into itself and have them reference-counted. */
@@ -787,14 +786,24 @@ int module_load(const void *image, unsigned long size, const char *name)
     if (m->init && m->init() != 0) {
         kprintf("module: %s: init failed, unloading\n", m->name);
         klog_printf(K_LOG_ERR, "module", "%s: init failed", m->name);
-        m->init = NULL;
-        m->exit = NULL;             /* init never completed; do not undo it */
-        m->refs = 0;
-        module_unload(m->name);
+        f = spin_lock_irqsave(&module_registry_lock);
+        struct module **failed_link;
+        for (failed_link = &modules; *failed_link;
+             failed_link = &(*failed_link)->next) {
+            if (*failed_link == m) {
+                *failed_link = m->next;
+                break;
+            }
+        }
+        spin_unlock_irqrestore(&module_registry_lock, f);
+        arena_free(m->base);
+        kfree(m);
         return MODERR_INIT;
     }
 
+    f = spin_lock_irqsave(&module_registry_lock);
     m->state = MODULE_STATE_LIVE;
+    spin_unlock_irqrestore(&module_registry_lock, f);
     kprintf("module: loaded %s (%lu bytes at %p)%s%s\n", m->name, m->size,
             m->base, m->desc[0] ? " - " : "", m->desc);
     klog_printf(K_LOG_INFO, "module", "loaded %s (%lu bytes)",
@@ -868,36 +877,42 @@ int module_unload(const char *name)
     if (!module_lock())
         return MODERR_BUSY;
 
+    f = spin_lock_irqsave(&module_registry_lock);
     m = module_find(name);
     if (!m) {
+        spin_unlock_irqrestore(&module_registry_lock, f);
         module_unlock();
         return MODERR_NOTFOUND;
     }
     if (m->refs > 0) {
-        kprintf("module: %s is in use (%d references)\n", m->name, m->refs);
+        int refs = m->refs;
+        spin_unlock_irqrestore(&module_registry_lock, f);
+        kprintf("module: %s is in use (%d references)\n", m->name, refs);
         module_unlock();
         return MODERR_BUSY;
     }
-    if (m->state == MODULE_STATE_UNLOADING) {
+    if (m->state != MODULE_STATE_LIVE) {
+        spin_unlock_irqrestore(&module_registry_lock, f);
         module_unlock();
         return MODERR_BUSY;
     }
 
     m->state = MODULE_STATE_UNLOADING;
     fn = m->exit;
+    spin_unlock_irqrestore(&module_registry_lock, f);
     module_unlock();
 
     if (fn)
         fn();
 
-    f = irq_save();
+    f = spin_lock_irqsave(&module_registry_lock);
     for (pp = &modules; *pp; pp = &(*pp)->next) {
         if (*pp == m) {
             *pp = m->next;
             break;
         }
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&module_registry_lock, f);
 
     kprintf("module: unloaded %s\n", m->name);
     klog_printf(K_LOG_INFO, "module", "unloaded %s", m->name);
@@ -915,7 +930,7 @@ int module_list(int index, struct module_info *out)
     if (index < 0 || !out)
         return -1;
 
-    f = irq_save();
+    f = spin_lock_irqsave(&module_registry_lock);
     for (m = modules; m; m = m->next, i++) {
         if (i != index)
             continue;
@@ -925,33 +940,35 @@ int module_list(int index, struct module_info *out)
         out->size = m->size;
         out->refs = m->refs;
         out->state = m->state;
-        irq_restore(f);
+        spin_unlock_irqrestore(&module_registry_lock, f);
         return 0;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&module_registry_lock, f);
     return -1;
 }
 
 int module_get(const char *name)
 {
     struct module *m;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&module_registry_lock);
 
     m = name ? module_find(name) : NULL;
-    if (m)
+    if (m && m->state != MODULE_STATE_UNLOADING)
         m->refs++;
-    irq_restore(f);
+    else
+        m = NULL;
+    spin_unlock_irqrestore(&module_registry_lock, f);
     return m ? 0 : MODERR_NOTFOUND;
 }
 
 int module_put(const char *name)
 {
     struct module *m;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&module_registry_lock);
 
     m = name ? module_find(name) : NULL;
     if (m && m->refs > 0)
         m->refs--;
-    irq_restore(f);
+    spin_unlock_irqrestore(&module_registry_lock, f);
     return m ? 0 : MODERR_NOTFOUND;
 }

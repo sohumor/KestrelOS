@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "io.h"
 #include "string.h"
+#include "random.h"
 #include "pci.h"
 #include "pmm.h"
 #include "interrupts.h"
@@ -8,6 +9,7 @@
 #include "net.h"
 #include "netdev.h"
 #include "rtl8139.h"
+#include "spinlock.h"
 
 /* Realtek RTL8139 (QEMU: -device rtl8139). I/O-port register file.
  *
@@ -59,6 +61,8 @@ static uint32_t rx_pos;          /* read offset within the 8K ring */
 static uint64_t tx_phys;         /* 4 pages, one per descriptor */
 static int tx_cur;
 static bool tx_used[TX_NDESC];
+static spinlock_t rx_lock = SPINLOCK_INIT;
+static spinlock_t tx_lock = SPINLOCK_INIT;
 
 static void rx_reset(void)
 {
@@ -97,13 +101,18 @@ static void rx_drain(void)
 static void rtl_irq(struct regs *r)
 {
     (void)r;
+    uint64_t f = spin_lock_irqsave(&rx_lock);
     uint16_t isr = inw(io_base + REG_ISR);
-    if (!isr)
+    if (!isr) {
+        spin_unlock_irqrestore(&rx_lock, f);
         return;
+    }
+    entropy_pool_add_interrupt(ENTROPY_NETWORK, isr);
     outw(io_base + REG_ISR, isr);   /* ack by writing the bits back */
     if (isr & (ISR_ROK | ISR_RER))
         rx_drain();
     /* TOK/TER: nothing to do, the send path polls descriptor status. */
+    spin_unlock_irqrestore(&rx_lock, f);
 }
 
 static struct netdev rtl_netdev = {
@@ -192,7 +201,7 @@ int rtl8139_send(const void *frame, int len)
     if (!present || len <= 0 || len > TX_MAX_LEN)
         return -1;
 
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&tx_lock);
 
     int d = tx_cur;
     tx_cur = (tx_cur + 1) % TX_NDESC;
@@ -205,7 +214,7 @@ int rtl8139_send(const void *frame, int len)
         while (!(inl(tsd) & TSD_OWN) && --spin > 0)
             ;
         if (spin == 0) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&tx_lock, f);
             kprintf("rtl8139: tx descriptor %d stuck\n", d);
             return -1;
         }
@@ -223,7 +232,7 @@ int rtl8139_send(const void *frame, int len)
     outl(tsd, (uint32_t)len);   /* size with OWN clear starts the DMA */
     tx_used[d] = true;
 
-    irq_restore(f);
+    spin_unlock_irqrestore(&tx_lock, f);
     return 0;
 }
 
@@ -231,10 +240,10 @@ void rtl8139_poll(void)
 {
     if (!present)
         return;
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&rx_lock);
     uint16_t isr = inw(io_base + REG_ISR);
     if (isr)
         outw(io_base + REG_ISR, isr);
     rx_drain();
-    irq_restore(f);
+    spin_unlock_irqrestore(&rx_lock, f);
 }

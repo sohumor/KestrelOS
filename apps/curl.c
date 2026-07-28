@@ -45,7 +45,7 @@ static void usage(void)
     printf("  -o <file>  write the body to <file> instead of stdout\n");
     printf("  -s         silent: suppress messages, print only the body\n");
     printf("\n");
-    printf("Only http:// is supported. Exit status is 0 for an HTTP 2xx\n");
+    printf("Verified http:// and https:// are supported. Exit status is 0 for an HTTP 2xx\n");
     printf("response and 1 for anything else.\n");
 }
 
@@ -57,7 +57,7 @@ static int url_host(const char *url, char *host, unsigned long n, int *port)
     unsigned long len;
     char *colon;
 
-    *port = 80;
+    *port = strncmp(url, "https://", 8) == 0 ? 443 : 80;
     if (!p)
         return -1;
     p += 3;
@@ -132,9 +132,10 @@ int main(int argc, char **argv)
         else
             snprintf(full, sizeof full, "%s", url);
 
-        if (strncmp(full, "http://", 7) != 0) {
+        if (strncmp(full, "http://", 7) != 0 &&
+            strncmp(full, "https://", 8) != 0) {
             if (!silent)
-                printf("curl: only http:// URLs are supported\n");
+                printf("curl: only http:// and https:// URLs are supported\n");
             return 1;
         }
         if (url_host(full, host, sizeof host, &port) != 0) {
@@ -156,11 +157,9 @@ int main(int argc, char **argv)
 
         rc = http_get(full, &body, &len, &status);
         if (rc != 0 || !body) {
-            char ipbuf[16];
             free(body);
             if (!silent)
-                printf("curl: cannot connect to %s (%s) port %d\n", host,
-                       ip_ntoa(ip, ipbuf), port);
+                printf("curl: %s: %s\n", full, http_strerror(rc));
             return 1;
         }
 

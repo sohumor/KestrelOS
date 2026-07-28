@@ -99,15 +99,21 @@ sti()
 fpu_init()      x87 + SSE on, FXSAVE area saved/restored per task
 pmm_init()      physical page bitmap built from the E820 map
 vmm_init()      real 4-level page tables: kernel higher half + direct map
+smp_init()      ACPI MADT discovery, BSP local APIC + per-CPU GS state
 kheap_init()    kernel heap on top of the pmm
    |
 proc_init()     the boot context becomes task 0; scheduler armed
    |
 ata_init()      identify the ATA primary master
+swap_init()     validate the raw page-aligned swap extent
 vfs_init()      mount KFS from LBA 2048 (may fail -> diskless)
+devfs_init()    mount random, log, console and registry devices at /dev
    |
-net_init()      PCI scan, RTL8139 bring-up, static IP config
+net_init()      PCI NIC bring-up, DHCP with static fallback
+tcp_init()      client TCP state, reassembly and SACK
+wm_init()       compositor state
 syscall_init()  install the int 0x80 dispatcher and ring-3 fault handler
+smp_start_aps() INIT/SIPI application processors into pinned idle tasks
    |
 "KESTREL READY"
    |
@@ -137,17 +143,18 @@ Built by `tools/mkimage.py` from the stage binaries, `kernel.bin` and
 
 | Area | Files | Responsibility |
 |------|-------|----------------|
-| Entry / CPU | `kernel/entry.asm`, `cpu.asm`, `isr.asm`, `switch.asm`, `usermode.asm` | long-mode entry, port/CR helpers, ISR stubs, context switch, `iretq` into ring 3 |
-| Descriptors | `gdt.c`, `idt.c` | GDT (`SEL_KCODE 0x08`, `SEL_KDATA 0x10`, `SEL_UCODE 0x18`, `SEL_UDATA 0x20`, `SEL_TSS 0x28`), TSS with the kernel stack for ring transitions, 256 IDT gates, vector `0x80` at DPL 3 |
-| Interrupts | `pic.c`, `timer.c` | 8259 remap to 0x20-0x2F, EOI, PIT at 100 Hz |
+| Entry / CPU | `kernel/entry.asm`, `ap_trampoline.asm`, `smp.c`, `cpu.asm`, `isr.asm`, `switch.asm`, `usermode.asm` | long-mode/AP entry, ACPI/xAPIC SMP, per-CPU GS, port/CR helpers, ISR stubs, context switch, `iretq` into ring 3 |
+| Descriptors | `gdt.c`, `idt.c` | per-CPU GDT/TSS with the current kernel stack, 256 IDT gates, vector `0x80` at DPL 3 |
+| Interrupts | `pic.c`, `timer.c`, `smp.c` | 8259 remap to 0x20-0x2F, PIT at 100 Hz on the BSP, LAPIC EOI and reschedule IPIs |
 | Console | `console.c`, `serial.c`, `kprintf.c` | VGA text buffer with colour + ANSI handling, COM1 in/out, formatted kernel printing, `panic()` |
 | Input | `keyboard.c`, `input.c` | PS/2 scancode decode (modifiers, extended keys) and COM1 keys funnelled into one blocking input queue with `KEY_*` codes |
 | FPU | `fpu.c` | enable x87/SSE, per-task FXSAVE area |
-| Memory | `pmm.c`, `vmm.c`, `kheap.c` | physical page bitmap allocator; 4-level paging, per-process PML4s, full physical direct map; kernel heap (`kmalloc`/`kzalloc`/`kfree`) |
-| Processes | `proc.c`, `switch.asm` | task structs, round-robin run queue, `SCHED_QUANTUM = 5` ticks, sleep/wake, zombies and reaping |
-| Userspace | `uproc.c`, `elf.c`, `usermode.asm`, `syscall.c` | ELF64 loading, argv packaging on the user stack, ring-3 entry, `int 0x80` dispatch, bounded user-memory copies, ring-3 fault handler |
-| Storage | `ata.c`, `kfs.c`, `vfs.c` | ATA PIO on the primary bus; KFS inode filesystem; thin absolute-path VFS producing `struct file` |
-| Network | `pci.c`, `rtl8139.c`, `net.c`, `udp.c`, `dns.c` | PCI config space and bus scan; RTL8139 RX ring + TX descriptors; Ethernet/ARP/IPv4/ICMP; UDP port bindings; DNS A-record resolver |
+| Memory | `pmm.c`, `vmm.c`, `vm.c`, `kheap.c` | physical pages; four-level paging; lazy ELF/heap/stack faults; swap eviction; kernel heap |
+| Processes | `proc.c`, `signal.c`, `switch.asm` | SMP-safe global run queue, per-CPU current/slices, sleep/wake, signal frames, exit/reaping |
+| Userspace | `uproc.c`, `elf.c`, `usermode.asm`, `syscall.c` | static/ET_DYN loading, `DT_NEEDED` dependencies and relocations, argv, ring-3 entry and syscall/user-copy paths |
+| Storage | `ata.c`, `kfs.c`, `vfs.c` | ATA PIO; KFS inode filesystem with checksummed file-data redo journal; mount-based VFS |
+| Network | `pci.c`, `rtl8139.c`, `e1000.c`, `net.c`, `udp.c`, `dns.c`, `tcp.c` | two NICs; Ethernet/ARP/IPv4/ICMP/UDP/DNS; TCP reassembly, retransmission and SACK |
+| Random | `random.c`, `random_core.c` | hardware/timing entropy, SHA-256 pool and ChaCha20 CSPRNG |
 | Support | `string.c`, `sched_test.c` | freestanding string/memory routines; scheduler self-test threads |
 
 Headers live in `kernel/include/`, one per subsystem, plus `kernel.h`
@@ -162,9 +169,9 @@ kernel half; only the user half is private.
 
 | Virtual range | Contents | Flags |
 |---------------|----------|-------|
-| `0x0000000000400000` | user program text/rodata/data/bss, load base `USER_LOAD_BASE` (`apps/user.ld`) | user, RW |
-| ... `user_brk` | user heap grown by `SYS_BRK` | user, RW |
-| `0x00007FFFFFFFE000` | `USER_STACK_TOP`; 16 pages (`USER_STACK_PAGES`) grow downward | user, RW |
+| `0x0000000000400000` and ET_DYN bases | lazy user ELF segments and dependencies | user, permissions from `PT_LOAD` |
+| ... `user_brk` | heap range grown by `SYS_BRK`, populated on fault | user, RW |
+| `0x00007FFFFFFFE000` | `USER_STACK_TOP`; 16-page range populated on fault | user, RW |
 | *non-canonical hole* | | |
 | `0xFFFF800000000000` | `PHYS_MAP_BASE` — direct map of all physical memory; `P2V(p)`/`V2P(v)` | kernel, RW |
 | `0xFFFFFFFF80000000` | `KERNEL_OFFSET` — the higher-half window onto physical 0 | kernel |
@@ -207,25 +214,23 @@ struct task {
     void *fpu_state;          /* 16-byte-aligned FXSAVE area  */
     uint64_t *pml4;           /* address space                */
     bool user; uint64_t sleep_until; int exit_code;
-    struct task *parent; int wait_child_pid;
+    int parent_pid; int wait_child_pid;
     uint64_t user_brk;
     struct file *files[MAX_OPEN_FILES];   /* 16 fds           */
     struct task *qnext, *allnext;         /* run queue, all   */
 };
 ```
 
-States: `TASK_RUNNABLE`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_ZOMBIE`
+States: `TASK_RUNNABLE`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_STOPPED`,
+`TASK_ZOMBIE`
 (mirrored to userspace as `K_STATE_*` through `SYS_PSINFO`).
 
-Scheduling is preemptive round robin over a circular `qnext` list. The
-PIT tick decrements the current task's slice; after `SCHED_QUANTUM = 5`
-ticks (50 ms at 100 Hz) `schedule()` picks the next runnable task,
-switches `pml4` if it differs, swaps FPU state, and hands off to the
-assembly `ctx_switch` in `kernel/switch.asm` (a brand-new task starts at
-`task_bootstrap` in the same file). `yield()` gives the
-rest of the slice away voluntarily; `task_sleep_ticks()` parks a task
-until `sleep_until` passes and `task_wake_sleepers()` promotes it back to
-runnable.
+Scheduling is preemptive round robin over one spin-locked circular run ring.
+The BSP PIT tick broadcasts a LAPIC reschedule IPI; every CPU tracks its own
+five-tick slice and selects a runnable task that is not already running
+elsewhere. The context-switch assembly drops `sched_lock` only after switching
+to the incoming kernel stack. Address-space and FPU state follow the task;
+idle tasks are pinned per CPU and ordinary tasks may migrate.
 
 ## Process lifecycle
 
@@ -246,9 +251,9 @@ runnable.
   user_task_thunk()
    |   vfs_open + vfs_read the executable into a kernel buffer
    |   pml4 = vmm_new_pml4()          (kernel half pre-populated)
-   |   elf_load(pml4, ...)            PT_LOAD segments -> USER_LOAD_BASE,
-   |                                  .bss zeroed, entry + initial brk out
-   |   map USER_STACK_PAGES (16) pages below USER_STACK_TOP
+   |   elf_load(task, ...)            record lazy PT_LOAD areas, load
+   |                                  ET_DYN dependencies and relocations
+   |   reserve USER_STACK_PAGES (16) below USER_STACK_TOP
    |   current->pml4 = pml4; vmm_switch(pml4)
    |   build_user_stack(): argv strings + pointer array on the user stack
    v

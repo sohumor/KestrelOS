@@ -112,9 +112,10 @@ the 0x80 / zero / 64-bit-length padding. It is checked against the three
 published test vectors (the empty string, `"abc"`, and the 448-bit
 `"abcdbcde…nopq"` message).
 
-The salt is 16 hex digits (8 bytes) drawn from `/dev/random`. If
-`/dev/random` cannot be opened the tools fall back to mixing `SYS_TIME`,
-the uptime and the pid through an LCG.
+The salt is 16 hex digits (8 bytes) drawn from `/dev/random`, backed by the
+kernel SHA-256 entropy pool and ChaCha20 CSPRNG. If the device cannot be
+opened, the tools retain a last-resort time/uptime/pid fallback so account
+management still reports a usable error path on a damaged `/dev` mount.
 
 ## What this protects against, and what it does not
 
@@ -125,12 +126,11 @@ share a password do not have the same hash. That is all it is for.
 
 It is **not** a real password-hashing construction:
 
-* **Our RNG is not cryptographic.** `/dev/random` in KestrelOS is a
-  software generator seeded from the machine's timers, not an entropy
-  pool with any adversarial analysis behind it. Salts are therefore
-  guessable in a way real salts are not. They still stop precomputed
-  tables and still de-duplicate identical passwords, which is what we
-  want from them here.
+* **The CSPRNG has not been independently audited.** It mixes RDSEED/RDRAND,
+  the bootloader seed, and interrupt timing through SHA-256, then generates
+  with ChaCha20 and fast key erasure. That is a real CSPRNG design, but its
+  entropy estimates and implementation have not received the adversarial
+  review expected of a production kernel. See `docs/random.md`.
 * **4096 rounds of SHA-256 is cheap.** A real construction (scrypt,
   Argon2, bcrypt) is deliberately memory-hard so that attacking it on a
   GPU is not thousands of times cheaper than checking it. Iterated

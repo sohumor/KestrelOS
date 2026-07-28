@@ -44,11 +44,22 @@ void yield_(void);
 
 /* ---- memory ---- */
 void *brk_(void *addr);        /* addr==0 queries; -> current break */
+long getrandom(void *buf, unsigned long len, unsigned flags);
+int swapinfo(uint64_t *total_kb, uint64_t *used_kb);
+
+/* ---- signals ---- */
+typedef void (*sighandler_t)(int);
+int kill(int pid, int sig);
+int sigaction_(int sig, const struct k_sigaction *act,
+               struct k_sigaction *oldact);
+int sigprocmask_(int how, const uint64_t *set, uint64_t *oldset);
+sighandler_t signal(int sig, sighandler_t handler);
 
 /* ---- system info ---- */
 unsigned long uptime_ms(void);
 int meminfo(uint64_t *total_kb, uint64_t *free_kb);
 int psinfo(int index, struct k_psinfo *out);         /* 0 / -1 end */
+int cpuinfo(struct k_cpuinfo *out);                  /* 0 / -1 */
 
 /* ---- network (all addresses big-endian / network order) ---- */
 int dns_resolve(const char *name, uint32_t *ip_be);  /* 0 / -1 */

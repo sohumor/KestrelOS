@@ -3,6 +3,7 @@
 #include "pmm.h"
 #include "proc.h"
 #include "string.h"
+#include "spinlock.h"
 
 /* Kernel heap living in the physical direct map.
  * Small allocations (<= 2048) come from power-of-two free lists carved out
@@ -26,6 +27,7 @@ struct freeobj {
  * schedule()/reap() calls kfree() from IRQ context, so every read-modify-
  * write of a list head runs with interrupts masked. */
 static struct freeobj *freelist[MAX_SHIFT + 1];
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 void kheap_init(void)
 {
@@ -56,16 +58,16 @@ void *kmalloc(size_t size)
         int shift = MIN_SHIFT;
         while (((size_t)1 << shift) < need)
             shift++;
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&heap_lock);
         if (!freelist[shift])
             refill(shift);
         struct freeobj *o = freelist[shift];
         if (!o) {
-            irq_restore(f);
+            spin_unlock_irqrestore(&heap_lock, f);
             return NULL;
         }
         freelist[shift] = o->next;
-        irq_restore(f);
+        spin_unlock_irqrestore(&heap_lock, f);
         struct hdr *h = (struct hdr *)o;
         h->magic = MAGIC_SMALL;
         h->info = shift;
@@ -97,10 +99,10 @@ void kfree(void *ptr)
         int shift = h->info;
         h->magic = 0;
         struct freeobj *o = (struct freeobj *)h;
-        uint64_t f = irq_save();
+        uint64_t f = spin_lock_irqsave(&heap_lock);
         o->next = freelist[shift];
         freelist[shift] = o;
-        irq_restore(f);
+        spin_unlock_irqrestore(&heap_lock, f);
     } else if (h->magic == MAGIC_LARGE) {
         h->magic = 0;
         pmm_free_contig(V2P(h), h->info);

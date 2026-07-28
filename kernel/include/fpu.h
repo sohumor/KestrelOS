@@ -9,6 +9,7 @@
 #define FPU_STATE_SIZE 512      /* FXSAVE area, must be 16-byte aligned */
 
 void fpu_init(void);            /* enable SSE on this CPU */
+void fpu_init_ap(void);         /* same per-CPU setup, without boot log */
 void fpu_state_init(void *area);/* prime a fresh task's save area */
 
 static inline void fpu_save(void *area)

@@ -2,6 +2,8 @@
 #include "timer.h"
 #include "interrupts.h"
 #include "io.h"
+#include "random.h"
+#include "smp.h"
 
 static volatile uint64_t ticks;
 
@@ -9,6 +11,8 @@ static void timer_irq(struct regs *r)
 {
     (void)r;
     ticks++;
+    entropy_pool_add_interrupt(ENTROPY_TIMER, (uint32_t)ticks);
+    smp_broadcast_reschedule();
 }
 
 void timer_init(uint32_t hz)

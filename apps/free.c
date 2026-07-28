@@ -6,6 +6,7 @@
 int main(int argc, char **argv)
 {
     uint64_t total_kb = 0, free_kb = 0, used_kb;
+    uint64_t swap_total_kb = 0, swap_used_kb = 0;
 
     (void)argc;
     (void)argv;
@@ -26,5 +27,13 @@ int main(int argc, char **argv)
     printf("%-7s %10llu %10llu\n", "free:",
            (unsigned long long)free_kb,
            (unsigned long long)(free_kb / 1024));
+    if (swapinfo(&swap_total_kb, &swap_used_kb) == 0) {
+        printf("%-7s %10llu %10llu\n", "swap:",
+               (unsigned long long)swap_total_kb,
+               (unsigned long long)(swap_total_kb / 1024));
+        printf("%-7s %10llu %10llu\n", "swapuse:",
+               (unsigned long long)swap_used_kb,
+               (unsigned long long)(swap_used_kb / 1024));
+    }
     return 0;
 }

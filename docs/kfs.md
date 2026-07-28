@@ -2,13 +2,13 @@
 
 KFS is a deliberately small fixed-layout filesystem: one superblock, one
 block bitmap, a fixed redo journal, a fixed inode table, then data blocks.
-Regular file data is write-through; metadata updates commit atomically through
-the journal and are replayed at mount after an interrupted write.
+Regular file data and metadata commit atomically through the same journal and
+are replayed at mount after an interrupted write.
 
 All multi-byte fields are little-endian.
 
 **This document describes on-disk format version 3** (magic `"KFS3"`).
-v3 reserves a checksummed metadata redo journal; the inode layout is unchanged
+v3 reserves a checksummed full-data redo journal; the inode layout is unchanged
 from v2. v2 added `mode`, `uid`, `gid` and `mtime` to the inode so KestrelOS
 could grow multi-user support, and dropped `nlink` (KFS has never supported
 hard links, so the field was never anything but decoration). The inode stayed
@@ -58,7 +58,7 @@ First 52 bytes of block 0; the rest of the block is zero.
 | 36     | u32  | data_start    | first data block                         |
 | 40     | u32  | root_ino      | root directory inode (= 1)               |
 | 44     | u32  | free_blocks   | count of free blocks                     |
-| 48     | u32  | features      | `1` = metadata redo journal              |
+| 48     | u32  | features      | `1` = checksummed redo journal           |
 
 ## Block bitmap
 
@@ -70,9 +70,10 @@ Padding bits at or past `total_blocks` are always zero.
 ## Metadata journal
 
 The journal is fixed at 33 blocks: one header and 32 full-block redo payloads.
-A transaction coalesces repeated writes to the same metadata block, so the
-default geometry needs only a handful of entries even when truncating the
-largest possible file.
+A transaction coalesces repeated writes to the same home block. Kernel
+write syscalls feed KFS in 512-byte chunks, so a regular-file transaction
+normally contains one data block plus the handful of allocation, inode and
+pointer blocks that describe it.
 
 The committed header contains:
 
@@ -87,7 +88,7 @@ The committed header contains:
 
 Commit ordering is:
 
-1. write regular file data and every journal payload;
+1. write every journal payload (file data and metadata);
 2. write the checksummed committed header;
 3. copy every payload to its home block;
 4. zero the journal header.
@@ -99,11 +100,10 @@ cleared without replay because home writes never begin before a valid commit
 record. Unsafe targets (outside the filesystem, duplicated, or inside the
 journal itself) refuse the mount.
 
-The journal covers structural metadata: the superblock, bitmap, inode table,
-indirect pointer blocks, and directory contents. Regular file contents use
-ordered-data semantics rather than data journaling: new data reaches disk
-before the inode size which exposes it, but an in-place data overwrite can be
-partially visible after a power loss.
+The journal covers regular file contents as well as the superblock, bitmap,
+inode table, indirect pointer blocks, and directories. The data block and
+the inode size/mtime that expose a write are therefore one replay unit;
+an in-place overwrite cannot become partially visible after a power loss.
 
 ## Inodes
 
@@ -193,7 +193,7 @@ points assumes the lock is held. The lock may only be held across polled
 disk I/O — never across the clock, the keyboard or the network — which is
 why the mutating entry points take an `mtime` argument instead of reading
 the RTC themselves. Each public mutator opens one journal transaction while
-holding that lock; failed operations discard staged metadata and restore the
+holding that lock; failed operations discard staged blocks and restore the
 in-memory superblock snapshot.
 
 ## Pipes
@@ -206,8 +206,8 @@ it. A pipe is a 4 KiB ring buffer with a reader count and a writer count:
 * reading blocks while the buffer is empty and a writer still exists, and
   returns 0 (EOF) once the last writer closes;
 * writing blocks while the buffer is full and a reader exists, and fails
-  with -1 once every reader is gone (KestrelOS has no signals, so there is
-  no `SIGPIPE`);
+  with -1 once every reader is gone (the pipe operation does not yet raise
+  `SIGPIPE`);
 * `vfs_close()` drops the right side and frees the buffer when both ends
   are gone.
 
@@ -232,9 +232,9 @@ Pipes are not seekable and have no inode.
 - every allocated inode is reachable from the root exactly once
   (hard links are not supported).
 
-Journal transactions are checksummed, but home metadata and file contents are
-not. Bit-rot in an already committed home block or inside file data remains
-undetectable by design; `kfsck` finds structural damage only.
+Journal transactions are checksummed, but home blocks are not. Bit-rot in an
+already committed metadata or file-data block remains undetectable by design;
+`kfsck` finds structural damage only.
 
 ## Tools
 
