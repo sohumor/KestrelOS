@@ -90,7 +90,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
-        test-random \
+        test-random test-browser-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -311,6 +311,10 @@ test-net: test-tcp test-checksum
 
 test-random:
 	sh tools/run-random-tests.sh
+
+test-browser-host:
+	sh tools/run-jsdom-tests.sh
+	sh tools/run-browser-stack.sh
 
 test-kfs-journal:
 	$(PY) tools/test_kfs_journal.py

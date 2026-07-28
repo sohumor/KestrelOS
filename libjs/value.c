@@ -205,6 +205,16 @@ int js_is_array(js_value v)
     return v.type == JS_OBJECT && v.u.obj->cls == JS_CLASS_ARRAY;
 }
 
+int js_is_promise(js_value v)
+{
+    return v.type == JS_OBJECT && v.u.obj->cls == JS_CLASS_PROMISE;
+}
+
+int js_is_arraybuffer(js_value v)
+{
+    return v.type == JS_OBJECT && v.u.obj->cls == JS_CLASS_ARRAYBUFFER;
+}
+
 const char *js_string_bytes(js_value v, unsigned long *len)
 {
     if (v.type != JS_STRING) { if (len) *len = 0; return 0; }
@@ -481,6 +491,35 @@ js_object *js_new_object(js_ctx *ctx)
 js_object *js_new_array(js_ctx *ctx)
 {
     return js_obj_alloc(ctx, JS_CLASS_ARRAY, ctx->proto[P_ARRAY]);
+}
+
+js_value js_arraybuffer_new(js_ctx *ctx, const void *data, unsigned long len)
+{
+    js_object *o;
+
+    if (!ctx || ctx->fatal || len > 0xFFFFFFFFu)
+        return js_undefined();
+    o = js_obj_alloc(ctx, JS_CLASS_ARRAYBUFFER, ctx->proto[P_ARRAYBUFFER]);
+    if (!o)
+        return js_undefined();
+    o->buffer = (uint8_t *)js_alloc(ctx, len ? len : 1);
+    if (!o->buffer)
+        return js_undefined();
+    if (data && len)
+        memcpy(o->buffer, data, len);
+    o->byte_length = (uint32_t)len;
+    if (js_define(ctx, o, "byteLength", js_number((double)len)) != JS_OK)
+        return js_undefined();
+    return js_object_value(o);
+}
+
+const void *js_arraybuffer_data(js_value v, unsigned long *len)
+{
+    if (v.type != JS_OBJECT || v.u.obj->cls != JS_CLASS_ARRAYBUFFER)
+        return 0;
+    if (len)
+        *len = v.u.obj->byte_length;
+    return v.u.obj->buffer;
 }
 
 js_env *js_env_new(js_ctx *ctx, js_env *parent, js_object *vars)
@@ -961,6 +1000,14 @@ int js_throw(js_ctx *ctx, js_value v)
 js_value js_exception(js_ctx *ctx)
 {
     return ctx->has_exception ? ctx->exception : js_undefined();
+}
+
+void js_clear_exception(js_ctx *ctx)
+{
+    if (!ctx || ctx->fatal)
+        return;
+    ctx->has_exception = 0;
+    ctx->exception = js_undefined();
 }
 
 int js_throw_error(js_ctx *ctx, int kind, const char *fmt, ...)
@@ -1950,7 +1997,7 @@ void js_dtoa_radix(double d, int radix, char *buf, unsigned long bufsz)
 /* decimal -> double                                                   */
 /* ================================================================== */
 
-static long double pow10l(int e)
+static long double js_pow10l(int e)
 {
     /* 10^k is exact in the 64-bit x87 significand up to k = 27. */
     static const long double t[28] = {
@@ -2083,12 +2130,12 @@ static double make_double(int neg, uint64_t mant, int ndig, int dexp, int over)
         /* Both operands are exact here, so one IEEE operation is already
          * correctly rounded. */
         double m = (double)mant;
-        r = dexp >= 0 ? m * (double)pow10l(dexp) : m / (double)pow10l(-dexp);
+        r = dexp >= 0 ? m * (double)js_pow10l(dexp) : m / (double)js_pow10l(-dexp);
         return neg ? -r : r;
     }
     if (dexp > 400) return neg ? js_inf(1) : js_inf(0);
     if (dexp < -400) return neg ? -0.0 : 0.0;
-    r = (double)((long double)mant * pow10l(dexp));
+    r = (double)((long double)mant * js_pow10l(dexp));
     if (!js_isinf(r))
         r = refine_double(mant, dexp, r);
     return neg ? -r : r;

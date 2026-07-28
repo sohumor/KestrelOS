@@ -887,6 +887,8 @@ static const char *class_name(int cls)
     case JS_CLASS_ARGUMENTS: return "Arguments";
     case JS_CLASS_MATH:      return "Math";
     case JS_CLASS_JSON:      return "JSON";
+    case JS_CLASS_PROMISE:   return "Promise";
+    case JS_CLASS_ARRAYBUFFER:return "ArrayBuffer";
     default:                 return "Object";
     }
 }
@@ -4048,6 +4050,1229 @@ int js_wrap_primitive(js_ctx *ctx, js_value v, js_value *out)
 }
 
 /* ================================================================== */
+/* Promise and microtasks                                              */
+/* ================================================================== */
+
+static js_object *promise_alloc(js_ctx *ctx)
+{
+    return js_obj_alloc(ctx, JS_CLASS_PROMISE, ctx->proto[P_PROMISE]);
+}
+
+js_value js_promise_new(js_ctx *ctx)
+{
+    js_object *p;
+
+    if (!ctx || ctx->fatal)
+        return js_undefined();
+    p = promise_alloc(ctx);
+    return p ? js_object_value(p) : js_undefined();
+}
+
+static int promise_queue(js_ctx *ctx, js_object *source,
+                         js_promise_reaction *reaction)
+{
+    js_promise_job *job = (js_promise_job *)js_alloc(
+        ctx, sizeof(js_promise_job));
+
+    if (!job)
+        return JS_THROW;
+    job->source = source;
+    job->reaction = reaction;
+    if (ctx->jobs_tail)
+        ctx->jobs_tail->next = job;
+    else
+        ctx->jobs_head = job;
+    ctx->jobs_tail = job;
+    return JS_OK;
+}
+
+static int promise_add_reaction(js_ctx *ctx, js_object *source,
+                                js_promise_reaction *reaction)
+{
+    js_promise_reaction **tail;
+
+    if (source->promise_state)
+        return promise_queue(ctx, source, reaction);
+    tail = &source->promise_reactions;
+    while (*tail)
+        tail = &(*tail)->next;
+    *tail = reaction;
+    return JS_OK;
+}
+
+static int promise_settle(js_ctx *ctx, js_object *promise, int state,
+                          js_value value)
+{
+    js_promise_reaction *reaction, *next;
+
+    if (!promise || promise->cls != JS_CLASS_PROMISE)
+        return js_throw_error(ctx, JS_ERR_TYPE, "value is not a Promise");
+    if (promise->promise_state)
+        return JS_OK;                    /* first resolver wins */
+
+    if (state == 1 && js_is_promise(value)) {
+        js_object *other = value.u.obj;
+
+        if (other == promise) {
+            js_object *e = js_new_error(
+                ctx, JS_ERR_TYPE, "a Promise cannot resolve to itself");
+            if (!e)
+                return JS_THROW;
+            state = 2;
+            value = js_object_value(e);
+        } else if (!other->promise_state) {
+            reaction = (js_promise_reaction *)js_alloc(
+                ctx, sizeof(js_promise_reaction));
+            if (!reaction)
+                return JS_THROW;
+            reaction->on_fulfilled = js_undefined();
+            reaction->on_rejected = js_undefined();
+            reaction->child = promise;
+            return promise_add_reaction(ctx, other, reaction);
+        } else {
+            state = other->promise_state;
+            value = other->promise_result;
+        }
+    }
+
+    promise->promise_state = (uint8_t)state;
+    promise->promise_result = value;
+    reaction = promise->promise_reactions;
+    promise->promise_reactions = 0;
+    while (reaction) {
+        next = reaction->next;
+        reaction->next = 0;
+        if (promise_queue(ctx, promise, reaction) != JS_OK)
+            return JS_THROW;
+        reaction = next;
+    }
+    return JS_OK;
+}
+
+int js_promise_resolve(js_ctx *ctx, js_value promise, js_value value)
+{
+    if (!js_is_promise(promise))
+        return js_throw_error(ctx, JS_ERR_TYPE, "value is not a Promise");
+    return promise_settle(ctx, promise.u.obj, 1, value);
+}
+
+int js_promise_reject(js_ctx *ctx, js_value promise, js_value reason)
+{
+    if (!js_is_promise(promise))
+        return js_throw_error(ctx, JS_ERR_TYPE, "value is not a Promise");
+    return promise_settle(ctx, promise.u.obj, 2, reason);
+}
+
+static int promise_then(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    js_promise_reaction *reaction;
+    js_value child;
+
+    if (!js_is_promise(t))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Promise.then called on a non-Promise");
+    child = js_promise_new(ctx);
+    if (!js_is_promise(child))
+        return JS_THROW;
+    reaction = (js_promise_reaction *)js_alloc(
+        ctx, sizeof(js_promise_reaction));
+    if (!reaction)
+        return JS_THROW;
+    reaction->on_fulfilled =
+        argc > 0 && js_is_function(argv[0]) ? argv[0] : js_undefined();
+    reaction->on_rejected =
+        argc > 1 && js_is_function(argv[1]) ? argv[1] : js_undefined();
+    reaction->child = child.u.obj;
+    if (promise_add_reaction(ctx, t.u.obj, reaction) != JS_OK)
+        return JS_THROW;
+    *ret = child;
+    return JS_OK;
+}
+
+static int promise_catch(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_value args[2];
+
+    args[0] = js_undefined();
+    args[1] = argc > 0 ? argv[0] : js_undefined();
+    return promise_then(ctx, t, 2, args, ret);
+}
+
+static int promise_resolver(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                            js_value *ret)
+{
+    js_value value = argc ? argv[0] : js_undefined();
+
+    *ret = js_undefined();
+    if (!js_is_promise(t))
+        return JS_OK;
+    return js_promise_resolve(ctx, t, value);
+}
+
+static int promise_rejecter(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                            js_value *ret)
+{
+    js_value reason = argc ? argv[0] : js_undefined();
+
+    *ret = js_undefined();
+    if (!js_is_promise(t))
+        return JS_OK;
+    return js_promise_reject(ctx, t, reason);
+}
+
+static int bound_native(js_ctx *ctx, js_value this_value, js_native native,
+                        const char *name, int argc, js_value *argv,
+                        js_value *ret)
+{
+    js_object *fn = js_new_native(ctx, native, name, 1);
+    js_value bind, args[4];
+    int i;
+
+    if (!fn)
+        return JS_THROW;
+    if (argc < 0 || argc > 3)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "too many bound native arguments");
+    if (js_get(ctx, js_object_value(fn), "bind", &bind) != JS_OK)
+        return JS_THROW;
+    args[0] = this_value;
+    for (i = 0; i < argc; i++)
+        args[i + 1] = argv[i];
+    return js_call(ctx, bind, js_object_value(fn), argc + 1, args, ret);
+}
+
+static int bound_resolver(js_ctx *ctx, js_value promise, js_native native,
+                          const char *name, js_value *ret)
+{
+    return bound_native(ctx, promise, native, name, 0, 0, ret);
+}
+
+static int promise_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    js_value promise, resolve, reject, args[2], ignored, reason;
+    int rc;
+
+    (void)t;
+    if (argc < 1 || !js_is_function(argv[0]))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Promise resolver is not a function");
+    promise = js_promise_new(ctx);
+    if (!js_is_promise(promise))
+        return JS_THROW;
+    if (bound_resolver(ctx, promise, promise_resolver,
+                       "resolve", &resolve) != JS_OK ||
+        bound_resolver(ctx, promise, promise_rejecter,
+                       "reject", &reject) != JS_OK)
+        return JS_THROW;
+    args[0] = resolve;
+    args[1] = reject;
+    rc = js_call(ctx, argv[0], js_undefined(), 2, args, &ignored);
+    if (rc != JS_OK) {
+        reason = js_exception(ctx);
+        if (ctx->fatal)
+            return JS_THROW;
+        js_clear_exception(ctx);
+        if (js_promise_reject(ctx, promise, reason) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = promise;
+    return JS_OK;
+}
+
+static int promise_static_resolve(js_ctx *ctx, js_value t, int argc,
+                                  js_value *argv, js_value *ret)
+{
+    js_value value = argc ? argv[0] : js_undefined();
+    (void)t;
+
+    if (js_is_promise(value)) {
+        *ret = value;
+        return JS_OK;
+    }
+    *ret = js_promise_new(ctx);
+    if (!js_is_promise(*ret))
+        return JS_THROW;
+    return js_promise_resolve(ctx, *ret, value);
+}
+
+static int promise_static_reject(js_ctx *ctx, js_value t, int argc,
+                                 js_value *argv, js_value *ret)
+{
+    js_value reason = argc ? argv[0] : js_undefined();
+    (void)t;
+
+    *ret = js_promise_new(ctx);
+    if (!js_is_promise(*ret))
+        return JS_THROW;
+    return js_promise_reject(ctx, *ret, reason);
+}
+
+#define ARRAYBUFFER_BYTE_MAX (8UL * 1024UL * 1024UL)
+
+static int arraybuffer_ctor(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    uint32_t len = 0;
+    (void)t;
+
+    if (argc && js_to_uint32(ctx, argv[0], &len) != JS_OK)
+        return JS_THROW;
+    if (len > ARRAYBUFFER_BYTE_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "ArrayBuffer is too large");
+    *ret = js_arraybuffer_new(ctx, 0, len);
+    return js_is_arraybuffer(*ret) ? JS_OK : JS_THROW;
+}
+
+static int arraybuffer_slice(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    const uint8_t *data;
+    unsigned long len;
+    int32_t begin = 0, end;
+
+    data = (const uint8_t *)js_arraybuffer_data(t, &len);
+    if (!data)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "ArrayBuffer.slice receiver is invalid");
+    end = (int32_t)len;
+    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && js_to_int32(ctx, argv[1], &end) != JS_OK)
+        return JS_THROW;
+    if (begin < 0) begin += (int32_t)len;
+    if (end < 0) end += (int32_t)len;
+    if (begin < 0) begin = 0;
+    if (end < begin) end = begin;
+    if ((unsigned long)begin > len) begin = (int32_t)len;
+    if ((unsigned long)end > len) end = (int32_t)len;
+    *ret = js_arraybuffer_new(ctx, data + begin,
+                             (unsigned long)(end - begin));
+    return js_is_arraybuffer(*ret) ? JS_OK : JS_THROW;
+}
+
+static int promise_all_item(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_value values, result, remaining;
+    uint32_t index, left;
+
+    if (!js_is_object(t) || argc < 2 ||
+        js_to_uint32(ctx, argv[0], &index) != JS_OK ||
+        js_get(ctx, t, "values", &values) != JS_OK ||
+        js_get(ctx, t, "result", &result) != JS_OK ||
+        js_get(ctx, t, "remaining", &remaining) != JS_OK ||
+        !js_is_object(values) ||
+        js_to_uint32(ctx, remaining, &left) != JS_OK)
+        return JS_THROW;
+    if (aput(ctx, values.u.obj, index, argv[1]) != JS_OK)
+        return JS_THROW;
+    if (left)
+        left--;
+    if (js_set(ctx, t, "remaining", js_number((double)left)) != JS_OK)
+        return JS_THROW;
+    *ret = js_undefined();
+    return left ? JS_OK : js_promise_resolve(ctx, result, values);
+}
+
+static int promise_static_all(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_object *input, *values, *state;
+    js_value result, statev, reject;
+    unsigned long n, i;
+    (void)t;
+
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Promise.all requires an array-like value");
+    if (this_object(ctx, argv[0], &input) != JS_OK)
+        return JS_THROW;
+    if (alen(ctx, input, &n) != JS_OK)
+        return JS_THROW;
+    if (n > 65535)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Promise.all input is too large");
+    result = js_promise_new(ctx);
+    values = js_new_array(ctx);
+    state = js_new_object(ctx);
+    if (!js_is_promise(result) || !values || !state)
+        return JS_THROW;
+    for (i = 0; i < n; i++)
+        if (js_array_push(ctx, values, js_undefined()) != JS_OK)
+            return JS_THROW;
+    statev = js_object_value(state);
+    if (js_set(ctx, statev, "values", js_object_value(values)) != JS_OK ||
+        js_set(ctx, statev, "result", result) != JS_OK ||
+        js_set(ctx, statev, "remaining", js_number((double)n)) != JS_OK ||
+        bound_resolver(ctx, result, promise_rejecter,
+                       "reject", &reject) != JS_OK)
+        return JS_THROW;
+    if (!n) {
+        *ret = result;
+        return js_promise_resolve(ctx, result, js_object_value(values));
+    }
+    for (i = 0; i < n; i++) {
+        js_value item, normalized, on_item, args[2], index;
+
+        if (aget(ctx, input, i, &item) != JS_OK ||
+            promise_static_resolve(ctx, js_undefined(), 1,
+                                   &item, &normalized) != JS_OK)
+            return JS_THROW;
+        index = js_number((double)i);
+        if (bound_native(ctx, statev, promise_all_item, "all item",
+                         1, &index, &on_item) != JS_OK)
+            return JS_THROW;
+        args[0] = on_item;
+        args[1] = reject;
+        if (promise_then(ctx, normalized, 2, args, &item) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = result;
+    return JS_OK;
+}
+
+static int promise_static_race(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *input;
+    js_value result, resolve, reject;
+    unsigned long n, i;
+    (void)t;
+
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Promise.race requires an array-like value");
+    if (this_object(ctx, argv[0], &input) != JS_OK)
+        return JS_THROW;
+    if (alen(ctx, input, &n) != JS_OK)
+        return JS_THROW;
+    if (n > 65535)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Promise.race input is too large");
+    result = js_promise_new(ctx);
+    if (!js_is_promise(result) ||
+        bound_resolver(ctx, result, promise_resolver,
+                       "resolve", &resolve) != JS_OK ||
+        bound_resolver(ctx, result, promise_rejecter,
+                       "reject", &reject) != JS_OK)
+        return JS_THROW;
+    for (i = 0; i < n; i++) {
+        js_value item, normalized, ignored, args[2];
+
+        if (aget(ctx, input, i, &item) != JS_OK ||
+            promise_static_resolve(ctx, js_undefined(), 1,
+                                   &item, &normalized) != JS_OK)
+            return JS_THROW;
+        args[0] = resolve;
+        args[1] = reject;
+        if (promise_then(ctx, normalized, 2, args, &ignored) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = result;
+    return JS_OK;
+}
+
+static int promise_finally_pass(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret)
+{
+    uint32_t rejected = 0;
+    js_value original = argc ? argv[0] : js_undefined();
+    (void)t;
+
+    if (argc > 1 && js_to_uint32(ctx, argv[1], &rejected) != JS_OK)
+        return JS_THROW;
+    if (rejected)
+        return js_throw(ctx, original);
+    *ret = original;
+    return JS_OK;
+}
+
+static int promise_finally_branch(js_ctx *ctx, js_value t, int argc,
+                                  js_value *argv, js_value *ret)
+{
+    js_value cleanup, normalized, pass, ignored, bound[2], args[2];
+    (void)t;
+
+    if (argc < 3 || !js_is_function(argv[0]))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid Promise.finally callback");
+    if (js_call(ctx, argv[0], js_undefined(), 0, 0, &cleanup) != JS_OK)
+        return JS_THROW;
+    if (promise_static_resolve(ctx, js_undefined(), 1,
+                               &cleanup, &normalized) != JS_OK)
+        return JS_THROW;
+    bound[0] = argv[2];          /* original value or rejection reason */
+    bound[1] = argv[1];          /* zero = return, one = rethrow */
+    if (bound_native(ctx, js_undefined(), promise_finally_pass,
+                     "finally pass", 2, bound, &pass) != JS_OK)
+        return JS_THROW;
+    args[0] = pass;
+    args[1] = js_undefined();
+    if (promise_then(ctx, normalized, 2, args, &ignored) != JS_OK)
+        return JS_THROW;
+    *ret = ignored;
+    return JS_OK;
+}
+
+static int promise_finally(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    js_value on_finally, fulfilled, rejected, b0, b1, args[2];
+
+    if (!js_is_promise(t))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Promise.finally called on a non-Promise");
+    on_finally = argc ? argv[0] : js_undefined();
+    if (!js_is_function(on_finally)) {
+        args[0] = on_finally;
+        args[1] = on_finally;
+        return promise_then(ctx, t, 2, args, ret);
+    }
+    b0 = on_finally;
+    b1 = js_number(0);
+    {
+        js_value bound[2] = { b0, b1 };
+        if (bound_native(ctx, js_undefined(), promise_finally_branch,
+                         "finally fulfilled", 2, bound, &fulfilled) != JS_OK)
+            return JS_THROW;
+    }
+    b1 = js_number(1);
+    {
+        js_value bound[2] = { b0, b1 };
+        if (bound_native(ctx, js_undefined(), promise_finally_branch,
+                         "finally rejected", 2, bound, &rejected) != JS_OK)
+            return JS_THROW;
+    }
+    args[0] = fulfilled;
+    args[1] = rejected;
+    return promise_then(ctx, t, 2, args, ret);
+}
+
+int js_run_jobs(js_ctx *ctx, unsigned long max_jobs)
+{
+    unsigned long ran = 0;
+
+    if (!ctx || ctx->fatal)
+        return -1;
+    if (!max_jobs)
+        max_jobs = 1024;
+    while (ctx->jobs_head && ran < max_jobs) {
+        js_promise_job *job = ctx->jobs_head;
+        js_promise_reaction *reaction = job->reaction;
+        js_object *source = job->source;
+        js_value handler, result;
+        int rc;
+
+        ctx->jobs_head = job->next;
+        if (!ctx->jobs_head)
+            ctx->jobs_tail = 0;
+        handler = source->promise_state == 1
+            ? reaction->on_fulfilled : reaction->on_rejected;
+        if (!js_is_function(handler)) {
+            rc = promise_settle(ctx, reaction->child,
+                                source->promise_state,
+                                source->promise_result);
+        } else {
+            result = js_undefined();
+            rc = js_call(ctx, handler, js_undefined(), 1,
+                         &source->promise_result, &result);
+            if (rc == JS_OK) {
+                rc = promise_settle(ctx, reaction->child, 1, result);
+            } else if (!ctx->fatal) {
+                js_value reason = js_exception(ctx);
+                js_clear_exception(ctx);
+                rc = promise_settle(ctx, reaction->child, 2, reason);
+            }
+        }
+        if (rc != JS_OK || ctx->fatal)
+            return -1;
+        ran++;
+    }
+    return (int)ran;
+}
+
+/* ================================================================== */
+/* WebAssembly MVP execution core                                      */
+/* ================================================================== */
+
+#define WASM_MODULE_TAG   0x574D4F44u
+#define WASM_INSTANCE_TAG 0x574D494Eu
+#define WASM_CALL_TAG     0x574D4341u
+#define WASM_BYTE_MAX     (1024UL * 1024UL)
+#define WASM_FUNC_MAX     256
+#define WASM_TYPE_MAX     256
+#define WASM_EXPORT_MAX   256
+#define WASM_LOCAL_MAX    256
+#define WASM_STACK_MAX    256
+#define WASM_CALL_MAX     32
+#define WASM_STEP_MAX     100000
+
+struct wasm_reader {
+    const uint8_t *p, *end;
+};
+
+struct wasm_type {
+    uint8_t nparam, nresult;
+};
+
+struct wasm_func {
+    uint32_t type;
+    const uint8_t *code;
+    uint32_t code_len;
+};
+
+struct wasm_export {
+    char *name;
+    uint32_t func;
+};
+
+struct wasm_module {
+    uint8_t *bytes;
+    unsigned long len;
+    struct wasm_type *types;
+    struct wasm_func *funcs;
+    struct wasm_export *exports;
+    uint32_t ntypes, nfuncs, nexports;
+};
+
+struct wasm_callable {
+    struct wasm_module *module;
+    uint32_t func;
+};
+
+static int wasm_u32(struct wasm_reader *r, uint32_t *out)
+{
+    uint32_t v = 0;
+    int shift = 0, i;
+
+    for (i = 0; i < 5 && r->p < r->end; i++) {
+        uint8_t b = *r->p++;
+
+        if (i == 4 && (b & 0xF0))
+            return 0;
+        v |= (uint32_t)(b & 0x7F) << shift;
+        if (!(b & 0x80)) {
+            *out = v;
+            return 1;
+        }
+        shift += 7;
+    }
+    return 0;
+}
+
+static int wasm_i32(struct wasm_reader *r, int32_t *out)
+{
+    uint32_t v = 0;
+    uint8_t b = 0;
+    int shift = 0, i;
+
+    for (i = 0; i < 5 && r->p < r->end; i++) {
+        b = *r->p++;
+        v |= (uint32_t)(b & 0x7F) << shift;
+        shift += 7;
+        if (!(b & 0x80)) {
+            if (shift < 32 && (b & 0x40))
+                v |= ~0u << shift;
+            *out = (int32_t)v;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int wasm_error(js_ctx *ctx, const char *msg)
+{
+    return js_throw_error(ctx, JS_ERR_SYNTAX, "WebAssembly: %s", msg);
+}
+
+static int wasm_source(js_ctx *ctx, js_value value, uint8_t **out,
+                       unsigned long *out_len)
+{
+    js_object *source = 0;
+    unsigned long n, i;
+    uint8_t *bytes;
+    const void *buffer = js_arraybuffer_data(value, &n);
+
+    if (!buffer) {
+        if (this_object(ctx, value, &source) != JS_OK)
+            return JS_THROW;
+        if (alen(ctx, source, &n) != JS_OK)
+            return JS_THROW;
+    }
+    if (n > WASM_BYTE_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "WebAssembly input is too large");
+    bytes = (uint8_t *)js_alloc(ctx, n ? n : 1);
+    if (!bytes)
+        return JS_THROW;
+    if (buffer && n) {
+        memcpy(bytes, buffer, n);
+        *out = bytes;
+        *out_len = n;
+        return JS_OK;
+    }
+    for (i = 0; i < n; i++) {
+        js_value v;
+        uint32_t byte;
+
+        if (aget(ctx, source, i, &v) != JS_OK ||
+            js_to_uint32(ctx, v, &byte) != JS_OK)
+            return JS_THROW;
+        if (byte > 255)
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "WebAssembly bytes must be 0..255");
+        bytes[i] = (uint8_t)byte;
+    }
+    *out = bytes;
+    *out_len = n;
+    return JS_OK;
+}
+
+static int wasm_scan_code(js_ctx *ctx, struct wasm_module *m,
+                          uint32_t fi)
+{
+    struct wasm_func *f = &m->funcs[fi];
+    struct wasm_type *ft = &m->types[f->type];
+    struct wasm_reader r = { f->code, f->code + f->code_len };
+    uint32_t groups, locals = ft->nparam, i, stack = 0, steps = 0;
+    int ended = 0;
+
+    if (!wasm_u32(&r, &groups) || groups > WASM_LOCAL_MAX)
+        return wasm_error(ctx, "invalid local declaration vector");
+    for (i = 0; i < groups; i++) {
+        uint32_t count;
+
+        if (!wasm_u32(&r, &count) || r.p >= r.end || *r.p++ != 0x7F ||
+            count > WASM_LOCAL_MAX - locals)
+            return wasm_error(ctx, "only bounded i32 locals are supported");
+        locals += count;
+    }
+    while (r.p < r.end && steps++ < WASM_STEP_MAX) {
+        uint8_t op = *r.p++;
+        uint32_t index;
+        int32_t constant;
+
+        switch (op) {
+        case 0x0B: /* end */
+            ended = r.p == r.end;
+            if (!ended)
+                return wasm_error(ctx, "structured control is not supported");
+            break;
+        case 0x1A: /* drop */
+            if (!stack) return wasm_error(ctx, "operand stack underflow");
+            stack--;
+            break;
+        case 0x20: /* local.get */
+            if (!wasm_u32(&r, &index) || index >= locals)
+                return wasm_error(ctx, "invalid local.get");
+            if (stack >= WASM_STACK_MAX)
+                return wasm_error(ctx, "operand stack is too deep");
+            stack++;
+            break;
+        case 0x21: /* local.set */
+            if (!wasm_u32(&r, &index) || index >= locals || !stack)
+                return wasm_error(ctx, "invalid local.set");
+            stack--;
+            break;
+        case 0x22: /* local.tee */
+            if (!wasm_u32(&r, &index) || index >= locals || !stack)
+                return wasm_error(ctx, "invalid local.tee");
+            break;
+        case 0x41: /* i32.const */
+            if (!wasm_i32(&r, &constant))
+                return wasm_error(ctx, "invalid i32 constant");
+            if (stack >= WASM_STACK_MAX)
+                return wasm_error(ctx, "operand stack is too deep");
+            stack++;
+            break;
+        case 0x10: /* call */
+            if (!wasm_u32(&r, &index) || index >= m->nfuncs)
+                return wasm_error(ctx, "invalid function call");
+            if (stack < m->types[m->funcs[index].type].nparam)
+                return wasm_error(ctx, "call operand stack underflow");
+            stack -= m->types[m->funcs[index].type].nparam;
+            stack += m->types[m->funcs[index].type].nresult;
+            if (stack > WASM_STACK_MAX)
+                return wasm_error(ctx, "operand stack is too deep");
+            break;
+        case 0x45: /* i32.eqz */
+            if (!stack) return wasm_error(ctx, "operand stack underflow");
+            break;
+        case 0x46: case 0x47: case 0x48: case 0x4A:
+        case 0x4C: case 0x4E:
+        case 0x6A: case 0x6B: case 0x6C:
+        case 0x71: case 0x72: case 0x73:
+        case 0x74: case 0x75: case 0x76:
+            if (stack < 2)
+                return wasm_error(ctx, "operand stack underflow");
+            stack--;
+            break;
+        default:
+            return wasm_error(ctx,
+                              "opcode is outside the bounded i32 MVP core");
+        }
+        if (ended)
+            break;
+    }
+    if (!ended || stack != ft->nresult)
+        return wasm_error(ctx, "function result does not match its type");
+    return JS_OK;
+}
+
+static struct wasm_module *wasm_compile_value(js_ctx *ctx, js_value input)
+{
+    struct wasm_module *m;
+    struct wasm_reader r;
+    uint8_t *bytes = 0;
+    unsigned long len = 0;
+    uint32_t seen = 0, last = 0, code_count = 0;
+
+    if (wasm_source(ctx, input, &bytes, &len) != JS_OK)
+        return 0;
+    if (len < 8 || memcmp(bytes, "\0asm\1\0\0\0", 8))
+        return wasm_error(ctx, "bad magic or version"), (struct wasm_module *)0;
+    m = (struct wasm_module *)js_alloc(ctx, sizeof(*m));
+    if (!m)
+        return 0;
+    memset(m, 0, sizeof(*m));
+    m->bytes = bytes;
+    m->len = len;
+    r.p = bytes + 8;
+    r.end = bytes + len;
+    while (r.p < r.end) {
+        uint8_t id = *r.p++;
+        uint32_t size;
+        struct wasm_reader s;
+
+        if (!wasm_u32(&r, &size) ||
+            (unsigned long)(r.end - r.p) < size)
+            return wasm_error(ctx, "truncated section"), (struct wasm_module *)0;
+        s.p = r.p;
+        s.end = r.p + size;
+        r.p = s.end;
+        if (id > 12)
+            return wasm_error(ctx, "unknown section id"), (struct wasm_module *)0;
+        if (id && (id < last || (seen & (1u << id))))
+            return wasm_error(ctx, "duplicate or out-of-order section"),
+                   (struct wasm_module *)0;
+        if (id) {
+            last = id;
+            seen |= 1u << id;
+        }
+        if (id == 0)
+            continue;
+        if (id == 1) {
+            uint32_t count, i;
+
+            if (!wasm_u32(&s, &count) || count > WASM_TYPE_MAX)
+                return wasm_error(ctx, "too many function types"),
+                       (struct wasm_module *)0;
+            m->types = (struct wasm_type *)js_alloc(
+                ctx, (count ? count : 1) * sizeof(*m->types));
+            if (!m->types) return 0;
+            memset(m->types, 0, (count ? count : 1) * sizeof(*m->types));
+            m->ntypes = count;
+            for (i = 0; i < count; i++) {
+                uint32_t n, j;
+
+                if (s.p >= s.end || *s.p++ != 0x60 ||
+                    !wasm_u32(&s, &n) || n > 16)
+                    return wasm_error(ctx, "invalid function type"),
+                           (struct wasm_module *)0;
+                m->types[i].nparam = (uint8_t)n;
+                for (j = 0; j < n; j++)
+                    if (s.p >= s.end || *s.p++ != 0x7F)
+                        return wasm_error(ctx, "only i32 parameters are supported"),
+                               (struct wasm_module *)0;
+                if (!wasm_u32(&s, &n) || n > 1)
+                    return wasm_error(ctx, "invalid result vector"),
+                           (struct wasm_module *)0;
+                m->types[i].nresult = (uint8_t)n;
+                if (n && (s.p >= s.end || *s.p++ != 0x7F))
+                    return wasm_error(ctx, "only i32 results are supported"),
+                           (struct wasm_module *)0;
+            }
+        } else if (id == 2) {
+            uint32_t count;
+
+            if (!wasm_u32(&s, &count) || count)
+                return wasm_error(ctx, "imports are not supported yet"),
+                       (struct wasm_module *)0;
+        } else if (id == 3) {
+            uint32_t count, i;
+
+            if (!wasm_u32(&s, &count) || count > WASM_FUNC_MAX)
+                return wasm_error(ctx, "too many functions"),
+                       (struct wasm_module *)0;
+            m->funcs = (struct wasm_func *)js_alloc(
+                ctx, (count ? count : 1) * sizeof(*m->funcs));
+            if (!m->funcs) return 0;
+            memset(m->funcs, 0, (count ? count : 1) * sizeof(*m->funcs));
+            m->nfuncs = count;
+            for (i = 0; i < count; i++)
+                if (!wasm_u32(&s, &m->funcs[i].type) ||
+                    m->funcs[i].type >= m->ntypes)
+                    return wasm_error(ctx, "invalid function type index"),
+                           (struct wasm_module *)0;
+        } else if (id == 7) {
+            uint32_t count, i;
+
+            if (!wasm_u32(&s, &count) || count > WASM_EXPORT_MAX)
+                return wasm_error(ctx, "too many exports"),
+                       (struct wasm_module *)0;
+            m->exports = (struct wasm_export *)js_alloc(
+                ctx, (count ? count : 1) * sizeof(*m->exports));
+            if (!m->exports) return 0;
+            memset(m->exports, 0, (count ? count : 1) * sizeof(*m->exports));
+            for (i = 0; i < count; i++) {
+                uint32_t name_len, index;
+                uint8_t kind;
+                char *name;
+
+                if (!wasm_u32(&s, &name_len) || name_len > 128 ||
+                    (unsigned long)(s.end - s.p) < name_len + 1)
+                    return wasm_error(ctx, "invalid export"),
+                           (struct wasm_module *)0;
+                name = (char *)js_alloc(ctx, name_len + 1);
+                if (!name) return 0;
+                memcpy(name, s.p, name_len);
+                name[name_len] = 0;
+                s.p += name_len;
+                kind = *s.p++;
+                if (!wasm_u32(&s, &index))
+                    return wasm_error(ctx, "invalid export index"),
+                           (struct wasm_module *)0;
+                if (kind == 0) {
+                    if (index >= m->nfuncs)
+                        return wasm_error(ctx, "function export is out of range"),
+                               (struct wasm_module *)0;
+                    m->exports[m->nexports].name = name;
+                    m->exports[m->nexports].func = index;
+                    m->nexports++;
+                }
+            }
+        } else if (id == 8) {
+            return wasm_error(ctx, "start functions are not supported yet"),
+                   (struct wasm_module *)0;
+        } else if (id == 10) {
+            uint32_t count, i;
+
+            if (!wasm_u32(&s, &count) || count != m->nfuncs)
+                return wasm_error(ctx, "code/function count mismatch"),
+                       (struct wasm_module *)0;
+            code_count = count;
+            for (i = 0; i < count; i++) {
+                uint32_t body_len;
+
+                if (!wasm_u32(&s, &body_len) ||
+                    (unsigned long)(s.end - s.p) < body_len)
+                    return wasm_error(ctx, "truncated function body"),
+                           (struct wasm_module *)0;
+                m->funcs[i].code = s.p;
+                m->funcs[i].code_len = body_len;
+                s.p += body_len;
+            }
+        }
+        if (s.p != s.end)
+            return wasm_error(ctx, "section has trailing bytes"),
+                   (struct wasm_module *)0;
+    }
+    if (m->nfuncs != code_count)
+        return wasm_error(ctx, "functions require a code section"),
+               (struct wasm_module *)0;
+    {
+        uint32_t i;
+        for (i = 0; i < m->nfuncs; i++)
+            if (wasm_scan_code(ctx, m, i) != JS_OK)
+                return 0;
+    }
+    return m;
+}
+
+static int wasm_exec(struct wasm_module *m, uint32_t fi,
+                     const int32_t *args, int32_t *result,
+                     int depth, uint32_t *steps)
+{
+    struct wasm_func *f;
+    struct wasm_type *ft;
+    struct wasm_reader r;
+    int32_t locals[WASM_LOCAL_MAX], stack[WASM_STACK_MAX];
+    uint32_t groups, nlocals, sp = 0, i;
+
+    if (depth >= WASM_CALL_MAX || fi >= m->nfuncs)
+        return 0;
+    f = &m->funcs[fi];
+    ft = &m->types[f->type];
+    r.p = f->code;
+    r.end = f->code + f->code_len;
+    memset(locals, 0, sizeof(locals));
+    for (i = 0; i < ft->nparam; i++)
+        locals[i] = args[i];
+    nlocals = ft->nparam;
+    if (!wasm_u32(&r, &groups))
+        return 0;
+    for (i = 0; i < groups; i++) {
+        uint32_t count;
+        if (!wasm_u32(&r, &count) || r.p >= r.end || *r.p++ != 0x7F ||
+            count > WASM_LOCAL_MAX - nlocals)
+            return 0;
+        nlocals += count;
+    }
+    while (r.p < r.end && (*steps)++ < WASM_STEP_MAX) {
+        uint8_t op = *r.p++;
+        uint32_t index;
+        int32_t a, b;
+
+        if (op == 0x0B) {
+            *result = ft->nresult ? stack[sp - 1] : 0;
+            return 1;
+        }
+        switch (op) {
+        case 0x1A: sp--; break;
+        case 0x20:
+            if (!wasm_u32(&r, &index)) return 0;
+            stack[sp++] = locals[index];
+            break;
+        case 0x21:
+            if (!wasm_u32(&r, &index)) return 0;
+            locals[index] = stack[--sp];
+            break;
+        case 0x22:
+            if (!wasm_u32(&r, &index)) return 0;
+            locals[index] = stack[sp - 1];
+            break;
+        case 0x41:
+            if (!wasm_i32(&r, &stack[sp++])) return 0;
+            break;
+        case 0x10: {
+            int32_t call_args[16], call_result = 0;
+            struct wasm_type *ct;
+            uint32_t j;
+
+            if (!wasm_u32(&r, &index) || index >= m->nfuncs) return 0;
+            ct = &m->types[m->funcs[index].type];
+            for (j = ct->nparam; j > 0; j--)
+                call_args[j - 1] = stack[--sp];
+            if (!wasm_exec(m, index, call_args, &call_result,
+                           depth + 1, steps))
+                return 0;
+            if (ct->nresult) stack[sp++] = call_result;
+            break;
+        }
+        case 0x45: stack[sp - 1] = stack[sp - 1] == 0; break;
+        default:
+            b = stack[--sp];
+            a = stack[--sp];
+            switch (op) {
+            case 0x46: a = a == b; break;
+            case 0x47: a = a != b; break;
+            case 0x48: a = a < b; break;
+            case 0x4A: a = a > b; break;
+            case 0x4C: a = a <= b; break;
+            case 0x4E: a = a >= b; break;
+            case 0x6A: a = (int32_t)((uint32_t)a + (uint32_t)b); break;
+            case 0x6B: a = (int32_t)((uint32_t)a - (uint32_t)b); break;
+            case 0x6C: a = (int32_t)((uint32_t)a * (uint32_t)b); break;
+            case 0x71: a &= b; break;
+            case 0x72: a |= b; break;
+            case 0x73: a ^= b; break;
+            case 0x74: a = (int32_t)((uint32_t)a << ((uint32_t)b & 31)); break;
+            case 0x75: a >>= (uint32_t)b & 31; break;
+            case 0x76: a = (int32_t)((uint32_t)a >>
+                                     ((uint32_t)b & 31)); break;
+            default: return 0;
+            }
+            stack[sp++] = a;
+            break;
+        }
+    }
+    return 0;
+}
+
+static int wasm_invoke(js_ctx *ctx, js_value t, int argc,
+                       js_value *argv, js_value *ret)
+{
+    struct wasm_callable *call =
+        (struct wasm_callable *)js_host_ptr(t, WASM_CALL_TAG);
+    struct wasm_type *type;
+    int32_t args[16], result = 0;
+    uint32_t steps = 0, i;
+
+    if (!call)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid WebAssembly function receiver");
+    type = &call->module->types[call->module->funcs[call->func].type];
+    for (i = 0; i < type->nparam; i++) {
+        js_value v = (int)i < argc ? argv[i] : js_undefined();
+        if (js_to_int32(ctx, v, &args[i]) != JS_OK)
+            return JS_THROW;
+    }
+    if (!wasm_exec(call->module, call->func, args, &result, 0, &steps))
+        return js_throw_error(ctx, JS_ERR_ERROR,
+                              "WebAssembly execution limit exceeded");
+    *ret = type->nresult ? js_number((double)result) : js_undefined();
+    return JS_OK;
+}
+
+static int wasm_wrap_module(js_ctx *ctx, struct wasm_module *m, js_value *ret)
+{
+    js_object *o = js_new_host(ctx, m, WASM_MODULE_TAG,
+                               ctx->proto[P_WASM_MODULE]);
+    if (!o) return JS_THROW;
+    *ret = js_object_value(o);
+    return JS_OK;
+}
+
+static int wasm_module_ctor(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    struct wasm_module *m;
+    (void)t;
+
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "WebAssembly.Module requires bytes");
+    m = wasm_compile_value(ctx, argv[0]);
+    return m ? wasm_wrap_module(ctx, m, ret) : JS_THROW;
+}
+
+static int wasm_make_instance(js_ctx *ctx, struct wasm_module *m,
+                              js_value *ret)
+{
+    js_object *instance, *exports;
+    js_value iv, ev;
+    uint32_t i;
+
+    instance = js_new_host(ctx, m, WASM_INSTANCE_TAG,
+                           ctx->proto[P_WASM_INSTANCE]);
+    exports = js_new_object(ctx);
+    if (!instance || !exports)
+        return JS_THROW;
+    iv = js_object_value(instance);
+    ev = js_object_value(exports);
+    for (i = 0; i < m->nexports; i++) {
+        struct wasm_callable *call = (struct wasm_callable *)
+            js_alloc(ctx, sizeof(*call));
+        js_object *host;
+        js_value fn, hostv;
+
+        if (!call)
+            return JS_THROW;
+        call->module = m;
+        call->func = m->exports[i].func;
+        host = js_new_host(ctx, call, WASM_CALL_TAG, ctx->proto[P_OBJECT]);
+        if (!host)
+            return JS_THROW;
+        hostv = js_object_value(host);
+        if (bound_native(ctx, hostv, wasm_invoke, m->exports[i].name,
+                         0, 0, &fn) != JS_OK ||
+            js_set(ctx, ev, m->exports[i].name, fn) != JS_OK)
+            return JS_THROW;
+    }
+    if (js_set(ctx, iv, "exports", ev) != JS_OK)
+        return JS_THROW;
+    *ret = iv;
+    return JS_OK;
+}
+
+static int wasm_instance_ctor(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    struct wasm_module *m;
+    (void)t;
+
+    if (argc < 1 ||
+        !(m = (struct wasm_module *)js_host_ptr(argv[0], WASM_MODULE_TAG)))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "WebAssembly.Instance requires a Module");
+    return wasm_make_instance(ctx, m, ret);
+}
+
+static int wasm_validate(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    struct wasm_module *m;
+    (void)t;
+
+    if (argc < 1) {
+        *ret = js_bool(0);
+        return JS_OK;
+    }
+    m = wasm_compile_value(ctx, argv[0]);
+    if (!m) {
+        if (ctx->fatal)
+            return JS_THROW;
+        js_clear_exception(ctx);
+    }
+    *ret = js_bool(m != 0);
+    return JS_OK;
+}
+
+static int wasm_compile_async(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_value module, reason;
+    int rc = wasm_module_ctor(ctx, t, argc, argv, &module);
+
+    if (rc == JS_OK)
+        return promise_static_resolve(ctx, js_undefined(), 1, &module, ret);
+    if (ctx->fatal)
+        return JS_THROW;
+    reason = js_exception(ctx);
+    js_clear_exception(ctx);
+    return promise_static_reject(ctx, js_undefined(), 1, &reason, ret);
+}
+
+static int wasm_instantiate_async(js_ctx *ctx, js_value t, int argc,
+                                  js_value *argv, js_value *ret)
+{
+    struct wasm_module *m;
+    js_value module, instance, result, reason;
+    int supplied_module;
+    (void)t;
+
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "WebAssembly.instantiate requires bytes");
+    m = (struct wasm_module *)js_host_ptr(argv[0], WASM_MODULE_TAG);
+    supplied_module = m != 0;
+    if (!m) {
+        m = wasm_compile_value(ctx, argv[0]);
+        if (!m)
+            goto reject;
+        if (wasm_wrap_module(ctx, m, &module) != JS_OK)
+            goto reject;
+    } else {
+        module = argv[0];
+    }
+    if (wasm_make_instance(ctx, m, &instance) != JS_OK)
+        goto reject;
+    if (supplied_module) {
+        result = instance;
+    } else {
+        js_object *pair = js_new_object(ctx);
+        if (!pair)
+            goto reject;
+        result = js_object_value(pair);
+        if (js_set(ctx, result, "module", module) != JS_OK ||
+            js_set(ctx, result, "instance", instance) != JS_OK)
+            goto reject;
+    }
+    return promise_static_resolve(ctx, js_undefined(), 1, &result, ret);
+
+reject:
+    if (ctx->fatal)
+        return JS_THROW;
+    reason = js_exception(ctx);
+    js_clear_exception(ctx);
+    return promise_static_reject(ctx, js_undefined(), 1, &reason, ret);
+}
+
+/* ================================================================== */
 /* Bootstrap                                                           */
 /* ================================================================== */
 
@@ -4132,7 +5357,7 @@ int js_init_builtins(js_ctx *ctx)
     if (!ctx->genv) return 0;
     ctx->genv->this_val = js_object_value(g);
 
-    for (i = P_ARRAY; i <= P_REGEXP; i++) {
+    for (i = P_ARRAY; i <= P_WASM_INSTANCE; i++) {
         ctx->proto[i] = js_obj_alloc(ctx,
             i == P_ARRAY ? JS_CLASS_ARRAY : JS_CLASS_OBJECT, ctx->proto[P_OBJECT]);
         if (!ctx->proto[i]) return 0;
@@ -4311,6 +5536,60 @@ int js_init_builtins(js_ctx *ctx)
         return 0;
     ctx->ctor_regexp = mkctor(ctx, bi_regexp_ctor, "RegExp", 2, p);
     if (!ctx->ctor_regexp) return 0;
+
+    /* ---- Promise ---- */
+    p = ctx->proto[P_PROMISE];
+    DEFN(p, "then", promise_then, 2);
+    DEFN(p, "catch", promise_catch, 1);
+    DEFN(p, "finally", promise_finally, 1);
+    {
+        js_object *promise_ctor_obj =
+            mkctor(ctx, promise_ctor, "Promise", 1, p);
+        if (!promise_ctor_obj) return 0;
+        DEFN(promise_ctor_obj, "resolve", promise_static_resolve, 1);
+        DEFN(promise_ctor_obj, "reject", promise_static_reject, 1);
+        DEFN(promise_ctor_obj, "all", promise_static_all, 1);
+        DEFN(promise_ctor_obj, "race", promise_static_race, 1);
+    }
+
+    /* ---- ArrayBuffer ---- */
+    p = ctx->proto[P_ARRAYBUFFER];
+    DEFN(p, "slice", arraybuffer_slice, 2);
+    if (!mkctor(ctx, arraybuffer_ctor, "ArrayBuffer", 1, p))
+        return 0;
+
+    /* ---- WebAssembly ---- */
+    {
+        js_object *w = js_new_object(ctx);
+        js_object *module_ctor_obj =
+            js_new_native(ctx, wasm_module_ctor, "Module", 1);
+        js_object *instance_ctor_obj =
+            js_new_native(ctx, wasm_instance_ctor, "Instance", 2);
+        js_prop *constructor;
+
+        if (!w || !module_ctor_obj || !instance_ctor_obj)
+            return 0;
+        module_ctor_obj->fn->ctor_kind = JS_CTOR_NATIVE;
+        instance_ctor_obj->fn->ctor_kind = JS_CTOR_NATIVE;
+        DEFV(module_ctor_obj, "prototype",
+             js_object_value(ctx->proto[P_WASM_MODULE]));
+        DEFV(instance_ctor_obj, "prototype",
+             js_object_value(ctx->proto[P_WASM_INSTANCE]));
+        constructor = js_add_prop(ctx, ctx->proto[P_WASM_MODULE],
+                                  ctx->s_constructor, JS_P_HIDDEN);
+        if (!constructor) return 0;
+        constructor->value = js_object_value(module_ctor_obj);
+        constructor = js_add_prop(ctx, ctx->proto[P_WASM_INSTANCE],
+                                  ctx->s_constructor, JS_P_HIDDEN);
+        if (!constructor) return 0;
+        constructor->value = js_object_value(instance_ctor_obj);
+        DEFV(w, "Module", js_object_value(module_ctor_obj));
+        DEFV(w, "Instance", js_object_value(instance_ctor_obj));
+        DEFN(w, "validate", wasm_validate, 1);
+        DEFN(w, "compile", wasm_compile_async, 1);
+        DEFN(w, "instantiate", wasm_instantiate_async, 2);
+        DEFV(g, "WebAssembly", js_object_value(w));
+    }
 
     /* ---- Math ---- */
     {

@@ -67,6 +67,9 @@ void css_style_initial(struct computed_style *cs)
     cs->border_collapse = CSS_BORDERCOLLAPSE_SEPARATE;
     cs->text_transform = CSS_TEXTTRANSFORM_NONE;
     cs->text_decoration = CSS_DECOR_NONE;
+    cs->flex_direction = CSS_FLEXDIR_ROW;
+    cs->justify_content = CSS_JUSTIFY_START;
+    cs->align_items = CSS_ALIGN_STRETCH;
     cs->font_weight = 400;
     cs->font_size = 16;
     cs->z_auto = 1;
@@ -1589,7 +1592,8 @@ static void test_replaced(void)
 {
     struct tctx *t = tnew();
     struct computed_style *p = st_block(t), *im = st(t);
-    struct dom_node *d, *i;
+    struct computed_style *media = st(t);
+    struct dom_node *d, *i, *v, *a, *svg, *svg_ratio;
     struct lay_document *L;
     struct lay_opts o;
     struct lay_box *b;
@@ -1666,6 +1670,90 @@ static void test_replaced(void)
     b = box_nth(L, i, 0);
     CHECK_EQ(b->w, 80);
     CHECK_EQ(b->h, 40);
+    lay_free(L);
+
+    /* Video posters use the ordinary image pipeline and preserve its
+     * intrinsic ratio. Audio and inline SVG have HTML default sizes. */
+    media->display = CSS_DISPLAY_INLINE_BLOCK;
+    v = el(t, d, "video", media);
+    dom_set_attr(v, "poster", "a.png");
+    a = el(t, d, "audio", media);
+    svg = el(t, d, "svg", media);
+    svg_ratio = el(t, d, "svg", media);
+    dom_set_attr(svg_ratio, "width", "120");
+    dom_set_attr(svg_ratio, "viewBox", "0 0 4 2");
+    L = lay_layout_node(d, &o);
+    CHECK_EQ(box_nth(L, v, 0)->w, 100);
+    CHECK_EQ(box_nth(L, v, 0)->h, 50);
+    CHECK_EQ(box_nth(L, a, 0)->w, 300);
+    CHECK_EQ(box_nth(L, a, 0)->h, 32);
+    CHECK_EQ(box_nth(L, svg, 0)->w, 300);
+    CHECK_EQ(box_nth(L, svg, 0)->h, 150);
+    CHECK_EQ(box_nth(L, svg_ratio, 0)->w, 120);
+    CHECK_EQ(box_nth(L, svg_ratio, 0)->h, 60);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_flex_row(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *flex = st_block(t);
+    struct computed_style *a = st_block(t);
+    struct computed_style *b = st_block(t);
+    struct computed_style *c = st_block(t);
+    struct dom_node *root, *na, *nb, *nc;
+    struct lay_document *L;
+    struct lay_box *ba, *bb, *bc;
+
+    GROUP("flex: row growth, gaps, and cross-axis centering");
+
+    flex->display = CSS_DISPLAY_FLEX;
+    flex->width = LPX(300);
+    flex->gap = 10;
+    flex->align_items = CSS_ALIGN_CENTER;
+    a->width = LPX(50);
+    a->height = LPX(10);
+    b->height = LPX(20);
+    b->flex_grow = 1000;
+    c->height = LPX(30);
+    c->flex_grow = 2000;
+    root = el(t, 0, "div", flex);
+    na = el(t, root, "div", a);
+    nb = el(t, root, "div", b);
+    nc = el(t, root, "div", c);
+
+    L = run(t, root, 400, 200);
+    ba = box_nth(L, na, 0);
+    bb = box_nth(L, nb, 0);
+    bc = box_nth(L, nc, 0);
+    CHECK(ba && bb && bc);
+    CHECK_EQ(box_nth(L, root, 0)->w, 300);
+    CHECK_EQ(ba->x, 0);
+    CHECK_EQ(ba->w, 50);
+    CHECK_EQ(bb->x, 60);
+    CHECK_EQ(bb->w, 76);
+    CHECK_EQ(bc->x, 146);
+    CHECK_EQ(bc->w, 154);
+    CHECK_EQ(ba->y, 10);
+    CHECK_EQ(bb->y, 5);
+    CHECK_EQ(bc->y, 0);
+    CHECK_EQ(box_nth(L, root, 0)->h, 30);
+    lay_free(L);
+
+    GROUP("flex: row-reverse preserves the allocated item sizes");
+    flex->flex_direction = CSS_FLEXDIR_ROW_REVERSE;
+    flex->align_items = CSS_ALIGN_START;
+    L = run(t, root, 400, 200);
+    ba = box_nth(L, na, 0);
+    bb = box_nth(L, nb, 0);
+    bc = box_nth(L, nc, 0);
+    CHECK_EQ(bc->x, 0);
+    CHECK_EQ(bc->w, 154);
+    CHECK_EQ(bb->x, 164);
+    CHECK_EQ(bb->w, 76);
+    CHECK_EQ(ba->x, 250);
+    CHECK_EQ(ba->w, 50);
     lay_free(L);
     tfree(t);
 }
@@ -2029,6 +2117,123 @@ static long count_color(const struct paint_target *t, uint32_t c)
         if ((t->px[i] & 0x00FFFFFFu) == c)
             n++;
     return n;
+}
+
+static void test_paint_svg(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *cs = st(t);
+    struct dom_node *svg, *rect, *circle, *line, *polygon, *path, *bad_color;
+    struct dom_node *zero_line, *multi, *svg_aspect, *aspect_rect;
+    struct dom_node *svg_hostile, *huge_circle, *relative_path;
+    struct lay_document *L;
+    struct paint_target tg = mk_target(100, 80);
+    struct paint_opts o;
+    struct paint_stats stats;
+
+    GROUP("paint: bounded inline SVG shapes and viewBox scaling");
+
+    cs->display = CSS_DISPLAY_INLINE_BLOCK;
+    svg = el(t, 0, "svg", cs);
+    dom_set_attr(svg, "width", "100");
+    dom_set_attr(svg, "height", "80");
+    dom_set_attr(svg, "viewBox", "0 0 100 80");
+    rect = el(t, svg, "rect", cs);
+    dom_set_attr(rect, "x", "10");
+    dom_set_attr(rect, "y", "10");
+    dom_set_attr(rect, "width", "50");
+    dom_set_attr(rect, "height", "20");
+    dom_set_attr(rect, "fill", "#ff0000");
+    circle = el(t, svg, "circle", cs);
+    dom_set_attr(circle, "cx", "80");
+    dom_set_attr(circle, "cy", "50");
+    dom_set_attr(circle, "r", "10");
+    dom_set_attr(circle, "fill", "blue");
+    line = el(t, svg, "line", cs);
+    dom_set_attr(line, "x1", "5");
+    dom_set_attr(line, "y1", "70");
+    dom_set_attr(line, "x2", "95");
+    dom_set_attr(line, "y2", "70");
+    dom_set_attr(line, "stroke", "green");
+    dom_set_attr(line, "stroke-width", "2");
+    polygon = el(t, svg, "polygon", cs);
+    dom_set_attr(polygon, "points", "5,40 25,40 15,60");
+    dom_set_attr(polygon, "style", "fill:#ff00ff");
+    path = el(t, svg, "path", cs);
+    dom_set_attr(path, "d", "M 60 10 L 90 10 L 75 30 Z");
+    dom_set_attr(path, "style", "fill:#00ffff;stroke:#000000;"
+                              "stroke-width:1");
+    bad_color = el(t, svg, "rect", cs);
+    dom_set_attr(bad_color, "x", "1");
+    dom_set_attr(bad_color, "y", "1");
+    dom_set_attr(bad_color, "width", "3");
+    dom_set_attr(bad_color, "height", "3");
+    dom_set_attr(bad_color, "fill", "#");
+    zero_line = el(t, svg, "line", cs);
+    dom_set_attr(zero_line, "x1", "10");
+    dom_set_attr(zero_line, "y1", "75");
+    dom_set_attr(zero_line, "x2", "90");
+    dom_set_attr(zero_line, "y2", "75");
+    dom_set_attr(zero_line, "stroke", "red");
+    dom_set_attr(zero_line, "stroke-width", "0");
+    multi = el(t, svg, "path", cs);
+    dom_set_attr(multi, "d", "M 30 65 L 40 65 M 60 65 L 70 65");
+    dom_set_attr(multi, "style", "fill:none;stroke:black;"
+                               "stroke-width:1");
+
+    L = run(t, svg, 100, 80);
+    paint_opts_init(&o);
+    o.canvas = CSS_RGB(0xFF, 0xFF, 0xFF);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 100, 80), &o, &stats);
+    CHECK_EQ(px_at(&tg, 15, 15), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 80, 50), 0x0000FF);
+    CHECK_EQ(px_at(&tg, 50, 70), 0x008000);
+    CHECK_EQ(px_at(&tg, 15, 45), 0xFF00FF);
+    CHECK_EQ(px_at(&tg, 75, 15), 0x00FFFF);
+    CHECK_EQ(px_at(&tg, 2, 2), 0x000000);
+    CHECK_EQ(px_at(&tg, 35, 65), 0x000000);
+    CHECK_EQ(px_at(&tg, 50, 65), 0xFFFFFF);
+    CHECK_EQ(px_at(&tg, 50, 75), 0xFFFFFF);
+    CHECK_EQ(stats.images, 1);
+    free(tg.px);
+    lay_free(L);
+
+    svg_aspect = el(t, 0, "svg", cs);
+    dom_set_attr(svg_aspect, "width", "100");
+    dom_set_attr(svg_aspect, "height", "100");
+    dom_set_attr(svg_aspect, "viewBox", "0 0 200 100");
+    aspect_rect = el(t, svg_aspect, "rect", cs);
+    dom_set_attr(aspect_rect, "width", "200");
+    dom_set_attr(aspect_rect, "height", "100");
+    dom_set_attr(aspect_rect, "fill", "red");
+    L = run(t, svg_aspect, 100, 100);
+    tg = mk_target(100, 100);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 100, 100), &o, &stats);
+    CHECK_EQ(px_at(&tg, 50, 10), 0xFFFFFF);
+    CHECK_EQ(px_at(&tg, 50, 50), 0xFF0000);
+    free(tg.px);
+    lay_free(L);
+
+    svg_hostile = el(t, 0, "svg", cs);
+    dom_set_attr(svg_hostile, "width", "10");
+    dom_set_attr(svg_hostile, "height", "10");
+    dom_set_attr(svg_hostile, "viewBox", "0 0 .001 .001");
+    huge_circle = el(t, svg_hostile, "circle", cs);
+    dom_set_attr(huge_circle, "cx", "0");
+    dom_set_attr(huge_circle, "cy", "0");
+    dom_set_attr(huge_circle, "r", "1000000");
+    dom_set_attr(huge_circle, "fill", "blue");
+    relative_path = el(t, svg_hostile, "path", cs);
+    dom_set_attr(relative_path, "d",
+                 "M0 0 l1000000 0 l1000000 0 l1000000 0");
+    dom_set_attr(relative_path, "style", "fill:none;stroke:none");
+    L = run(t, svg_hostile, 10, 10);
+    tg = mk_target(10, 10);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 10, 10), &o, &stats);
+    CHECK_EQ(px_at(&tg, 0, 0), 0x0000FF);
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
 }
 
 static void test_paint_basics(void)
@@ -2924,6 +3129,7 @@ int main(int argc, char **argv)
     test_table_row_index_capacity();
 
     test_replaced();
+    test_flex_row();
     test_absolute();
     test_fixed_and_relative();
     test_fixed_inside_relative();
@@ -2933,6 +3139,7 @@ int main(int argc, char **argv)
     test_hit_test();
     test_scroll_to_id();
 
+    test_paint_svg();
     test_paint_basics();
     test_paint_clip();
     test_paint_text_and_scroll();

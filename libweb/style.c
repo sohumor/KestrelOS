@@ -98,12 +98,17 @@ void css_style_initial(struct computed_style *cs)
     cs->border_collapse = CSS_BORDERCOLLAPSE_SEPARATE;
     cs->text_transform = CSS_TEXTTRANSFORM_NONE;
     cs->text_decoration = CSS_DECOR_NONE;
+    cs->flex_direction = CSS_FLEXDIR_ROW;
+    cs->justify_content = CSS_JUSTIFY_START;
+    cs->align_items = CSS_ALIGN_STRETCH;
     cs->font_weight = 400;
     cs->font_size = STYLE_DEFAULT_FONT_SIZE;
     cs->border_spacing = 0;
     cs->z_index = 0;
     cs->z_auto = 1;
     cs->vertical_align_px = 0;
+    cs->flex_grow = 0;
+    cs->gap = 0;
     cs->width = len_auto();
     cs->height = len_auto();
     cs->min_width = len_px(0);
@@ -202,6 +207,16 @@ static void copy_prop(struct computed_style *d, const struct computed_style *s,
         d->z_index = s->z_index;
         d->z_auto = s->z_auto;
         break;
+    case CSS_PROP_FLEX_DIRECTION:
+        d->flex_direction = s->flex_direction; break;
+    case CSS_PROP_JUSTIFY_CONTENT:
+        d->justify_content = s->justify_content; break;
+    case CSS_PROP_ALIGN_ITEMS:
+        d->align_items = s->align_items; break;
+    case CSS_PROP_FLEX_GROW:
+        d->flex_grow = s->flex_grow; break;
+    case CSS_PROP_GAP:
+        d->gap = s->gap; break;
     default: break;
     }
 }
@@ -375,6 +390,15 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
     case CSS_PROP_TEXT_DECORATION:
         if (v->type == CSS_VAL_BITS) cs->text_decoration = (uint8_t)v->kw;
         break;
+    case CSS_PROP_FLEX_DIRECTION:
+        if (v->type == CSS_VAL_KEYWORD) cs->flex_direction = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_JUSTIFY_CONTENT:
+        if (v->type == CSS_VAL_KEYWORD) cs->justify_content = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_ALIGN_ITEMS:
+        if (v->type == CSS_VAL_KEYWORD) cs->align_items = (uint8_t)v->kw;
+        break;
     case CSS_PROP_FONT_FAMILY:
         if (v->type == CSS_VAL_KEYWORD) {
             cs->font_family = (uint8_t)v->kw;
@@ -497,6 +521,20 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
     case CSS_PROP_BORDER_SPACING:
         if (v->type == CSS_VAL_LENGTH)
             cs->border_spacing = resolve_px(se, v, fs, root_fs);
+        break;
+    case CSS_PROP_FLEX_GROW:
+        if (v->type == CSS_VAL_NUMBER) {
+            int32_t grow = v->num;
+            if (grow < 0) grow = 0;
+            if (grow > 1000000) grow = 1000000;
+            cs->flex_grow = grow;
+        }
+        break;
+    case CSS_PROP_GAP:
+        if (v->type == CSS_VAL_LENGTH) {
+            int32_t gap = resolve_px(se, v, fs, root_fs);
+            cs->gap = gap > 0 ? gap : 0;
+        }
         break;
     case CSS_PROP_Z_INDEX:
         if (v->type == CSS_VAL_AUTO) {
@@ -863,12 +901,24 @@ static int dom_ops_is_empty(void *e)
     return DN(e)->first_child == 0;
 }
 
+static unsigned dom_ops_state(void *e)
+{
+    struct dom_node *n = DN(e);
+    unsigned state = 0;
+
+    if (dom_has_attr(n, "checked") || dom_has_attr(n, "selected"))
+        state |= CSS_STATE_CHECKED;
+    if (dom_has_attr(n, "disabled"))
+        state |= CSS_STATE_DISABLED;
+    return state;
+}
+
 const struct css_elem_ops *css_dom_ops(void)
 {
     static const struct css_elem_ops ops = {
         dom_ops_tag, dom_ops_attr, dom_ops_parent, dom_ops_prev,
         dom_ops_next, dom_ops_first_child, dom_ops_id, dom_ops_has_class,
-        0, dom_ops_is_empty
+        dom_ops_state, dom_ops_is_empty
     };
     return &ops;
 }

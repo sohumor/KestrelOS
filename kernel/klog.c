@@ -2,6 +2,7 @@
 #include "klog.h"
 #include "console.h"
 #include "serial.h"
+#include "output.h"
 #include "string.h"
 #include "proc.h"
 #include "kestrel_abi.h"
@@ -260,10 +261,7 @@ static void mirror_entry(const struct k_logent *e)
 {
     char line[sizeof(e->tag) + sizeof(e->msg) + 32];
     klog_format_entry(e, line, sizeof(line));
-    for (const char *p = line; *p; p++) {
-        console_putc(*p);
-        serial_putc(*p);
-    }
+    output_write(line, strlen(line));
 }
 
 void klog_write(int level, const char *tag, const char *msg)

@@ -9,6 +9,7 @@
 #include "proc.h"
 #include "console.h"
 #include "serial.h"
+#include "output.h"
 #include "input.h"
 #include "timer.h"
 #include "random.h"
@@ -531,12 +532,7 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
 
 static long write_console(const void *buf, unsigned long n)
 {
-    const char *p = buf;
-
-    for (unsigned long i = 0; i < n; i++) {
-        console_putc(p[i]);
-        serial_putc(p[i]);
-    }
+    output_write((const char *)buf, n);
     return (long)n;
 }
 

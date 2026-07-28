@@ -109,6 +109,30 @@ typedef int32_t css_num;
     X(CSS_DISPLAY_INLINE_GRID,        "inline-grid")
 enum { CSS_DISPLAY_LIST(CSS_ENUM_X) CSS_DISPLAY_COUNT };
 
+#define CSS_FLEXDIR_LIST(X) \
+    X(CSS_FLEXDIR_ROW,            "row") \
+    X(CSS_FLEXDIR_ROW_REVERSE,    "row-reverse") \
+    X(CSS_FLEXDIR_COLUMN,         "column") \
+    X(CSS_FLEXDIR_COLUMN_REVERSE, "column-reverse")
+enum { CSS_FLEXDIR_LIST(CSS_ENUM_X) CSS_FLEXDIR_COUNT };
+
+#define CSS_JUSTIFY_LIST(X) \
+    X(CSS_JUSTIFY_START,         "flex-start") \
+    X(CSS_JUSTIFY_END,           "flex-end") \
+    X(CSS_JUSTIFY_CENTER,        "center") \
+    X(CSS_JUSTIFY_SPACE_BETWEEN, "space-between") \
+    X(CSS_JUSTIFY_SPACE_AROUND,  "space-around") \
+    X(CSS_JUSTIFY_SPACE_EVENLY,  "space-evenly")
+enum { CSS_JUSTIFY_LIST(CSS_ENUM_X) CSS_JUSTIFY_COUNT };
+
+#define CSS_ALIGN_LIST(X) \
+    X(CSS_ALIGN_STRETCH, "stretch") \
+    X(CSS_ALIGN_START,   "flex-start") \
+    X(CSS_ALIGN_END,     "flex-end") \
+    X(CSS_ALIGN_CENTER,  "center") \
+    X(CSS_ALIGN_BASELINE,"baseline")
+enum { CSS_ALIGN_LIST(CSS_ENUM_X) CSS_ALIGN_COUNT };
+
 #define CSS_POSITION_LIST(X) \
     X(CSS_POSITION_STATIC,   "static") \
     X(CSS_POSITION_RELATIVE, "relative") \
@@ -327,7 +351,12 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_VISIBILITY,          "visibility") \
     X(CSS_PROP_BORDER_COLLAPSE,     "border-collapse") \
     X(CSS_PROP_BORDER_SPACING,      "border-spacing") \
-    X(CSS_PROP_Z_INDEX,             "z-index")
+    X(CSS_PROP_Z_INDEX,             "z-index") \
+    X(CSS_PROP_FLEX_DIRECTION,      "flex-direction") \
+    X(CSS_PROP_JUSTIFY_CONTENT,     "justify-content") \
+    X(CSS_PROP_ALIGN_ITEMS,         "align-items") \
+    X(CSS_PROP_FLEX_GROW,           "flex-grow") \
+    X(CSS_PROP_GAP,                 "gap")
 enum { CSS_PROP_LIST(CSS_ENUM_X) CSS_PROP_COUNT };
 
 /* ------------------------------------------------------------------ *
@@ -578,6 +607,7 @@ struct computed_style {
     uint8_t visibility, font_style, font_family, list_style_type;
     uint8_t list_style_position, border_collapse, text_transform;
     uint8_t text_decoration;             /* CSS_DECOR_* bitmask         */
+    uint8_t flex_direction, justify_content, align_items;
     uint8_t border_style[4];
     uint8_t z_auto;
     uint16_t font_weight;                /* 100..900                    */
@@ -587,6 +617,8 @@ struct computed_style {
     int32_t border_spacing;              /* px                          */
     int32_t z_index;
     int32_t vertical_align_px;           /* when vertical_align == LENGTH */
+    int32_t flex_grow;                   /* unitless, thousandths        */
+    int32_t gap;                         /* px                           */
 
     struct css_len width, height;
     struct css_len min_width, max_width, min_height, max_height;

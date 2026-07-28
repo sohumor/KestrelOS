@@ -7,6 +7,10 @@
 
 #define COM1 0x3F8
 static spinlock_t serial_lock = SPINLOCK_INIT;
+static spinlock_t serial_rx_lock = SPINLOCK_INIT;
+static volatile bool serial_input_online;
+
+static void serial_drain_rx(void);
 
 void serial_init(void)
 {
@@ -15,15 +19,33 @@ void serial_init(void)
     outb(COM1 + 0, 0x01);    /* divisor 1 -> 115200 baud */
     outb(COM1 + 1, 0x00);
     outb(COM1 + 3, 0x03);    /* 8N1 */
-    outb(COM1 + 2, 0xC7);    /* FIFO on, clear, 14-byte threshold */
+    /*
+     * Interactive input arrives in short bursts.  A 14-byte RX trigger can
+     * leave a whole shell command waiting for the UART timeout and overrun
+     * the FIFO while an SMP guest is busy printing logs.  Interrupt on the
+     * first byte so serial input is drained promptly.
+     */
+    outb(COM1 + 2, 0x07);    /* FIFO on, clear RX/TX, 1-byte threshold */
     outb(COM1 + 4, 0x0B);    /* DTR | RTS | OUT2 */
 }
 
 static void serial_emit(char c)
 {
+    /*
+     * Kernel output is record-locked with local IRQs disabled so an IRQ log
+     * cannot deadlock by re-entering the same output stream.  A long record
+     * can therefore outlast COM1's tiny RX FIFO.  Poll received bytes while
+     * waiting for and filling the transmitter; the normal IRQ path uses the
+     * same drain routine once the record releases the lock.
+     */
+    if (serial_input_online)
+        serial_drain_rx();
     while (!(inb(COM1 + 5) & 0x20))
-        ;
+        if (serial_input_online)
+            serial_drain_rx();
     outb(COM1, c);
+    if (serial_input_online)
+        serial_drain_rx();
 }
 
 void serial_putc(char c)
@@ -126,16 +148,26 @@ static void serial_handle_byte(uint8_t b)
 static void serial_irq(struct regs *r)
 {
     (void)r;
+    serial_drain_rx();
+}
+
+static void serial_drain_rx(void)
+{
+    uint64_t flags = spin_lock_irqsave(&serial_rx_lock);
+
     while (inb(COM1 + 5) & 1) {
         uint8_t byte = inb(COM1);
         entropy_pool_add_interrupt(ENTROPY_SERIAL, byte);
         serial_handle_byte(byte);
     }
+    spin_unlock_irqrestore(&serial_rx_lock, flags);
 }
 
 void serial_init_irq(void)
 {
-    outb(COM1 + 1, 0x01);    /* enable "data available" interrupt */
     irq_install_handler(4, serial_irq);
+    serial_input_online = true;
+    serial_drain_rx();
+    outb(COM1 + 1, 0x01);    /* enable "data available" interrupt */
     pic_clear_mask(4);
 }

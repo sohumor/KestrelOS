@@ -31,7 +31,8 @@ static const struct { const char *w; int tok; } kw_table[] = {
     { "null", TK_NULL_KW }, { "return", TK_RETURN }, { "switch", TK_SWITCH },
     { "this", TK_THIS }, { "throw", TK_THROW }, { "true", TK_TRUE },
     { "try", TK_TRY }, { "typeof", TK_TYPEOF }, { "var", TK_VAR },
-    { "void", TK_VOID }, { "while", TK_WHILE }, { "with", TK_WITH },
+    { "const", TK_CONST }, { "let", TK_LET }, { "void", TK_VOID },
+    { "while", TK_WHILE }, { "with", TK_WITH },
     { 0, 0 }
 };
 

@@ -112,7 +112,9 @@ of a cycle and is marked `failed`; the algorithm always terminates.
 Before starting a unit, init recursively starts every hard requirement.
 A requirement is usable when it is running, or when it is a successful
 `restart=never` one-shot. If a hard requirement later becomes unavailable,
-init stops its active dependents and marks them failed.
+init stops its active dependents and marks them failed. A control command
+that removes a requirement publishes that dependent failure before its
+acknowledgement; the terminating child remains supervised until it is reaped.
 
 When `ready=` is set, init removes any stale marker, spawns the service in
 the `starting` state, and waits until the marker appears. Exiting before the
@@ -153,7 +155,7 @@ Unit states, as reported in the state file and by `service`:
 | `running`  | alive and ready, pid in the state file |
 | `waiting`  | dead, waiting for its restart backoff |
 | `exited`   | finished and not supervised (`once`, `respawn=no`, `sysinit`) |
-| `failed`   | crash loop, missing program, bad `.svc`, or a dependency cycle |
+| `failed`   | crash loop, missing program, bad `.svc`, dependency loss, or a cycle |
 | `disabled` | `enabled=no` |
 
 ### Why not SYS_WAITANY
@@ -198,7 +200,11 @@ sh running 7 2 0
 
 Fields are `name state pid restarts exit-code`, separated by single
 spaces. `service list` and `service status` read this file and nothing
-else.
+else. init publishes the table as one fixed-size, journaled in-place write,
+so readers see either the preceding complete snapshot or the new complete
+snapshot; it never truncates the live file before filling it. A successful
+control acknowledgement is written only after the corresponding snapshot
+has been published.
 
 ### /run/init.cmd — written by `service`, consumed by init
 

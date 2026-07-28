@@ -231,6 +231,9 @@ static const char *const d_float[]     = { CSS_FLOAT_LIST(X_STR) 0 };
 static const char *const d_clear[]     = { CSS_CLEAR_LIST(X_STR) 0 };
 static const char *const d_talign[]    = { CSS_TEXTALIGN_LIST(X_STR) 0 };
 static const char *const d_valign[]    = { CSS_VALIGN_LIST(X_STR) 0 };
+static const char *const d_flexdir[]   = { CSS_FLEXDIR_LIST(X_STR) 0 };
+static const char *const d_justify[]   = { CSS_JUSTIFY_LIST(X_STR) 0 };
+static const char *const d_align[]     = { CSS_ALIGN_LIST(X_STR) 0 };
 static const char *const d_ws[]        = { CSS_WHITESPACE_LIST(X_STR) 0 };
 static const char *const d_ovf[]       = { CSS_OVERFLOW_LIST(X_STR) 0 };
 static const char *const d_vis[]       = { CSS_VISIBILITY_LIST(X_STR) 0 };
@@ -323,6 +326,17 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
         else
             strcpy(out, kwname(d_valign, cs->vertical_align, CSS_VALIGN_COUNT));
         return 1;
+    case CSS_PROP_FLEX_DIRECTION:
+        strcpy(out, kwname(d_flexdir, cs->flex_direction,
+                           CSS_FLEXDIR_COUNT)); return 1;
+    case CSS_PROP_JUSTIFY_CONTENT:
+        strcpy(out, kwname(d_justify, cs->justify_content,
+                           CSS_JUSTIFY_COUNT)); return 1;
+    case CSS_PROP_ALIGN_ITEMS:
+        strcpy(out, kwname(d_align, cs->align_items,
+                           CSS_ALIGN_COUNT)); return 1;
+    case CSS_PROP_FLEX_GROW: fmt_milli(cs->flex_grow, out); return 1;
+    case CSS_PROP_GAP:       sprintf(out, "%dpx", (int)cs->gap); return 1;
     case CSS_PROP_FONT_SIZE:   sprintf(out, "%dpx", (int)cs->font_size); return 1;
     case CSS_PROP_FONT_WEIGHT: sprintf(out, "%d", (int)cs->font_weight); return 1;
     case CSS_PROP_Z_INDEX:
@@ -677,6 +691,18 @@ static const struct tcase cases[] = {
 {"z-index", "#t { z-index: 5 }", "<p id=t/>", "t", "z-index=5", 0},
 {"z-index-auto", "#t { z-index: auto }", "<p id=t/>", "t", "z-index=auto", 0},
 {"z-index-neg", "#t { z-index: -2 }", "<p id=t/>", "t", "z-index=-2", 0},
+{"flex-properties",
+ "#t { display:flex; flex-direction:row-reverse; "
+ "justify-content:space-between; align-items:center; flex-grow:2.5; gap:12px }",
+ "<div id=t/>", "t",
+ "display=flex;flex-direction=row-reverse;justify-content=space-between;"
+ "align-items=center;flex-grow=2.5;gap=12px", 0},
+{"flex-invalid",
+ "#t { flex-direction:diagonal; justify-content:left; align-items:sideways; "
+ "flex-grow:-1; gap:-2px }",
+ "<div id=t/>", "t",
+ "flex-direction=row;justify-content=flex-start;align-items=stretch;"
+ "flex-grow=0;gap=0px", 0},
 
 /* ---------------- @media ---------------- */
 {"media-screen-in", "@media screen { #t { color: red } }", "<p id=t/>", "t",
@@ -725,6 +751,18 @@ static const struct tcase cases[] = {
 {"supports-skipped",
  "@supports (display: grid) { #t { color: blue } } #t { color: red }",
  "<p id=t/>", "t", "color=#ff0000", 0},
+{"supports-flex",
+ "@supports (display: flex) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
+{"supports-not-grid",
+ "@supports not (grid-template-columns: 1fr) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
+{"supports-and",
+ "@supports (display:flex) and (gap:1px) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
+{"supports-or",
+ "@supports ((display:grid) or (display:flex)) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
 {"charset-skipped", "@charset \"utf-8\"; #t { color: red }", "<p id=t/>", "t",
  "color=#ff0000", 0},
 {"import-then-rule", "@import url(a.css); #t { color: red }", "<p id=t/>", "t",
@@ -960,12 +998,14 @@ static void api_tests(void)
     {
         const char *src = "@import url(reset.css);\n"
                           "@import \"theme.css\" screen;\n"
+                          "@import url('/quoted.css');\n"
                           "p { color: red }";
         struct css_stylesheet *ss = css_parse(src, strlen(src),
                                               CSS_ORIGIN_AUTHOR, 0);
-        expect_int("import count", css_import_count(ss), 2);
+        expect_int("import count", css_import_count(ss), 3);
         expect_str("import 0", css_import_url(ss, 0), "reset.css");
         expect_str("import 1", css_import_url(ss, 1), "theme.css");
+        expect_str("import quoted url", css_import_url(ss, 2), "/quoted.css");
         expect_int("import: rule survives", css_rule_count(ss), 1);
         css_free(ss);
     }

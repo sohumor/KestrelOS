@@ -4,7 +4,7 @@
  *
  * SCOPE. This is not a production JavaScript engine and does not pretend to
  * be one. There is no JIT, no garbage collector, no event loop, no promises,
- * no generators, no `let`/`const`, no modules, and no strict mode. What it
+ * no generators, no modules, and no strict mode. What it
  * does implement is the ES5 core language -- the full expression grammar,
  * the full statement set, closures, prototypes, exceptions, automatic
  * semicolon insertion, the ES5 abstract coercion operations, and the common
@@ -144,6 +144,8 @@ static inline int js_is_string(js_value v)    { return v.type == JS_STRING; }
 static inline int js_is_object(js_value v)    { return v.type == JS_OBJECT; }
 int  js_is_function(js_value v);
 int  js_is_array(js_value v);
+int  js_is_promise(js_value v);
+int  js_is_arraybuffer(js_value v);
 
 /* Bytes of a string value; `len` may be NULL. NULL for non-strings. */
 const char *js_string_bytes(js_value v, unsigned long *len);
@@ -182,6 +184,12 @@ unsigned long js_array_length(js_object *a);
 int           js_array_push(js_ctx *ctx, js_object *a, js_value v);
 int           js_array_get(js_ctx *ctx, js_object *a, unsigned long i, js_value *out);
 
+/* ArrayBuffer storage is owned by the JS context and remains valid until
+ * js_free(). The constructor copies `data`; NULL creates zero-filled bytes. */
+js_value      js_arraybuffer_new(js_ctx *ctx, const void *data,
+                                unsigned long len);
+const void   *js_arraybuffer_data(js_value v, unsigned long *len);
+
 /* The global object, as a value. */
 js_value js_global(js_ctx *ctx);
 
@@ -219,11 +227,22 @@ int js_throw(js_ctx *ctx, js_value v);
 int js_throw_error(js_ctx *ctx, int kind, const char *fmt, ...);
 /* The pending exception (undefined if none). */
 js_value js_exception(js_ctx *ctx);
+void     js_clear_exception(js_ctx *ctx);
 
 /* Render any value the way an uncaught-error report would: Error objects
  * become "TypeError: message", everything else goes through ToString. The
  * result points into the context and stays valid until js_free(). */
 const char *js_error_text(js_ctx *ctx, js_value v);
+
+/* ---- promises and the microtask queue ----
+ * Promise callbacks do not run recursively while a promise is settled.
+ * Embedders call js_run_jobs() from their event loop/microtask checkpoint.
+ * The returned count is the number of reactions run; -1 means a fatal
+ * interpreter limit fired. */
+js_value js_promise_new(js_ctx *ctx);
+int js_promise_resolve(js_ctx *ctx, js_value promise, js_value value);
+int js_promise_reject(js_ctx *ctx, js_value promise, js_value reason);
+int js_run_jobs(js_ctx *ctx, unsigned long max_jobs);
 
 /* ------------------------------------------------------------------ */
 /* Known deviations from ES5                                           */
@@ -236,9 +255,13 @@ const char *js_error_text(js_ctx *ctx, js_value v);
  *     ES5 requires; anything else does not.
  * 2.  No garbage collection (see MEMORY MODEL above).
  * 3.  No strict mode; `"use strict"` parses and is ignored.
- * 4.  No `let`, `const`, arrow functions, classes, template literals,
- *     destructuring, spread, generators, promises, Symbol, Proxy, or
- *     typed arrays. Those are ES6+ and out of scope.
+ * 4.  `let` and `const` are accepted but currently use function-scoped
+ *     `var` bindings. There are no temporal dead zones or immutable
+ *     bindings. No arrow functions, classes, template literals,
+ *     destructuring, spread, generators, Symbol, Proxy, or
+ *     typed arrays. Promise (including all/race/finally), its microtask
+ *     queue, and ArrayBuffer are implemented; typed views and the other
+ *     language features remain outside the current subset.
  * 5.  Property attributes exist (enumerable/writable/configurable) and are
  *     honoured, but Object.defineProperty/getOwnPropertyDescriptor are the
  *     only ES5 meta-API implemented; seal/freeze/preventExtensions are
@@ -272,6 +295,11 @@ const char *js_error_text(js_ctx *ctx, js_value v);
  *     510 produce byte-identical output. The four that differ are the
  *     scope cuts above -- the ES2016 `**` operator, the ES6 method
  *     String.prototype.repeat, `__proto__`, and local-time-is-UTC.
+ * 14. WebAssembly implements a bounded i32-only MVP execution core. It
+ *     accepts ArrayBuffer or array-like bytes and supports straight-line
+ *     functions, locals, calls, comparisons, integer arithmetic and
+ *     exports. Imports, memory/tables/globals, structured control flow,
+ *     floating point, SIMD, threads and reference types are rejected.
  */
 
 /* ================================================================== */
@@ -296,7 +324,8 @@ enum js_token {
     TK_BREAK, TK_CASE, TK_CATCH, TK_CONTINUE, TK_DEBUGGER, TK_DEFAULT,
     TK_DELETE, TK_DO, TK_ELSE, TK_FALSE, TK_FINALLY, TK_FOR, TK_FUNCTION,
     TK_IF, TK_IN, TK_INSTANCEOF, TK_NEW, TK_NULL_KW, TK_RETURN, TK_SWITCH,
-    TK_THIS, TK_THROW, TK_TRUE, TK_TRY, TK_TYPEOF, TK_VAR, TK_VOID,
+    TK_THIS, TK_THROW, TK_TRUE, TK_TRY, TK_TYPEOF, TK_VAR, TK_CONST, TK_LET,
+    TK_VOID,
     TK_WHILE, TK_WITH,
     TK__COUNT
 };
@@ -407,11 +436,24 @@ typedef struct js_prop {
     uint32_t   hnext;      /* hash chain, index+1, 0 = end */
 } js_prop;
 
+typedef struct js_promise_reaction {
+    js_value on_fulfilled;
+    js_value on_rejected;
+    js_object *child;
+    struct js_promise_reaction *next;
+} js_promise_reaction;
+
+typedef struct js_promise_job {
+    js_object *source;
+    js_promise_reaction *reaction;
+    struct js_promise_job *next;
+} js_promise_job;
+
 enum js_class {
     JS_CLASS_OBJECT = 0, JS_CLASS_ARRAY, JS_CLASS_FUNCTION, JS_CLASS_ERROR,
     JS_CLASS_DATE, JS_CLASS_REGEXP, JS_CLASS_STRING, JS_CLASS_NUMBER,
     JS_CLASS_BOOLEAN, JS_CLASS_ARGUMENTS, JS_CLASS_MATH, JS_CLASS_JSON,
-    JS_CLASS_HOST
+    JS_CLASS_PROMISE, JS_CLASS_ARRAYBUFFER, JS_CLASS_HOST
 };
 
 struct js_object {
@@ -431,6 +473,11 @@ struct js_object {
     js_func   *fn;          /* JS_CLASS_FUNCTION */
     js_value   prim;        /* wrapper primitive / Date time value */
     js_regexp *re;          /* JS_CLASS_REGEXP */
+    uint8_t    promise_state; /* 0 pending, 1 fulfilled, 2 rejected */
+    js_value   promise_result;
+    js_promise_reaction *promise_reactions;
+    uint8_t   *buffer;      /* JS_CLASS_ARRAYBUFFER */
+    uint32_t   byte_length;
     void      *host;        /* embedder pointer */
     uint32_t   host_tag;
 
@@ -533,6 +580,9 @@ struct js_ctx {
     js_value     *argstack;
     uint32_t      argsp;
 
+    js_promise_job *jobs_head;
+    js_promise_job *jobs_tail;
+
     const char   *script_name;
 
     /* per-tag host finalizers */
@@ -555,7 +605,8 @@ struct js_ctx {
 enum {
     P_OBJECT = 0, P_FUNCTION, P_ARRAY, P_STRING, P_NUMBER, P_BOOLEAN,
     P_ERROR, P_TYPEERROR, P_RANGEERROR, P_SYNTAXERROR, P_REFERENCEERROR,
-    P_EVALERROR, P_URIERROR, P_DATE, P_REGEXP
+    P_EVALERROR, P_URIERROR, P_DATE, P_REGEXP, P_PROMISE, P_ARRAYBUFFER,
+    P_WASM_MODULE, P_WASM_INSTANCE
 };
 
 /* ---- growable byte buffer (malloc-backed, charged to the heap cap) ---- */

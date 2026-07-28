@@ -4,6 +4,7 @@
 #include "interrupts.h"
 #include "console.h"
 #include "serial.h"
+#include "output.h"
 #include "input.h"
 #include "vfs.h"
 #include "vmm.h"
@@ -123,10 +124,7 @@ static long sys_write(uint64_t fd, uint64_t ubuf, uint64_t len)
                 n = COPY_CHUNK;
             if (copy_from_user(chunk, (const void *)(ubuf + done), n) < 0)
                 return done ? (long)done : -1;
-            for (uint64_t i = 0; i < n; i++) {
-                console_putc(chunk[i]);
-                serial_putc(chunk[i]);
-            }
+            output_write(chunk, (unsigned long)n);
             done += n;
         }
         return (long)done;

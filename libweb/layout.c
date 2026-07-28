@@ -507,9 +507,9 @@ static int used_display(const struct computed_style *cs)
     return d;
 }
 
-/* flex and grid have no layout of their own here; they behave as block
- * (or inline-block) containers, which keeps their contents readable and
- * in the right order instead of dropping them. */
+/* Flex containers use the bounded row layout below.  Unsupported column
+ * flex and grid constructs retain a readable block (or inline-block)
+ * fallback instead of dropping their contents. */
 static int box_kind_for_display(int d, uint32_t *flags)
 {
     switch (d) {
@@ -757,18 +757,173 @@ static int node_is_replaced(struct dom_node *n)
         return 0;
     switch (n->tag_id) {
     case HTAG_IMG:
+    case HTAG_AUDIO:
     case HTAG_CANVAS:
     case HTAG_VIDEO:
+    case HTAG_SVG:
     case HTAG_EMBED:
     case HTAG_OBJECT:
+    case HTAG_INPUT:
+    case HTAG_SELECT:
+    case HTAG_TEXTAREA:
         return 1;
-    case HTAG_INPUT: {
-        const char *t = dom_get_attr(n, "type");
-
-        return t && (t[0] == 'i' || t[0] == 'I') && !strncmp(t + 1, "mage", 4);
-    }
     default:
         return 0;
+    }
+}
+
+static int attr_positive(struct dom_node *n, const char *name, int def,
+                         int max)
+{
+    const char *s = dom_get_attr(n, name);
+    long v = s && *s ? atol(s) : def;
+
+    if (v <= 0)
+        v = def;
+    if (v > max)
+        v = max;
+    return (int)v;
+}
+
+static int value_is(const char *a, const char *b)
+{
+    if (!a)
+        return 0;
+    while (*a && *b) {
+        if (lo_ascii((unsigned char)*a) != lo_ascii((unsigned char)*b))
+            return 0;
+        a++;
+        b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static int viewbox_number(const char **pp, int64_t *out)
+{
+    const char *p = *pp;
+    int64_t whole = 0, frac = 0, scale = 1;
+    int sign = 1, have = 0, digits = 0;
+
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' ||
+           *p == ',')
+        p++;
+    if (*p == '-' || *p == '+') {
+        if (*p++ == '-') sign = -1;
+    }
+    while (*p >= '0' && *p <= '9') {
+        have = 1;
+        if (whole < 1000000)
+            whole = whole * 10 + (*p - '0');
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            have = 1;
+            if (digits++ < 3) {
+                frac = frac * 10 + (*p - '0');
+                scale *= 10;
+            }
+            p++;
+        }
+    }
+    if (!have)
+        return 0;
+    *out = sign * (whole * 1000 + frac * 1000 / scale);
+    *pp = p;
+    return 1;
+}
+
+static int svg_viewbox_ratio(struct dom_node *n, int64_t *vw, int64_t *vh)
+{
+    const char *p = dom_get_attr(n, "viewbox");
+    int64_t v[4];
+    int i;
+
+    if (!p)
+        return 0;
+    for (i = 0; i < 4; i++)
+        if (!viewbox_number(&p, &v[i]))
+            return 0;
+    if (v[2] <= 0 || v[3] <= 0)
+        return 0;
+    *vw = v[2];
+    *vh = v[3];
+    return 1;
+}
+
+static void control_intrinsic(struct dom_node *n, int32_t *w, int32_t *h)
+{
+    const char *type;
+
+    if (n->tag_id == HTAG_AUDIO) {
+        if (!*w) *w = 300;
+        if (!*h) *h = 32;
+        return;
+    }
+    if (n->tag_id == HTAG_SVG) {
+        int64_t vw, vh;
+
+        if (svg_viewbox_ratio(n, &vw, &vh)) {
+            if (*w && !*h) {
+                int64_t derived = (int64_t)*w * vh / vw;
+                *h = (int32_t)(derived < 1 ? 1 :
+                               (derived > 100000 ? 100000 : derived));
+            } else if (*h && !*w) {
+                int64_t derived = (int64_t)*h * vw / vh;
+                *w = (int32_t)(derived < 1 ? 1 :
+                               (derived > 100000 ? 100000 : derived));
+            }
+        }
+        if (!*w) *w = 300;
+        if (!*h) *h = 150;
+        return;
+    }
+    if (n->tag_id == HTAG_VIDEO || n->tag_id == HTAG_CANVAS) {
+        if (!*w) *w = 300;
+        if (!*h) *h = 150;
+        return;
+    }
+    if (n->tag_id == HTAG_TEXTAREA) {
+        *w = attr_positive(n, "cols", 20, 200) * 8 + 8;
+        *h = attr_positive(n, "rows", 2, 100) * 16 + 8;
+        return;
+    }
+    if (n->tag_id == HTAG_SELECT) {
+        int rows = dom_has_attr(n, "multiple")
+            ? attr_positive(n, "size", 4, 100) : 1;
+
+        *w = 180;
+        *h = rows * 18 + 6;
+        return;
+    }
+    if (n->tag_id != HTAG_INPUT)
+        return;
+    type = dom_get_attr(n, "type");
+    if (!type || !*type)
+        type = "text";
+    if (value_is(type, "checkbox") || value_is(type, "radio")) {
+        *w = 13;
+        *h = 13;
+    } else if (value_is(type, "submit") || value_is(type, "reset") ||
+               value_is(type, "button")) {
+        const char *v = dom_get_attr(n, "value");
+        int chars = v && *v ? (int)strlen(v) : 8;
+
+        if (chars < 4) chars = 4;
+        if (chars > 40) chars = 40;
+        *w = chars * 8 + 16;
+        *h = 24;
+    } else if (value_is(type, "image")) {
+        /* The image callback or width/height attributes decide this. */
+    } else if (value_is(type, "range")) {
+        *w = 160;
+        *h = 20;
+    } else {
+        int chars = attr_positive(n, "size", 20, 200);
+
+        *w = chars * 8 + 8;
+        *h = 22;
     }
 }
 
@@ -856,6 +1011,8 @@ static struct lay_box *build_node(struct build_env *e, struct dom_node *n,
 
     if ((uintptr_t)&here < c->stack_lo)
         c->stack_lo = (uintptr_t)&here;
+    if ((uintptr_t)&here > c->stack_hi)
+        c->stack_hi = (uintptr_t)&here;
     if (depth > c->depth_max)
         c->depth_max = depth;
 
@@ -880,7 +1037,14 @@ static struct lay_box *build_node(struct build_env *e, struct dom_node *n,
     /* Replaced elements are atomic: they never get child boxes. */
     if (node_is_replaced(n)) {
         int32_t iw = 0, ih = 0;
-        const char *src = dom_get_attr(n, "src");
+        const char *input_type = n->tag_id == HTAG_INPUT
+            ? dom_get_attr(n, "type") : 0;
+        const char *src = n->tag_id == HTAG_VIDEO
+            ? dom_get_attr(n, "poster")
+            : ((n->tag_id == HTAG_IMG ||
+                (n->tag_id == HTAG_INPUT &&
+                 value_is(input_type, "image")))
+               ? dom_get_attr(n, "src") : 0);
 
         b = box_new(c, LAY_BOX_REPLACED, cs, n);
         if (!b)
@@ -901,6 +1065,7 @@ static struct lay_box *build_node(struct build_env *e, struct dom_node *n,
         }
         if (!iw) attr_px(n, "width", &iw);
         if (!ih) attr_px(n, "height", &ih);
+        control_intrinsic(n, &iw, &ih);
         b->intrinsic_w = iw;
         b->intrinsic_h = ih;
         return b;
@@ -1375,6 +1540,8 @@ static void intrinsic_widths(struct lay_ctx *c, struct lay_box *b,
 
     if ((uintptr_t)&here < c->stack_lo)
         c->stack_lo = (uintptr_t)&here;
+    if ((uintptr_t)&here > c->stack_hi)
+        c->stack_hi = (uintptr_t)&here;
 
     *minw = *maxw = 0;
     if (depth >= LAY_MAX_DEPTH) {
@@ -2864,6 +3031,151 @@ static void place_marker_outside(struct lay_box *b, struct lay_box *m)
     box_append(b, m);
 }
 
+struct flex_item {
+    struct lay_box *box;
+    int32_t basis;
+    int32_t allocated;
+};
+
+/* A bounded single-line flex formatting context.  It covers the common
+ * navigation/toolbar/card-row case: row and row-reverse, flex-grow, gap,
+ * justify-content and cross-axis start/end/center alignment.  Column flex
+ * intentionally continues through normal block flow, which is already its
+ * interoperable fallback. */
+static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
+                               int32_t y, struct lay_bfc *bfc, int depth)
+{
+    struct flex_item *items;
+    struct lay_box *ch;
+    int count = 0, i, reverse;
+    int64_t total = 0, grow_total = 0;
+    int32_t gap = b->style->gap > 0 ? b->style->gap : 0;
+    int32_t free_space, start = 0, gap_extra = 0, cursor, max_h = 0;
+
+    for (ch = b->first_child; ch; ch = ch->next)
+        if (ch->kind != LAY_BOX_MARKER && !(ch->flags & LAYF_ABSOLUTE))
+            count++;
+    if (!count)
+        return 0;
+    if (count > 512)
+        return -1;
+    items = (struct flex_item *)calloc((unsigned long)count, sizeof(*items));
+    if (!items)
+        return -1;
+    i = 0;
+    for (ch = b->first_child; ch; ch = ch->next) {
+        int32_t basis, mn = 0, mx = 0;
+
+        if (ch->kind == LAY_BOX_MARKER)
+            continue;
+        if (ch->flags & LAYF_ABSOLUTE) {
+            record_out_of_flow(c, ch, b->x, y);
+            continue;
+        }
+        if (ch->style->width.type == CSS_LEN_PX ||
+            ch->style->width.type == CSS_LEN_PCT) {
+            basis = used_len(ch->style->width, b->w, 0);
+        } else if (ch->style->flex_grow > 0) {
+            basis = 0;
+        } else {
+            intrinsic_widths(c, ch, &mn, &mx, depth + 1);
+            basis = mx;
+        }
+        if (basis < 0) basis = 0;
+        if (basis > b->w) basis = b->w;
+        items[i].box = ch;
+        items[i].basis = basis;
+        items[i].allocated = basis;
+        total += basis;
+        grow_total += ch->style->flex_grow;
+        i++;
+    }
+    total += (int64_t)gap * (count - 1);
+    free_space = total < b->w ? b->w - (int32_t)total : 0;
+    if (free_space > 0 && grow_total > 0) {
+        int32_t remaining = free_space;
+        int64_t grow_left = grow_total;
+
+        for (i = 0; i < count; i++) {
+            int32_t grow = items[i].box->style->flex_grow;
+            int32_t add;
+
+            if (grow <= 0)
+                continue;
+            add = grow == grow_left ? remaining :
+                (int32_t)((int64_t)remaining * grow / grow_left);
+            items[i].allocated += add;
+            remaining -= add;
+            grow_left -= grow;
+        }
+        free_space = 0;
+    } else if (total > b->w) {
+        int64_t bases = total - (int64_t)gap * (count - 1);
+        int32_t room = b->w - gap * (count - 1);
+
+        if (room < count) room = count;
+        if (bases > 0)
+            for (i = 0; i < count; i++) {
+                items[i].allocated = (int32_t)
+                    ((int64_t)items[i].basis * room / bases);
+                if (items[i].allocated < 1)
+                    items[i].allocated = 1;
+            }
+        free_space = 0;
+    }
+    if (free_space > 0) {
+        switch (b->style->justify_content) {
+        case CSS_JUSTIFY_END:
+            start = free_space;
+            break;
+        case CSS_JUSTIFY_CENTER:
+            start = free_space / 2;
+            break;
+        case CSS_JUSTIFY_SPACE_BETWEEN:
+            if (count > 1) gap_extra = free_space / (count - 1);
+            break;
+        case CSS_JUSTIFY_SPACE_AROUND:
+            gap_extra = free_space / count;
+            start = gap_extra / 2;
+            break;
+        case CSS_JUSTIFY_SPACE_EVENLY:
+            gap_extra = free_space / (count + 1);
+            start = gap_extra;
+            break;
+        default:
+            break;
+        }
+    }
+    reverse = b->style->flex_direction == CSS_FLEXDIR_ROW_REVERSE;
+    cursor = b->x + start;
+    for (i = 0; i < count; i++) {
+        int at = reverse ? count - 1 - i : i;
+        lay_rect r;
+
+        ch = items[at].box;
+        layout_standalone(c, ch, cursor, y, items[at].allocated,
+                          0, depth + 1);
+        r = lay_margin_rect(ch);
+        if (r.h > max_h) max_h = r.h;
+        cursor += items[at].allocated + gap + gap_extra;
+    }
+    if (b->style->align_items == CSS_ALIGN_END ||
+        b->style->align_items == CSS_ALIGN_CENTER) {
+        for (i = 0; i < count; i++) {
+            lay_rect r = lay_margin_rect(items[i].box);
+            int32_t dy = max_h - r.h;
+
+            if (b->style->align_items == CSS_ALIGN_CENTER)
+                dy /= 2;
+            if (dy > 0)
+                translate_subtree(items[i].box, 0, dy);
+        }
+    }
+    free(items);
+    (void)bfc;
+    return max_h;
+}
+
 /* ---- the block box ----------------------------------------------- */
 
 static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
@@ -2883,6 +3195,8 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
 
     if ((uintptr_t)&here < c->stack_lo)
         c->stack_lo = (uintptr_t)&here;
+    if ((uintptr_t)&here > c->stack_hi)
+        c->stack_hi = (uintptr_t)&here;
     if (depth > c->depth_max)
         c->depth_max = depth;
     if (depth >= LAY_BLOCK_MAX_DEPTH) {
@@ -2978,6 +3292,14 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
 
         h_children = layout_inline(c, b, &mine, content_y, &mw, depth);
         has_lines = h_children > 0;
+        flow = content_y + h_children;
+        open = marg_of(0);
+    } else if ((cs->display == CSS_DISPLAY_FLEX ||
+                cs->display == CSS_DISPLAY_INLINE_FLEX) &&
+               (cs->flex_direction == CSS_FLEXDIR_ROW ||
+                cs->flex_direction == CSS_FLEXDIR_ROW_REVERSE) &&
+               (h_children = layout_flex_row(c, b, content_y,
+                                             &mine, depth)) >= 0) {
         flow = content_y + h_children;
         open = marg_of(0);
     } else {
@@ -3404,6 +3726,8 @@ static void layout_table(struct lay_ctx *c, struct lay_box *t, int32_t cb_x,
 
     if ((uintptr_t)&here < c->stack_lo)
         c->stack_lo = (uintptr_t)&here;
+    if ((uintptr_t)&here > c->stack_hi)
+        c->stack_hi = (uintptr_t)&here;
     if (depth >= LAY_MAX_DEPTH) {
         c->L->trunc |= LAY_TRUNC_DEPTH;
         return;

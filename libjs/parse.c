@@ -771,7 +771,8 @@ static js_node *parse_for(parser *p)
     if (!advance(p)) return 0;               /* past 'for' */
     if (!expect(p, TK_LPAREN, "( after for")) return 0;
 
-    if (p->lx.tok == TK_VAR) {
+    if (p->lx.tok == TK_VAR || p->lx.tok == TK_CONST ||
+        p->lx.tok == TK_LET) {
         init = parse_var(p, 1, &ndecl);
         if (!init) return 0;
         is_var = 1;
@@ -940,6 +941,8 @@ static js_node *parse_stmt(parser *p)
         return (n && advance(p)) ? n : 0;
 
     case TK_VAR:
+    case TK_CONST:
+    case TK_LET:
         n = parse_var(p, 0, 0);
         leave(p);
         return (n && semicolon(p)) ? n : 0;

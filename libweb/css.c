@@ -872,6 +872,9 @@ static void append_tok_text(const struct css_tok *t, char *b, int *len, int cap)
 #define CSS_STR_X(n, s) s,
 
 static const char *const kw_display[]     = { CSS_DISPLAY_LIST(CSS_STR_X) 0 };
+static const char *const kw_flexdir[]     = { CSS_FLEXDIR_LIST(CSS_STR_X) 0 };
+static const char *const kw_justify[]     = { CSS_JUSTIFY_LIST(CSS_STR_X) 0 };
+static const char *const kw_align[]       = { CSS_ALIGN_LIST(CSS_STR_X) 0 };
 static const char *const kw_position[]    = { CSS_POSITION_LIST(CSS_STR_X) 0 };
 static const char *const kw_float[]       = { CSS_FLOAT_LIST(CSS_STR_X) 0 };
 static const char *const kw_clear[]       = { CSS_CLEAR_LIST(CSS_STR_X) 0 };
@@ -965,7 +968,12 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_VISIBILITY]          = { 1, 0, kw_visibility },
     [CSS_PROP_BORDER_COLLAPSE]     = { 1, 0, kw_bcollapse },
     [CSS_PROP_BORDER_SPACING]      = { 1, PA_LEN, 0 },
-    [CSS_PROP_Z_INDEX]             = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 }
+    [CSS_PROP_Z_INDEX]             = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
+    [CSS_PROP_FLEX_DIRECTION]      = { 0, 0, kw_flexdir },
+    [CSS_PROP_JUSTIFY_CONTENT]     = { 0, 0, kw_justify },
+    [CSS_PROP_ALIGN_ITEMS]         = { 0, 0, kw_align },
+    [CSS_PROP_FLEX_GROW]           = { 0, PA_NUM, 0 },
+    [CSS_PROP_GAP]                 = { 0, PA_LEN, 0 }
 };
 
 const char *css_property_name(int prop)
@@ -2954,6 +2962,94 @@ static int parse_media_list(struct css_parser *p, int parent)
 
 static void parse_rule_list(struct css_parser *p, int in_block);
 
+/* A bounded CSS Conditional Rules subset.  Feature declarations are fed
+ * through the same value coercion as ordinary declarations, so
+ * @supports(display:flex) cannot claim a feature the engine would discard.
+ * The boolean grammar covers nested parentheses plus not/and/or. */
+static int parse_supports_or(struct css_parser *p);
+
+static int parse_supports_term(struct css_parser *p)
+{
+    int value = 0;
+
+    skip_ws(p);
+    if (p->tok.type == T_IDENT &&
+        css_stricmp(p->tok.text, "not") == 0) {
+        nx(p);
+        return !parse_supports_term(p);
+    }
+    if (p->tok.type != T_LPAREN)
+        return 0;
+    nx(p);
+    skip_ws(p);
+    if (p->tok.type == T_IDENT) {
+        char name[CSS_MAX_IDENT];
+
+        memcpy(name, p->tok.text, (unsigned long)p->tok.tlen + 1);
+        nx(p);
+        skip_ws(p);
+        if (p->tok.type == T_COLON) {
+            int important = 0, saved = p->nblock;
+
+            nx(p);
+            if (read_value(p, &important) &&
+                p->tok.type == T_RPAREN)
+                value = apply_declaration(p, name, important);
+            p->nblock = saved;
+        } else {
+            /* An identifier-led non-declaration condition is unknown. */
+            while (p->tok.type != T_RPAREN &&
+                   p->tok.type != T_LBRACE &&
+                   p->tok.type != T_EOF)
+                nx(p);
+        }
+    } else {
+        value = parse_supports_or(p);
+    }
+    skip_ws(p);
+    if (p->tok.type == T_RPAREN)
+        nx(p);
+    else
+        value = 0;
+    return value;
+}
+
+static int parse_supports_and(struct css_parser *p)
+{
+    int value = parse_supports_term(p);
+
+    for (;;) {
+        int rhs;
+
+        skip_ws(p);
+        if (p->tok.type != T_IDENT ||
+            css_stricmp(p->tok.text, "and") != 0)
+            break;
+        nx(p);
+        rhs = parse_supports_term(p);
+        value = value && rhs;
+    }
+    return value;
+}
+
+static int parse_supports_or(struct css_parser *p)
+{
+    int value = parse_supports_and(p);
+
+    for (;;) {
+        int rhs;
+
+        skip_ws(p);
+        if (p->tok.type != T_IDENT ||
+            css_stricmp(p->tok.text, "or") != 0)
+            break;
+        nx(p);
+        rhs = parse_supports_and(p);
+        value = value || rhs;
+    }
+    return value;
+}
+
 static void parse_at_rule(struct css_parser *p)
 {
     char name[CSS_MAX_IDENT];
@@ -2978,6 +3074,31 @@ static void parse_at_rule(struct css_parser *p)
         }
         return;
     }
+    if (css_stricmp(name, "supports") == 0) {
+        int matches;
+
+        skip_ws(p);
+        matches = parse_supports_or(p);
+        skip_ws(p);
+        if (p->tok.type != T_LBRACE) {
+            while (p->tok.type != T_SEMI &&
+                   p->tok.type != T_LBRACE &&
+                   p->tok.type != T_EOF)
+                nx(p);
+        }
+        if (p->tok.type == T_SEMI) {
+            nx(p);
+            return;
+        }
+        if (p->tok.type == T_LBRACE) {
+            nx(p);
+            if (matches)
+                parse_rule_list(p, 1);
+            else
+                skip_block(p);
+        }
+        return;
+    }
     if (css_stricmp(name, "import") == 0) {
         skip_ws(p);
         if (p->tok.type == T_URL || p->tok.type == T_STRING) {
@@ -2990,6 +3111,24 @@ static void parse_at_rule(struct css_parser *p)
                 p->ss->truncated = 1;
             }
             nx(p);
+        } else if (p->tok.type == T_FUNCTION &&
+                   css_stricmp(p->tok.text, "url") == 0) {
+            nx(p);
+            skip_ws(p);
+            if (p->tok.type == T_STRING) {
+                if (p->ss->nimport < CSS_MAX_IMPORTS) {
+                    const char *u = arena_str(&p->ss->arena, p->tok.text,
+                                              (unsigned long)p->tok.tlen);
+                    if (u)
+                        p->ss->imports[p->ss->nimport++] = u;
+                } else {
+                    p->ss->truncated = 1;
+                }
+                nx(p);
+                skip_ws(p);
+                if (p->tok.type == T_RPAREN)
+                    nx(p);
+            }
         }
         while (p->tok.type != T_SEMI && p->tok.type != T_EOF &&
                p->tok.type != T_LBRACE)
@@ -3002,10 +3141,8 @@ static void parse_at_rule(struct css_parser *p)
         }
         return;
     }
-    /* Everything else - @font-face, @page, @keyframes, @supports,
-     * @charset, @namespace - is parsed far enough to be skipped safely.
-     * @supports in particular is skipped rather than included: its blocks
-     * are gated on features this engine does not have. */
+    /* Everything else - @font-face, @page, @keyframes, @charset and
+     * @namespace - is parsed far enough to be skipped safely. */
     while (p->tok.type != T_SEMI && p->tok.type != T_LBRACE &&
            p->tok.type != T_EOF)
         nx(p);

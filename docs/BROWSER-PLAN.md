@@ -48,33 +48,71 @@ reports its own size and the browser's total is tracked.
 ## The honest ceiling
 
 **JavaScript.** A production engine (JIT, full ES2023, the complete DOM and Web
-APIs) is a multi-year project for a team. What is achievable here is a
-tree-walking interpreter for an ES5 subset with DOM bindings: enough to run
-simple scripts that manipulate the page, handle a click, or validate a form. It
-will not run Gmail, React, or anything that expects `fetch`, promises,
-modules, or a real event loop — and pages built entirely in JavaScript will
-render as whatever their `<noscript>` fallback is, which is usually nothing.
+APIs) is a multi-year project for a team. The current tree-walking interpreter
+has an ES5 core, `let`/`const` syntax with `var` semantics, bounded static module
+graphs, a Promise/microtask subset (`all`, `race`, and `finally` included),
+asynchronous `fetch`/`Response`, and a bounded i32-only WebAssembly MVP core.
+Those features run controlled applications and tests; they do not turn it into
+a full modern-JavaScript engine. `import.meta.url` and literal-string
+`import()` are supported, but literal dynamic imports are eagerly resolved and
+evaluated before their Promise is returned. Inline `import.meta.url` is the
+document URL. External modules follow fetch-style CORS/cookie rules and require
+a JavaScript MIME type; supported import statements preserve source after
+their terminating semicolon. Module bindings are not live, computed imports
+and general ES2015+ syntax are absent, and large framework applications remain
+outside the compatibility boundary.
 
 **Crypto.** The TLS implementation is written from the specifications and is
 **not audited**. It is constant-time where that is cheap to arrange and not
 where it is not. It is good enough to fetch a public web page; it should not be
 trusted with anything that matters.
 
-**Rendering.** The framebuffer has no alpha compositing and the fonts are
-bitmaps, so gradients, shadows, rounded corners, transforms and web fonts are
-out of reach. Pages will be legible and correctly laid out, not pixel-identical
-to Chrome.
+**Rendering.** The renderer has alpha compositing, conventional block/inline/
+table/floating/positioned layout, and a bounded single-line flex-row subset.
+Inline SVG supports basic rectangles, lines, circles, ellipses, text,
+polygons, polylines, presentation fill/stroke, and `viewBox`. Its bounded path
+subset accepts move, line, horizontal/vertical line, quadratic/cubic curve,
+arc, and close commands, but arcs use an endpoint fallback and this is not a
+complete path or SVG implementation. Only one bounded subpath is consumed.
+Default `viewBox` painting is centered and aspect-preserving with meet
+behavior, and one missing intrinsic dimension can be derived from its ratio.
+Coordinate, point, shape, path-flattening, pixel, and total raster-work caps
+bound processing. Transforms, gradients, masks, and complete
+`preserveAspectRatio` behavior remain absent. Video posters and audio/video
+fallback boxes render, but codecs and playback do not exist. Fonts are built-in
+bitmaps and downloadable webfonts are not implemented. Pages should be
+legible, not pixel-identical to Chrome.
+
+**Transport.** HTTPS is HTTP/1.1 protected by verified TLS 1.3. HTTP/2 and its
+HPACK/framing layer are not implemented. HTTP/3 would additionally require a
+QUIC stack, QPACK, and UDP transport work and is also not implemented.
 
 **What should work well:** documentation sites, wikis, news articles, blogs,
 forums, plain-HTML applications, and anything designed to degrade gracefully.
 That is a large and genuinely useful part of the web.
 
-## Order of work
+## Implementation status
 
-- **Wave A — foundations:** DEFLATE; hashes, HMAC/HKDF and AEADs; bignum, RSA,
+- **Wave A — foundations (complete):** DEFLATE; hashes, HMAC/HKDF and AEADs; bignum, RSA,
   X25519, P-256, X.509; multi-size and multi-weight fonts; the HTML5 tokenizer
   and DOM tree.
-- **Wave B — the engine:** TLS 1.3 on the crypto; the CSS parser and cascade;
+- **Wave B — the engine (complete):** TLS 1.3 on the crypto; the CSS parser and cascade;
   the layout engine; PNG, GIF and JPEG.
-- **Wave C — the product:** the HTTP stack, the JavaScript interpreter, the
-  browser UI (tabs, history, bookmarks, find, zoom, downloads), and the tests.
+- **Wave C — usable web product (in progress):** HTTP, cache, cookies,
+  JavaScript/DOM bindings, external resources, history, forms, and controlled
+  web tests are implemented. Bounded static modules, Promise jobs and
+  `all`/`race`/`finally`, asynchronous fetch with redirect/CORS controls,
+  `Response.text()`/`json()`/`arrayBuffer()`, an i32-only WebAssembly MVP core,
+  `import.meta.url`, eagerly resolved literal-string `import()`, a flex-row
+  layout subset, MIME/CORS-checked external modules, bounded
+  aspect-preserving inline SVG shapes/paths, and video-poster/media fallbacks
+  are present.
+- **Wave D — broader compatibility (future):** tabs, bookmarks, find, zoom,
+  downloads, lexical ES2015+ semantics and broader syntax, live module
+  bindings and computed/on-demand dynamic import, complete Fetch/DOM/Web APIs,
+  full flex/grid and SVG, downloadable webfonts, media codecs/playback,
+  HTTP/2, and HTTP/3.
+
+This is not a plan to promise compatibility with every website. Each added
+surface must remain bounded and testable, and the documentation must distinguish
+a useful subset from standards conformance.

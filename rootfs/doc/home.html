@@ -32,10 +32,28 @@ line; in VirtualBox, an Intel PRO/1000 adapter.</p>
 HTTPS, redirects, cookies, caching, chunked bodies and gzip decoding all run
 through KestrelOS's own libraries.</p>
 
-<p>The limits are real: there is no TLS 1.2 fallback, the JavaScript engine is
-not yet connected to page DOM objects, external stylesheets and images are not
-fetched in this release, and the from-scratch cryptography has not had a
-professional audit. Many complex sites will still degrade or fail.</p>
+<p>Linked and imported stylesheets, PNG/JPEG/GIF/BMP images, classic
+JavaScript, bounded static modules, Promise jobs and asynchronous fetch,
+live DOM mutation, cookies, form controls and GET/POST submission are enabled.
+Script changes are re-styled and re-laid out. Small i32 WebAssembly modules,
+single-line flex rows and basic inline SVG shapes are also supported.</p>
+
+<p>The limits are real: <code>let</code>/<code>const</code> currently have
+<code>var</code> semantics and module bindings are not live.
+<code>import.meta.url</code> works, and literal-string
+<code>import()</code> returns a Promise, but those modules are eagerly loaded
+and computed imports are unsupported. Inline modules report the document URL;
+external modules require a JavaScript MIME type and obey fetch-style
+CORS/cookie rules. Inline SVG has polygons, polylines and a bounded,
+single-subpath command subset, not complete paths, arcs or effects. Its default
+<code>viewBox</code> scaling is centered and aspect-preserving, one missing
+dimension can be derived from that ratio, and coordinate/raster work is
+capped. Downloadable webfonts, media codecs and playback are not implemented;
+video can show a poster and audio/video otherwise use fallback boxes. HTTPS
+uses HTTP/1.1 over TLS 1.3 &mdash; HTTP/2 and HTTP/3 are not implemented. The
+from-scratch cryptography has not had a professional audit. Complex sites will
+still degrade or fail; this browser does not claim compatibility with every
+website.</p>
 
 <h2>Getting around</h2>
 

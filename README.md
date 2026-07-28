@@ -63,6 +63,13 @@ verified TLS 1.3 HTTPS clients on top.
 buffer is mapped into the owning process, with stacking, focus, draggable title
 bars and routed input; a userspace widget toolkit; and a desktop shell with a
 taskbar, a graphical terminal, file manager, clock, paint program and browser.
+The browser has verified HTTPS, persistent cookies and cache, linked/imported
+CSS, PNG/GIF/JPEG/BMP images, a live DOM with guarded ES5 JavaScript, bounded
+static modules, Promise/fetch support, a small i32 WebAssembly core, native
+form controls, and GET/POST submission. Rendering includes a flex-row subset,
+bounded aspect-preserving inline SVG shapes/paths, and video-poster/media
+fallbacks. External modules enforce JavaScript MIME and fetch-style CORS/cookie
+rules.
 
 **System** — multi-user logins with salted iterated SHA-256 password hashes
 (written from the specification), a service-supervising init with readiness,
@@ -153,6 +160,18 @@ not arbitrary System V binaries. Signals are the traditional non-realtime
 subset. KFS transactions are capped at 32 full blocks, networking is IPv4-only,
 and TLS is 1.3-only. The from-scratch TLS, CSPRNG, and filesystem code are
 educational implementations and have not had a professional security audit.
+
+The browser is intentionally a bounded compatibility subset, not a claim of
+support for every website. Its module bindings are not live, `let`/`const`
+currently have `var` semantics, and literal-string `import()` is eagerly
+resolved rather than truly on demand; `import.meta.url` is supported, but
+computed imports are not. Inline `import.meta.url` is the document URL. SVG has
+only a bounded single-subpath shape/path subset with coordinate and raster-work
+caps; its default `viewBox` uses centered meet scaling, but full arcs,
+transforms, effects, and complete `preserveAspectRatio` behavior are absent.
+Full modern JavaScript, downloadable webfonts, media codecs/playback, HTTP/2,
+and HTTP/3 are not implemented. HTTPS currently carries HTTP/1.1 over verified
+TLS 1.3.
 
 **This cannot run Chrome, and never will.** Chrome needs the Linux syscall ABI,
 glibc, X11 or Wayland, GPU drivers and a JIT — far more work than this entire

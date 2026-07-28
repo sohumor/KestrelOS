@@ -26,6 +26,7 @@ Usage:
 
 import atexit
 import argparse
+import base64
 import collections
 import http.client
 import http.server
@@ -268,17 +269,23 @@ class _QuietHTTPServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs):
         self._get_count = 0
+        self._path_counts = {}
         self._get_count_lock = threading.Lock()
         super().__init__(*args, **kwargs)
 
-    def record_get(self):
+    def record_get(self, path="/"):
         with self._get_count_lock:
             self._get_count += 1
+            self._path_counts[path] = self._path_counts.get(path, 0) + 1
 
     @property
     def get_count(self):
         with self._get_count_lock:
             return self._get_count
+
+    def path_count(self, path):
+        with self._get_count_lock:
+            return self._path_counts.get(path, 0)
 
     def handle_error(self, request, client_address):
         # The certificate-negative client deliberately aborts during the
@@ -296,13 +303,203 @@ def _marker_handler(marker):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self):
-            self.server.record_get()
+            path = self.path.split("?", 1)[0]
+            self.server.record_get(path)
+            content_type = "text/html; charset=us-ascii"
+            response = body
+            if path == "/compat":
+                response = (
+                    "<!doctype html><html><head>"
+                    "<title>Kestrel compatibility fixture</title>"
+                    "<link rel=stylesheet href=/compat.css>"
+                    "<script src=/compat.js></script>"
+                    "<script type=module src=/main.mjs></script>"
+                    "</head><body><h1>WEB-COMPAT-START</h1>"
+                    "<p id=css-proof style='display:none'>CSS-EXTERNAL-OK</p>"
+                    "<p id=import-proof style='display:none'>CSS-IMPORT-OK</p>"
+                    "<p id=message>JS-NOT-RUN</p>"
+                    "<img src=/pixel.png alt=IMAGE-RESOURCE-OK>"
+                    "<script>var x=document.createElement('strong');"
+                    "x.textContent=' INLINE-JS-OK';"
+                    "document.body.appendChild(x);</script>"
+                    "<script type=module>"
+                    "const inlineMeta=document.createElement('p');"
+                    "inlineMeta.textContent=import.meta.url.indexOf("
+                    "'/compat')>=0?'INLINE-META-OK':'INLINE-META-BAD';"
+                    "document.body.appendChild(inlineMeta);"
+                    "</script>"
+                    "</body></html>"
+                ).encode("ascii")
+            elif path == "/module-policy":
+                blocked = getattr(self.server, "blocked_module_url", "")
+                response = (
+                    "<!doctype html><html><head>"
+                    "<title>Module policy fixture</title>"
+                    "<script type=module src=/bad-mime.mjs></script>"
+                    "<script type=module src='%s'></script>"
+                    "</head><body><p>MODULE-POLICY-PAGE</p></body></html>"
+                    % blocked
+                ).encode("ascii")
+            elif path == "/compat.css":
+                content_type = "text/css"
+                response = (
+                    "@import url('/import.css');"
+                    "#css-proof{display:block!important;color:#123456}"
+                ).encode("ascii")
+            elif path == "/import.css":
+                content_type = "text/css"
+                response = b"#import-proof{display:block!important}"
+            elif path == "/compat.js":
+                content_type = "text/javascript"
+                response = (
+                    "var p=document.querySelector('body #message');"
+                    "p.textContent='JS-DOM-OK';"
+                    "p.classList.add('executed');"
+                    "p.style.fontWeight='bold';"
+                    "document.cookie='clientcookie=client; Path=/';"
+                    "var ck=document.createElement('p');"
+                    "ck.textContent=document.cookie.indexOf("
+                    "'clientcookie=client')>=0 && document.cookie.indexOf("
+                    "'servercookie=server')<0?'COOKIE-DOM-OK':"
+                    "'COOKIE-DOM-BAD';"
+                    "document.body.appendChild(ck);"
+                    "var cs=document.createElement('p');"
+                    "cs.textContent=getComputedStyle("
+                    "document.getElementById('css-proof')).display==='block'"
+                    "?'COMPUTED-STYLE-OK':'COMPUTED-STYLE-BAD';"
+                    "document.body.appendChild(cs);"
+                    "console.log('COMPAT-CONSOLE-OK');"
+                ).encode("ascii")
+            elif path == "/main.mjs":
+                content_type = "text/javascript"
+                cors_import = (
+                    "import {corsMarker} from '%s';\n"
+                    % getattr(self.server, "cors_module_url", ""))
+                response = (
+                    "import base, {suffix as ending} from './dep.mjs';"
+                    "const minifiedTail='MINIFIED-TAIL-OK';\n"
+                    + cors_import +
+                    "/*\n"
+                    "import('./commented-out.mjs');\n"
+                    "*/\n"
+                    "const marker=base+'-IMPORT-'+ending;\n"
+                    "const node=document.createElement('p');\n"
+                    "node.textContent=marker+' '+minifiedTail;\n"
+                    "document.body.appendChild(node);\n"
+                    "const corsNode=document.createElement('p');\n"
+                    "corsNode.textContent=corsMarker;\n"
+                    "document.body.appendChild(corsNode);\n"
+                    "const holder={};\n"
+                    "holder.import=function(){return 'MEMBER-IMPORT-OK';};\n"
+                    "const memberNode=document.createElement('p');\n"
+                    "memberNode.textContent=holder.import();\n"
+                    "document.body.appendChild(memberNode);\n"
+                    "fetch('/api/data',{method:'POST',body:'q=1'})\n"
+                    ".then(function(response){return response.json();})\n"
+                    ".then(function(data){\n"
+                    " const fetched=document.createElement('p');\n"
+                    " fetched.textContent=data.marker;\n"
+                    " document.body.appendChild(fetched);\n"
+                    "});\n"
+                    "Promise.all([Promise.resolve('PROMISE'),'-ALL-','OK'])\n"
+                    ".then(function(parts){\n"
+                    " const joined=document.createElement('p');\n"
+                    " joined.textContent=parts.join('');\n"
+                    " document.body.appendChild(joined);\n"
+                    "});\n"
+                    "fetch('/module.wasm')\n"
+                    ".then(function(response){return response.arrayBuffer();})\n"
+                    ".then(function(buffer){return WebAssembly.instantiate(buffer);})\n"
+                    ".then(function(pair){\n"
+                    " const wasm=document.createElement('p');\n"
+                    " wasm.textContent=pair.instance.exports.add(20,22)===42"
+                    "?'WASM-FETCH-OK':'WASM-FETCH-BAD';\n"
+                    " document.body.appendChild(wasm);\n"
+                    "});\n"
+                    "const metaOk=import.meta.url.indexOf('/main.mjs')>=0;\n"
+                    "import('./dynamic.mjs').then(function(namespace){\n"
+                    " const dynamic=document.createElement('p');\n"
+                    " dynamic.textContent=namespace.marker+' '+"
+                    "(metaOk?'META-URL-OK':'META-URL-BAD');\n"
+                    " document.body.appendChild(dynamic);\n"
+                    "});\n"
+                    "export const exportedImport=import('./dynamic.mjs');\n"
+                    "exportedImport.then(function(namespace){\n"
+                    " const exported=document.createElement('p');\n"
+                    " exported.textContent=namespace.marker==="
+                    "'DYNAMIC-MODULE-OK'?'EXPORT-DYNAMIC-OK':"
+                    "'EXPORT-DYNAMIC-BAD';\n"
+                    " document.body.appendChild(exported);\n"
+                    "});\n"
+                    "export const moduleReady=true;\n"
+                ).encode("ascii")
+            elif path == "/dep.mjs":
+                content_type = "text/javascript"
+                response = (
+                    "const base='MODULE';\n"
+                    "export default base;\n"
+                    "export const suffix='OK';\n"
+                ).encode("ascii")
+            elif path == "/dynamic.mjs":
+                content_type = "text/javascript"
+                response = b"export const marker='DYNAMIC-MODULE-OK';\n"
+            elif path == "/cors.mjs":
+                content_type = "text/javascript"
+                response = b"export const corsMarker='CORS-MODULE-OK';\n"
+            elif path == "/bad-mime.mjs":
+                content_type = "text/plain"
+                response = (
+                    "const bad=document.createElement('p');"
+                    "bad.textContent='BAD-MIME-EXECUTED';"
+                    "document.body.appendChild(bad);"
+                ).encode("ascii")
+            elif path == "/blocked.mjs":
+                content_type = "text/javascript"
+                response = (
+                    "const bad=document.createElement('p');"
+                    "bad.textContent='CORS-BLOCK-EXECUTED';"
+                    "document.body.appendChild(bad);"
+                ).encode("ascii")
+            elif path == "/pixel.png":
+                content_type = "image/png"
+                response = base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                    "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            elif path == "/module.wasm":
+                content_type = "application/wasm"
+                response = bytes([
+                    0, 97, 115, 109, 1, 0, 0, 0,
+                    1, 7, 1, 96, 2, 127, 127, 1, 127,
+                    3, 2, 1, 0,
+                    7, 7, 1, 3, 97, 100, 100, 0, 0,
+                    10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11,
+                ])
             self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=us-ascii")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(response)))
+            if path == "/compat":
+                self.send_header(
+                    "Set-Cookie",
+                    "servercookie=server; Path=/; HttpOnly")
+            if path == "/cors.mjs":
+                self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(response)
+
+        def do_POST(self):
+            path = self.path.split("?", 1)[0]
+            self.server.record_get(path)
+            length = int(self.headers.get("Content-Length", "0"))
+            request = self.rfile.read(length)
+            marker = "PROMISE-FETCH-OK" if request == b"q=1" else "FETCH-BAD"
+            response = ('{"marker":"%s"}' % marker).encode("ascii")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(response)
 
         def log_message(self, fmt, *args):
             del fmt, args
@@ -316,9 +513,13 @@ class BrowserFixtureServers:
     def __init__(self):
         self.temp = None
         self.http = None
+        self.cors = None
         self.https = None
         self.threads = []
         self.http_url = None
+        self.compat_url = None
+        self.module_policy_url = None
+        self.cors_url = None
         self.https_url = None
 
     @staticmethod
@@ -354,6 +555,8 @@ class BrowserFixtureServers:
 
         self.http = _QuietHTTPServer(
             ("0.0.0.0", 0), _marker_handler(HTTP_BODY_MARKER))
+        self.cors = _QuietHTTPServer(
+            ("0.0.0.0", 0), _marker_handler(HTTP_BODY_MARKER))
         self.https = _QuietHTTPServer(
             ("0.0.0.0", 0), _marker_handler(TLS_NEGATIVE_BODY_MARKER))
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -364,8 +567,18 @@ class BrowserFixtureServers:
             self.https.socket, server_side=True)
 
         self.threads.append(self._serve(self.http))
+        self.threads.append(self._serve(self.cors))
         self.threads.append(self._serve(self.https))
+        self.cors_url = "http://%s:%d/cors.mjs" % (
+            QEMU_HOST, self.cors.server_address[1])
+        self.http.cors_module_url = self.cors_url
+        self.http.blocked_module_url = "http://%s:%d/blocked.mjs" % (
+            QEMU_HOST, self.cors.server_address[1])
         self.http_url = "http://%s:%d/plain" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.compat_url = "http://%s:%d/compat" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.module_policy_url = "http://%s:%d/module-policy" % (
             QEMU_HOST, self.http.server_address[1])
         self.https_url = "https://%s:%d/negative" % (
             QEMU_HOST, self.https.server_address[1])
@@ -375,7 +588,7 @@ class BrowserFixtureServers:
         return self
 
     def close(self):
-        for server in (self.http, self.https):
+        for server in (self.http, self.cors, self.https):
             if server:
                 server.shutdown()
                 server.server_close()
@@ -383,6 +596,7 @@ class BrowserFixtureServers:
             thread.join(timeout=5)
         self.threads = []
         self.http = None
+        self.cors = None
         self.https = None
         if self.temp:
             self.temp.cleanup()
@@ -829,11 +1043,13 @@ def t_service_lifecycle(h):
     h.send("service stop readiness")
     h.expect("ok stop readiness (was not running)")
     wait_prompt(h)
-    h.send("sleep 1")
-    wait_prompt(h)
 
+    # The control acknowledgement publishes dependency failure atomically;
+    # status must not expose a stale "running" window.
     h.send("service status dependent")
     h.expect(r"\n  state +failed\n", regex=True)
+    wait_prompt(h)
+    h.send("sleep 1")
     wait_prompt(h)
 
     h.send("service reset-failed dependent")
@@ -1064,6 +1280,94 @@ def t_browser_http_controlled(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def t_browser_web_compat(h):
+    """External CSS/imports, scripts, live DOM mutation, and images."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    paths = ["/compat", "/compat.css", "/import.css",
+             "/compat.js", "/main.mjs", "/dep.mjs", "/dynamic.mjs",
+             "/api/data", "/pixel.png", "/module.wasm"]
+    commented = "/commented-out.mjs"
+    cors_path = "/cors.mjs"
+    before = {p: browser_fixtures.http.path_count(p) for p in paths}
+    commented_before = browser_fixtures.http.path_count(commented)
+    cors_before = browser_fixtures.cors.path_count(cors_path)
+    end = "BROWSER-COMPAT-END"
+    h.send("/bin/browser -t -v %s; echo BROWSER-COMPAT-STATUS-$?; echo %s"
+           % (browser_fixtures.compat_url, end))
+    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
+    counts = {p: browser_fixtures.http.path_count(p) - before[p]
+              for p in paths}
+    for marker in ("CSS-EXTERNAL-OK", "CSS-IMPORT-OK", "JS-DOM-OK",
+                   "INLINE-JS-OK", "COOKIE-DOM-OK",
+                   "COMPUTED-STYLE-OK",
+                   "COMPAT-CONSOLE-OK", "MODULE-IMPORT-OK",
+                   "PROMISE-FETCH-OK", "PROMISE-ALL-OK",
+                   "WASM-FETCH-OK", "DYNAMIC-MODULE-OK",
+                   "META-URL-OK", "INLINE-META-OK",
+                   "MINIFIED-TAIL-OK", "MEMBER-IMPORT-OK",
+                   "EXPORT-DYNAMIC-OK", "CORS-MODULE-OK"):
+        if marker not in block:
+            raise TimeoutError("web compatibility marker %s was absent "
+                               "(resource requests %r)" % (marker, counts))
+    statuses = re.findall(r"(?m)^BROWSER-COMPAT-STATUS-(-?\d+)$", block)
+    if statuses != ["0"]:
+        raise TimeoutError("browser compatibility status was %r" % statuses)
+    if not re.search(r"(?m)^subresources: 10  resource-bytes: \d+  "
+                     r"resource-errors: 0$", block):
+        raise TimeoutError("resource/decode summary was missing or unhealthy")
+    if not re.search(r"(?m)^stylesheets: 2  scripts: 7  script-errors: 0$",
+                     block):
+        raise TimeoutError("CSS/script summary was missing or unhealthy")
+    missed = [p for p in paths if counts[p] <= 0]
+    if missed:
+        raise TimeoutError("browser did not request resources %r" % missed)
+    if browser_fixtures.http.path_count(commented) != commented_before:
+        raise TimeoutError("module loader fetched an import inside a comment")
+    if browser_fixtures.cors.path_count(cors_path) <= cors_before:
+        raise TimeoutError("cross-origin module was not requested")
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+
+def t_browser_module_policy(h):
+    """ES modules reject invalid MIME types and cross-origin denial."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    bad_mime = "/bad-mime.mjs"
+    blocked = "/blocked.mjs"
+    bad_before = browser_fixtures.http.path_count(bad_mime)
+    blocked_before = browser_fixtures.cors.path_count(blocked)
+    end = "BROWSER-MODULE-POLICY-END"
+    h.send("/bin/browser -t -v %s; "
+           "echo BROWSER-MODULE-POLICY-STATUS-$?; echo %s"
+           % (browser_fixtures.module_policy_url, end))
+    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
+    if "MODULE-POLICY-PAGE" not in block:
+        raise TimeoutError("module policy fixture page did not render")
+    for forbidden in ("BAD-MIME-EXECUTED", "CORS-BLOCK-EXECUTED"):
+        if forbidden in block:
+            raise TimeoutError("blocked module executed: %s" % forbidden)
+    if "non-JavaScript MIME type" not in block:
+        raise TimeoutError("invalid module MIME rejection was not reported")
+    if "cross-origin response did not allow" not in block:
+        raise TimeoutError("module CORS rejection was not reported")
+    if not re.search(r"(?m)^subresources: 1  resource-bytes: \d+  "
+                     r"resource-errors: 2$", block):
+        raise TimeoutError("module policy resource summary was unexpected")
+    if not re.search(r"(?m)^stylesheets: 0  scripts: 0  script-errors: 2$",
+                     block):
+        raise TimeoutError("module policy script summary was unexpected")
+    statuses = re.findall(
+        r"(?m)^BROWSER-MODULE-POLICY-STATUS-(-?\d+)$", block)
+    if statuses != ["0"]:
+        raise TimeoutError("module policy browser status was %r" % statuses)
+    if browser_fixtures.http.path_count(bad_mime) <= bad_before:
+        raise TimeoutError("bad-MIME module was not requested")
+    if browser_fixtures.cors.path_count(blocked) <= blocked_before:
+        raise TimeoutError("CORS-blocked module was not requested")
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+
 def t_browser_tls_certificate_negative(h):
     """Reject a parseable self-signed TLS 1.3 certificate ten times."""
     if not browser_fixtures:
@@ -1244,6 +1548,8 @@ TESTS = [
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
+    ("browser-web-compat", t_browser_web_compat),
+    ("browser-module-policy", t_browser_module_policy),
     ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),
     ("curl-https", t_curl_https),
@@ -1485,6 +1791,8 @@ def main():
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
                     help="run boot + prompt tests only")
+    ap.add_argument("--only", action="append", metavar="NAME",
+                    help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
                     help="list tests and exit")
     ap.add_argument("--selftest", action="store_true",
@@ -1513,9 +1821,18 @@ def main():
         print("error: build/os.img not found (run make first)")
         return 1
 
-    tests = TESTS[:SMOKE_TESTS] if args.smoke else TESTS
+    if args.only:
+        available = dict(TESTS)
+        missing = [name for name in args.only if name not in available]
+        if missing:
+            ap.error("unknown --only test(s): %s" % ", ".join(missing))
+        selected = set(args.only)
+        tests = TESTS[:SMOKE_TESTS] + [
+            item for item in TESTS[SMOKE_TESTS:] if item[0] in selected]
+    else:
+        tests = TESTS[:SMOKE_TESTS] if args.smoke else TESTS
     fixtures = None
-    if not args.smoke:
+    if not args.smoke or args.only:
         try:
             fixtures = BrowserFixtureServers()
             fixtures.start()

@@ -696,17 +696,36 @@ static void order_services(void)
 static void state_write(void)
 {
     char buf[STATESZ];
+    long n;
+    int fd;
     int i;
 
-    state_dirty = 0;
     if (!have_run)
         return;
-    setstr(buf, sizeof(buf), "# kestrel init state: name state pid restarts exit\n");
+    state_dirty = 1;
+    /*
+     * Publish the snapshot with one fixed-size in-place write.  Opening with
+     * O_TRUNC made publication two filesystem transactions (truncate, then
+     * write), so `service status` could observe an empty or prefix-only unit
+     * table between them.  KFS journals one write syscall atomically and
+     * serializes readers against it; zero-filling the fixed-size file also
+     * removes any tail left by a previously longer snapshot.
+     */
+    memset(buf, 0, sizeof(buf));
+    setstr(buf, sizeof(buf),
+           "# kestrel init state: name state pid restarts exit\n");
     for (i = 0; i < nunits; i++)
         appendf(buf, sizeof(buf), "%s %s %d %d %d\n", units[i].name,
                 state_name[units[i].state], units[i].pid,
                 units[i].restarts, units[i].exit_code);
-    write_file(STATE_PATH, buf);
+
+    fd = open(STATE_PATH, O_WRONLY | O_CREAT);
+    if (fd < 0)
+        return;
+    n = write(fd, buf, sizeof(buf));
+    close(fd);
+    if (n == (long)sizeof(buf))
+        state_dirty = 0;
 }
 
 /* --- starting and reaping --------------------------------------------- */
@@ -969,7 +988,8 @@ static void reap_children(void)
 
     for (i = 0; i < nunits; i++) {
         u = &units[i];
-        if ((u->state != S_RUNNING && u->state != S_STARTING) || u->pid <= 0)
+        if ((u->state != S_RUNNING && u->state != S_STARTING &&
+             !u->stopping) || u->pid <= 0)
             continue;
         if (pid_alive(u->pid))
             continue;
@@ -1078,9 +1098,18 @@ static void enforce_dependencies(void)
                  u->name, d->name);
             u->dependency_failed = 1;
             u->next_start = 0;
-            if (u->pid > 0)
+            if (u->pid > 0) {
                 unit_stop(u);
-            else {
+                /*
+                 * Dependency loss is already a failed service transition;
+                 * do not keep publishing "running" until SIGTERM happens
+                 * to be reaped on a later supervisor tick.  The stopping
+                 * flag keeps the child in reap_children() while its PID is
+                 * still live.
+                 */
+                u->state = S_FAILED;
+                state_dirty = 1;
+            } else {
                 u->state = S_FAILED;
                 u->dependency_failed = 0;
                 state_dirty = 1;
@@ -1211,9 +1240,18 @@ static void poll_command(void)
     else
         run_command(tok[0], tok[1], ack, sizeof(ack));
 
+    /* Apply lifecycle effects of a stop/reload before committing the
+     * command acknowledgement and its state snapshot. */
+    enforce_dependencies();
+    state_dirty = 1;
+    /*
+     * An acknowledgement commits the control operation to the client.
+     * Publish its resulting state first so an immediate `service status`
+     * cannot race behind a successful start/stop/reload reply.
+     */
+    state_write();
     unlink_(CMD_PATH);
     write_file(ACK_PATH, ack);
-    state_dirty = 1;
 }
 
 /* --- shutdown --------------------------------------------------------- */

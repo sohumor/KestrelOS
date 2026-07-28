@@ -117,6 +117,28 @@ void http_client_set_agent(struct http_client *c, const char *agent)
     (void)agent;
 }
 
+struct cookie_jar *http_client_jar(struct http_client *c)
+{
+    (void)c;
+    return 0;
+}
+
+int cookie_jar_load(struct cookie_jar *j, const char *file, long now)
+{
+    (void)j;
+    (void)file;
+    (void)now;
+    return 0;
+}
+
+int cookie_jar_save(struct cookie_jar *j, const char *file, long now)
+{
+    (void)j;
+    (void)file;
+    (void)now;
+    return 0;
+}
+
 int http_register_scheme(const char *scheme, http_transport_fn fn, void *user)
 {
     (void)scheme;
@@ -169,6 +191,20 @@ int inflate_buf(const void *src, unsigned long slen, void **out,
     if (olen)
         *olen = 0;
     return INFLATE_ERR_STATE;
+}
+
+int img_decode(const void *data, unsigned long len, struct image *out)
+{
+    (void)data;
+    (void)len;
+    memset(out, 0, sizeof(*out));
+    return IMG_ERR_FORMAT;
+}
+
+void img_free(struct image *im)
+{
+    if (im)
+        memset(im, 0, sizeof(*im));
 }
 
 void tls_options_default(struct tls_options *o)
@@ -317,7 +353,13 @@ static int make_fixture(char path[64], size_t *fixture_len)
                     "html,body,div,a{display:block}"
                     "div{margin:0;padding:0;border:0}"
                     "</style><title>Browser stack gate</title></head><body>"
-                    "<p>STACK-GATE-TOP</p>") != 0)
+                    "<p>STACK-GATE-TOP</p>"
+                    "<p id=\"module-proof\">MODULE-NOT-RUN</p>"
+                    "<script type=\"module\">\n"
+                    "const proof='STACK-MODULE-OK';\n"
+                    "document.getElementById('module-proof').textContent=proof;\n"
+                    "export const ready=true;\n"
+                    "</script>") != 0)
         return -1;
     for (i = 0; i < 128; i++)
         if (append_text(page, sizeof(page), &used, "<div>") != 0)

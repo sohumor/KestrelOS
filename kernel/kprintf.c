@@ -1,6 +1,7 @@
 #include "kernel.h"
 #include "console.h"
 #include "serial.h"
+#include "output.h"
 #include "string.h"
 #include "klog.h"
 #include "spinlock.h"
@@ -8,8 +9,7 @@
 static spinlock_t print_lock = SPINLOCK_INIT;
 static void kputc(char c)
 {
-    console_putc(c);
-    serial_putc(c);
+    output_putc_locked(c);
     /* NULL until klog_hook_kprintf() runs, so this is inert during early
      * boot and cannot recurse: klog writes via console/serial directly. */
     if (klog_kprintf_sink)
@@ -70,6 +70,7 @@ static void print_str(const char *s, int width, bool left)
 void kvprintf(const char *fmt, va_list ap)
 {
     uint64_t flags = spin_lock_irqsave(&print_lock);
+    uint64_t output_flags = output_begin();
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
             kputc(*fmt);
@@ -149,6 +150,7 @@ void kvprintf(const char *fmt, va_list ap)
             kputc(*fmt);
         }
     }
+    output_end(output_flags);
     spin_unlock_irqrestore(&print_lock, flags);
 }
 
