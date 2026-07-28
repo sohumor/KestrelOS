@@ -1,0 +1,11 @@
+# One-shot readiness demonstration. init removes ready= before spawning the
+# process, waits for /bin/touch to publish it, and only then releases services
+# which require this unit.
+name=readiness
+exec=/bin/touch
+args=/run/readiness.ready
+restart=never
+ready=/run/readiness.ready
+timeout_ms=2000
+after=logger
+enabled=yes

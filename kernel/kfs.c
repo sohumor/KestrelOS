@@ -8,10 +8,10 @@
 #include "string.h"
 #include "kestrel_abi.h"
 
-/* KFS driver, on-disk format v2. Write-through: every metadata update goes
- * straight to disk. A handful of static scratch blocks stand in for a
- * buffer cache; they are carefully assigned so no code path aliases two
- * uses of the same buffer (see comments at each declaration).
+/* KFS driver, on-disk format v3. Regular file data is write-through and
+ * metadata is committed through a fixed checksummed redo journal. A handful
+ * of static scratch blocks stand in for a buffer cache; they are carefully
+ * assigned so no code path aliases two uses of the same buffer.
  *
  * The file has two halves. Below is the driver proper, which knows about
  * blocks, inodes and directories and enforces no access control at all.
@@ -51,7 +51,9 @@
  * shift every inode after the first. */
 _Static_assert(sizeof(struct kfs_inode) == 64, "kfs inode must be 64 bytes");
 _Static_assert(sizeof(struct kfs_dirent) == 64, "kfs dirent must be 64 bytes");
-_Static_assert(sizeof(struct kfs_superblock) == 40, "kfs superblock is 40 bytes");
+_Static_assert(sizeof(struct kfs_superblock) == 52, "kfs superblock is 52 bytes");
+_Static_assert(sizeof(struct kfs_journal_header) <= KFS_BLOCK_SIZE,
+               "kfs journal header must fit one block");
 
 #define KFS_MAX_MOUNTS 4
 
@@ -100,6 +102,36 @@ static uint8_t inode_buf[KFS_BLOCK_SIZE];  /* iget/iput only */
 static uint8_t data_buf[KFS_BLOCK_SIZE];   /* readi/writei data blocks */
 static uint8_t ind_buf[KFS_BLOCK_SIZE];    /* indirect blocks (bmap, truncate) */
 static uint8_t zero_buf[KFS_BLOCK_SIZE];   /* zeroing fresh blocks */
+static uint8_t journal_block[KFS_BLOCK_SIZE]; /* journal header I/O */
+
+struct journal_entry {
+    uint32_t blk;
+    uint8_t data[KFS_BLOCK_SIZE];
+};
+
+/* There is one transaction globally because the whole-driver mutex admits
+ * only one mutator. Entries coalesce repeated writes to the same metadata
+ * block, so even truncating the largest file needs only a bitmap block, the
+ * superblock, one inode block and one indirect block on the default image. */
+static struct {
+    struct kfs_fs *fs;
+    int active;
+    int failed;
+    uint32_t sequence;
+    uint32_t count;
+    struct kfs_superblock saved_sb;
+    struct journal_entry entry[KFS_JOURNAL_ENTRIES];
+} journal_tx;
+
+static const uint8_t *journal_pending(struct kfs_fs *fs, uint32_t blk)
+{
+    if (!journal_tx.active || journal_tx.fs != fs)
+        return NULL;
+    for (uint32_t i = 0; i < journal_tx.count; i++)
+        if (journal_tx.entry[i].blk == blk)
+            return journal_tx.entry[i].data;
+    return NULL;
+}
 
 /* ---------- block I/O ----------
  * FS block numbers are relative to the start of the filesystem; the
@@ -113,10 +145,9 @@ static uint8_t zero_buf[KFS_BLOCK_SIZE];   /* zeroing fresh blocks */
  * bitmap block, an inode block, a directory block or two — so a handful of
  * entries removes essentially all of it.
  *
- * Write-through, never write-back: KFS has no journal and no flush on
- * shutdown, so a dirty cache would turn a reset into a corrupt filesystem.
- * The cache is only consulted with the filesystem lock held, which is what
- * makes it safe without any locking of its own. */
+ * The cache is write-through, never write-back. Pending journal entries are
+ * checked first so a transaction reads its own staged metadata. The cache is
+ * only consulted with the filesystem lock held. */
 
 #define BCACHE_SLOTS 16
 
@@ -163,8 +194,13 @@ static void bcache_invalidate(struct kfs_fs *fs)
 
 static int bread(struct kfs_fs *fs, uint32_t blk, void *buf)
 {
+    const uint8_t *pending = journal_pending(fs, blk);
     struct bcache_slot *s = bcache_find(fs, blk);
 
+    if (pending) {
+        memcpy(buf, pending, KFS_BLOCK_SIZE);
+        return 0;
+    }
     if (s) {
         s->stamp = ++bcache_clock;
         memcpy(buf, s->data, KFS_BLOCK_SIZE);
@@ -208,6 +244,228 @@ static int bwrite(struct kfs_fs *fs, uint32_t blk, const void *buf)
     return 0;
 }
 
+static uint32_t crc32_update(uint32_t crc, const void *data, uint32_t len)
+{
+    const uint8_t *p = data;
+
+    while (len--) {
+        crc ^= *p++;
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)-(int)(crc & 1));
+    }
+    return crc;
+}
+
+static uint32_t journal_checksum(uint32_t sequence, uint32_t count,
+                                 const struct journal_entry *entry)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+
+    crc = crc32_update(crc, &sequence, sizeof(sequence));
+    crc = crc32_update(crc, &count, sizeof(count));
+    for (uint32_t i = 0; i < count; i++)
+        crc = crc32_update(crc, &entry[i].blk, sizeof(entry[i].blk));
+    for (uint32_t i = 0; i < count; i++)
+        crc = crc32_update(crc, entry[i].data, KFS_BLOCK_SIZE);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static int journal_raw_write(struct kfs_fs *fs, uint32_t blk, const void *buf)
+{
+    return blockdev_write(fs->bd,
+                          fs->start_lba + (uint64_t)blk * fs->spb,
+                          fs->spb, buf);
+}
+
+static int journal_raw_read(struct kfs_fs *fs, uint32_t blk, void *buf)
+{
+    return blockdev_read(fs->bd,
+                         fs->start_lba + (uint64_t)blk * fs->spb,
+                         fs->spb, buf);
+}
+
+static int journal_clear(struct kfs_fs *fs)
+{
+    memset(journal_block, 0, sizeof(journal_block));
+    return journal_raw_write(fs, fs->sb.journal_start, journal_block);
+}
+
+static int journal_begin(struct kfs_fs *fs)
+{
+    if (journal_tx.active)
+        return -1;
+    journal_tx.fs = fs;
+    journal_tx.active = 1;
+    journal_tx.failed = 0;
+    journal_tx.count = 0;
+    memcpy(&journal_tx.saved_sb, &fs->sb, sizeof(fs->sb));
+    journal_tx.sequence++;
+    if (journal_tx.sequence == 0)
+        journal_tx.sequence++;
+    return 0;
+}
+
+static void journal_reset(void)
+{
+    journal_tx.active = 0;
+    journal_tx.failed = 0;
+    journal_tx.count = 0;
+    journal_tx.fs = NULL;
+}
+
+static void journal_abort(void)
+{
+    if (journal_tx.active && journal_tx.fs)
+        memcpy(&journal_tx.fs->sb, &journal_tx.saved_sb,
+               sizeof(journal_tx.saved_sb));
+    journal_reset();
+}
+
+static int journal_stage(struct kfs_fs *fs, uint32_t blk, const void *buf)
+{
+    if (!journal_tx.active || journal_tx.fs != fs)
+        return bwrite(fs, blk, buf);
+
+    for (uint32_t i = 0; i < journal_tx.count; i++) {
+        if (journal_tx.entry[i].blk == blk) {
+            memcpy(journal_tx.entry[i].data, buf, KFS_BLOCK_SIZE);
+            return 0;
+        }
+    }
+    if (journal_tx.count >= KFS_JOURNAL_ENTRIES) {
+        journal_tx.failed = 1;
+        return -1;
+    }
+    struct journal_entry *e = &journal_tx.entry[journal_tx.count++];
+    e->blk = blk;
+    memcpy(e->data, buf, KFS_BLOCK_SIZE);
+    return 0;
+}
+
+static int journal_commit(struct kfs_fs *fs)
+{
+    struct kfs_journal_header *jh;
+    int r = -1;
+
+    if (!journal_tx.active || journal_tx.fs != fs || journal_tx.failed)
+        goto out;
+    if (journal_tx.count == 0) {
+        r = 0;
+        goto out;
+    }
+
+    /* Ordered-data redo protocol:
+     *   payloads -> committed header -> home blocks -> clean header.
+     * A crash before the header exposes nothing; a crash after it replays
+     * every home block idempotently at the next mount. */
+    for (uint32_t i = 0; i < journal_tx.count; i++)
+        if (journal_raw_write(fs, fs->sb.journal_start + 1 + i,
+                              journal_tx.entry[i].data) < 0)
+            goto out;
+
+    memset(journal_block, 0, sizeof(journal_block));
+    jh = (struct kfs_journal_header *)journal_block;
+    jh->magic = KFS_JOURNAL_MAGIC;
+    jh->state = KFS_JOURNAL_COMMITTED;
+    jh->sequence = journal_tx.sequence;
+    jh->count = journal_tx.count;
+    for (uint32_t i = 0; i < journal_tx.count; i++)
+        jh->targets[i] = journal_tx.entry[i].blk;
+    jh->checksum = journal_checksum(jh->sequence, jh->count,
+                                    journal_tx.entry);
+    if (journal_raw_write(fs, fs->sb.journal_start, journal_block) < 0) {
+        /* The device may have installed all, part, or none of the commit
+         * record. Do not let this mount reuse the payload area until a
+         * fresh mount has classified and recovered that state. */
+        fs->mounted = 0;
+        bcache_invalidate(fs);
+        goto out;
+    }
+
+    for (uint32_t i = 0; i < journal_tx.count; i++) {
+        if (bwrite(fs, journal_tx.entry[i].blk,
+                   journal_tx.entry[i].data) < 0) {
+            /* Leave the committed header for the next mount. Continuing to
+             * mutate this instance could overwrite the only recovery record. */
+            fs->mounted = 0;
+            bcache_invalidate(fs);
+            goto out;
+        }
+    }
+    if (journal_clear(fs) < 0) {
+        fs->mounted = 0;
+        bcache_invalidate(fs);
+        goto out;
+    }
+    r = 0;
+
+out:
+    if (r < 0 && fs->mounted)
+        memcpy(&fs->sb, &journal_tx.saved_sb, sizeof(fs->sb));
+    journal_reset();
+    return r;
+}
+
+/* Mount-time replay. Returns 1 when a committed transaction was replayed,
+ * 0 for a clean/torn-uncommitted journal, and -1 for an unsafe journal. */
+static int journal_recover(struct kfs_fs *fs)
+{
+    struct kfs_journal_header *jh;
+    uint32_t checksum;
+
+    if (journal_raw_read(fs, fs->sb.journal_start, journal_block) < 0)
+        return -1;
+    jh = (struct kfs_journal_header *)journal_block;
+
+    if (jh->magic == 0 && jh->state == 0 && jh->count == 0)
+        return 0;
+    if (jh->magic != KFS_JOURNAL_MAGIC ||
+        jh->state != KFS_JOURNAL_COMMITTED ||
+        jh->count == 0 || jh->count > KFS_JOURNAL_ENTRIES) {
+        kprintf("kfs: discarding incomplete journal header\n");
+        return journal_clear(fs) < 0 ? -1 : 0;
+    }
+
+    for (uint32_t i = 0; i < jh->count; i++) {
+        uint32_t target = jh->targets[i];
+        if (target >= fs->sb.total_blocks ||
+            (target >= fs->sb.journal_start &&
+             target < fs->sb.journal_start + fs->sb.journal_blocks)) {
+            kprintf("kfs: journal target %u is unsafe\n", target);
+            return -1;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (jh->targets[j] == target) {
+                kprintf("kfs: duplicate journal target %u\n", target);
+                return -1;
+            }
+        }
+        journal_tx.entry[i].blk = target;
+        if (journal_raw_read(fs, fs->sb.journal_start + 1 + i,
+                             journal_tx.entry[i].data) < 0)
+            return -1;
+    }
+
+    checksum = journal_checksum(jh->sequence, jh->count, journal_tx.entry);
+    if (checksum != jh->checksum) {
+        kprintf("kfs: discarding torn journal transaction %u\n",
+                jh->sequence);
+        return journal_clear(fs) < 0 ? -1 : 0;
+    }
+
+    for (uint32_t i = 0; i < jh->count; i++)
+        if (bwrite(fs, journal_tx.entry[i].blk,
+                   journal_tx.entry[i].data) < 0)
+            return -1;
+    uint32_t sequence = jh->sequence;
+    uint32_t count = jh->count;
+    if (journal_clear(fs) < 0)
+        return -1;
+    kprintf("kfs: replayed journal transaction %u (%u blocks)\n",
+            sequence, count);
+    return 1;
+}
+
 void kfs_cache_stats(uint64_t *hits, uint64_t *misses)
 {
     if (hits)
@@ -219,7 +477,7 @@ void kfs_cache_stats(uint64_t *hits, uint64_t *misses)
 static int sb_sync(struct kfs_fs *fs)
 {
     memcpy(sb_block, &fs->sb, sizeof(fs->sb));
-    return bwrite(fs, 0, sb_block);
+    return journal_stage(fs, 0, sb_block);
 }
 
 /* ---------- block allocator ---------- */
@@ -241,7 +499,8 @@ static uint32_t balloc(struct kfs_fs *fs)
                 if (blk >= fs->sb.total_blocks)
                     return 0;
                 bitmap_buf[i] |= (1 << bit);
-                if (bwrite(fs, fs->sb.bitmap_start + bb, bitmap_buf) < 0)
+                if (journal_stage(fs, fs->sb.bitmap_start + bb,
+                                  bitmap_buf) < 0)
                     return 0;
                 fs->sb.free_blocks--;
                 sb_sync(fs);
@@ -270,7 +529,7 @@ static void bfree(struct kfs_fs *fs, uint32_t blk)
         return;
     }
     bitmap_buf[i] &= ~(1 << bit);
-    bwrite(fs, fs->sb.bitmap_start + bb, bitmap_buf);
+    journal_stage(fs, fs->sb.bitmap_start + bb, bitmap_buf);
     fs->sb.free_blocks++;
     sb_sync(fs);
 }
@@ -312,7 +571,7 @@ static int iput(struct kfs_fs *fs, uint32_t ino, const struct kfs_inode *ip)
     if (bread(fs, blk, inode_buf) < 0)
         return -1;
     memcpy(inode_buf + off, ip, sizeof(struct kfs_inode));
-    return bwrite(fs, blk, inode_buf);
+    return journal_stage(fs, blk, inode_buf);
 }
 
 /* Allocate a free inode slot, initialized to the given type and owner. */
@@ -389,7 +648,7 @@ static uint32_t bmap(struct kfs_fs *fs, uint32_t ino, struct kfs_inode *ip,
             return 0;
         /* balloc does not touch ind_buf; the table is still valid. */
         tab[fbn] = b;
-        if (bwrite(fs, ip->indirect, ind_buf) < 0)
+        if (journal_stage(fs, ip->indirect, ind_buf) < 0)
             return 0;
     }
     return b;
@@ -451,7 +710,9 @@ static long writei(struct kfs_fs *fs, uint32_t ino, uint32_t off,
                 break;
         }
         memcpy(data_buf + boff, (const uint8_t *)buf + done, chunk);
-        if (bwrite(fs, b, data_buf) < 0)
+        if ((ip.type == KFS_TYPE_DIR
+                 ? journal_stage(fs, b, data_buf)
+                 : bwrite(fs, b, data_buf)) < 0)
             break;
         done += chunk;
         if (pos + chunk > ip.size) {
@@ -488,8 +749,15 @@ long kfs_write(struct kfs_fs *fs, uint32_t ino, uint32_t off, const void *buf,
     if (fs == NULL || !fs->mounted || buf == NULL)
         return -1;
     fs_lock();
-    if (iget(fs, ino, &ip) == 0 && ip.type == KFS_TYPE_FILE)
+    if (journal_begin(fs) == 0 &&
+        iget(fs, ino, &ip) == 0 && ip.type == KFS_TYPE_FILE)
         r = writei(fs, ino, off, buf, n, mtime);
+    if (r >= 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
     fs_unlock();
     return r;
 }
@@ -708,7 +976,14 @@ int kfs_create(struct kfs_fs *fs, const char *path, uint16_t mode,
     if (fs == NULL)
         return -1;
     fs_lock();
-    int r = create_locked(fs, path, mode, uid, gid, mtime);
+    int r = fs->mounted && journal_begin(fs) == 0
+                ? create_locked(fs, path, mode, uid, gid, mtime) : -1;
+    if (r >= 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
     fs_unlock();
     return r;
 }
@@ -741,7 +1016,14 @@ int kfs_mkdir(struct kfs_fs *fs, const char *path, uint16_t mode, uint32_t uid,
     if (fs == NULL)
         return -1;
     fs_lock();
-    int r = mkdir_locked(fs, path, mode, uid, gid, mtime);
+    int r = fs->mounted && journal_begin(fs) == 0
+                ? mkdir_locked(fs, path, mode, uid, gid, mtime) : -1;
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
     fs_unlock();
     return r;
 }
@@ -776,7 +1058,14 @@ int kfs_unlink(struct kfs_fs *fs, const char *path, uint32_t mtime)
     if (fs == NULL)
         return -1;
     fs_lock();
-    int r = unlink_locked(fs, path, mtime);
+    int r = fs->mounted && journal_begin(fs) == 0
+                ? unlink_locked(fs, path, mtime) : -1;
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
     fs_unlock();
     return r;
 }
@@ -848,7 +1137,14 @@ int kfs_truncate(struct kfs_fs *fs, uint32_t ino, uint32_t mtime)
     if (fs == NULL)
         return -1;
     fs_lock();
-    int r = truncate_locked(fs, ino, mtime);
+    int r = fs->mounted && journal_begin(fs) == 0
+                ? truncate_locked(fs, ino, mtime) : -1;
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
     fs_unlock();
     return r;
 }
@@ -861,10 +1157,17 @@ int kfs_chmod(struct kfs_fs *fs, uint32_t ino, uint16_t mode, uint32_t mtime)
     if (fs == NULL)
         return -1;
     fs_lock();
-    if (fs->mounted && iget(fs, ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
+    if (fs->mounted && journal_begin(fs) == 0 &&
+        iget(fs, ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
         ip.mode = (uint16_t)(mode & KFS_MODE_MASK);
         ip.mtime = mtime;
         r = iput(fs, ino, &ip);
+    }
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
     }
     fs_unlock();
     return r;
@@ -879,11 +1182,18 @@ int kfs_chown(struct kfs_fs *fs, uint32_t ino, uint32_t uid, uint32_t gid,
     if (fs == NULL)
         return -1;
     fs_lock();
-    if (fs->mounted && iget(fs, ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
+    if (fs->mounted && journal_begin(fs) == 0 &&
+        iget(fs, ino, &ip) == 0 && ip.type != KFS_TYPE_FREE) {
         ip.uid = uid;
         ip.gid = gid;
         ip.mtime = mtime;
         r = iput(fs, ino, &ip);
+    }
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
     }
     fs_unlock();
     return r;
@@ -898,14 +1208,14 @@ int kfs_chown(struct kfs_fs *fs, uint32_t ino, uint32_t uid, uint32_t gid,
 static int sb_plausible(struct kfs_fs *fs, int verbose)
 {
     struct kfs_superblock *sb = &fs->sb;
+    uint64_t bitmap_end, journal_end, inode_end;
 
-    if (sb->magic == KFS_MAGIC_V1) {
-        /* A v1 inode has nlink where v2 has mode and 12 direct pointers
-         * where v2 has 10: reading it as v2 would hand out garbage block
-         * numbers. Refuse it by name instead. */
-        if (verbose)
-            kprintf("kfs: image is KFS v1, this kernel needs v2 "
-                    "(rebuild with tools/mkfs.py)\n");
+    if (sb->magic == KFS_MAGIC_V1 || sb->magic == KFS_MAGIC_V2) {
+        if (verbose) {
+            unsigned version = sb->magic == KFS_MAGIC_V1 ? 1u : 2u;
+            kprintf("kfs: image is KFS v%u, this kernel needs v3 "
+                    "(rebuild with tools/mkfs.py)\n", version);
+        }
         return 0;
     }
     if (sb->magic != KFS_MAGIC) {
@@ -914,24 +1224,32 @@ static int sb_plausible(struct kfs_fs *fs, int verbose)
                     sb->magic, KFS_MAGIC);
         return 0;
     }
-    if (sb->root_ino != KFS_ROOT_INO ||
-        sb->bitmap_start == 0 ||
+    bitmap_end = (uint64_t)sb->bitmap_start + sb->bitmap_blocks;
+    journal_end = (uint64_t)sb->journal_start + sb->journal_blocks;
+    inode_end = (uint64_t)sb->inode_start + sb->inode_blocks;
+    if (sb->total_blocks == 0 ||
+        sb->root_ino != KFS_ROOT_INO ||
+        sb->bitmap_start != 1 ||
         sb->bitmap_blocks == 0 ||
-        sb->bitmap_start + sb->bitmap_blocks > sb->inode_start ||
-        sb->data_start <= sb->inode_start ||
-        sb->inode_start <= sb->bitmap_start ||
-        sb->inode_start + sb->inode_blocks > sb->data_start ||
-        sb->data_start > sb->total_blocks ||
-        sb->free_blocks > sb->total_blocks ||
+        bitmap_end != sb->journal_start ||
+        sb->journal_blocks != KFS_JOURNAL_BLOCKS ||
+        journal_end != sb->inode_start ||
+        sb->inode_blocks == 0 ||
+        inode_end != sb->data_start ||
+        sb->data_start >= sb->total_blocks ||
+        sb->free_blocks > sb->total_blocks - sb->data_start ||
+        sb->features != KFS_FEATURE_JOURNAL ||
         sb->inode_count == 0 ||
-        sb->inode_count > sb->inode_blocks * KFS_INODES_PER_BLOCK) {
+        sb->inode_count >
+            (uint64_t)sb->inode_blocks * KFS_INODES_PER_BLOCK) {
         if (verbose)
             kprintf("kfs: superblock is inconsistent\n");
         return 0;
     }
     /* The filesystem must fit inside the device it claims to live on. */
     uint64_t need = (uint64_t)sb->total_blocks * fs->spb;
-    if (fs->start_lba + need > fs->bd->blocks) {
+    if (fs->start_lba > fs->bd->blocks ||
+        need > fs->bd->blocks - fs->start_lba) {
         if (verbose)
             kprintf("kfs: filesystem runs past the end of %s\n", fs->bd->name);
         return 0;
@@ -953,7 +1271,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
 {
     struct kfs_fs *fs = NULL;
     uint64_t part_lba;
-    int ok;
+    int ok, recovered;
 
     if (bd == NULL || fs_priv == NULL)
         return -1;
@@ -1004,6 +1322,18 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         ok = try_offset(fs, part_lba, 0);
     if (!ok)
         ok = try_offset(fs, part_lba, 1);   /* again, this time loudly */
+    recovered = 0;
+    if (ok) {
+        recovered = journal_recover(fs);
+        if (recovered < 0) {
+            kprintf("kfs: journal recovery failed on %s\n", bd->name);
+            ok = 0;
+        } else if (recovered > 0) {
+            /* The transaction may include block 0. Refresh the in-memory
+             * superblock from the replayed home copy and validate it again. */
+            ok = try_offset(fs, fs->start_lba, 1);
+        }
+    }
     if (ok)
         fs->mounted = 1;
     fs_unlock();
@@ -1015,7 +1345,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         return -1;
     }
 
-    kprintf("kfs: mounted v2 on %s at lba %lu, %u blocks (%u free), "
+    kprintf("kfs: mounted v3 journaled on %s at lba %lu, %u blocks (%u free), "
             "%u inodes\n", bd->name, (unsigned long)fs->start_lba,
             fs->sb.total_blocks, fs->sb.free_blocks, fs->sb.inode_count);
     *fs_priv = fs;

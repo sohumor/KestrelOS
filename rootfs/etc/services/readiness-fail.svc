@@ -1,0 +1,10 @@
+# Disabled negative readiness fixture. Starting it exercises timeout, kill,
+# reap, failed-state, and reset-failed handling without delaying normal boot.
+name=readiness-fail
+exec=/bin/sleep
+args=5
+restart=never
+ready=/run/readiness-never-created.ready
+timeout_ms=200
+after=logger
+enabled=no

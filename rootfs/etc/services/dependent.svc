@@ -1,0 +1,9 @@
+# Disabled demonstration of a long-running service with ordering and hard
+# lifecycle dependencies. `service start dependent` starts it on demand.
+name=dependent
+exec=/bin/sleep
+args=30
+restart=on-failure
+after=logger, readiness
+requires=readiness
+enabled=no

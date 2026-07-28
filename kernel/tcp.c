@@ -5,6 +5,7 @@
 #include "kheap.h"
 #include "net.h"
 #include "tcp.h"
+#include "tcp_reassembly.h"
 
 /* TCP (client side).
  *
@@ -93,7 +94,10 @@ struct tcp_conn {
     uint8_t *rxbuf;        /* ring */
     int      rx_head;
     int      rx_len;
+    struct tcp_reassembly reassembly;
     bool     peer_fin;
+    bool     fin_queued;
+    uint32_t fin_rcv_seq;
     bool     need_ack;
 
     /* timers */
@@ -121,35 +125,6 @@ static inline bool seq_lt(uint32_t a, uint32_t b)
 static inline bool seq_leq(uint32_t a, uint32_t b)
 {
     return (int32_t)(a - b) <= 0;
-}
-
-/* ---- checksum ----
- * Same convention as net_checksum(): the result is already big-endian and
- * ready to store, and checksumming a valid segment yields 0. */
-
-static uint16_t tcp_csum(uint32_t src_be, uint32_t dst_be,
-                         const uint8_t *seg, int len)
-{
-    const uint8_t *s = (const uint8_t *)&src_be;
-    const uint8_t *d = (const uint8_t *)&dst_be;
-    uint32_t sum = 0;
-
-    /* pseudo-header: src, dst, zero, protocol, TCP length */
-    sum += (uint32_t)((s[0] << 8) | s[1]);
-    sum += (uint32_t)((s[2] << 8) | s[3]);
-    sum += (uint32_t)((d[0] << 8) | d[1]);
-    sum += (uint32_t)((d[2] << 8) | d[3]);
-    sum += (uint32_t)IP_PROTO_TCP;
-    sum += (uint32_t)len;
-
-    for (int i = 0; i + 1 < len; i += 2)
-        sum += (uint32_t)((seg[i] << 8) | seg[i + 1]);
-    if (len & 1)
-        sum += (uint32_t)(seg[len - 1] << 8);
-
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    return htons((uint16_t)~sum);
 }
 
 /* ---- helpers ---- */
@@ -213,7 +188,8 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
     }
     irq_restore(f);
 
-    th->csum = tcp_csum(net_ip_addr(), c->peer_ip, pkt, hlen + dlen);
+    th->csum = net_transport_checksum(net_ip_addr(), c->peer_ip,
+                                      IP_PROTO_TCP, pkt, hlen + dlen);
     return net_ip_send(c->peer_ip, IP_PROTO_TCP, pkt, hlen + dlen);
 }
 
@@ -232,7 +208,7 @@ static void conn_release(struct tcp_conn *c)
     c->tx_head = c->tx_len = 0;
     c->rx_head = c->rx_len = 0;
     c->fin_pending = c->fin_sent = false;
-    c->peer_fin = c->need_ack = c->reset = false;
+    c->peer_fin = c->fin_queued = c->need_ack = c->reset = false;
     c->rto_deadline = 0;
     c->retries = 0;
     irq_restore(f);
@@ -324,34 +300,43 @@ static void process_ack(struct tcp_conn *c, uint32_t ack, uint16_t win)
     }
 }
 
-/* Only data landing exactly at rcv_nxt is kept: anything else is dropped
- * and an ACK is scheduled so the peer retransmits the hole. */
 static void accept_data(struct tcp_conn *c, uint32_t seq,
                         const uint8_t *data, int dlen)
 {
-    if (seq != c->rcv_nxt || c->peer_fin) {
+    if (c->peer_fin) {
         c->need_ack = true;
         return;
     }
 
-    int freebytes = TCP_RXBUF - c->rx_len;
-    int n = dlen < freebytes ? dlen : freebytes;
-    if (n <= 0) {
-        c->need_ack = true;           /* window closed: re-advertise 0 */
-        return;
+    if (c->fin_queued) {
+        int32_t before_fin = (int32_t)(c->fin_rcv_seq - seq);
+        if (before_fin <= 0) {
+            c->need_ack = true;
+            return;
+        }
+        if (dlen > before_fin)
+            dlen = before_fin;
     }
 
-    int tail = (c->rx_head + c->rx_len) % TCP_RXBUF;
-    int first = TCP_RXBUF - tail;
-    if (first > n)
-        first = n;
-    memcpy(c->rxbuf + tail, data, (size_t)first);
-    if (n > first)
-        memcpy(c->rxbuf, data + first, (size_t)(n - first));
-
-    c->rx_len += n;
-    c->rcv_nxt += (uint32_t)n;
+    tcp_reassembly_accept(&c->reassembly, c->rxbuf, c->rx_head,
+                          &c->rx_len, &c->rcv_nxt, seq, data, dlen);
     c->need_ack = true;
+}
+
+static void accept_peer_fin(struct tcp_conn *c)
+{
+    c->rcv_nxt++;
+    c->peer_fin = true;
+    c->fin_queued = false;
+    c->need_ack = true;
+    if (c->state == TCP_ESTABLISHED) {
+        c->state = TCP_CLOSE_WAIT;
+    } else if (c->state == TCP_FIN_WAIT_2) {
+        c->state = TCP_TIME_WAIT;
+        c->tw_deadline = timer_ticks() + TCP_TW_TICKS;
+    }
+    /* FIN_WAIT_1: stay put; process_ack() promotes us to TIME_WAIT once
+     * our own FIN is acknowledged. */
 }
 
 void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
@@ -363,7 +348,8 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
     int hlen = (th->off >> 4) * 4;
     if (hlen < (int)sizeof(*th) || hlen > len)
         return;
-    if (tcp_csum(src_ip_be, net_ip_addr(), seg, len) != 0)
+    if (net_transport_checksum(src_ip_be, net_ip_addr(), IP_PROTO_TCP,
+                               seg, len) != 0)
         return;
 
     struct tcp_conn *c = conn_lookup(src_ip_be, ntohs(th->sport),
@@ -409,24 +395,28 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
     if (fl & TCP_ACK)
         process_ack(c, ack, ntohs(th->win));
 
+    /* Remember an in-window FIN even when data in front of it is missing.
+     * A later segment which fills the hole can then complete the close
+     * without waiting for the peer's FIN retransmission timer. */
+    uint32_t fin_seq = seq + (uint32_t)dlen;
+    if ((fl & TCP_FIN) && !c->peer_fin) {
+        int32_t delta = (int32_t)(fin_seq - c->rcv_nxt);
+        int window = TCP_RXBUF - c->rx_len;
+        if (delta >= 0 && delta < window &&
+            (!c->fin_queued || c->fin_rcv_seq == fin_seq)) {
+            c->fin_queued = true;
+            c->fin_rcv_seq = fin_seq;
+            tcp_reassembly_discard_from(&c->reassembly, c->rx_head,
+                                        c->rx_len, c->rcv_nxt, fin_seq);
+            c->need_ack = true;
+        }
+    }
+
     if (dlen > 0)
         accept_data(c, seq, data, dlen);
 
-    /* Honour the FIN only once every byte in front of it has been taken,
-     * otherwise its sequence number is not the one at rcv_nxt. */
-    if ((fl & TCP_FIN) && seq + (uint32_t)dlen == c->rcv_nxt) {
-        c->rcv_nxt++;
-        c->peer_fin = true;
-        c->need_ack = true;
-        if (c->state == TCP_ESTABLISHED) {
-            c->state = TCP_CLOSE_WAIT;
-        } else if (c->state == TCP_FIN_WAIT_2) {
-            c->state = TCP_TIME_WAIT;
-            c->tw_deadline = timer_ticks() + TCP_TW_TICKS;
-        }
-        /* FIN_WAIT_1: stay put; process_ack() promotes us to TIME_WAIT
-         * once our own FIN is acknowledged. */
-    }
+    if (c->fin_queued && c->fin_rcv_seq == c->rcv_nxt)
+        accept_peer_fin(c);
 }
 
 /* ---- task side: the transmit pump ---- */
@@ -469,8 +459,9 @@ static void conn_pump(struct tcp_conn *c)
         goto out;
     }
 
-    /* Retransmission: go back to snd_una and resend from there. There is
-     * no selective ack and no reassembly queue, so go-back-N is exact. */
+    /* Retransmission: go back to snd_una and resend from there. The receive
+     * side reassembles reordered data, but the send side uses cumulative
+     * ACKs and deliberately stays with simple go-back-N. */
     if (c->snd_una != c->snd_nxt && c->rto_deadline && now >= c->rto_deadline) {
         if (c->retries >= TCP_MAX_TRIES) {
             kprintf("tcp: giving up after %d retransmits\n", c->retries);
@@ -592,6 +583,8 @@ void tcp_init(void)
         c->owner_pid = 0;
         c->tx_head = c->tx_len = 0;
         c->rx_head = c->rx_len = 0;
+        tcp_reassembly_reset(&c->reassembly);
+        c->peer_fin = c->fin_queued = false;
     }
     port_next = TCP_PORT_FIRST;
 }
@@ -674,7 +667,8 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
     c->fin_seq = 0;
     c->irs = c->rcv_nxt = 0;
     c->rx_head = c->rx_len = 0;
-    c->peer_fin = c->need_ack = c->reset = false;
+    tcp_reassembly_reset(&c->reassembly);
+    c->peer_fin = c->fin_queued = c->need_ack = c->reset = false;
     c->rto_ticks = TCP_RTO_MIN;
     c->rto_deadline = 0;
     c->retries = 0;

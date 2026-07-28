@@ -86,8 +86,9 @@ ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless test smoke fsck screenshot vm-images clean help \
-        reconfig checkconfig
+.PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
+        test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
+        screenshot vm-images clean help reconfig checkconfig
 
 all: $(BUILD)/os.img
 
@@ -259,8 +260,30 @@ run-headless: all
 test: all
 	$(PY) tools/e2e.py
 
+test-e1000: all
+	$(PY) tools/e2e.py --nic e1000
+
+test-tcp:
+	sh tools/run-tcp-tests.sh
+
+test-checksum:
+	sh tools/run-net-checksum-tests.sh
+
+test-net: test-tcp test-checksum
+
+test-kfs-journal:
+	$(PY) tools/test_kfs_journal.py
+
+test-kfs-boot-recovery: all
+	$(PY) tools/test_kfs_boot_recovery.py
+
+test-kfs: test-kfs-journal test-kfs-boot-recovery
+
 smoke: all
 	$(PY) tools/e2e.py --smoke
+
+smoke-e1000: all
+	$(PY) tools/e2e.py --smoke --nic e1000
 
 fsck: $(BUILD)/fs.img
 	$(PY) tools/kfsck.py -l $<
@@ -277,7 +300,14 @@ help:
 	@echo "  make run        boot it in QEMU (window + serial on stdio)"
 	@echo "  make run-headless   boot it with serial only"
 	@echo "  make test       run the end-to-end suite in headless QEMU"
+	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
+	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
+	@echo "  make test-net   run host TCP + network checksum tests"
+	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
+	@echo "  make test-kfs-boot-recovery   boot a committed journal through recovery"
+	@echo "  make test-kfs   run both KFS recovery suites"
 	@echo "  make smoke      boot-only quick check"
+	@echo "  make smoke-e1000   boot-only check with the Intel NIC"
 	@echo "  make fsck       validate + list the generated KFS image"
 	@echo "  make screenshot capture the VGA console to a PNG"
 	@echo "  make vm-images  convert to VirtualBox/VMware disk formats"

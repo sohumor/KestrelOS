@@ -2,7 +2,7 @@
 
 #include <stdint.h>
 
-/* KFS: the native KestrelOS filesystem, on-disk version 2.
+/* KFS: the native KestrelOS filesystem, on-disk version 3.
  * (see docs/kfs.md)
  *
  *   Block size 4096 bytes = 8 disk sectors. A KFS image starts at some
@@ -13,15 +13,19 @@
  *
  *   block 0                superblock
  *   bitmap_start ..        block bitmap, 1 bit per FS block, set = used
+ *   journal_start ..       redo-journal header + payload blocks
  *   inode_start ..         inode table, 64 inodes per block, ino is 1-based
  *   data_start ..          data blocks
  *
- * v2 adds mode / uid / gid / mtime to the inode and drops nlink (KFS has
+ * v2 added mode / uid / gid / mtime to the inode and dropped nlink (KFS has
  * never supported hard links). The inode stayed 64 bytes by giving up two
  * direct block pointers, so the maximum file size shrank slightly.
+ * v3 reserves a checksummed, fixed-size redo journal for atomic metadata
+ * transactions. The inode layout is unchanged from v2.
  */
 
-#define KFS_MAGIC             0x3253464B  /* "KFS2" little-endian */
+#define KFS_MAGIC             0x3353464B  /* "KFS3" little-endian */
+#define KFS_MAGIC_V2          0x3253464B  /* "KFS2": recognised, rejected */
 #define KFS_MAGIC_V1          0x3153464B  /* "KFS1": recognised, rejected */
 #define KFS_BLOCK_SIZE        4096
 #define KFS_SECTOR_SIZE       512
@@ -34,6 +38,12 @@
 #define KFS_ROOT_INO          1
 #define KFS_INODES_PER_BLOCK  (KFS_BLOCK_SIZE / 64)         /* 64 */
 #define KFS_DIRENTS_PER_BLOCK (KFS_BLOCK_SIZE / 64)         /* 64 */
+
+#define KFS_FEATURE_JOURNAL   0x00000001u
+#define KFS_JOURNAL_ENTRIES   32
+#define KFS_JOURNAL_BLOCKS    (1 + KFS_JOURNAL_ENTRIES)
+#define KFS_JOURNAL_MAGIC     0x314C4E4Au  /* "JNL1" little-endian */
+#define KFS_JOURNAL_COMMITTED 1u
 
 /* Where the boot disk keeps its KFS partition (tools/mkimage.py writes
  * it there). Only used as a probe candidate: a device whose superblock
@@ -51,18 +61,33 @@
 #define KFS_TYPE_FILE 1
 #define KFS_TYPE_DIR  2
 
-/* Block 0, first 40 bytes; the rest of the block is zero. */
+/* Block 0, first 52 bytes; the rest of the block is zero. */
 struct kfs_superblock {
     uint32_t magic;         /* KFS_MAGIC */
     uint32_t total_blocks;  /* size of the whole FS in blocks */
     uint32_t bitmap_start;  /* first bitmap block (= 1) */
     uint32_t bitmap_blocks;
+    uint32_t journal_start; /* journal header block */
+    uint32_t journal_blocks;/* header + KFS_JOURNAL_ENTRIES payload blocks */
     uint32_t inode_start;
     uint32_t inode_blocks;
     uint32_t inode_count;   /* number of inode slots (default 1024) */
     uint32_t data_start;    /* first data block */
     uint32_t root_ino;      /* = 1 */
     uint32_t free_blocks;
+    uint32_t features;      /* KFS_FEATURE_* */
+};
+
+/* First bytes of journal_start. Payload i lives in journal_start + 1 + i.
+ * A zero block is clean. A committed header is replayed only when its CRC32
+ * matches the sequence/count/targets and every payload byte. */
+struct kfs_journal_header {
+    uint32_t magic;
+    uint32_t state;
+    uint32_t sequence;
+    uint32_t count;
+    uint32_t checksum;
+    uint32_t targets[KFS_JOURNAL_ENTRIES];
 };
 
 /* Exactly 64 bytes on disk:

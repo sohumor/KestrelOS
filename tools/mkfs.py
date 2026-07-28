@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a KFS v2 filesystem image from a host directory tree.
+"""Build a KFS v3 filesystem image from a host directory tree.
 
 Usage: mkfs.py [options] <rootdir> <out.img> <size_mb>
 
@@ -15,7 +15,8 @@ Options:
                         GID defaults to UID.
 
 On-disk format (see docs/kfs.md): 4096-byte blocks, block 0 superblock,
-then block bitmap, inode table (64-byte inodes, 1-based), data blocks.
+then block bitmap, redo journal, inode table (64-byte inodes, 1-based),
+and data blocks.
 
 Default ownership and permissions:
   * everything is owned by root:root (uid 0, gid 0);
@@ -34,7 +35,10 @@ import struct
 import sys
 
 BLOCK_SIZE = 4096
-MAGIC = 0x3253464B          # "KFS2"
+MAGIC = 0x3353464B          # "KFS3"
+FEATURE_JOURNAL = 1
+JOURNAL_ENTRIES = 32
+JOURNAL_BLOCKS = 1 + JOURNAL_ENTRIES
 NDIRECT = 10
 NINDIRECT = BLOCK_SIZE // 4
 MAX_FILE_SIZE = (NDIRECT + NINDIRECT) * BLOCK_SIZE
@@ -67,7 +71,9 @@ class Fs:
         self.total_blocks = total_blocks
         self.bitmap_start = 1
         self.bitmap_blocks = (total_blocks + BLOCK_SIZE * 8 - 1) // (BLOCK_SIZE * 8)
-        self.inode_start = self.bitmap_start + self.bitmap_blocks
+        self.journal_start = self.bitmap_start + self.bitmap_blocks
+        self.journal_blocks = JOURNAL_BLOCKS
+        self.inode_start = self.journal_start + self.journal_blocks
         self.data_start = self.inode_start + INODE_BLOCKS
         if self.data_start >= total_blocks:
             raise SystemExit("mkfs: image too small for metadata")
@@ -130,10 +136,11 @@ class Fs:
         if rem:
             self.image[boff + full] = (1 << rem) - 1
         # superblock
-        sb = struct.pack("<10I", MAGIC, self.total_blocks, self.bitmap_start,
-                         self.bitmap_blocks, self.inode_start, INODE_BLOCKS,
-                         INODE_COUNT, self.data_start, ROOT_INO,
-                         self.total_blocks - used)
+        sb = struct.pack(
+            "<13I", MAGIC, self.total_blocks, self.bitmap_start,
+            self.bitmap_blocks, self.journal_start, self.journal_blocks,
+            self.inode_start, INODE_BLOCKS, INODE_COUNT, self.data_start,
+            ROOT_INO, self.total_blocks - used, FEATURE_JOURNAL)
         self.image[0:len(sb)] = sb
 
 
@@ -298,7 +305,8 @@ def main():
     for path in policy.unused():
         print("mkfs: warning: override for %s matched nothing" % path,
               file=sys.stderr)
-    print("mkfs: %s: KFS v2, %d blocks (%d used, %d free), %d/%d inodes"
+    print("mkfs: %s: KFS v3 journaled, %d blocks (%d used, %d free), "
+          "%d/%d inodes"
           % (out_path, total_blocks, fs.next_block,
              total_blocks - fs.next_block, fs.next_ino - 1, INODE_COUNT))
     return 0

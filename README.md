@@ -46,9 +46,10 @@ with a full direct map, per-process address spaces, and a kernel heap.
 per-task FPU state and credentials, an ELF64 loader, pipes, I/O redirection,
 process control, and a 50-plus call syscall interface.
 
-**Storage** — an ATA driver and **KFS**, a custom filesystem with directories,
-indirect blocks, and per-file ownership, permissions and timestamps, enforced
-by the VFS against each task's credentials. Plus `/dev` with real device files.
+**Storage** — an ATA driver and **KFS**, a custom filesystem with a checksummed
+metadata redo journal, directories, indirect blocks, and per-file ownership,
+permissions and timestamps, enforced by the VFS against each task's
+credentials. Plus `/dev` with real device files.
 
 **Networking** — PCI enumeration, two NIC drivers (RTL8139 and Intel e1000)
 behind a common interface, and a from-scratch stack: Ethernet, ARP, IPv4, ICMP,
@@ -60,9 +61,10 @@ bars and routed input; a userspace widget toolkit; and a desktop shell with a
 taskbar, a graphical terminal, file manager, clock, paint program and browser.
 
 **System** — multi-user logins with salted iterated SHA-256 password hashes
-(written from the specification), a service-supervising init with dependency
-ordering and restart backoff, a package manager with dependency resolution and
-integrity verification, and around 70 userspace programs.
+(written from the specification), a service-supervising init with readiness,
+hard dependencies, restart policies and backoff, a package manager with
+dependency resolution and integrity verification, and around 70 userspace
+programs.
 
 ## Building
 
@@ -135,11 +137,9 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 ## Known limitations
 
 Single CPU (no SMP), no swap or demand paging, no signals, no dynamic linking,
-no journal in the filesystem, TCP does not reassemble out-of-order segments,
-and TLS supports 1.3 only. The from-scratch TLS code is unaudited, and its
-entropy is weak on a CPU without a hardware random source. `libtls` and
-`tlstest` can make verified HTTPS requests, but the graphical browser still
-uses the old flat renderer and is not wired to the new TLS/HTTP/web stack yet.
+metadata-only journaling (not file-data journaling or checksums), no TCP
+selective acknowledgements, and TLS 1.3 only. The from-scratch TLS code is
+unaudited, and its entropy is weak on a CPU without a hardware random source.
 The password hashing is honest about being non-cryptographic, because the
 random number generator behind the salts is not.
 

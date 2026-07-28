@@ -88,6 +88,6 @@ what `browser` is.
 
 Single CPU (no SMP or per-CPU locking), cooperative-ish kernel preemption rather
 than fully reentrant kernel paths, no swap or demand paging from disk, no
-signals (process termination is a direct kill), no dynamic linking, no journal in
-the filesystem, and no cryptography beyond a password hash — nothing here should
-be relied on for secrecy.
+signals (process termination is a direct kill), no dynamic linking, no file-data
+journaling or checksums, and no cryptography beyond a password hash — nothing
+here should be relied on for secrecy.

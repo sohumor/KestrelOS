@@ -4,14 +4,18 @@
 #   name=      informational; the unit name always follows the file name
 #   exec=      absolute path of the program (required)
 #   args=      arguments, split on whitespace, at most 8
-#   respawn=   yes|no - restart it when it exits (default yes)
-#   after=     start only once this other service has been started
+#   restart=   always|on-failure|never (default always)
+#   respawn=   compatibility yes|no spelling for always|never
+#   after=     comma/space-separated startup ordering dependencies
+#   requires=  hard dependencies, kept healthy while this unit is active
+#   ready=     absolute marker path init waits for after spawning
+#   timeout_ms= readiness deadline, 100..60000 (default 5000)
 #   stdout=    append the program's fd 1 to this file (default: console)
 #   stderr=    only honoured when it equals stdout=; fd 2 stays on console
 #   enabled=   yes|no - no means configured but not started (default yes)
 name=example
 exec=/bin/true
 args=
-respawn=no
+restart=never
 after=logger
 enabled=no

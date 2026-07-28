@@ -403,8 +403,8 @@ understands the ANSI sequences the libc `term_*` helpers emit.
   (VirtualBox default `e1000`).
 - **DHCP configuration.** `kernel/net.c` attempts DHCP auto-configuration at boot and falls
   back to standard static defaults (`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`).
-  Any other network topology needs those constants changed. There is no
-  DHCP client.
+  Check the boot log for the acquired lease or the fallback notice when
+  diagnosing a non-default network topology.
 - **`ping` to an outside host times out.** QEMU user-mode networking does
   not forward ICMP to the internet on every host/platform. `ping 10.0.2.2`
   (the built-in gateway) is the reliable check; the test harness treats an

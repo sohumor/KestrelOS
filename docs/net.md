@@ -1,8 +1,8 @@
 # KestrelOS network stack
 
 From-scratch network stack: PCI enumeration, RTL8139 and Intel e1000 NIC
-drivers, and an Ethernet / ARP / IPv4 / ICMP / UDP stack with a small DNS
-resolver.
+drivers, and an Ethernet / ARP / IPv4 / ICMP / UDP / TCP stack with a small
+DNS resolver.
 
 ## Files
 
@@ -27,7 +27,7 @@ resolver.
                     arp_resolve       │                 ┌── ARP ──────┤
                    (wait + retry)     v                 │  (reply,    v
                           └────> netdev->send <── ICMP echo reply   IPv4 demux
-                                  (TX descr.)                    ICMP / udp_input
+                                  (TX descr.)               ICMP / UDP / TCP
 ```
 
 ## NIC drivers
@@ -75,14 +75,15 @@ disabled ("net: no NIC found").
   received ARP and IPv4 packet, which is why ICMP echo replies from IRQ
   context never block on ARP.
 * **IPv4**: ihl=5 on send, ttl 64, header checksum generated and
-  verified. Fragments are dropped (no reassembly). Only ICMP (1) and
-  UDP (17) are demuxed.
+  verified. Fragments are dropped (no reassembly). ICMP (1), TCP (6), and
+  UDP (17) are demultiplexed.
 * **ICMP**: answers inbound echo requests (the host can ping the VM).
   `icmp_ping()` sends a 32-byte-payload echo request and reports RTT with
   10 ms granularity (PIT tick).
 * **UDP**: 16 port bindings, 8 queued packets per port, drop-on-full.
-  `udp_recv()` binds the port on the fly if needed. TX checksum is 0
-  (legal for UDP over IPv4).
+  `udp_recv()` binds the port on the fly if needed. Transmit checksums include
+  the IPv4 pseudo-header; receive drops corrupt checksummed datagrams while
+  retaining IPv4 compatibility with peers that explicitly send checksum 0.
 * **DNS**: single A query with RD=1 to the configured server, source port
   `0xC000 + counter`, 2 tries with 1 s timeout each, handles name
   compression pointers, takes the first A answer. Dotted-quad strings are
@@ -121,13 +122,14 @@ ping/UDP/DNS works out of the box.
 * Answering inbound ICMP echo requests and ARP requests
 * UDP send/recv with port queues
 * DNS A-record resolution
-* Full client TCP stack and HTTP/1.1 client
+* Client TCP with bounded out-of-order receive reassembly
+* HTTP/1.1 client
 
 ## Limits
 
 * No IP fragmentation/reassembly; frames limited to a 1500-byte MTU.
-* No checksum on transmitted UDP (checksum 0 — allowed for IPv4).
 * One NIC, one IP; RTL8139 or e1000 (RTL8139 wins if both are present).
+* TCP uses cumulative ACKs and go-back-N retransmission; no SACK support.
 * ARP cache entries never expire (fine for slirp's static world).
 * On an RX ring error the receiver is reset and any queued frames in the
   ring are lost (never observed under QEMU in practice).

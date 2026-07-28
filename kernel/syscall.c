@@ -966,6 +966,12 @@ static void syscall_dispatch(struct regs *r)
     }
 
     r->rax = (uint64_t)ret;
+
+    /* SYS_KILL never tears a task down while it may hold a kernel lock.
+     * A sleeping victim is made runnable and resumes inside its interrupted
+     * syscall, so this return checkpoint is what makes the pending kill
+     * take effect before any more ring-3 code can run. */
+    task_check_kill();
 }
 
 /* Ring-3 CPU exception: kill the process, never the kernel. */

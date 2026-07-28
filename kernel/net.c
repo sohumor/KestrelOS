@@ -85,25 +85,6 @@ const struct netdev *netdev_current(void)
 
 /* ---- helpers ---- */
 
-uint16_t net_checksum(const void *data, int len)
-{
-    const uint8_t *p = data;
-    uint32_t sum = 0;
-
-    while (len > 1) {
-        sum += (uint32_t)((p[0] << 8) | p[1]);
-        p += 2;
-        len -= 2;
-    }
-    if (len)
-        sum += (uint32_t)(p[0] << 8);
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    /* Complement, then store big-endian so it can go straight into
-     * a header field. Checksumming a valid header then yields 0. */
-    return htons((uint16_t)~sum);
-}
-
 bool net_ready(void)
 {
     return ready && netdev_current() != NULL;
@@ -458,7 +439,7 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
     if (ip->proto == IP_PROTO_ICMP)
         icmp_input(ip->src, eh->src, payload, plen);
     else if (ip->proto == IP_PROTO_UDP)
-        udp_input(ip->src, payload, plen);
+        udp_input(ip->src, ip->dst, payload, plen);
     else if (ip->proto == IP_PROTO_TCP)
         tcp_input(ip->src, payload, plen);
 }

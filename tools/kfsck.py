@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
-"""Check a KFS v2 image for consistency; optionally list its tree.
+"""Check a KFS v3 image for consistency; optionally recover/list its tree.
 
-Usage: kfsck.py [-l] <image>
+Usage: kfsck.py [--recover] [-l] <image>
 
-Validates the superblock, block bitmap, inode table (including the v2
+Validates the journal, superblock, block bitmap, inode table (including the v2
 mode/uid/gid/mtime fields), directory structure and reachability. Exits
 nonzero if any corruption is found. With -l the directory tree is printed
-with permissions, owner, size and timestamp.
+with permissions, owner, size and timestamp. --recover replays a valid
+committed redo transaction (or clears an incomplete one) before checking.
 """
 import struct
 import sys
 import time
+import zlib
 
 BLOCK_SIZE = 4096
-MAGIC = 0x3253464B          # "KFS2"
+MAGIC = 0x3353464B          # "KFS3"
+MAGIC_V2 = 0x3253464B       # "KFS2"
 MAGIC_V1 = 0x3153464B       # "KFS1"
+FEATURE_JOURNAL = 1
+JOURNAL_MAGIC = 0x314C4E4A  # "JNL1"
+JOURNAL_COMMITTED = 1
+JOURNAL_ENTRIES = 32
+JOURNAL_BLOCKS = 1 + JOURNAL_ENTRIES
 NDIRECT = 10
 NINDIRECT = BLOCK_SIZE // 4
 INODE_SIZE = 64
@@ -50,12 +58,14 @@ def warn(msg):
 
 class Img:
     def __init__(self, path):
+        self.path = path
         with open(path, "rb") as f:
-            self.data = f.read()
+            self.data = bytearray(f.read())
         (self.magic, self.total_blocks, self.bitmap_start, self.bitmap_blocks,
-         self.inode_start, self.inode_blocks, self.inode_count,
-         self.data_start, self.root_ino, self.free_blocks) = \
-            struct.unpack_from("<10I", self.data, 0)
+         self.journal_start, self.journal_blocks, self.inode_start,
+         self.inode_blocks, self.inode_count, self.data_start, self.root_ino,
+         self.free_blocks, self.features) = \
+            struct.unpack_from("<13I", self.data, 0)
 
     def block(self, n):
         return self.data[n * BLOCK_SIZE:(n + 1) * BLOCK_SIZE]
@@ -71,6 +81,63 @@ class Img:
     def bit(self, blk):
         b = self.data[self.bitmap_start * BLOCK_SIZE + blk // 8]
         return (b >> (blk % 8)) & 1
+
+    def write_block(self, n, data):
+        assert len(data) == BLOCK_SIZE
+        self.data[n * BLOCK_SIZE:(n + 1) * BLOCK_SIZE] = data
+
+    def save(self):
+        with open(self.path, "wb") as f:
+            f.write(self.data)
+
+
+def journal_info(img):
+    raw = img.block(img.journal_start)
+    magic, state, sequence, count, checksum = struct.unpack_from("<5I", raw, 0)
+    if magic == 0 and state == 0 and count == 0:
+        return {"status": "clean"}
+    if magic != JOURNAL_MAGIC or state != JOURNAL_COMMITTED or \
+            count == 0 or count > JOURNAL_ENTRIES:
+        return {"status": "incomplete", "sequence": sequence}
+
+    targets = list(struct.unpack_from("<%dI" % JOURNAL_ENTRIES, raw, 20))[:count]
+    for i, target in enumerate(targets):
+        if target >= img.total_blocks or \
+                img.journal_start <= target < img.journal_start + img.journal_blocks:
+            return {"status": "unsafe", "target": target}
+        if target in targets[:i]:
+            return {"status": "unsafe", "target": target}
+
+    payloads = [img.block(img.journal_start + 1 + i) for i in range(count)]
+    crc = zlib.crc32(struct.pack("<II", sequence, count))
+    crc = zlib.crc32(struct.pack("<%dI" % count, *targets), crc)
+    for payload in payloads:
+        crc = zlib.crc32(payload, crc)
+    crc &= 0xFFFFFFFF
+    if crc != checksum:
+        return {"status": "torn", "sequence": sequence}
+    return {"status": "committed", "sequence": sequence, "count": count,
+            "targets": targets, "payloads": payloads}
+
+
+def recover_journal(img):
+    info = journal_info(img)
+    status = info["status"]
+    if status == "clean":
+        return 0
+    if status == "unsafe":
+        err("journal contains unsafe/duplicate target %d" % info["target"])
+        return -1
+    if status == "committed":
+        for target, payload in zip(info["targets"], info["payloads"]):
+            img.write_block(target, payload)
+        print("kfsck: replayed journal transaction %d (%d blocks)"
+              % (info["sequence"], info["count"]))
+    else:
+        print("kfsck: cleared %s journal transaction" % status)
+    img.write_block(img.journal_start, bytes(BLOCK_SIZE))
+    img.save()
+    return 1
 
 
 def check_meta(ino, node):
@@ -172,15 +239,17 @@ def describe(node):
 def main():
     args = sys.argv[1:]
     do_list = "-l" in args
-    args = [a for a in args if a != "-l"]
+    do_recover = "--recover" in args
+    args = [a for a in args if a not in ("-l", "--recover")]
     if len(args) != 1:
-        print("usage: kfsck.py [-l] <image>")
+        print("usage: kfsck.py [--recover] [-l] <image>")
         return 2
     img = Img(args[0])
 
     # --- superblock ---
-    if img.magic == MAGIC_V1:
-        err("image is KFS v1; this checker (and the kernel) need v2")
+    if img.magic in (MAGIC_V1, MAGIC_V2):
+        version = 1 if img.magic == MAGIC_V1 else 2
+        err("image is KFS v%d; this checker (and the kernel) need v3" % version)
         return 1
     if img.magic != MAGIC:
         err("bad magic 0x%08X" % img.magic)
@@ -193,9 +262,15 @@ def main():
     if img.bitmap_start != 1 or img.bitmap_blocks < want_bb:
         err("bad bitmap geometry (start %d, blocks %d, want >= %d)"
             % (img.bitmap_start, img.bitmap_blocks, want_bb))
-    if img.inode_start != img.bitmap_start + img.bitmap_blocks:
-        err("inode_start %d != bitmap end %d"
-            % (img.inode_start, img.bitmap_start + img.bitmap_blocks))
+    if img.journal_start != img.bitmap_start + img.bitmap_blocks:
+        err("journal_start %d != bitmap end %d"
+            % (img.journal_start, img.bitmap_start + img.bitmap_blocks))
+    if img.journal_blocks != JOURNAL_BLOCKS:
+        err("journal_blocks %d != required %d"
+            % (img.journal_blocks, JOURNAL_BLOCKS))
+    if img.inode_start != img.journal_start + img.journal_blocks:
+        err("inode_start %d != journal end %d"
+            % (img.inode_start, img.journal_start + img.journal_blocks))
     if img.data_start != img.inode_start + img.inode_blocks:
         err("data_start %d != inode end %d"
             % (img.data_start, img.inode_start + img.inode_blocks))
@@ -203,8 +278,26 @@ def main():
         err("inode_count %d exceeds inode table capacity" % img.inode_count)
     if img.root_ino != 1:
         err("root_ino is %d, expected 1" % img.root_ino)
+    if img.features != FEATURE_JOURNAL:
+        err("unsupported feature mask 0x%08X" % img.features)
     if errors:
         return 1
+
+    info = journal_info(img)
+    if info["status"] != "clean":
+        if not do_recover:
+            if info["status"] == "committed":
+                err("committed journal transaction %d needs recovery"
+                    % info["sequence"])
+            elif info["status"] == "unsafe":
+                err("journal contains unsafe/duplicate target %d"
+                    % info["target"])
+            else:
+                err("%s journal transaction needs cleanup" % info["status"])
+            return 1
+        if recover_journal(img) < 0:
+            return 1
+        img = Img(args[0])
 
     # --- collect all used blocks from inodes ---
     owner = {}          # block -> ino
@@ -316,7 +409,8 @@ def main():
     if errors:
         print("kfsck: %d error(s)" % len(errors), file=sys.stderr)
         return 1
-    print("kfsck: %s: clean (KFS v2, %d blocks, %d free, %d inodes in use%s)"
+    print("kfsck: %s: clean (KFS v3 journaled, %d blocks, %d free, "
+          "%d inodes in use%s)"
           % (args[0], img.total_blocks, img.free_blocks,
              sum(1 for t in types.values() if t != TYPE_FREE),
              ", %d warning(s)" % len(warnings) if warnings else ""))

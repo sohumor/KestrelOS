@@ -273,8 +273,11 @@ A ring-3 exception never reaches `panic()`: `user_fault()` in
 faults), records exit code `-1` and calls `task_exit(-1)`, so a crashing
 process dies alone.
 
-PID 1 is `/bin/init` (`apps/init.c`): it prints `/etc/motd` and then
-spawns `/bin/sh` in a loop, restarting it whenever it exits.
+PID 1 is `/bin/init` (`apps/init.c`): it parses `/etc/inittab`, orders
+services by `after=`/`requires=`, waits for explicit readiness markers,
+applies per-unit restart policy and crash backoff, exposes the `/run` service
+control protocol, and performs reverse-order shutdown. The login console is
+one supervised unit rather than a special case.
 
 ## System calls
 
@@ -337,14 +340,16 @@ Full details, struct layouts and error semantics: [ABI.md](ABI.md).
   vfs.c    absolute paths only; struct file { inum, pos, flags, refs }
           v
   kfs.c    superblock, block bitmap, 64-byte inodes, direct + one
-           indirect block, directory entries; write-through, no journal
+           indirect block, directory entries; metadata redo journal
           v
   ata.c    PIO reads/writes of 512-byte sectors on the primary master;
            FS block B  ->  LBA 2048 + 8*B
 ```
 
 KFS is a fixed-layout inode filesystem with 4096-byte blocks: block 0 is
-the superblock, then the block bitmap, then the inode table, then data.
+the superblock, then the block bitmap, fixed checksummed metadata journal,
+inode table, and data. Regular data is ordered write-through; committed
+metadata transactions replay at mount.
 Host-side tools `tools/mkfs.py` (build an image from a directory tree)
 and `tools/kfsck.py` (validate and list) implement the same format.
 

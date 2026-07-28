@@ -18,6 +18,7 @@ program prints are the three tricks used throughout.
 Usage:
     python3 tools/e2e.py            # full test sequence
     python3 tools/e2e.py --smoke    # boot + prompt only
+    python3 tools/e2e.py --nic e1000
     python3 tools/e2e.py --list     # list tests without running
     python3 tools/e2e.py --selftest # exercise expect/send plumbing
                                     # against a fake child (no image)
@@ -38,15 +39,30 @@ import tempfile
 import threading
 import time
 
-QEMU_CMD = [
+QEMU_BASE_CMD = [
     "qemu-system-x86_64",
     "-drive", "file=build/os.img,format=raw",
+    # Package/filesystem tests deliberately mutate the guest disk. Keep those
+    # writes in a temporary overlay so repeated runs always start from the
+    # image produced by make and never contaminate build/os.img.
+    "-snapshot",
     "-no-reboot",
     "-display", "none",
     "-serial", "stdio",
-    "-device", "rtl8139,netdev=n0",
-    "-netdev", "user,id=n0",
 ]
+
+QEMU_NICS = {
+    "rtl8139": "rtl8139",
+    "e1000": "e1000",
+}
+
+
+def qemu_command(nic):
+    return QEMU_BASE_CMD + [
+        "-device", "%s,netdev=n0" % QEMU_NICS[nic],
+        "-netdev", "user,id=n0",
+    ]
+
 
 DEFAULT_TIMEOUT = 20
 BOOT_TIMEOUT = 30
@@ -761,6 +777,87 @@ def t_service_list(h):
     wait_prompt(h)
 
 
+def t_service_lifecycle(h):
+    h.send("service status readiness")
+    h.expect(r"\n  state +exited\n", regex=True)
+    h.expect("ready=/run/readiness.ready")
+    wait_prompt(h)
+
+    h.send("service start dependent")
+    h.expect("ok start dependent (running)")
+    wait_prompt(h)
+
+    h.send("service status dependent")
+    h.expect(r"\n  state +running\n", regex=True)
+    h.expect("requires=readiness")
+    wait_prompt(h)
+
+    h.send("service reload dependent")
+    h.expect("ok reload dependent (restarting pid")
+    wait_prompt(h)
+    h.send("sleep 1")
+    wait_prompt(h)
+
+    # A hard requirement disappearing must stop and fail its dependents.
+    h.send("service stop readiness")
+    h.expect("ok stop readiness (was not running)")
+    wait_prompt(h)
+    h.send("sleep 1")
+    wait_prompt(h)
+
+    h.send("service status dependent")
+    h.expect(r"\n  state +failed\n", regex=True)
+    wait_prompt(h)
+
+    h.send("service reset-failed dependent")
+    h.expect("ok reset-failed dependent (stopped)")
+    wait_prompt(h)
+
+    # Restore the one-shot requirement and prove its dependent can start
+    # again after the failure state has been reset.
+    h.send("service start readiness")
+    h.expect("ok start readiness (running)")
+    wait_prompt(h)
+    h.send("sleep 1")
+    wait_prompt(h)
+
+    h.send("service start dependent")
+    h.expect("ok start dependent (running)")
+    wait_prompt(h)
+
+    h.send("service stop dependent")
+    h.expect("ok stop dependent (pid")
+    wait_prompt(h)
+    h.send("sleep 1")
+    wait_prompt(h)
+
+    h.send("service status dependent")
+    h.expect(r"\n  state +stopped\n", regex=True)
+    wait_prompt(h)
+
+    h.send("service reset-failed dependent")
+    h.expect("ok reset-failed dependent (stopped)")
+    wait_prompt(h)
+
+    # Reload installs configuration but must not turn an inactive unit back
+    # on merely because it was manually enabled earlier in the boot.
+    h.send("service reload dependent")
+    h.expect("ok reload dependent (stopped)")
+    wait_prompt(h)
+
+    # A service which never publishes ready= must be killed at its deadline
+    # and remain failed until reset-failed.
+    h.send("service start readiness-fail")
+    h.expect("err start readiness-fail (failed)")
+    wait_prompt(h)
+    h.send("service status readiness-fail")
+    h.expect(r"\n  state +failed\n", regex=True)
+    wait_prompt(h)
+    h.send("service reset-failed readiness-fail")
+    h.expect("ok reset-failed readiness-fail (stopped)")
+    wait_prompt(h)
+
+
 def t_lsmod(h):
     """Loadable modules are landing in this wave; tolerate their absence.
 
@@ -1087,6 +1184,7 @@ TESTS = [
     ("dev", t_dev),
     ("dmesg", t_dmesg),
     ("service-list", t_service_list),
+    ("service-lifecycle", t_service_lifecycle),
     ("permissions", t_permissions),
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
@@ -1337,6 +1435,8 @@ def main():
                     help="test harness plumbing without an OS image")
     ap.add_argument("--fixtures-selftest", action="store_true",
                     help="test controlled HTTP/TLS servers without an image")
+    ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
+                    help="emulated NIC to test (default: rtl8139)")
     args = ap.parse_args()
 
     if args.list:
@@ -1366,7 +1466,7 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(QEMU_CMD)
+    h = Harness(qemu_command(args.nic))
     try:
         h.start()
     except FileNotFoundError:

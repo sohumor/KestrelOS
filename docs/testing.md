@@ -10,6 +10,7 @@ no dependencies beyond `python3` and `qemu-system-x86_64` on PATH.
 make                       # build build/os.img first
 python3 tools/e2e.py       # full test sequence
 python3 tools/e2e.py --smoke     # boot + shell prompt only
+python3 tools/e2e.py --nic e1000 # full suite through the Intel NIC driver
 python3 tools/e2e.py --list      # list test names
 python3 tools/e2e.py --selftest  # verify harness plumbing (no image needed)
 ```
@@ -19,10 +20,34 @@ Run from the repo root (paths are relative to the cwd).
 Exit code 0 means all tests passed (SKIPs allowed); 1 means a failure.
 On failure the harness prints the last 40 lines of serial output.
 
+The TCP receive reassembler and Internet checksum code also have fast
+host-side sanitizer suites. KFS3 has a separate deterministic crash-injection
+suite for journal replay:
+
+```sh
+make test-net
+make test-kfs
+```
+
+They cover reordered and overlapping TCP segments, duplicate data,
+receive-window clipping, ring wrap, application reads while a hole is
+buffered, 32-bit sequence-number wraparound, known IPv4/UDP checksum vectors,
+pseudo-header binding, odd payload lengths, and corruption rejection.
+The journal suite covers committed replay, home-block installation,
+idempotence, torn transactions, journal clearing, and unsafe targets.
+The boot-recovery test injects a committed transaction into a temporary
+KFS image, boots it through the real kernel mount path, shuts down cleanly,
+then verifies the home block and cleared journal directly on the disk.
+
 ## How it works
 
 - QEMU is launched with `-display none -serial stdio`, so the OS serial
   console is attached to the harness's stdin/stdout pipes.
+- `--nic rtl8139` (the default) and `--nic e1000` run the same suite through
+  each supported NIC driver. `make test-e1000` is the e1000 shorthand.
+- QEMU snapshot mode keeps all guest disk writes in a temporary overlay.
+  Tests can install packages and create files without modifying
+  `build/os.img`, so repeated runs start from the same filesystem state.
 - A reader thread accumulates output; `expect(pattern, timeout)` strips
   ANSI escape sequences and `\r` before matching (default 20 s per step,
   30 s for boot).
@@ -63,6 +88,7 @@ On failure the harness prints the last 40 lines of serial output.
 | err-rm-missing  | `rm /nope`               | `rm: cannot remove`, back to prompt |
 | err-unknown-cmd | `notacommand42`          | `sh: command not found`, back to prompt |
 | long-line     | 300 junk chars (no spaces) | `sh: command not found` or `sh: too many tokens`, back to prompt |
+| service-lifecycle | start, inspect, reload, stop, and reset a hard-dependent service | readiness, dependency, restart, and stopped-state transitions |
 
 Network tests are fail-soft: if the OS prints `network unavailable`
 they count as SKIP, not FAIL. `date` is fail-soft the same way when the

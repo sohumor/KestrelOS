@@ -31,6 +31,12 @@ service logger
 # Template unit, disabled: `service start example` starts it by hand.
 service example
 
+# One-shot ready= producer, a disabled hard-dependent service, and a disabled
+# timeout fixture keep the dependency/readiness paths available to tests.
+service readiness
+service dependent
+service readiness-fail
+
 # --- console ---------------------------------------------------------
 # Create /etc/autologin (an empty file is enough) to boot straight into a
 # shell instead of the login prompt - that is what an unattended test run

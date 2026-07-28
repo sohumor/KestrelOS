@@ -129,7 +129,8 @@ void udp_unbind(uint16_t port)
 }
 
 /* IRQ context: parse a UDP segment and queue it on its binding. */
-void udp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
+void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
+               const uint8_t *seg, int len)
 {
     if (!seg || len < (int)sizeof(struct udp_hdr))
         return;
@@ -137,6 +138,9 @@ void udp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
 
     int ulen = ntohs(uh->len);
     if (ulen < (int)sizeof(*uh) || ulen > len)
+        return;
+    if (uh->csum != 0 &&
+        net_transport_checksum(src_ip_be, dst_ip_be, 17, seg, ulen) != 0)
         return;
     int plen = ulen - (int)sizeof(*uh);
     if (plen > NET_UDP_MAX)
@@ -168,8 +172,12 @@ int udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
     uh->sport = htons(sport);
     uh->dport = htons(dport);
     uh->len = htons((uint16_t)(sizeof(*uh) + len));
-    uh->csum = 0;                        /* 0 = no checksum (legal, IPv4) */
+    uh->csum = 0;
     memcpy(pkt + sizeof(*uh), buf, len);
+    uh->csum = net_transport_checksum(net_ip_addr(), ip_be, 17, pkt,
+                                      (int)sizeof(*uh) + len);
+    if (uh->csum == 0)
+        uh->csum = 0xFFFF;  /* RFC 768: computed zero is sent as all ones. */
     return net_ip_send(ip_be, 17, pkt, (int)sizeof(*uh) + len);
 }
 

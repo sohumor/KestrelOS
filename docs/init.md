@@ -11,7 +11,7 @@ Related programs, all in `/bin`:
 | program  | what it does |
 |----------|--------------|
 | `init`   | PID 1: configuration, supervision, shutdown |
-| `service`| inspect and control units (`list`, `status`, `start`, `stop`, `restart`, `log`) |
+| `service`| inspect and control units (`list`, `status`, `start`, `stop`, `restart`, `reload`, `reset-failed`, `log`) |
 | `logger` | supervised service: copies the kernel log ring into `/var/log/messages` |
 | `dmesg`  | print the kernel log ring (`-n N`, `-f`) |
 | `kill`   | terminate a process by pid |
@@ -82,8 +82,12 @@ message rather than a boot failure.
 | `name`    | —       | informational only; the unit name always follows the filename, and a mismatch is warned about |
 | `exec`    | —       | absolute path of the program. **Required**: without it the unit is marked `failed` |
 | `args`    | empty   | arguments, split on whitespace, at most 8 |
-| `respawn` | `yes`   | `yes`/`no` (`1`/`0`, `true`/`false`, `on`/`off`) — restart it when it exits |
-| `after`   | none    | one other service name that must be started first |
+| `restart` | `always`| `always`, `on-failure`, or `never` |
+| `respawn` | —       | compatibility spelling: `yes` = `restart=always`, `no` = `restart=never` |
+| `after`   | none    | comma- or whitespace-separated ordering dependencies |
+| `requires`| none    | hard dependencies, started first and enforced while this unit is active |
+| `ready`   | none    | absolute marker path that must appear before startup succeeds |
+| `timeout_ms` | `5000` | readiness deadline, from 100 through 60000 ms |
 | `stdout`  | console | the program's fd 1 is appended to this file |
 | `stderr`  | console | only honoured when it equals `stdout`; see below |
 | `enabled` | `yes`   | `no` means "configured but not started" |
@@ -96,21 +100,34 @@ redirects fd 0 and fd 1, and fd 2 always stays on the console. A
 `stderr=` that differs from `stdout=` is accepted, logged as
 unsupported, and ignored.
 
-### Dependency ordering
+### Dependencies and readiness
 
-`after=` names a single other service. init repeatedly places every
-service whose dependency is already placed; a target that is not a
-configured service, or that is the service itself, produces a warning and
-is ignored. Anything still unplaced when no further progress is possible
-is part of a cycle: each member is logged with
-`dependency cycle through after=<name>` and marked `failed` instead of
-being started. The algorithm always terminates — it never hangs waiting
-for a dependency.
+`after=` and `requires=` accept multiple service names separated by commas,
+whitespace, or both. Both participate in topological startup ordering.
+A missing `after=` target is only a bad ordering hint, so init warns and
+continues. A missing or self-referential `requires=` target makes the unit
+fail. Anything still unplaced when no further progress is possible is part
+of a cycle and is marked `failed`; the algorithm always terminates.
+
+Before starting a unit, init recursively starts every hard requirement.
+A requirement is usable when it is running, or when it is a successful
+`restart=never` one-shot. If a hard requirement later becomes unavailable,
+init stops its active dependents and marks them failed.
+
+When `ready=` is set, init removes any stale marker, spawns the service in
+the `starting` state, and waits until the marker appears. Exiting before the
+marker or exceeding `timeout_ms` fails startup; a timed-out process is killed
+and reaped. This is deliberately a small filesystem-marker protocol rather
+than a claim that process creation alone means a service is ready.
 
 ## Supervision
 
-Every death of a supervised child is logged with `SYS_LOG`. A unit with
-`respawn` restarts with a backoff of **0 s, 1 s, 2 s, then 5 s** for each
+Every death of a supervised child is logged with `SYS_LOG`.
+`restart=always` restarts after any exit; `restart=on-failure` restarts only
+after a nonzero or killed exit; and `restart=never` leaves the unit exited.
+The legacy `respawn=yes` path behaves like `restart=always`.
+
+Restarting units use a backoff of **0 s, 1 s, 2 s, then 5 s** for each
 further restart. If a unit dies **5 times within 30 seconds** it is
 marked `failed`, logged at error level
 (`... died 5 times in 30 s: marking it failed, no more restarts`), and is
@@ -132,7 +149,8 @@ Unit states, as reported in the state file and by `service`:
 | state      | meaning |
 |------------|---------|
 | `stopped`  | stopped by an operator, or never started |
-| `running`  | alive, pid in the state file |
+| `starting` | spawned and waiting for its `ready=` marker |
+| `running`  | alive and ready, pid in the state file |
 | `waiting`  | dead, waiting for its restart backoff |
 | `exited`   | finished and not supervised (`once`, `respawn=no`, `sysinit`) |
 | `failed`   | crash loop, missing program, bad `.svc`, or a dependency cycle |
@@ -184,10 +202,10 @@ else.
 
 ### /run/init.cmd — written by `service`, consumed by init
 
-One line: `<start|stop|restart> <name>` followed by a newline. **The
-newline is the commit marker** — init ignores the file until it contains
-one, so a half-written request is never acted on. init processes the
-request, unlinks the file and writes the reply to `/run/init.ack`.
+One line: `<start|stop|restart|reload|reset-failed> <name>` followed by a
+newline. **The newline is the commit marker** — init ignores the file until
+it contains one, so a half-written request is never acted on. init processes
+the request, unlinks the file and writes the reply to `/run/init.ack`.
 
 `service` unlinks the stale ack, waits up to 2 s for an in-flight command
 file to disappear (then overwrites it anyway, so a client that was killed
@@ -266,7 +284,9 @@ logger [-f <path>] [-i <interval ms>] [-c <cap KiB>]
 ```
 service list                    name, state, pid, restarts, exit code
 service status <name>           the state line plus the .svc contents
-service start|stop|restart <n>  send a request to init and print its reply
+service start|stop|restart <n>  change a unit's runtime state
+service reload <name>           re-read its .svc and restart it if active
+service reset-failed <name>     clear crash-loop failure/backoff state
 service log <name>              lines of /var/log/messages mentioning <name>
 ```
 
@@ -293,9 +313,10 @@ too). Non-numeric arguments are rejected before any syscall.
 
 1. write `/etc/services/myservice.svc` (copy `/etc/services/example.svc`);
 2. add `service myservice` to `/etc/inittab`;
-3. reboot, or `service start myservice` once init has been restarted.
+3. reboot to make the new unit known to PID 1.
 
-init reads its configuration only at startup; there is no reload
-directive yet. Adding one would mean re-parsing the inittab and
-reconciling the unit table against it, which is deliberately left out
-until the shutdown and control paths have run on real hardware.
+For an already-known unit, edit its `.svc` and run `service reload
+myservice`. Reload validates and installs that service's current keys,
+preserves an operator's runtime enable/disable choice, recomputes dependency
+order, and restarts it when active. It does not reparse `/etc/inittab`, add
+new unit names, or remove old ones; those table changes still require reboot.

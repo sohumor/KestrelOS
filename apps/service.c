@@ -2,7 +2,7 @@
  *
  *   service list                 name, state, pid, restarts
  *   service status <name>        state plus the .svc configuration
- *   service start|stop|restart <name>
+ *   service start|stop|restart|reload|reset-failed <name>
  *   service log <name>           lines mentioning <name> in the log
  *
  * init owns /run/services.state and polls /run/init.cmd; the protocol is
@@ -300,7 +300,7 @@ static void usage(void)
 {
     printf("usage: service list\n");
     printf("       service status <name>\n");
-    printf("       service start|stop|restart <name>\n");
+    printf("       service start|stop|restart|reload|reset-failed <name>\n");
     printf("       service log <name>\n");
 }
 
@@ -326,7 +326,8 @@ int main(int argc, char **argv)
     if (!strcmp(verb, "log"))
         return cmd_log(argv[2]);
     if (!strcmp(verb, "start") || !strcmp(verb, "stop") ||
-        !strcmp(verb, "restart"))
+        !strcmp(verb, "restart") || !strcmp(verb, "reload") ||
+        !strcmp(verb, "reset-failed"))
         return send_cmd(verb, argv[2]);
 
     printf("service: unknown command '%s'\n", verb);

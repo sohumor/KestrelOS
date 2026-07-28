@@ -65,6 +65,10 @@ int  net_ip_send(uint32_t dst_ip_be, uint8_t proto,
 
 /* Internet checksum, returned ready to store in a header field. */
 uint16_t net_checksum(const void *data, int len);
+/* IPv4 pseudo-header + transport segment checksum (TCP/UDP). */
+uint16_t net_transport_checksum(uint32_t src_be, uint32_t dst_be,
+                                uint8_t protocol,
+                                const void *segment, int len);
 
 uint32_t net_ip_addr(void);
 uint32_t net_dns_addr(void);
@@ -74,5 +78,6 @@ void net_wait_tick(void);
 
 /* udp.c internals used by net.c and dns.c */
 void udp_init(void);
-void udp_input(uint32_t src_ip_be, const uint8_t *seg, int len);
+void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
+               const uint8_t *seg, int len);
 void udp_unbind(uint16_t port);
