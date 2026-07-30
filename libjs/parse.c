@@ -69,6 +69,7 @@ static js_node *parse_expr(parser *p, int no_in);
 static js_node *parse_stmt(parser *p);
 static js_node *parse_function(parser *p, int is_decl);
 static int      parse_func_rest(parser *p, js_node *f);
+static js_node *parse_arrow(parser *p, js_node *covered);
 
 /* ------------------------------------------------------------------ */
 
@@ -334,7 +335,16 @@ static js_node *parse_primary(parser *p)
         return parse_object(p);
     case TK_LPAREN: {
         js_node *e;
+        lexmark empty;
+        lx_mark(&p->lx, &empty);
         if (!advance(p)) return 0;
+        if (p->lx.tok == TK_RPAREN) {
+            if (!advance(p)) return 0;
+            if (p->lx.tok == TK_ARROW)
+                return parse_arrow(p, 0);
+            lx_reset(&p->lx, &empty);
+            return perr(p, "empty parentheses are only valid in an arrow function");
+        }
         e = parse_expr(p, 0);
         if (!e) return 0;
         if (!expect(p, TK_RPAREN, ") to close the group")) return 0;
@@ -571,6 +581,94 @@ static int is_assign_tok(int t)
     return t == TK_ASSIGN || (t >= TK_ADD_A && t <= TK_BXOR_A);
 }
 
+static int collect_arrow_params(parser *p, js_node *covered, nodelist *params)
+{
+    js_node *copy;
+
+    if (!covered)
+        return 1;
+    if (covered->type == N_SEQ)
+        return collect_arrow_params(p, covered->a, params) &&
+               collect_arrow_params(p, covered->b, params);
+    if (covered->type != N_IDENT) {
+        perr(p, "arrow parameters must be identifiers");
+        return 0;
+    }
+    copy = nd(p, N_IDENT);
+    if (!copy)
+        return 0;
+    copy->str = covered->str;
+    list_add(params, copy);
+    return 1;
+}
+
+/* Convert the already parsed cover expression into a parameter list, then
+ * parse either an expression body or a statement block. Arrow functions use
+ * the ordinary function representation with a flag that gives the runtime
+ * lexical this/arguments and non-constructible semantics. */
+static js_node *parse_arrow(parser *p, js_node *covered)
+{
+    js_node *f, *ret;
+    nodelist params, body;
+    nodelist saved_vars = p->vars, saved_funcs = p->funcs;
+    int saved_iter = p->iter_depth, saved_switch = p->switch_depth;
+
+    memset(&params, 0, sizeof(params));
+    memset(&body, 0, sizeof(body));
+    if (p->lx.nl_before)
+        return perr(p, "line break before =>");
+    if (!collect_arrow_params(p, covered, &params))
+        return 0;
+    f = nd(p, N_FUNC);
+    if (!f)
+        return 0;
+    f->flags |= JS_NODE_ARROW;
+    f->a = params.head;
+    f->num = params.n;
+    if (!advance(p))                         /* past => */
+        return 0;
+
+    memset(&p->vars, 0, sizeof(p->vars));
+    memset(&p->funcs, 0, sizeof(p->funcs));
+    p->iter_depth = 0;
+    p->switch_depth = 0;
+    if (p->lx.tok == TK_LBRACE) {
+        if (!advance(p))
+            goto fail;
+        while (p->lx.tok != TK_RBRACE && p->lx.tok != TK_EOF) {
+            js_node *st = parse_stmt(p);
+            if (!st)
+                goto fail;
+            list_add(&body, st);
+        }
+        if (!expect(p, TK_RBRACE, "} to close the arrow body"))
+            goto fail;
+    } else {
+        ret = nd(p, N_RETURN);
+        if (!ret)
+            goto fail;
+        ret->a = parse_assign(p, 0);
+        if (!ret->a)
+            goto fail;
+        list_add(&body, ret);
+    }
+    f->b = body.head;
+    f->c = p->vars.head;
+    f->d = p->funcs.head;
+    p->vars = saved_vars;
+    p->funcs = saved_funcs;
+    p->iter_depth = saved_iter;
+    p->switch_depth = saved_switch;
+    return f;
+
+fail:
+    p->vars = saved_vars;
+    p->funcs = saved_funcs;
+    p->iter_depth = saved_iter;
+    p->switch_depth = saved_switch;
+    return 0;
+}
+
 static js_node *parse_assign(parser *p, int no_in)
 {
     js_node *lhs;
@@ -578,6 +676,11 @@ static js_node *parse_assign(parser *p, int no_in)
     if (!enter(p)) return 0;
     lhs = parse_cond(p, no_in);
     if (!lhs) { leave(p); return 0; }
+    if (p->lx.tok == TK_ARROW) {
+        lhs = parse_arrow(p, lhs);
+        leave(p);
+        return lhs;
+    }
     if (is_assign_tok(p->lx.tok)) {
         js_node *n;
         if (!is_target(lhs)) {

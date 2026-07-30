@@ -146,6 +146,8 @@ int  js_is_function(js_value v);
 int  js_is_array(js_value v);
 int  js_is_promise(js_value v);
 int  js_is_arraybuffer(js_value v);
+int  js_is_uint8array(js_value v);
+int  js_is_urlsearchparams(js_value v);
 
 /* Bytes of a string value; `len` may be NULL. NULL for non-strings. */
 const char *js_string_bytes(js_value v, unsigned long *len);
@@ -172,6 +174,7 @@ int js_get_value(js_ctx *ctx, js_value obj, js_value key, js_value *out);
 int js_set(js_ctx *ctx, js_value obj, const char *name, js_value v);
 int js_set_value(js_ctx *ctx, js_value obj, js_value key, js_value v);
 int js_has(js_ctx *ctx, js_value obj, const char *name);
+int js_has_own(js_ctx *ctx, js_value obj, const char *name);
 int js_delete(js_ctx *ctx, js_value obj, const char *name);
 
 /* Non-enumerable, writable, configurable -- what builtins want. */
@@ -189,6 +192,19 @@ int           js_array_get(js_ctx *ctx, js_object *a, unsigned long i, js_value 
 js_value      js_arraybuffer_new(js_ctx *ctx, const void *data,
                                 unsigned long len);
 const void   *js_arraybuffer_data(js_value v, unsigned long *len);
+/* A Uint8Array view keeps its backing ArrayBuffer alive for the context
+ * lifetime. The returned pointer addresses only the visible view. */
+const void   *js_uint8array_data(js_value v, unsigned long *len);
+void         *js_uint8array_mutable_data(js_value v, unsigned long *len);
+js_value      js_uint8array_new(js_ctx *ctx, const void *data,
+                               unsigned long len);
+
+/* Shared URLSearchParams operations for browser-owned live URL views. */
+js_value js_urlsearchparams_new(js_ctx *ctx, const char *query,
+                                unsigned long len);
+int js_urlsearchparams_replace(js_ctx *ctx, js_value params,
+                               const char *query, unsigned long len);
+int js_urlsearchparams_string(js_ctx *ctx, js_value params, js_value *out);
 
 /* The global object, as a value. */
 js_value js_global(js_ctx *ctx);
@@ -196,12 +212,23 @@ js_value js_global(js_ctx *ctx);
 /* ---- native functions and accessors ---- */
 /* Create a callable object. `name`/`nargs` populate .name and .length. */
 js_object *js_new_native(js_ctx *ctx, js_native fn, const char *name, int nargs);
+/* Create a native constructor and its non-enumerable prototype link. The
+ * native must return the constructed object; the caller chooses where to
+ * publish the constructor. */
+js_object *js_new_native_constructor(js_ctx *ctx, js_native fn,
+                                     const char *name, int nargs,
+                                     js_object *prototype);
+int js_is_constructing(js_ctx *ctx);
 /* Shorthand: attach a native method to `obj` (non-enumerable, as ES5 does). */
 int js_define_native(js_ctx *ctx, js_object *obj, const char *name,
                      js_native fn, int nargs);
 /* Define an accessor property backed by native code. Either may be NULL. */
 int js_define_accessor(js_ctx *ctx, js_object *obj, const char *name,
                        js_native getter, js_native setter, int enumerable);
+/* Variant for already-created (for example bound) function values. */
+int js_define_accessor_value(js_ctx *ctx, js_object *obj, const char *name,
+                             js_value getter, js_value setter,
+                             int enumerable);
 
 /* ---- opaque host pointers ---- */
 /* An object carrying an embedder pointer. `tag` lets the embedder check the
@@ -257,11 +284,15 @@ int js_run_jobs(js_ctx *ctx, unsigned long max_jobs);
  * 3.  No strict mode; `"use strict"` parses and is ignored.
  * 4.  `let` and `const` are accepted but currently use function-scoped
  *     `var` bindings. There are no temporal dead zones or immutable
- *     bindings. No arrow functions, classes, template literals,
- *     destructuring, spread, generators, Symbol, Proxy, or
- *     typed arrays. Promise (including all/race/finally), its microtask
- *     queue, and ArrayBuffer are implemented; typed views and the other
- *     language features remain outside the current subset.
+ *     bindings. Arrow functions support identifier parameter lists,
+ *     expression/block bodies, and lexical `this`/`arguments`, but not
+ *     default/rest/destructured parameters or async arrows. There are no
+ *     classes, template literals, destructuring, spread, generators,
+ *     Symbol, Proxy, or
+ *     typed arrays other than Uint8Array. Promise (including
+ *     all/race/finally), its microtask queue, ArrayBuffer, and bounded
+ *     Uint8Array views are implemented; the other language features remain
+ *     outside the current subset.
  * 5.  Property attributes exist (enumerable/writable/configurable) and are
  *     honoured, but Object.defineProperty/getOwnPropertyDescriptor are the
  *     only ES5 meta-API implemented; seal/freeze/preventExtensions are
@@ -317,7 +348,7 @@ enum js_token {
     TK_ADD, TK_SUB, TK_MUL, TK_DIV, TK_MOD,
     TK_INC, TK_DEC, TK_SHL, TK_SHR, TK_USHR,
     TK_BAND, TK_BOR, TK_BXOR, TK_NOT, TK_BNOT, TK_ANDAND, TK_OROR,
-    TK_QUESTION, TK_COLON, TK_ASSIGN,
+    TK_QUESTION, TK_COLON, TK_ASSIGN, TK_ARROW,
     TK_ADD_A, TK_SUB_A, TK_MUL_A, TK_DIV_A, TK_MOD_A,
     TK_SHL_A, TK_SHR_A, TK_USHR_A, TK_BAND_A, TK_BOR_A, TK_BXOR_A,
     /* keywords -- must stay contiguous and match kw_table[] in lex.c */
@@ -453,8 +484,14 @@ enum js_class {
     JS_CLASS_OBJECT = 0, JS_CLASS_ARRAY, JS_CLASS_FUNCTION, JS_CLASS_ERROR,
     JS_CLASS_DATE, JS_CLASS_REGEXP, JS_CLASS_STRING, JS_CLASS_NUMBER,
     JS_CLASS_BOOLEAN, JS_CLASS_ARGUMENTS, JS_CLASS_MATH, JS_CLASS_JSON,
-    JS_CLASS_PROMISE, JS_CLASS_ARRAYBUFFER, JS_CLASS_HOST
+    JS_CLASS_PROMISE, JS_CLASS_ARRAYBUFFER, JS_CLASS_UINT8ARRAY,
+    JS_CLASS_TEXTENCODER, JS_CLASS_TEXTDECODER, JS_CLASS_URLSEARCHPARAMS,
+    JS_CLASS_MAP, JS_CLASS_SET,
+    JS_CLASS_WEAKMAP, JS_CLASS_WEAKSET,
+    JS_CLASS_HOST
 };
+
+#define JS_NODE_ARROW 0x0001u
 
 struct js_object {
     uint8_t    cls;
@@ -478,6 +515,13 @@ struct js_object {
     js_promise_reaction *promise_reactions;
     uint8_t   *buffer;      /* JS_CLASS_ARRAYBUFFER */
     uint32_t   byte_length;
+    js_object *view_buffer; /* JS_CLASS_UINT8ARRAY backing ArrayBuffer */
+    uint32_t   byte_offset;
+    uint32_t   view_length;
+    js_object *params_list; /* URLSearchParams alternating key/value array */
+    js_object *collection_keys;   /* Map/Set insertion-ordered keys */
+    js_object *collection_values; /* Map values; NULL for Set */
+    uint8_t    codec_flags; /* TextDecoder fatal/ignore-BOM options */
     void      *host;        /* embedder pointer */
     uint32_t   host_tag;
 
@@ -485,6 +529,8 @@ struct js_object {
 };
 
 js_object *js_obj_alloc(js_ctx *ctx, int cls, js_object *proto);
+js_object *js_uint8array_view(js_ctx *ctx, js_object *buffer,
+                              uint32_t offset, uint32_t length);
 js_prop   *js_own_prop(js_object *o, js_string *key);
 js_prop   *js_add_prop(js_ctx *ctx, js_object *o, js_string *key, uint32_t flags);
 int        js_obj_get(js_ctx *ctx, js_object *o, js_string *key,
@@ -539,7 +585,7 @@ typedef struct js_label {
 } js_label;
 
 /* ---- the context ---- */
-#define JS_NPROTO 24
+#define JS_NPROTO 28
 #define JS_ARGSTACK 4096        /* js_value slots shared by all call frames */
 #define JS_MAXARGS  255
 
@@ -606,7 +652,8 @@ enum {
     P_OBJECT = 0, P_FUNCTION, P_ARRAY, P_STRING, P_NUMBER, P_BOOLEAN,
     P_ERROR, P_TYPEERROR, P_RANGEERROR, P_SYNTAXERROR, P_REFERENCEERROR,
     P_EVALERROR, P_URIERROR, P_DATE, P_REGEXP, P_PROMISE, P_ARRAYBUFFER,
-    P_WASM_MODULE, P_WASM_INSTANCE
+    P_UINT8ARRAY, P_TEXTENCODER, P_TEXTDECODER, P_URLSEARCHPARAMS,
+    P_WASM_MODULE, P_WASM_INSTANCE, P_MAP, P_SET, P_WEAKMAP, P_WEAKSET
 };
 
 /* ---- growable byte buffer (malloc-backed, charged to the heap cap) ---- */
@@ -685,6 +732,7 @@ js_object *js_make_function(js_ctx *ctx, js_func *fn, js_env *env);
 
 /* ---- builtins ---- */
 int  js_init_builtins(js_ctx *ctx);
+int  js_init_webapis(js_ctx *ctx);
 void js_run_host_finalizers(js_ctx *ctx);
 js_object *js_new_error(js_ctx *ctx, int kind, const char *msg);
 /* Number/String/Boolean wrapper for a primitive receiver. */

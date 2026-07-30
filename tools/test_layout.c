@@ -1758,6 +1758,66 @@ static void test_flex_row(void)
     tfree(t);
 }
 
+static void test_flex_column(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *flex = st_block(t);
+    struct computed_style *a = st_block(t);
+    struct computed_style *b = st_block(t);
+    struct computed_style *c = st_block(t);
+    struct dom_node *root, *na, *nb, *nc;
+    struct lay_document *L;
+    struct lay_box *ba, *bb, *bc;
+
+    GROUP("flex: column growth, gap, and cross-axis alignment");
+
+    flex->display = CSS_DISPLAY_FLEX;
+    flex->flex_direction = CSS_FLEXDIR_COLUMN;
+    flex->width = LPX(200);
+    flex->height = LPX(160);
+    flex->gap = 10;
+    flex->align_items = CSS_ALIGN_CENTER;
+    a->width = b->width = c->width = LPX(50);
+    a->height = b->height = c->height = LPX(20);
+    b->flex_grow = 1000;
+    c->flex_grow = 2000;
+    root = el(t, 0, "div", flex);
+    na = el(t, root, "div", a);
+    nb = el(t, root, "div", b);
+    nc = el(t, root, "div", c);
+
+    L = run(t, root, 400, 300);
+    ba = box_nth(L, na, 0);
+    bb = box_nth(L, nb, 0);
+    bc = box_nth(L, nc, 0);
+    CHECK(ba && bb && bc);
+    CHECK_EQ(ba->x, 75);
+    CHECK_EQ(bb->x, 75);
+    CHECK_EQ(bc->x, 75);
+    CHECK_EQ(ba->y, 0);
+    CHECK_EQ(ba->h, 20);
+    CHECK_EQ(bb->y, 30);
+    CHECK_EQ(bb->h, 46);
+    CHECK_EQ(bc->y, 86);
+    CHECK_EQ(bc->h, 74);
+    CHECK_EQ(box_nth(L, root, 0)->h, 160);
+    lay_free(L);
+
+    GROUP("flex: column-reverse and justify-content");
+    b->flex_grow = c->flex_grow = 0;
+    flex->flex_direction = CSS_FLEXDIR_COLUMN_REVERSE;
+    flex->justify_content = CSS_JUSTIFY_CENTER;
+    L = run(t, root, 400, 300);
+    ba = box_nth(L, na, 0);
+    bb = box_nth(L, nb, 0);
+    bc = box_nth(L, nc, 0);
+    CHECK_EQ(bc->y, 40);
+    CHECK_EQ(bb->y, 70);
+    CHECK_EQ(ba->y, 100);
+    lay_free(L);
+    tfree(t);
+}
+
 /* ================================================================== *
  * 8  positioning
  * ================================================================== */
@@ -3130,6 +3190,7 @@ int main(int argc, char **argv)
 
     test_replaced();
     test_flex_row();
+    test_flex_column();
     test_absolute();
     test_fixed_and_relative();
     test_fixed_inside_relative();

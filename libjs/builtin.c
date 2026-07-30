@@ -889,6 +889,14 @@ static const char *class_name(int cls)
     case JS_CLASS_JSON:      return "JSON";
     case JS_CLASS_PROMISE:   return "Promise";
     case JS_CLASS_ARRAYBUFFER:return "ArrayBuffer";
+    case JS_CLASS_UINT8ARRAY: return "Uint8Array";
+    case JS_CLASS_TEXTENCODER:return "TextEncoder";
+    case JS_CLASS_TEXTDECODER:return "TextDecoder";
+    case JS_CLASS_URLSEARCHPARAMS:return "URLSearchParams";
+    case JS_CLASS_MAP:       return "Map";
+    case JS_CLASS_SET:       return "Set";
+    case JS_CLASS_WEAKMAP:   return "WeakMap";
+    case JS_CLASS_WEAKSET:   return "WeakSet";
     default:                 return "Object";
     }
 }
@@ -1008,6 +1016,203 @@ static int bi_object_names(js_ctx *ctx, js_value t, int argc, js_value *argv,
 {
     (void)t;
     return own_names(ctx, arg(argc, argv, 0), 0, ret);
+}
+
+static int bi_object_assign(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_value target;
+    int source_index;
+
+    (void)t;
+    if (js_to_object(ctx, arg(argc, argv, 0), &target) != JS_OK)
+        return JS_THROW;
+    for (source_index = 1; source_index < argc; source_index++) {
+        js_value source = argv[source_index], names;
+        unsigned long length, i;
+
+        if (source.type == JS_UNDEFINED || source.type == JS_NULL)
+            continue;
+        if (js_to_object(ctx, source, &source) != JS_OK ||
+            own_names(ctx, source, 1, &names) != JS_OK ||
+            alen(ctx, names.u.obj, &length) != JS_OK)
+            return JS_THROW;
+        for (i = 0; i < length; i++) {
+            js_value key, value;
+
+            if (aget(ctx, names.u.obj, i, &key) != JS_OK ||
+                js_obj_get(ctx, source.u.obj, key.u.str, source, &value) !=
+                    JS_OK ||
+                js_obj_put(ctx, target.u.obj, key.u.str, value) != JS_OK)
+                return JS_THROW;
+        }
+    }
+    *ret = target;
+    return JS_OK;
+}
+
+static int bi_object_is(js_ctx *ctx, js_value t, int argc,
+                        js_value *argv, js_value *ret)
+{
+    js_value a = arg(argc, argv, 0), b = arg(argc, argv, 1);
+    int equal;
+
+    (void)ctx; (void)t;
+    if (a.type != b.type)
+        equal = 0;
+    else if (a.type == JS_NUMBER) {
+        if (js_isnan(a.u.num) && js_isnan(b.u.num))
+            equal = 1;
+        else if (a.u.num == 0 && b.u.num == 0)
+            equal = (1.0 / a.u.num < 0) == (1.0 / b.u.num < 0);
+        else
+            equal = a.u.num == b.u.num;
+    } else {
+        equal = js_strict_equals(a, b);
+    }
+    *ret = js_bool(equal);
+    return JS_OK;
+}
+
+static int object_values_or_entries(js_ctx *ctx, int entries,
+                                    int argc, js_value *argv, js_value *ret)
+{
+    js_value source = arg(argc, argv, 0), names;
+    js_object *out;
+    unsigned long length, i;
+
+    if (js_to_object(ctx, source, &source) != JS_OK ||
+        own_names(ctx, source, 1, &names) != JS_OK ||
+        alen(ctx, names.u.obj, &length) != JS_OK)
+        return JS_THROW;
+    out = js_new_array(ctx);
+    if (!out)
+        return JS_THROW;
+    for (i = 0; i < length; i++) {
+        js_value key, value;
+
+        if (aget(ctx, names.u.obj, i, &key) != JS_OK ||
+            js_obj_get(ctx, source.u.obj, key.u.str, source, &value) != JS_OK)
+            return JS_THROW;
+        if (entries) {
+            js_object *pair = js_new_array(ctx);
+            if (!pair ||
+                js_array_push(ctx, pair, key) != JS_OK ||
+                js_array_push(ctx, pair, value) != JS_OK ||
+                js_array_push(ctx, out, js_object_value(pair)) != JS_OK)
+                return JS_THROW;
+        } else if (js_array_push(ctx, out, value) != JS_OK) {
+            return JS_THROW;
+        }
+    }
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_object_values(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    (void)t;
+    return object_values_or_entries(ctx, 0, argc, argv, ret);
+}
+
+static int bi_object_entries(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    (void)t;
+    return object_values_or_entries(ctx, 1, argc, argv, ret);
+}
+
+#define FROM_ENTRIES_MAX 1000000UL
+
+static int from_entries_add(js_ctx *ctx, js_object *out, js_value entry)
+{
+    js_value key, value, converted;
+
+    if (entry.type != JS_OBJECT)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Object.fromEntries entry must be an object");
+    if (aget(ctx, entry.u.obj, 0, &key) != JS_OK ||
+        aget(ctx, entry.u.obj, 1, &value) != JS_OK ||
+        js_to_string(ctx, key, &converted) != JS_OK ||
+        js_obj_put(ctx, out, converted.u.str, value) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static int bi_object_fromentries(js_ctx *ctx, js_value t, int argc,
+                                 js_value *argv, js_value *ret)
+{
+    js_value input = arg(argc, argv, 0), object, next;
+    js_object *out;
+    unsigned long i;
+
+    (void)t;
+    if (js_to_object(ctx, input, &object) != JS_OK)
+        return JS_THROW;
+    out = js_new_object(ctx);
+    if (!out)
+        return JS_THROW;
+
+    if (object.u.obj->cls == JS_CLASS_MAP) {
+        unsigned long length = object.u.obj->collection_keys->elen;
+
+        for (i = 0; i < length; i++) {
+            js_value key = object.u.obj->collection_keys->elems[i];
+            js_value converted;
+
+            if (js_to_string(ctx, key, &converted) != JS_OK ||
+                js_obj_put(ctx, out, converted.u.str,
+                           object.u.obj->collection_values->elems[i]) != JS_OK)
+                return JS_THROW;
+        }
+        *ret = js_object_value(out);
+        return JS_OK;
+    }
+
+    if (js_get(ctx, object, "next", &next) != JS_OK)
+        return JS_THROW;
+    if (js_is_function(next)) {
+        for (i = 0; i < FROM_ENTRIES_MAX; i++) {
+            js_value step, done, entry;
+
+            if (js_step(ctx) != JS_OK ||
+                js_call(ctx, next, object, 0, 0, &step) != JS_OK)
+                return JS_THROW;
+            if (step.type != JS_OBJECT)
+                return js_throw_error(ctx, JS_ERR_TYPE,
+                                      "iterator result must be an object");
+            if (js_get(ctx, step, "done", &done) != JS_OK)
+                return JS_THROW;
+            if (js_to_boolean(done)) {
+                *ret = js_object_value(out);
+                return JS_OK;
+            }
+            if (js_get(ctx, step, "value", &entry) != JS_OK ||
+                from_entries_add(ctx, out, entry) != JS_OK)
+                return JS_THROW;
+        }
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Object.fromEntries iterator is too large");
+    } else {
+        unsigned long length;
+
+        if (alen(ctx, object.u.obj, &length) != JS_OK)
+            return JS_THROW;
+        if (length > FROM_ENTRIES_MAX)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Object.fromEntries input is too large");
+        for (i = 0; i < length; i++) {
+            js_value entry;
+
+            if (js_step(ctx) != JS_OK ||
+                aget(ctx, object.u.obj, i, &entry) != JS_OK ||
+                from_entries_add(ctx, out, entry) != JS_OK)
+                return JS_THROW;
+        }
+    }
+    *ret = js_object_value(out);
+    return JS_OK;
 }
 
 static int bi_object_getproto(js_ctx *ctx, js_value t, int argc, js_value *argv,
@@ -1386,6 +1591,163 @@ static int bi_array_isarray(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+#define ARRAY_FROM_MAX 1000000UL
+
+static int bi_array_from(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_value input = arg(argc, argv, 0), mapper = arg(argc, argv, 1);
+    js_value this_arg = arg(argc, argv, 2), object;
+    js_object *out;
+    unsigned long length, i;
+
+    (void)t;
+    if (js_to_object(ctx, input, &object) != JS_OK)
+        return JS_THROW;
+    if (mapper.type != JS_UNDEFINED && !js_is_function(mapper))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Array.from mapper must be a function");
+    if (alen(ctx, object.u.obj, &length) != JS_OK)
+        return JS_THROW;
+    if (length > ARRAY_FROM_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Array.from input is too large");
+    out = js_new_array(ctx);
+    if (!out)
+        return JS_THROW;
+    for (i = 0; i < length; i++) {
+        js_value value;
+
+        if (aget(ctx, object.u.obj, i, &value) != JS_OK)
+            return JS_THROW;
+        if (mapper.type != JS_UNDEFINED) {
+            js_value map_args[2], mapped;
+
+            map_args[0] = value;
+            map_args[1] = js_number((double)i);
+            if (js_call(ctx, mapper, this_arg, 2, map_args, &mapped) != JS_OK)
+                return JS_THROW;
+            value = mapped;
+        }
+        if (js_array_push(ctx, out, value) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_array_of(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                       js_value *ret)
+{
+    js_object *out = js_new_array(ctx);
+    int i;
+
+    (void)t;
+    if (!out)
+        return JS_THROW;
+    for (i = 0; i < argc; i++)
+        if (js_array_push(ctx, out, argv[i]) != JS_OK)
+            return JS_THROW;
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int array_iterator_next(js_ctx *ctx, js_value t,
+                               int argc, js_value *argv, js_value *ret)
+{
+    js_value source, index_value, kind_value;
+    js_object *result;
+    unsigned long length, index;
+    int kind;
+    (void)argc; (void)argv;
+
+    if (t.type != JS_OBJECT ||
+        js_get(ctx, t, "__array", &source) != JS_OK ||
+        js_get(ctx, t, "__index", &index_value) != JS_OK ||
+        js_get(ctx, t, "__kind", &kind_value) != JS_OK ||
+        source.type != JS_OBJECT || index_value.type != JS_NUMBER ||
+        kind_value.type != JS_NUMBER ||
+        alen(ctx, source.u.obj, &length) != JS_OK)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid Array iterator");
+    index = index_value.u.num < 0
+        ? 0 : (unsigned long)index_value.u.num;
+    kind = (int)kind_value.u.num;
+    result = js_new_object(ctx);
+    if (!result)
+        return JS_THROW;
+    if (index >= length) {
+        if (js_define_enum(ctx, result, "value", js_undefined()) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(1)) != JS_OK)
+            return JS_THROW;
+    } else {
+        js_value value;
+
+        if (kind == 0) {
+            value = js_number((double)index);
+        } else if (kind == 1) {
+            if (aget(ctx, source.u.obj, index, &value) != JS_OK)
+                return JS_THROW;
+        } else {
+            js_object *pair = js_new_array(ctx);
+            js_value element;
+
+            if (!pair || aget(ctx, source.u.obj, index, &element) != JS_OK ||
+                js_array_push(ctx, pair, js_number((double)index)) != JS_OK ||
+                js_array_push(ctx, pair, element) != JS_OK)
+                return JS_THROW;
+            value = js_object_value(pair);
+        }
+        if (js_define_enum(ctx, result, "value", value) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(0)) != JS_OK ||
+            js_set(ctx, t, "__index",
+                   js_number((double)(index + 1))) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(result);
+    return JS_OK;
+}
+
+static int array_iterator(js_ctx *ctx, js_value t, js_value *ret, int kind)
+{
+    js_object *source, *iterator;
+
+    if (this_object(ctx, t, &source) != JS_OK)
+        return JS_THROW;
+    iterator = js_new_object(ctx);
+    if (!iterator ||
+        js_define(ctx, iterator, "__array",
+                  js_object_value(source)) != JS_OK ||
+        js_define(ctx, iterator, "__index", js_number(0)) != JS_OK ||
+        js_define(ctx, iterator, "__kind", js_number(kind)) != JS_OK ||
+        js_define_native(ctx, iterator, "next",
+                         array_iterator_next, 0) != JS_OK)
+        return JS_THROW;
+    *ret = js_object_value(iterator);
+    return JS_OK;
+}
+
+static int bi_array_keys(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return array_iterator(ctx, t, ret, 0);
+}
+
+static int bi_array_values(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return array_iterator(ctx, t, ret, 1);
+}
+
+static int bi_array_entries(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return array_iterator(ctx, t, ret, 2);
+}
+
 /* ES5 relative-index rule: negative counts back from the end. */
 static unsigned long rel_index(double d, unsigned long len)
 {
@@ -1689,6 +2051,188 @@ static int bi_array_lastindexof(js_ctx *ctx, js_value t, int argc,
         if (aget(ctx, o, i - 1, &v) != JS_OK) return JS_THROW;
         if (js_strict_equals(v, needle)) { *ret = js_number((double)(i - 1)); return JS_OK; }
     }
+    return JS_OK;
+}
+
+static int bi_array_includes(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    js_object *object;
+    unsigned long length, i;
+    double from = 0;
+    js_value needle = arg(argc, argv, 0);
+
+    if (this_object(ctx, t, &object) != JS_OK ||
+        alen(ctx, object, &length) != JS_OK)
+        return JS_THROW;
+    *ret = js_bool(0);
+    if (!length)
+        return JS_OK;
+    if (argc > 1 && js_to_integer(ctx, argv[1], &from) != JS_OK)
+        return JS_THROW;
+    if (from < 0) {
+        from += (double)length;
+        if (from < 0)
+            from = 0;
+    }
+    if (from >= (double)length)
+        return JS_OK;
+    for (i = (unsigned long)from; i < length; i++) {
+        js_value value;
+
+        if (aget(ctx, object, i, &value) != JS_OK)
+            return JS_THROW;
+        if (js_strict_equals(value, needle) ||
+            (value.type == JS_NUMBER && needle.type == JS_NUMBER &&
+             js_isnan(value.u.num) && js_isnan(needle.u.num))) {
+            *ret = js_bool(1);
+            return JS_OK;
+        }
+    }
+    return JS_OK;
+}
+
+static int array_find(js_ctx *ctx, int return_index, js_value t,
+                      int argc, js_value *argv, js_value *ret)
+{
+    js_object *object;
+    unsigned long length, i;
+    js_value callback = arg(argc, argv, 0);
+    js_value this_arg = arg(argc, argv, 1);
+
+    if (this_object(ctx, t, &object) != JS_OK ||
+        alen(ctx, object, &length) != JS_OK)
+        return JS_THROW;
+    if (!js_is_function(callback))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Array find callback must be a function");
+    for (i = 0; i < length; i++) {
+        js_value value, args[3], selected;
+
+        if (aget(ctx, object, i, &value) != JS_OK)
+            return JS_THROW;
+        args[0] = value;
+        args[1] = js_number((double)i);
+        args[2] = js_object_value(object);
+        if (js_call(ctx, callback, this_arg, 3, args, &selected) != JS_OK)
+            return JS_THROW;
+        if (js_to_boolean(selected)) {
+            *ret = return_index ? js_number((double)i) : value;
+            return JS_OK;
+        }
+    }
+    *ret = return_index ? js_number(-1) : js_undefined();
+    return JS_OK;
+}
+
+static int bi_array_find(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    return array_find(ctx, 0, t, argc, argv, ret);
+}
+
+static int bi_array_findindex(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    return array_find(ctx, 1, t, argc, argv, ret);
+}
+
+#define ARRAY_FLAT_MAX 1000000UL
+#define ARRAY_FLAT_DEPTH_MAX 32
+
+static int array_flatten_into(js_ctx *ctx, js_object *out, js_object *input,
+                              int depth, unsigned long *count)
+{
+    unsigned long length, i;
+
+    if (alen(ctx, input, &length) != JS_OK)
+        return JS_THROW;
+    for (i = 0; i < length; i++) {
+        js_value value;
+
+        if (js_step(ctx) != JS_OK || aget(ctx, input, i, &value) != JS_OK)
+            return JS_THROW;
+        if (depth > 0 && js_is_array(value)) {
+            if (array_flatten_into(ctx, out, value.u.obj,
+                                   depth - 1, count) != JS_OK)
+                return JS_THROW;
+        } else {
+            if (*count >= ARRAY_FLAT_MAX)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "flattened array is too large");
+            if (js_array_push(ctx, out, value) != JS_OK)
+                return JS_THROW;
+            (*count)++;
+        }
+    }
+    return JS_OK;
+}
+
+static int bi_array_flat(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    js_object *input, *out;
+    double requested = 1;
+    unsigned long count = 0;
+
+    if (this_object(ctx, t, &input) != JS_OK)
+        return JS_THROW;
+    if (argc > 0 && argv[0].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[0], &requested) != JS_OK)
+        return JS_THROW;
+    if (requested < 0)
+        requested = 0;
+    if (js_isinf(requested) || requested > ARRAY_FLAT_DEPTH_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "array flatten depth is too large");
+    out = js_new_array(ctx);
+    if (!out ||
+        array_flatten_into(ctx, out, input, (int)requested, &count) != JS_OK)
+        return JS_THROW;
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_array_flatmap(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_object *input, *out;
+    js_value callback = arg(argc, argv, 0);
+    js_value this_arg = arg(argc, argv, 1);
+    unsigned long length, i, count = 0;
+
+    if (this_object(ctx, t, &input) != JS_OK ||
+        alen(ctx, input, &length) != JS_OK)
+        return JS_THROW;
+    if (!js_is_function(callback))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Array.flatMap callback must be a function");
+    out = js_new_array(ctx);
+    if (!out)
+        return JS_THROW;
+    for (i = 0; i < length; i++) {
+        js_value value, args[3], mapped;
+
+        if (js_step(ctx) != JS_OK || aget(ctx, input, i, &value) != JS_OK)
+            return JS_THROW;
+        args[0] = value;
+        args[1] = js_number((double)i);
+        args[2] = js_object_value(input);
+        if (js_call(ctx, callback, this_arg, 3, args, &mapped) != JS_OK)
+            return JS_THROW;
+        if (js_is_array(mapped)) {
+            if (array_flatten_into(ctx, out, mapped.u.obj, 0, &count) != JS_OK)
+                return JS_THROW;
+        } else {
+            if (count >= ARRAY_FLAT_MAX)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "flatMap result is too large");
+            if (js_array_push(ctx, out, mapped) != JS_OK)
+                return JS_THROW;
+            count++;
+        }
+    }
+    *ret = js_object_value(out);
     return JS_OK;
 }
 
@@ -2203,6 +2747,178 @@ static int bi_string_indexof(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+static int string_reject_regexp(js_ctx *ctx, js_value value)
+{
+    if (value.type == JS_OBJECT && value.u.obj->cls == JS_CLASS_REGEXP)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "regular expression is not a string search");
+    return JS_OK;
+}
+
+static int bi_string_includes(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_value search = arg(argc, argv, 0);
+    double position = 0;
+
+    if (this_string(ctx, t, &string) != JS_OK ||
+        string_reject_regexp(ctx, search) != JS_OK ||
+        js_to_string(ctx, search, &search) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && js_to_integer(ctx, argv[1], &position) != JS_OK)
+        return JS_THROW;
+    if (position < 0)
+        position = 0;
+    if (position > (double)string->len)
+        position = (double)string->len;
+    *ret = js_bool(find_sub(string->data, string->len,
+                            search.u.str->data, search.u.str->len,
+                            (unsigned long)position) >= 0);
+    return JS_OK;
+}
+
+static int bi_string_startswith(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_value search = arg(argc, argv, 0);
+    double position = 0;
+    unsigned long start;
+
+    if (this_string(ctx, t, &string) != JS_OK ||
+        string_reject_regexp(ctx, search) != JS_OK ||
+        js_to_string(ctx, search, &search) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && js_to_integer(ctx, argv[1], &position) != JS_OK)
+        return JS_THROW;
+    if (position < 0)
+        position = 0;
+    if (position > (double)string->len)
+        position = (double)string->len;
+    start = (unsigned long)position;
+    *ret = js_bool(search.u.str->len <= string->len - start &&
+                   memcmp(string->data + start, search.u.str->data,
+                          search.u.str->len) == 0);
+    return JS_OK;
+}
+
+static int bi_string_endswith(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_value search = arg(argc, argv, 0);
+    double position;
+    unsigned long end;
+
+    if (this_string(ctx, t, &string) != JS_OK ||
+        string_reject_regexp(ctx, search) != JS_OK ||
+        js_to_string(ctx, search, &search) != JS_OK)
+        return JS_THROW;
+    position = (double)string->len;
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[1], &position) != JS_OK)
+        return JS_THROW;
+    if (position < 0)
+        position = 0;
+    if (position > (double)string->len)
+        position = (double)string->len;
+    end = (unsigned long)position;
+    *ret = js_bool(search.u.str->len <= end &&
+                   memcmp(string->data + end - search.u.str->len,
+                          search.u.str->data, search.u.str->len) == 0);
+    return JS_OK;
+}
+
+#define MODERN_STRING_MAX 1048576UL
+
+static int bi_string_repeat(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_sbuf buffer;
+    double count;
+    unsigned long i, repetitions;
+
+    if (this_string(ctx, t, &string) != JS_OK ||
+        js_to_integer(ctx, arg(argc, argv, 0), &count) != JS_OK)
+        return JS_THROW;
+    if (count < 0 || js_isinf(count) ||
+        (string->len && count > (double)(MODERN_STRING_MAX / string->len)))
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "repeated string is too large");
+    repetitions = (unsigned long)count;
+    js_sb_init(&buffer, ctx);
+    for (i = 0; i < repetitions; i++)
+        if (js_sb_put(&buffer, string->data, string->len) != JS_OK) {
+            js_sb_free(&buffer);
+            return JS_THROW;
+        }
+    return js_sb_finish(&buffer, ret);
+}
+
+static int string_pad(js_ctx *ctx, int at_start, js_value t,
+                      int argc, js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_value fill_value;
+    js_string *fill;
+    js_sbuf buffer;
+    double requested;
+    unsigned long target, needed, written = 0;
+
+    if (this_string(ctx, t, &string) != JS_OK ||
+        js_to_integer(ctx, arg(argc, argv, 0), &requested) != JS_OK)
+        return JS_THROW;
+    if (requested <= (double)string->len)
+        return ret_str(ctx, string->data, string->len, ret);
+    if (js_isinf(requested) || requested > (double)MODERN_STRING_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "padded string is too large");
+    if (argc < 2 || argv[1].type == JS_UNDEFINED)
+        fill_value = js_mkcstring(ctx, " ");
+    else if (js_to_string(ctx, argv[1], &fill_value) != JS_OK)
+        return JS_THROW;
+    if (fill_value.type != JS_STRING)
+        return JS_THROW;
+    fill = fill_value.u.str;
+    if (!fill->len)
+        return ret_str(ctx, string->data, string->len, ret);
+    target = (unsigned long)requested;
+    needed = target - string->len;
+    js_sb_init(&buffer, ctx);
+    if (!at_start &&
+        js_sb_put(&buffer, string->data, string->len) != JS_OK)
+        goto fail;
+    while (written < needed) {
+        unsigned long chunk = fill->len;
+        if (chunk > needed - written)
+            chunk = needed - written;
+        if (js_sb_put(&buffer, fill->data, chunk) != JS_OK)
+            goto fail;
+        written += chunk;
+    }
+    if (at_start &&
+        js_sb_put(&buffer, string->data, string->len) != JS_OK)
+        goto fail;
+    return js_sb_finish(&buffer, ret);
+fail:
+    js_sb_free(&buffer);
+    return JS_THROW;
+}
+
+static int bi_string_padstart(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    return string_pad(ctx, 1, t, argc, argv, ret);
+}
+
+static int bi_string_padend(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    return string_pad(ctx, 0, t, argc, argv, ret);
+}
+
 static int bi_string_lastindexof(js_ctx *ctx, js_value t, int argc,
                                  js_value *argv, js_value *ret)
 {
@@ -2329,18 +3045,40 @@ static int is_space(unsigned char c)
            c == '\v' || c == '\f' || c == 0xA0;
 }
 
-static int bi_string_trim(js_ctx *ctx, js_value t, int argc, js_value *argv,
-                          js_value *ret)
+static int string_trim(js_ctx *ctx, js_value t, js_value *ret,
+                       int leading, int trailing)
 {
     js_string *s;
     unsigned long a = 0, b;
 
-    (void)argc; (void)argv;
     if (this_string(ctx, t, &s) != JS_OK) return JS_THROW;
     b = s->len;
-    while (a < b && is_space((unsigned char)s->data[a])) a++;
-    while (b > a && is_space((unsigned char)s->data[b - 1])) b--;
+    if (leading)
+        while (a < b && is_space((unsigned char)s->data[a])) a++;
+    if (trailing)
+        while (b > a && is_space((unsigned char)s->data[b - 1])) b--;
     return ret_str(ctx, s->data + a, b - a, ret);
+}
+
+static int bi_string_trim(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                          js_value *ret)
+{
+    (void)argc; (void)argv;
+    return string_trim(ctx, t, ret, 1, 1);
+}
+
+static int bi_string_trimstart(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return string_trim(ctx, t, ret, 1, 0);
+}
+
+static int bi_string_trimend(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return string_trim(ctx, t, ret, 0, 1);
 }
 
 static int bi_string_concat(js_ctx *ctx, js_value t, int argc, js_value *argv,
@@ -2596,6 +3334,70 @@ fail:
     return JS_THROW;
 }
 
+static int bi_string_replaceall(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret)
+{
+    js_string *string;
+    js_value pattern = arg(argc, argv, 0), replacement = arg(argc, argv, 1);
+    js_value pattern_string;
+    js_string *template = 0;
+    js_sbuf buffer;
+    unsigned long cursor = 0, search_from = 0;
+    int use_function = js_is_function(replacement);
+
+    if (this_string(ctx, t, &string) != JS_OK)
+        return JS_THROW;
+    if (pattern.type == JS_OBJECT &&
+        pattern.u.obj->cls == JS_CLASS_REGEXP && pattern.u.obj->re) {
+        if (!pattern.u.obj->re->global)
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "replaceAll regular expression must be global");
+        return bi_string_replace(ctx, t, argc, argv, ret);
+    }
+    if (js_to_string(ctx, pattern, &pattern_string) != JS_OK)
+        return JS_THROW;
+    if (!use_function) {
+        js_value converted;
+        if (js_to_string(ctx, replacement, &converted) != JS_OK)
+            return JS_THROW;
+        template = converted.u.str;
+    }
+    js_sb_init(&buffer, ctx);
+    while (search_from <= string->len) {
+        long at = find_sub(string->data, string->len,
+                           pattern_string.u.str->data,
+                           pattern_string.u.str->len, search_from);
+        long caps[2];
+
+        if (at < 0)
+            break;
+        if (js_step(ctx) != JS_OK ||
+            js_sb_put(&buffer, string->data + cursor,
+                      (unsigned long)at - cursor) != JS_OK)
+            goto fail;
+        caps[0] = at;
+        caps[1] = at + (long)pattern_string.u.str->len;
+        if (use_function) {
+            if (call_repl(ctx, &buffer, replacement,
+                          string, caps, 1) != JS_OK)
+                goto fail;
+        } else if (expand_repl(ctx, &buffer, template,
+                               string, caps, 1) != JS_OK) {
+            goto fail;
+        }
+        cursor = (unsigned long)caps[1];
+        search_from = pattern_string.u.str->len
+            ? cursor : (unsigned long)at + 1;
+    }
+    if (js_sb_put(&buffer, string->data + cursor,
+                  string->len - cursor) != JS_OK)
+        goto fail;
+    return js_sb_finish(&buffer, ret);
+fail:
+    js_sb_free(&buffer);
+    return JS_THROW;
+}
+
 static int bi_string_split(js_ctx *ctx, js_value t, int argc, js_value *argv,
                            js_value *ret)
 {
@@ -2784,6 +3586,54 @@ static int bi_number_toexponential(js_ctx *ctx, js_value t, int argc,
     }
     js_dtoa_exponential(d, (int)f, buf, sizeof(buf));
     return ret_str(ctx, buf, strlen(buf), ret);
+}
+
+static int bi_number_isfinite(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_value value = arg(argc, argv, 0);
+    (void)ctx; (void)t;
+    *ret = js_bool(value.type == JS_NUMBER &&
+                   !js_isnan(value.u.num) && !js_isinf(value.u.num));
+    return JS_OK;
+}
+
+static int bi_number_isnan(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    js_value value = arg(argc, argv, 0);
+    (void)ctx; (void)t;
+    *ret = js_bool(value.type == JS_NUMBER && js_isnan(value.u.num));
+    return JS_OK;
+}
+
+static int bi_number_isinteger(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_value value = arg(argc, argv, 0);
+    (void)ctx; (void)t;
+    *ret = js_bool(value.type == JS_NUMBER &&
+                   !js_isnan(value.u.num) && !js_isinf(value.u.num) &&
+                   js_floor(value.u.num) == value.u.num);
+    return JS_OK;
+}
+
+static int bi_number_issafeinteger(js_ctx *ctx, js_value t, int argc,
+                                   js_value *argv, js_value *ret)
+{
+    js_value value = arg(argc, argv, 0);
+    double number;
+    (void)ctx; (void)t;
+
+    if (value.type != JS_NUMBER) {
+        *ret = js_bool(0);
+        return JS_OK;
+    }
+    number = value.u.num;
+    *ret = js_bool(!js_isnan(number) && !js_isinf(number) &&
+                   js_floor(number) == number &&
+                   js_fabs(number) <= 9007199254740991.0);
+    return JS_OK;
 }
 
 static int bi_bool_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
@@ -4050,6 +4900,436 @@ int js_wrap_primitive(js_ctx *ctx, js_value v, js_value *out)
 }
 
 /* ================================================================== */
+/* Map and Set                                                        */
+/* ================================================================== */
+
+#define COLLECTION_MAX 4096UL
+
+static int same_value_zero(js_value a, js_value b)
+{
+    if (a.type != b.type)
+        return 0;
+    switch (a.type) {
+    case JS_UNDEFINED:
+    case JS_NULL:
+        return 1;
+    case JS_BOOL:
+        return a.u.b == b.u.b;
+    case JS_NUMBER:
+        return a.u.num == b.u.num ||
+               (js_isnan(a.u.num) && js_isnan(b.u.num));
+    case JS_STRING:
+        return js_str_eq(a.u.str, b.u.str);
+    case JS_OBJECT:
+        return a.u.obj == b.u.obj;
+    default:
+        return 0;
+    }
+}
+
+static js_object *collection_object(js_value value, int expected)
+{
+    if (value.type != JS_OBJECT ||
+        (value.u.obj->cls != JS_CLASS_MAP &&
+         value.u.obj->cls != JS_CLASS_SET &&
+         value.u.obj->cls != JS_CLASS_WEAKMAP &&
+         value.u.obj->cls != JS_CLASS_WEAKSET))
+        return 0;
+    if (expected && value.u.obj->cls != expected)
+        return 0;
+    return value.u.obj;
+}
+
+static int collection_is_map(const js_object *collection)
+{
+    return collection->cls == JS_CLASS_MAP ||
+           collection->cls == JS_CLASS_WEAKMAP;
+}
+
+static int collection_is_weak(const js_object *collection)
+{
+    return collection->cls == JS_CLASS_WEAKMAP ||
+           collection->cls == JS_CLASS_WEAKSET;
+}
+
+static long collection_find(js_object *collection, js_value key)
+{
+    uint32_t i;
+
+    for (i = 0; i < collection->collection_keys->elen; i++)
+        if (same_value_zero(collection->collection_keys->elems[i], key))
+            return (long)i;
+    return -1;
+}
+
+static int collection_store(js_ctx *ctx, js_object *collection,
+                            js_value key, js_value value)
+{
+    long index = collection_find(collection, key);
+
+    if (collection_is_weak(collection) && key.type != JS_OBJECT)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "weak collection keys must be objects");
+    if (index >= 0) {
+        if (collection_is_map(collection))
+            collection->collection_values->elems[index] = value;
+        return JS_OK;
+    }
+    if (collection->collection_keys->elen >= COLLECTION_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "collection has too many entries");
+    if (js_array_push(ctx, collection->collection_keys, key) != JS_OK)
+        return JS_THROW;
+    if (collection_is_map(collection) &&
+        js_array_push(ctx, collection->collection_values, value) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static js_object *collection_alloc(js_ctx *ctx, int cls)
+{
+    int prototype = cls == JS_CLASS_MAP ? P_MAP :
+                    cls == JS_CLASS_SET ? P_SET :
+                    cls == JS_CLASS_WEAKMAP ? P_WEAKMAP : P_WEAKSET;
+    js_object *collection = js_obj_alloc(ctx, cls, ctx->proto[prototype]);
+
+    if (!collection)
+        return 0;
+    collection->collection_keys = js_new_array(ctx);
+    if (!collection->collection_keys)
+        return 0;
+    if (cls == JS_CLASS_MAP || cls == JS_CLASS_WEAKMAP) {
+        collection->collection_values = js_new_array(ctx);
+        if (!collection->collection_values)
+            return 0;
+    }
+    return collection;
+}
+
+static int collection_ctor(js_ctx *ctx, int cls,
+                           int argc, js_value *argv, js_value *ret)
+{
+    js_object *collection;
+    js_value input = arg(argc, argv, 0);
+    const char *name = cls == JS_CLASS_MAP ? "Map" :
+                       cls == JS_CLASS_SET ? "Set" :
+                       cls == JS_CLASS_WEAKMAP ? "WeakMap" : "WeakSet";
+    unsigned long length = 0, i;
+
+    if (!js_is_constructing(ctx))
+        return js_throw_error(ctx, JS_ERR_TYPE, "%s requires new", name);
+    collection = collection_alloc(ctx, cls);
+    if (!collection)
+        return JS_THROW;
+    if (input.type != JS_UNDEFINED && input.type != JS_NULL) {
+        if (input.type != JS_OBJECT)
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "collection input must be array-like");
+        if (alen(ctx, input.u.obj, &length) != JS_OK)
+            return JS_THROW;
+        if (length > COLLECTION_MAX)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "collection input is too large");
+        for (i = 0; i < length; i++) {
+            js_value item, key, value;
+
+            if (aget(ctx, input.u.obj, i, &item) != JS_OK)
+                return JS_THROW;
+            if (cls == JS_CLASS_SET || cls == JS_CLASS_WEAKSET) {
+                if (collection_store(ctx, collection, item, item) != JS_OK)
+                    return JS_THROW;
+                continue;
+            }
+            if (item.type != JS_OBJECT)
+                return js_throw_error(ctx, JS_ERR_TYPE,
+                                      "%s entry must be array-like", name);
+            if (aget(ctx, item.u.obj, 0, &key) != JS_OK ||
+                aget(ctx, item.u.obj, 1, &value) != JS_OK ||
+                collection_store(ctx, collection, key, value) != JS_OK)
+                return JS_THROW;
+        }
+    }
+    *ret = js_object_value(collection);
+    return JS_OK;
+}
+
+static int map_ctor(js_ctx *ctx, js_value t, int argc,
+                    js_value *argv, js_value *ret)
+{
+    (void)t;
+    return collection_ctor(ctx, JS_CLASS_MAP, argc, argv, ret);
+}
+
+static int set_ctor(js_ctx *ctx, js_value t, int argc,
+                    js_value *argv, js_value *ret)
+{
+    (void)t;
+    return collection_ctor(ctx, JS_CLASS_SET, argc, argv, ret);
+}
+
+static int weakmap_ctor(js_ctx *ctx, js_value t, int argc,
+                        js_value *argv, js_value *ret)
+{
+    (void)t;
+    return collection_ctor(ctx, JS_CLASS_WEAKMAP, argc, argv, ret);
+}
+
+static int weakset_ctor(js_ctx *ctx, js_value t, int argc,
+                        js_value *argv, js_value *ret)
+{
+    (void)t;
+    return collection_ctor(ctx, JS_CLASS_WEAKSET, argc, argv, ret);
+}
+
+static int collection_size_get(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *collection = collection_object(t, 0);
+    (void)ctx; (void)argc; (void)argv;
+
+    if (!collection)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    *ret = js_number(collection->collection_keys->elen);
+    return JS_OK;
+}
+
+static int map_set(js_ctx *ctx, js_value t, int argc,
+                   js_value *argv, js_value *ret)
+{
+    js_object *map = collection_object(t, 0);
+
+    if (!map || !collection_is_map(map))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid Map receiver");
+    if (collection_store(ctx, map, arg(argc, argv, 0),
+                         arg(argc, argv, 1)) != JS_OK)
+        return JS_THROW;
+    *ret = t;
+    return JS_OK;
+}
+
+static int set_add(js_ctx *ctx, js_value t, int argc,
+                   js_value *argv, js_value *ret)
+{
+    js_object *set = collection_object(t, 0);
+    js_value value = arg(argc, argv, 0);
+
+    if (!set || collection_is_map(set))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid Set receiver");
+    if (collection_store(ctx, set, value, value) != JS_OK)
+        return JS_THROW;
+    *ret = t;
+    return JS_OK;
+}
+
+static int map_get(js_ctx *ctx, js_value t, int argc,
+                   js_value *argv, js_value *ret)
+{
+    js_object *map = collection_object(t, 0);
+    long index;
+
+    if (!map || !collection_is_map(map))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid Map receiver");
+    index = collection_find(map, arg(argc, argv, 0));
+    *ret = index >= 0
+        ? map->collection_values->elems[index] : js_undefined();
+    return JS_OK;
+}
+
+static int collection_has(js_ctx *ctx, js_value t, int argc,
+                          js_value *argv, js_value *ret)
+{
+    js_object *collection = collection_object(t, 0);
+
+    if (!collection)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    *ret = js_bool(collection_find(collection,
+                                   arg(argc, argv, 0)) >= 0);
+    return JS_OK;
+}
+
+static int collection_delete(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    js_object *collection = collection_object(t, 0);
+    long index;
+    uint32_t trailing;
+
+    if (!collection)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    index = collection_find(collection, arg(argc, argv, 0));
+    if (index < 0) {
+        *ret = js_bool(0);
+        return JS_OK;
+    }
+    trailing = collection->collection_keys->elen - (uint32_t)index - 1;
+    if (trailing) {
+        memmove(&collection->collection_keys->elems[index],
+                &collection->collection_keys->elems[index + 1],
+                (unsigned long)trailing * sizeof(js_value));
+        if (collection_is_map(collection))
+            memmove(&collection->collection_values->elems[index],
+                    &collection->collection_values->elems[index + 1],
+                    (unsigned long)trailing * sizeof(js_value));
+    }
+    collection->collection_keys->elen--;
+    if (collection_is_map(collection))
+        collection->collection_values->elen--;
+    *ret = js_bool(1);
+    return JS_OK;
+}
+
+static int collection_clear(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_object *collection = collection_object(t, 0);
+    (void)argc; (void)argv;
+
+    if (!collection)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    collection->collection_keys->elen = 0;
+    if (collection_is_map(collection))
+        collection->collection_values->elen = 0;
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+static int collection_for_each(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *collection = collection_object(t, 0);
+    js_value callback = arg(argc, argv, 0);
+    js_value this_arg = arg(argc, argv, 1);
+    uint32_t i = 0;
+
+    if (!collection)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    if (!js_is_function(callback))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "collection forEach requires a function");
+    while (i < collection->collection_keys->elen) {
+        js_value args[3], ignored;
+
+        args[0] = collection_is_map(collection)
+            ? collection->collection_values->elems[i]
+            : collection->collection_keys->elems[i];
+        args[1] = collection->collection_keys->elems[i];
+        args[2] = t;
+        if (js_call(ctx, callback, this_arg, 3, args, &ignored) != JS_OK)
+            return JS_THROW;
+        i++;
+    }
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+static int collection_iterator_next(js_ctx *ctx, js_value t,
+                                    int argc, js_value *argv, js_value *ret)
+{
+    js_value collection_value, index_value, kind_value;
+    js_object *collection, *result;
+    unsigned long index;
+    int kind;
+    (void)argc; (void)argv;
+
+    if (t.type != JS_OBJECT ||
+        js_get(ctx, t, "__collection", &collection_value) != JS_OK ||
+        js_get(ctx, t, "__index", &index_value) != JS_OK ||
+        js_get(ctx, t, "__kind", &kind_value) != JS_OK ||
+        !(collection = collection_object(collection_value, 0)) ||
+        index_value.type != JS_NUMBER || kind_value.type != JS_NUMBER)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection iterator");
+    index = index_value.u.num < 0
+        ? 0 : (unsigned long)index_value.u.num;
+    kind = (int)kind_value.u.num;
+    result = js_new_object(ctx);
+    if (!result)
+        return JS_THROW;
+    if (index >= collection->collection_keys->elen) {
+        if (js_define_enum(ctx, result, "value", js_undefined()) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(1)) != JS_OK)
+            return JS_THROW;
+    } else {
+        js_value value;
+
+        if (kind == 0)
+            value = collection->collection_keys->elems[index];
+        else if (kind == 1)
+            value = collection_is_map(collection)
+                ? collection->collection_values->elems[index]
+                : collection->collection_keys->elems[index];
+        else {
+            js_object *pair = js_new_array(ctx);
+            if (!pair ||
+                js_array_push(ctx, pair,
+                              collection->collection_keys->elems[index]) !=
+                    JS_OK ||
+                js_array_push(ctx, pair,
+                              collection_is_map(collection)
+                              ? collection->collection_values->elems[index]
+                              : collection->collection_keys->elems[index]) !=
+                    JS_OK)
+                return JS_THROW;
+            value = js_object_value(pair);
+        }
+        if (js_define_enum(ctx, result, "value", value) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(0)) != JS_OK ||
+            js_set(ctx, t, "__index",
+                   js_number((double)(index + 1))) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(result);
+    return JS_OK;
+}
+
+static int collection_iterator(js_ctx *ctx, js_value t,
+                               js_value *ret, int kind)
+{
+    js_object *iterator;
+    js_object *collection = collection_object(t, 0);
+
+    if (!collection || collection_is_weak(collection))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid collection receiver");
+    iterator = js_new_object(ctx);
+    if (!iterator ||
+        js_define(ctx, iterator, "__collection", t) != JS_OK ||
+        js_define(ctx, iterator, "__index", js_number(0)) != JS_OK ||
+        js_define(ctx, iterator, "__kind", js_number(kind)) != JS_OK ||
+        js_define_native(ctx, iterator, "next",
+                         collection_iterator_next, 0) != JS_OK)
+        return JS_THROW;
+    *ret = js_object_value(iterator);
+    return JS_OK;
+}
+
+static int collection_keys(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return collection_iterator(ctx, t, ret, 0);
+}
+
+static int collection_values(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return collection_iterator(ctx, t, ret, 1);
+}
+
+static int collection_entries(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    (void)argc; (void)argv;
+    return collection_iterator(ctx, t, ret, 2);
+}
+
+/* ================================================================== */
 /* Promise and microtasks                                              */
 /* ================================================================== */
 
@@ -4352,6 +5632,236 @@ static int arraybuffer_slice(js_ctx *ctx, js_value t, int argc,
     *ret = js_arraybuffer_new(ctx, data + begin,
                              (unsigned long)(end - begin));
     return js_is_arraybuffer(*ret) ? JS_OK : JS_THROW;
+}
+
+static js_object *uint8array_this(js_ctx *ctx, js_value value)
+{
+    if (!js_is_uint8array(value)) {
+        js_throw_error(ctx, JS_ERR_TYPE, "invalid Uint8Array receiver");
+        return 0;
+    }
+    return value.u.obj;
+}
+
+static int uint8array_length_get(js_ctx *ctx, js_value t, int argc,
+                                 js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_number((double)o->view_length);
+    return JS_OK;
+}
+
+static int uint8array_byte_offset_get(js_ctx *ctx, js_value t, int argc,
+                                      js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_number((double)o->byte_offset);
+    return JS_OK;
+}
+
+static int uint8array_buffer_get(js_ctx *ctx, js_value t, int argc,
+                                 js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_object_value(o->view_buffer);
+    return JS_OK;
+}
+
+static int uint8array_ctor(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    js_value source = arg(argc, argv, 0);
+    js_object *view = 0;
+    uint32_t offset = 0, length = 0;
+    unsigned long i, count = 0;
+    (void)t;
+
+    if (js_is_undefined(source)) {
+        *ret = js_uint8array_new(ctx, 0, 0);
+        return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+    }
+    if (js_is_arraybuffer(source)) {
+        unsigned long bytes = 0;
+
+        js_arraybuffer_data(source, &bytes);
+        if (argc > 1 && js_to_uint32(ctx, argv[1], &offset) != JS_OK)
+            return JS_THROW;
+        if ((unsigned long)offset > bytes)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Uint8Array byteOffset is out of range");
+        length = (uint32_t)(bytes - offset);
+        if (argc > 2 && !js_is_undefined(argv[2]) &&
+            js_to_uint32(ctx, argv[2], &length) != JS_OK)
+            return JS_THROW;
+        if ((unsigned long)length > bytes - offset)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Uint8Array length is out of range");
+        view = js_uint8array_view(ctx, source.u.obj, offset, length);
+        *ret = view ? js_object_value(view) : js_undefined();
+        return view ? JS_OK : JS_THROW;
+    }
+    if (js_is_number(source)) {
+        double d;
+
+        if (js_to_number(ctx, source, &d) != JS_OK)
+            return JS_THROW;
+        if (d < 0 || d > ARRAYBUFFER_BYTE_MAX || d != js_floor(d))
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Uint8Array length is invalid");
+        *ret = js_uint8array_new(ctx, 0, (unsigned long)d);
+        return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+    }
+    {
+        js_object *input;
+
+        if (this_object(ctx, source, &input) != JS_OK ||
+            alen(ctx, input, &count) != JS_OK)
+            return JS_THROW;
+        if (count > ARRAYBUFFER_BYTE_MAX)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Uint8Array source is too large");
+        *ret = js_uint8array_new(ctx, 0, count);
+        if (!js_is_uint8array(*ret))
+            return JS_THROW;
+        view = ret->u.obj;
+        for (i = 0; i < count; i++) {
+            js_value item;
+            uint32_t byte;
+
+            if (aget(ctx, input, i, &item) != JS_OK ||
+                js_to_uint32(ctx, item, &byte) != JS_OK)
+                return JS_THROW;
+            view->view_buffer->buffer[i] = (uint8_t)byte;
+        }
+    }
+    return JS_OK;
+}
+
+static void relative_range(int32_t *begin, int32_t *end, uint32_t length)
+{
+    if (*begin < 0) *begin += (int32_t)length;
+    if (*end < 0) *end += (int32_t)length;
+    if (*begin < 0) *begin = 0;
+    if (*end < 0) *end = 0;
+    if ((uint32_t)*begin > length) *begin = (int32_t)length;
+    if ((uint32_t)*end > length) *end = (int32_t)length;
+    if (*end < *begin) *end = *begin;
+}
+
+static int uint8array_subarray(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    js_object *view;
+    int32_t begin = 0, end;
+
+    if (!o) return JS_THROW;
+    end = (int32_t)o->view_length;
+    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && !js_is_undefined(argv[1]) &&
+        js_to_int32(ctx, argv[1], &end) != JS_OK)
+        return JS_THROW;
+    relative_range(&begin, &end, o->view_length);
+    view = js_uint8array_view(ctx, o->view_buffer,
+                              o->byte_offset + (uint32_t)begin,
+                              (uint32_t)(end - begin));
+    *ret = view ? js_object_value(view) : js_undefined();
+    return view ? JS_OK : JS_THROW;
+}
+
+static int uint8array_slice(js_ctx *ctx, js_value t, int argc,
+                            js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    int32_t begin = 0, end;
+
+    if (!o) return JS_THROW;
+    end = (int32_t)o->view_length;
+    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && !js_is_undefined(argv[1]) &&
+        js_to_int32(ctx, argv[1], &end) != JS_OK)
+        return JS_THROW;
+    relative_range(&begin, &end, o->view_length);
+    *ret = js_uint8array_new(
+        ctx, o->view_buffer->buffer + o->byte_offset + (uint32_t)begin,
+        (unsigned long)(end - begin));
+    return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+}
+
+static int uint8array_set(js_ctx *ctx, js_value t, int argc,
+                          js_value *argv, js_value *ret)
+{
+    js_object *dst = uint8array_this(ctx, t);
+    js_object *source;
+    unsigned long count, i;
+    uint32_t offset = 0;
+
+    if (!dst) return JS_THROW;
+    if (argc < 1 || this_object(ctx, argv[0], &source) != JS_OK ||
+        alen(ctx, source, &count) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && js_to_uint32(ctx, argv[1], &offset) != JS_OK)
+        return JS_THROW;
+    if (offset > dst->view_length ||
+        count > (unsigned long)dst->view_length - offset)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Uint8Array.set source does not fit");
+    if (source->cls == JS_CLASS_UINT8ARRAY) {
+        memmove(dst->view_buffer->buffer + dst->byte_offset + offset,
+                source->view_buffer->buffer + source->byte_offset, count);
+    } else {
+        for (i = 0; i < count; i++) {
+            js_value item;
+            uint32_t byte;
+
+            if (aget(ctx, source, i, &item) != JS_OK ||
+                js_to_uint32(ctx, item, &byte) != JS_OK)
+                return JS_THROW;
+            dst->view_buffer->buffer[dst->byte_offset + offset + i] =
+                (uint8_t)byte;
+        }
+    }
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+static int uint8array_fill(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    js_object *o = uint8array_this(ctx, t);
+    uint32_t byte = 0;
+    int32_t begin = 0, end;
+
+    if (!o) return JS_THROW;
+    if (argc > 0 && js_to_uint32(ctx, argv[0], &byte) != JS_OK)
+        return JS_THROW;
+    end = (int32_t)o->view_length;
+    if (argc > 1 && js_to_int32(ctx, argv[1], &begin) != JS_OK)
+        return JS_THROW;
+    if (argc > 2 && !js_is_undefined(argv[2]) &&
+        js_to_int32(ctx, argv[2], &end) != JS_OK)
+        return JS_THROW;
+    relative_range(&begin, &end, o->view_length);
+    memset(o->view_buffer->buffer + o->byte_offset + (uint32_t)begin,
+           (unsigned char)byte, (unsigned long)(end - begin));
+    *ret = t;
+    return JS_OK;
+}
+
+static int arraybuffer_is_view(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    (void)ctx; (void)t;
+    *ret = js_bool(argc > 0 && js_is_uint8array(argv[0]));
+    return JS_OK;
 }
 
 static int promise_all_item(js_ctx *ctx, js_value t, int argc,
@@ -4696,6 +6206,9 @@ static int wasm_source(js_ctx *ctx, js_value value, uint8_t **out,
     unsigned long n, i;
     uint8_t *bytes;
     const void *buffer = js_arraybuffer_data(value, &n);
+
+    if (!buffer)
+        buffer = js_uint8array_data(value, &n);
 
     if (!buffer) {
         if (this_object(ctx, value, &source) != JS_OK)
@@ -5357,7 +6870,7 @@ int js_init_builtins(js_ctx *ctx)
     if (!ctx->genv) return 0;
     ctx->genv->this_val = js_object_value(g);
 
-    for (i = P_ARRAY; i <= P_WASM_INSTANCE; i++) {
+    for (i = P_ARRAY; i <= P_WEAKSET; i++) {
         ctx->proto[i] = js_obj_alloc(ctx,
             i == P_ARRAY ? JS_CLASS_ARRAY : JS_CLASS_OBJECT, ctx->proto[P_OBJECT]);
         if (!ctx->proto[i]) return 0;
@@ -5376,6 +6889,11 @@ int js_init_builtins(js_ctx *ctx)
     ctx->ctor_object = mkctor(ctx, bi_object_ctor, "Object", 1, p);
     if (!ctx->ctor_object) return 0;
     DEFN(ctx->ctor_object, "keys", bi_object_keys, 1);
+    DEFN(ctx->ctor_object, "values", bi_object_values, 1);
+    DEFN(ctx->ctor_object, "entries", bi_object_entries, 1);
+    DEFN(ctx->ctor_object, "fromEntries", bi_object_fromentries, 1);
+    DEFN(ctx->ctor_object, "assign", bi_object_assign, 2);
+    DEFN(ctx->ctor_object, "is", bi_object_is, 2);
     DEFN(ctx->ctor_object, "getOwnPropertyNames", bi_object_names, 1);
     DEFN(ctx->ctor_object, "getPrototypeOf", bi_object_getproto, 1);
     DEFN(ctx->ctor_object, "defineProperty", bi_object_defprop, 3);
@@ -5411,6 +6929,14 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "concat", bi_array_concat, 1);
     DEFN(p, "indexOf", bi_array_indexof, 1);
     DEFN(p, "lastIndexOf", bi_array_lastindexof, 1);
+    DEFN(p, "includes", bi_array_includes, 1);
+    DEFN(p, "find", bi_array_find, 1);
+    DEFN(p, "findIndex", bi_array_findindex, 1);
+    DEFN(p, "flat", bi_array_flat, 0);
+    DEFN(p, "flatMap", bi_array_flatmap, 1);
+    DEFN(p, "keys", bi_array_keys, 0);
+    DEFN(p, "values", bi_array_values, 0);
+    DEFN(p, "entries", bi_array_entries, 0);
     DEFN(p, "reverse", bi_array_reverse, 0);
     DEFN(p, "sort", bi_array_sort, 1);
     DEFN(p, "forEach", bi_array_foreach, 1);
@@ -5423,6 +6949,8 @@ int js_init_builtins(js_ctx *ctx)
     ctx->ctor_array = mkctor(ctx, bi_array_ctor, "Array", 1, p);
     if (!ctx->ctor_array) return 0;
     DEFN(ctx->ctor_array, "isArray", bi_array_isarray, 1);
+    DEFN(ctx->ctor_array, "from", bi_array_from, 1);
+    DEFN(ctx->ctor_array, "of", bi_array_of, 0);
 
     /* ---- String ---- */
     p = ctx->proto[P_STRING];
@@ -5432,6 +6960,12 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "charCodeAt", bi_string_charcodeat, 1);
     DEFN(p, "indexOf", bi_string_indexof, 1);
     DEFN(p, "lastIndexOf", bi_string_lastindexof, 1);
+    DEFN(p, "includes", bi_string_includes, 1);
+    DEFN(p, "startsWith", bi_string_startswith, 1);
+    DEFN(p, "endsWith", bi_string_endswith, 1);
+    DEFN(p, "repeat", bi_string_repeat, 1);
+    DEFN(p, "padStart", bi_string_padstart, 1);
+    DEFN(p, "padEnd", bi_string_padend, 1);
     DEFN(p, "slice", bi_string_slice, 2);
     DEFN(p, "substring", bi_string_substring, 2);
     DEFN(p, "substr", bi_string_substr, 2);
@@ -5440,10 +6974,15 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "toLocaleUpperCase", bi_string_upper, 0);
     DEFN(p, "toLocaleLowerCase", bi_string_lower, 0);
     DEFN(p, "trim", bi_string_trim, 0);
+    DEFN(p, "trimStart", bi_string_trimstart, 0);
+    DEFN(p, "trimLeft", bi_string_trimstart, 0);
+    DEFN(p, "trimEnd", bi_string_trimend, 0);
+    DEFN(p, "trimRight", bi_string_trimend, 0);
     DEFN(p, "concat", bi_string_concat, 1);
     DEFN(p, "localeCompare", bi_string_localecompare, 1);
     DEFN(p, "split", bi_string_split, 2);
     DEFN(p, "replace", bi_string_replace, 2);
+    DEFN(p, "replaceAll", bi_string_replaceall, 2);
     DEFN(p, "match", bi_string_match, 1);
     DEFN(p, "search", bi_string_search, 1);
     {
@@ -5468,6 +7007,15 @@ int js_init_builtins(js_ctx *ctx)
         DEFV(c, "NaN", js_number(js_nan()));
         DEFV(c, "POSITIVE_INFINITY", js_number(js_inf(0)));
         DEFV(c, "NEGATIVE_INFINITY", js_number(js_inf(1)));
+        DEFV(c, "EPSILON", js_number(2.2204460492503131e-16));
+        DEFV(c, "MAX_SAFE_INTEGER", js_number(9007199254740991.0));
+        DEFV(c, "MIN_SAFE_INTEGER", js_number(-9007199254740991.0));
+        DEFN(c, "isFinite", bi_number_isfinite, 1);
+        DEFN(c, "isNaN", bi_number_isnan, 1);
+        DEFN(c, "isInteger", bi_number_isinteger, 1);
+        DEFN(c, "isSafeInteger", bi_number_issafeinteger, 1);
+        DEFN(c, "parseInt", bi_parseint, 2);
+        DEFN(c, "parseFloat", bi_parsefloat, 1);
     }
 
     /* ---- Boolean ---- */
@@ -5555,7 +7103,87 @@ int js_init_builtins(js_ctx *ctx)
     /* ---- ArrayBuffer ---- */
     p = ctx->proto[P_ARRAYBUFFER];
     DEFN(p, "slice", arraybuffer_slice, 2);
-    if (!mkctor(ctx, arraybuffer_ctor, "ArrayBuffer", 1, p))
+    {
+        js_object *arraybuffer_ctor_obj =
+            mkctor(ctx, arraybuffer_ctor, "ArrayBuffer", 1, p);
+        if (!arraybuffer_ctor_obj) return 0;
+        DEFN(arraybuffer_ctor_obj, "isView", arraybuffer_is_view, 1);
+    }
+
+    /* ---- Uint8Array ---- */
+    p = ctx->proto[P_UINT8ARRAY];
+    if (js_define_accessor(ctx, p, "length",
+                           uint8array_length_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "byteLength",
+                           uint8array_length_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "byteOffset",
+                           uint8array_byte_offset_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "buffer",
+                           uint8array_buffer_get, 0, 0) != JS_OK)
+        return 0;
+    DEFN(p, "set", uint8array_set, 2);
+    DEFN(p, "subarray", uint8array_subarray, 2);
+    DEFN(p, "slice", uint8array_slice, 2);
+    DEFN(p, "fill", uint8array_fill, 3);
+    DEFV(p, "BYTES_PER_ELEMENT", js_number(1));
+    {
+        js_object *uint8_ctor_obj =
+            mkctor(ctx, uint8array_ctor, "Uint8Array", 3, p);
+        if (!uint8_ctor_obj) return 0;
+        DEFV(uint8_ctor_obj, "BYTES_PER_ELEMENT", js_number(1));
+    }
+
+    /* ---- Map ---- */
+    p = ctx->proto[P_MAP];
+    if (js_define_accessor(ctx, p, "size",
+                           collection_size_get, 0, 0) != JS_OK)
+        return 0;
+    DEFN(p, "set", map_set, 2);
+    DEFN(p, "get", map_get, 1);
+    DEFN(p, "has", collection_has, 1);
+    DEFN(p, "delete", collection_delete, 1);
+    DEFN(p, "clear", collection_clear, 0);
+    DEFN(p, "forEach", collection_for_each, 1);
+    DEFN(p, "keys", collection_keys, 0);
+    DEFN(p, "values", collection_values, 0);
+    DEFN(p, "entries", collection_entries, 0);
+    if (!mkctor(ctx, map_ctor, "Map", 0, p))
+        return 0;
+
+    /* ---- Set ---- */
+    p = ctx->proto[P_SET];
+    if (js_define_accessor(ctx, p, "size",
+                           collection_size_get, 0, 0) != JS_OK)
+        return 0;
+    DEFN(p, "add", set_add, 1);
+    DEFN(p, "has", collection_has, 1);
+    DEFN(p, "delete", collection_delete, 1);
+    DEFN(p, "clear", collection_clear, 0);
+    DEFN(p, "forEach", collection_for_each, 1);
+    DEFN(p, "keys", collection_keys, 0);
+    DEFN(p, "values", collection_values, 0);
+    DEFN(p, "entries", collection_entries, 0);
+    if (!mkctor(ctx, set_ctor, "Set", 0, p))
+        return 0;
+
+    /* ---- WeakMap ---- */
+    p = ctx->proto[P_WEAKMAP];
+    DEFN(p, "set", map_set, 2);
+    DEFN(p, "get", map_get, 1);
+    DEFN(p, "has", collection_has, 1);
+    DEFN(p, "delete", collection_delete, 1);
+    if (!mkctor(ctx, weakmap_ctor, "WeakMap", 0, p))
+        return 0;
+
+    /* ---- WeakSet ---- */
+    p = ctx->proto[P_WEAKSET];
+    DEFN(p, "add", set_add, 1);
+    DEFN(p, "has", collection_has, 1);
+    DEFN(p, "delete", collection_delete, 1);
+    if (!mkctor(ctx, weakset_ctor, "WeakSet", 0, p))
+        return 0;
+
+    if (!js_init_webapis(ctx))
         return 0;
 
     /* ---- WebAssembly ---- */

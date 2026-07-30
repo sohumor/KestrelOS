@@ -92,6 +92,18 @@
 #define DOM_TEXT     2
 #define DOM_COMMENT  3
 #define DOM_DOCTYPE  4
+#define DOM_FRAGMENT 5
+
+#define DOM_NS_HTML   0
+#define DOM_NS_SVG    1
+#define DOM_NS_MATHML 2
+#define DOM_NS_NONE   3
+
+#define DOM_NS_HTML_URI   "http://www.w3.org/1999/xhtml"
+#define DOM_NS_SVG_URI    "http://www.w3.org/2000/svg"
+#define DOM_NS_MATHML_URI "http://www.w3.org/1998/Math/MathML"
+#define DOM_NS_XML_URI    "http://www.w3.org/XML/1998/namespace"
+#define DOM_NS_XMLNS_URI  "http://www.w3.org/2000/xmlns/"
 
 /* ------------------------------------------------------------------ *
  * Tag identifiers
@@ -148,20 +160,26 @@ enum {
 struct dom_document;
 
 struct dom_attr {
-    const char *name;   /* interned, ASCII-lowercased, NUL-terminated */
-    const char *value;  /* NUL-terminated UTF-8, owned by the document */
-    unsigned long len;  /* strlen(value), precomputed                  */
+    const char *name;          /* qualified name, NUL-terminated       */
+    const char *local_name;    /* local name (name for null namespace) */
+    const char *prefix;        /* prefix or 0                          */
+    const char *namespace_uri; /* exact URI or 0                       */
+    const char *value;         /* UTF-8, owned by the document         */
+    unsigned long len;         /* strlen(value), precomputed           */
 };
 
 struct dom_node {
     unsigned char type;         /* DOM_*                                */
     unsigned char self_closed;  /* source said <x/>                     */
+    unsigned char namespace_id; /* DOM_NS_* for elements                */
+    unsigned char _node_pad;
     unsigned short nattr;
     unsigned short cattr;       /* private: attribute array capacity    */
     int tag_id;                 /* HTAG_*, elements only                */
     unsigned int depth;         /* 0 for the document node              */
     unsigned int index;         /* serial in document order at parse    */
     const char *tag;            /* interned lowercase name, or 0        */
+    const char *namespace_uri;  /* exact URI, or 0 for no namespace     */
     char *text;                 /* text/comment data, doctype name      */
     unsigned long text_len;
     struct dom_attr *attr;
@@ -237,10 +255,13 @@ void dom_document_free(struct dom_document *d);
  * (the document's truncated/oom fields say which). */
 struct dom_node *dom_create_element(struct dom_document *d,
                                     const char *tag, long taglen);
+int dom_set_namespace(struct dom_node *node,
+                      const char *namespace_uri, long length);
 struct dom_node *dom_create_text(struct dom_document *d,
                                  const char *s, unsigned long n);
 struct dom_node *dom_create_comment(struct dom_document *d,
                                     const char *s, unsigned long n);
+struct dom_node *dom_create_fragment(struct dom_document *d);
 
 /* Tree editing. Return 1 on success, 0 when the move is illegal (a
  * cycle, a null argument, or a depth-cap violation). */
@@ -265,6 +286,13 @@ int dom_set_attr(struct dom_node *n, const char *name, const char *value);
 int dom_set_attr_n(struct dom_node *n, const char *name, long namelen,
                    const char *value, unsigned long vallen);
 int dom_remove_attr(struct dom_node *n, const char *name);
+const char *dom_get_attr_ns(const struct dom_node *n,
+                            const char *namespace_uri,
+                            const char *local_name);
+int dom_set_attr_ns(struct dom_node *n, const char *namespace_uri,
+                    const char *qualified_name, const char *value);
+int dom_remove_attr_ns(struct dom_node *n, const char *namespace_uri,
+                       const char *local_name);
 
 unsigned int dom_attr_count(const struct dom_node *n);
 const struct dom_attr *dom_attr_at(const struct dom_node *n, unsigned int i);

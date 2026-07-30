@@ -33,6 +33,7 @@ compile libweb/css.c css
 compile libweb/style.c style
 compile libweb/ua_style.c ua_style
 compile libweb/url.c url
+compile libweb/storage.c storage
 compile libweb/jsdom.c jsdom
 compile libweb/layout.c layout
 compile libweb/paint.c paint
@@ -41,6 +42,8 @@ compile libjs/lex.c js_lex
 compile libjs/parse.c js_parse
 compile libjs/interp.c js_interp
 compile libjs/builtin.c js_builtin
+compile libjs/webapi.c js_webapi
+compile libtls/hash.c tls_hash
 compile libgui/font.c font
 compile libgui/font_data.c font_data
 compile libgui/draw.c draw
@@ -48,9 +51,10 @@ compile libgui/draw.c draw
 "$CC" -pthread -o "$OUT/test_browser_stack" \
     "$OUT/test_browser_stack.o" "$OUT/dom.o" "$OUT/entities.o" \
     "$OUT/html.o" "$OUT/css.o" "$OUT/style.o" "$OUT/ua_style.o" \
-    "$OUT/url.o" "$OUT/jsdom.o" "$OUT/layout.o" "$OUT/paint.o" \
+    "$OUT/url.o" "$OUT/storage.o" "$OUT/jsdom.o" "$OUT/layout.o" "$OUT/paint.o" \
     "$OUT/js_value.o" "$OUT/js_lex.o" "$OUT/js_parse.o" \
-    "$OUT/js_interp.o" "$OUT/js_builtin.o" \
+    "$OUT/js_interp.o" "$OUT/js_builtin.o" "$OUT/js_webapi.o" \
+    "$OUT/tls_hash.o" \
     "$OUT/font.o" \
     "$OUT/font_data.o" "$OUT/draw.o"
 
@@ -61,6 +65,7 @@ fi
 cat "$OUT/text.out"
 grep -F "STACK-GATE-TOP" "$OUT/text.out" >/dev/null || failed=1
 grep -F "STACK-MODULE-OK" "$OUT/text.out" >/dev/null || failed=1
+grep -F "lifecycle: complete" "$OUT/text.out" >/dev/null || failed=1
 grep -F "#deep" "$OUT/text.out" >/dev/null || failed=1
 grep -F "[layout truncated: 0x2]" "$OUT/text.out" >/dev/null || failed=1
 grep -F "STACK-GATE mode=text" "$OUT/text.out" >/dev/null || failed=1

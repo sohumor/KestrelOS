@@ -52,8 +52,44 @@ is a plain memory write with no message passing at all.
 
 Applications get a small set of syscalls (create, flush, event, move, destroy)
 and a userspace widget toolkit is layered on top in libgui. The window manager
-policy — stacking, focus, dragging, the close box — is kernel-side too, which is
-the classic tradeoff: less flexible, much simpler, and impossible to deadlock.
+policy — stacking, focus, dragging, close and minimize — is kernel-side too,
+which is the classic tradeoff: less flexible, much simpler, and impossible to
+deadlock.
+
+The desktop shell has two additional calls: enumerate ordinary same-user
+windows and request focus, minimize, restore or close. Those calls are a
+capability rather than a global control channel: the kernel accepts them only
+from a process that already owns a `K_WIN_DESKTOP` surface, and never returns a
+window belonging to another uid. This is what makes the dock a real task
+switcher without making window ids an ambient authority.
+
+### The shell is a desktop environment, not one large mock-up
+
+The background remains a full-screen `K_WIN_DESKTOP` layer. The top panel,
+wallpaper, shortcuts, dock and notifications are painted into that layer, while
+the searchable launcher and quick-settings panel are temporary undecorated
+windows. A popup can therefore accept keyboard input and sit above applications
+without allowing the background itself to steal focus from the console.
+
+The shell provides:
+
+- a searchable application grid opened by the Super key;
+- a live dock backed by the compositor's real window list;
+- click-to-focus, click-again-to-minimize and click-to-restore behavior;
+- network, memory, CPU and clock status, with confirmed power actions;
+- four generated wallpapers, dark/light modes, six accents and dock density;
+- per-user preferences (root's defaults live in `/etc/desktop.conf`);
+- transient notifications and keyboard task switching with Alt-Tab/Alt-F4.
+
+The graphical suite includes Settings, System Monitor and Calculator alongside
+Terminal, Files, Clock, Paint, About and Browser. All use the same immediate-mode
+toolkit palette and widgets; open applications poll the preference file and
+adopt theme changes without restarting.
+
+The pixel buffers remain fixed-size mappings. That is why this version offers a
+correct minimize/restore path but not a pretend maximize button: safely resizing
+a mapping while an application may be drawing on another CPU needs a separate
+buffer-generation protocol and acknowledgement handshake.
 
 ### Permissions are an on-disk format change
 

@@ -215,6 +215,11 @@ int js_is_arraybuffer(js_value v)
     return v.type == JS_OBJECT && v.u.obj->cls == JS_CLASS_ARRAYBUFFER;
 }
 
+int js_is_uint8array(js_value v)
+{
+    return v.type == JS_OBJECT && v.u.obj->cls == JS_CLASS_UINT8ARRAY;
+}
+
 const char *js_string_bytes(js_value v, unsigned long *len)
 {
     if (v.type != JS_STRING) { if (len) *len = 0; return 0; }
@@ -522,6 +527,57 @@ const void *js_arraybuffer_data(js_value v, unsigned long *len)
     return v.u.obj->buffer;
 }
 
+js_object *js_uint8array_view(js_ctx *ctx, js_object *buffer,
+                              uint32_t offset, uint32_t length)
+{
+    js_object *o;
+
+    if (!ctx || !buffer || buffer->cls != JS_CLASS_ARRAYBUFFER ||
+        offset > buffer->byte_length ||
+        length > buffer->byte_length - offset) {
+        if (ctx)
+            js_throw_error(ctx, JS_ERR_RANGE,
+                           "Uint8Array view is outside its ArrayBuffer");
+        return 0;
+    }
+    o = js_obj_alloc(ctx, JS_CLASS_UINT8ARRAY, ctx->proto[P_UINT8ARRAY]);
+    if (!o)
+        return 0;
+    o->view_buffer = buffer;
+    o->byte_offset = offset;
+    o->view_length = length;
+    return o;
+}
+
+js_value js_uint8array_new(js_ctx *ctx, const void *data, unsigned long len)
+{
+    js_value buffer;
+    js_object *view;
+
+    buffer = js_arraybuffer_new(ctx, data, len);
+    if (!js_is_arraybuffer(buffer))
+        return js_undefined();
+    view = js_uint8array_view(ctx, buffer.u.obj, 0, (uint32_t)len);
+    return view ? js_object_value(view) : js_undefined();
+}
+
+const void *js_uint8array_data(js_value v, unsigned long *len)
+{
+    js_object *o;
+
+    if (!js_is_uint8array(v))
+        return 0;
+    o = v.u.obj;
+    if (len)
+        *len = o->view_length;
+    return o->view_buffer->buffer + o->byte_offset;
+}
+
+void *js_uint8array_mutable_data(js_value v, unsigned long *len)
+{
+    return (void *)js_uint8array_data(v, len);
+}
+
 js_env *js_env_new(js_ctx *ctx, js_env *parent, js_object *vars)
 {
     js_env *e = (js_env *)js_alloc(ctx, sizeof(js_env));
@@ -653,6 +709,13 @@ int js_obj_get(js_ctx *ctx, js_object *o, js_string *key,
                 *out = p->elems[idx];
                 return JS_OK;
             }
+        } else if (p->cls == JS_CLASS_UINT8ARRAY) {
+            idx = js_array_index(key);
+            if (idx >= 0 && (uint32_t)idx < p->view_length) {
+                *out = js_number((double)
+                    p->view_buffer->buffer[p->byte_offset + (uint32_t)idx]);
+                return JS_OK;
+            }
         } else if (p->cls == JS_CLASS_STRING && p->prim.type == JS_STRING) {
             if (js_str_eq(key, ctx->s_length)) {
                 *out = js_number((double)p->prim.u.str->len);
@@ -725,6 +788,19 @@ int js_obj_put(js_ctx *ctx, js_object *o, js_string *key, js_value v)
             }
             o->sparse = 1;      /* fall through to a named property */
         }
+    } else if (o->cls == JS_CLASS_UINT8ARRAY) {
+        idx = js_array_index(key);
+        if (idx >= 0) {
+            uint32_t byte;
+
+            if ((uint32_t)idx >= o->view_length)
+                return JS_OK;
+            if (js_to_uint32(ctx, v, &byte) != JS_OK)
+                return JS_THROW;
+            o->view_buffer->buffer[o->byte_offset + (uint32_t)idx] =
+                (uint8_t)byte;
+            return JS_OK;
+        }
     }
 
     pr = js_own_prop(o, key);
@@ -770,6 +846,10 @@ int js_obj_delete(js_ctx *ctx, js_object *o, js_string *key)
                 o->elems[idx] = js_undefined();
             return 1;
         }
+    } else if (o->cls == JS_CLASS_UINT8ARRAY) {
+        idx = js_array_index(key);
+        if (idx >= 0 && (uint32_t)idx < o->view_length)
+            return 0;
     }
     pr = js_own_prop(o, key);
     if (!pr)
@@ -792,6 +872,10 @@ int js_obj_has_own(js_ctx *ctx, js_object *o, js_string *key)
             return 1;
         idx = js_array_index(key);
         if (idx >= 0 && (uint32_t)idx < o->elen)
+            return 1;
+    } else if (o->cls == JS_CLASS_UINT8ARRAY) {
+        idx = js_array_index(key);
+        if (idx >= 0 && (uint32_t)idx < o->view_length)
             return 1;
     } else if (o->cls == JS_CLASS_STRING && o->prim.type == JS_STRING) {
         if (js_str_eq(key, ctx->s_length))
@@ -895,6 +979,14 @@ int js_has(js_ctx *ctx, js_value obj, const char *name)
     if (!k || obj.type != JS_OBJECT)
         return 0;
     return js_obj_has(ctx, obj.u.obj, k);
+}
+
+int js_has_own(js_ctx *ctx, js_value obj, const char *name)
+{
+    js_string *k = js_str_intern(ctx, name, strlen(name));
+    if (!k || obj.type != JS_OBJECT)
+        return 0;
+    return js_obj_has_own(ctx, obj.u.obj, k);
 }
 
 int js_delete(js_ctx *ctx, js_value obj, const char *name)

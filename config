@@ -71,8 +71,9 @@ CONFIG_DNS=y
 # console is VGA text mode only and nothing graphical can run. (y/n)
 CONFIG_GRAPHICS=y
 
-# The compositor and window manager, and the GUI apps that need it:
-# desktop, terminal, gclock, gfiles, gpaint. Needs GRAPHICS. (y/n)
+# The compositor, window manager, desktop shell and graphical app suite.
+# Includes Settings, System Monitor, Calculator, Terminal, Browser, Files,
+# Clock, Paint and About. Needs GRAPHICS. (y/n)
 CONFIG_WM=y
 
 # PS/2 mouse driver. (y/n)

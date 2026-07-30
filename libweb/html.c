@@ -674,6 +674,16 @@ static struct dom_node *make_el(struct parser *p, const char *tag,
         return 0;
     }
     *in_tree = place(p, el, allow_foster);
+    if (el->tag_id == HTAG_SVG)
+        dom_set_namespace(el, DOM_NS_SVG_URI, -1);
+    else if (el->parent && el->parent->type == DOM_ELEMENT &&
+             el->parent->namespace_id == DOM_NS_SVG &&
+             strcmp(el->parent->tag, "foreignobject"))
+        dom_set_namespace(el, DOM_NS_SVG_URI, -1);
+    else if (!strcmp(el->tag, "math") ||
+             (el->parent && el->parent->type == DOM_ELEMENT &&
+              el->parent->namespace_id == DOM_NS_MATHML))
+        dom_set_namespace(el, DOM_NS_MATHML_URI, -1);
     return el;
 }
 

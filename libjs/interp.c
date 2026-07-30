@@ -176,7 +176,7 @@ js_object *js_make_function(js_ctx *ctx, js_func *fn, js_env *env)
     if (!p) return 0;
     p->value = js_string_value(fn->name ? fn->name : ctx->s_empty);
 
-    if (!fn->native) {
+    if (!fn->native && fn->ctor_kind != JS_CTOR_NONE) {
         js_object *proto = js_new_object(ctx);
         if (!proto) return 0;
         p = js_add_prop(ctx, proto, ctx->s_constructor, JS_P_HIDDEN);
@@ -205,6 +205,34 @@ js_object *js_new_native(js_ctx *ctx, js_native native, const char *name,
     return js_make_function(ctx, fn, 0);
 }
 
+js_object *js_new_native_constructor(js_ctx *ctx, js_native native,
+                                     const char *name, int nargs,
+                                     js_object *prototype)
+{
+    js_object *ctor = js_new_native(ctx, native, name, nargs);
+    js_prop *property;
+
+    if (!ctor)
+        return 0;
+    ctor->fn->ctor_kind = JS_CTOR_NATIVE;
+    if (!prototype)
+        return ctor;
+    property = js_add_prop(ctx, ctor, ctx->s_prototype, 0);
+    if (!property)
+        return 0;
+    property->value = js_object_value(prototype);
+    property = js_add_prop(ctx, prototype, ctx->s_constructor, JS_P_HIDDEN);
+    if (!property)
+        return 0;
+    property->value = js_object_value(ctor);
+    return ctor;
+}
+
+int js_is_constructing(js_ctx *ctx)
+{
+    return ctx && ctx->new_target != 0;
+}
+
 int js_define_native(js_ctx *ctx, js_object *obj, const char *name,
                      js_native native, int nargs)
 {
@@ -217,27 +245,45 @@ int js_define_native(js_ctx *ctx, js_object *obj, const char *name,
 int js_define_accessor(js_ctx *ctx, js_object *obj, const char *name,
                        js_native getter, js_native setter, int enumerable)
 {
-    js_string *k = js_str_intern(ctx, name, strlen(name));
-    js_prop *p;
+    js_value getter_value = js_undefined();
+    js_value setter_value = js_undefined();
 
-    if (!k)
-        return JS_THROW;
-    p = js_add_prop(ctx, obj, k, 0);
-    if (!p)
-        return JS_THROW;
-    p->flags = JS_P_ACCESSOR | JS_P_CONFIG | (enumerable ? JS_P_ENUM : 0);
-    p->value = js_undefined();
-    p->setter = js_undefined();
     if (getter) {
         js_object *g = js_new_native(ctx, getter, name, 0);
-        if (!g) return JS_THROW;
-        p->value = js_object_value(g);
+        if (!g)
+            return JS_THROW;
+        getter_value = js_object_value(g);
     }
     if (setter) {
         js_object *s = js_new_native(ctx, setter, name, 1);
-        if (!s) return JS_THROW;
-        p->setter = js_object_value(s);
+        if (!s)
+            return JS_THROW;
+        setter_value = js_object_value(s);
     }
+    return js_define_accessor_value(ctx, obj, name, getter_value,
+                                    setter_value, enumerable);
+}
+
+int js_define_accessor_value(js_ctx *ctx, js_object *obj, const char *name,
+                             js_value getter, js_value setter,
+                             int enumerable)
+{
+    js_string *key = js_str_intern(ctx, name, strlen(name));
+    js_prop *property;
+
+    if (!key)
+        return JS_THROW;
+    if ((getter.type != JS_UNDEFINED && !js_is_function(getter)) ||
+        (setter.type != JS_UNDEFINED && !js_is_function(setter)))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "accessor must be a function");
+    property = js_add_prop(ctx, obj, key, 0);
+    if (!property)
+        return JS_THROW;
+    property->flags = JS_P_ACCESSOR | JS_P_CONFIG |
+                      (enumerable ? JS_P_ENUM : 0);
+    property->value = getter;
+    property->setter = setter;
     return JS_OK;
 }
 
@@ -322,7 +368,8 @@ static int invoke(js_ctx *ctx, js_object *f, js_value this_val,
     env = js_env_new(ctx, fn->closure, act);
     if (!env)
         return JS_THROW;
-    env->this_val = this_val;
+    env->this_val = fn->ctor_kind == JS_CTOR_NONE && fn->closure
+        ? fn->closure->this_val : this_val;
 
     /* Hoisted var names, then parameters, then the arguments object, then
      * nested function declarations -- the ES5 order, so a parameter beats a
@@ -339,7 +386,8 @@ static int invoke(js_ctx *ctx, js_object *f, js_value this_val,
             p->value = (i < argc) ? argv[i] : js_undefined();
         }
     }
-    if (!js_own_prop(act, ctx->s_arguments) &&
+    if (fn->ctor_kind != JS_CTOR_NONE &&
+        !js_own_prop(act, ctx->s_arguments) &&
         make_arguments(ctx, f, act, argc, argv) != JS_OK)
         return JS_THROW;
     if (instantiate_funcs(ctx, fn->funcs, act, env) != JS_OK)
@@ -758,6 +806,8 @@ static int eval_func(js_ctx *ctx, js_node *n, js_env *env, js_value *out)
     fn->vars = n->c;
     fn->funcs = n->d;
     fn->nparams = (int)n->num;
+    fn->ctor_kind = (n->flags & JS_NODE_ARROW)
+        ? JS_CTOR_NONE : JS_CTOR_NORMAL;
 
     /* A named function expression can see its own name. */
     if (n->str) {

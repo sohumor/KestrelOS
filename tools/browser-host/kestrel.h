@@ -22,8 +22,10 @@
 
 int browser_host_stat(const char *path, struct k_stat *out);
 int browser_host_netinfo(struct k_netinfo *out);
+int browser_host_cpuinfo(struct k_cpuinfo *out);
 long browser_host_syscall(long n, long a, long b, long c, long d);
 
 #define stat_   browser_host_stat
 #define netinfo browser_host_netinfo
+#define cpuinfo browser_host_cpuinfo
 #define syscall browser_host_syscall

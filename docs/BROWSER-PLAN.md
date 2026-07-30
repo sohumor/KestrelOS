@@ -49,9 +49,16 @@ reports its own size and the browser's total is tracked.
 
 **JavaScript.** A production engine (JIT, full ES2023, the complete DOM and Web
 APIs) is a multi-year project for a team. The current tree-walking interpreter
-has an ES5 core, `let`/`const` syntax with `var` semantics, bounded static module
-graphs, a Promise/microtask subset (`all`, `race`, and `finally` included),
-asynchronous `fetch`/`Response`, and a bounded i32-only WebAssembly MVP core.
+has an ES5 core, bounded arrow functions, `let`/`const` syntax with `var`
+semantics, `Uint8Array`, UTF-8 text codecs, live `URL`/`URLSearchParams`,
+bounded `Map`/`Set`, object-keyed `WeakMap`/`WeakSet`, common modern
+Object/Array/Number static helpers, bounded Array/String search, flattening,
+replacement, and padding helpers, explicit Array iterators, and bounded
+`Object.fromEntries()`,
+bounded static module graphs, a
+Promise/microtask subset (`all`, `race`, and `finally` included),
+asynchronous `fetch`/`Response` with
+`AbortController` cancellation, and a bounded i32-only WebAssembly MVP core.
 Those features run controlled applications and tests; they do not turn it into
 a full modern-JavaScript engine. `import.meta.url` and literal-string
 `import()` are supported, but literal dynamic imports are eagerly resolved and
@@ -59,7 +66,7 @@ evaluated before their Promise is returned. Inline `import.meta.url` is the
 document URL. External modules follow fetch-style CORS/cookie rules and require
 a JavaScript MIME type; supported import statements preserve source after
 their terminating semicolon. Module bindings are not live, computed imports
-and general ES2015+ syntax are absent, and large framework applications remain
+and most ES2015+ syntax are absent, and large framework applications remain
 outside the compatibility boundary.
 
 **Crypto.** The TLS implementation is written from the specifications and is
@@ -68,7 +75,8 @@ where it is not. It is good enough to fetch a public web page; it should not be
 trusted with anything that matters.
 
 **Rendering.** The renderer has alpha compositing, conventional block/inline/
-table/floating/positioned layout, and a bounded single-line flex-row subset.
+table/floating/positioned layout, and bounded single-line flex-row and
+flex-column subsets.
 Inline SVG supports basic rectangles, lines, circles, ellipses, text,
 polygons, polylines, presentation fill/stroke, and `viewBox`. Its bounded path
 subset accepts move, line, horizontal/vertical line, quadratic/cubic curve,
@@ -103,8 +111,35 @@ That is a large and genuinely useful part of the web.
   web tests are implemented. Bounded static modules, Promise jobs and
   `all`/`race`/`finally`, asynchronous fetch with redirect/CORS controls,
   `Response.text()`/`json()`/`arrayBuffer()`, an i32-only WebAssembly MVP core,
-  `import.meta.url`, eagerly resolved literal-string `import()`, a flex-row
-  layout subset, MIME/CORS-checked external modules, bounded
+  `import.meta.url`, eagerly resolved literal-string `import()`, arrow
+  functions, `Uint8Array`, UTF-8 text codecs, live `URL`/`URLSearchParams`,
+  `AbortController`/`AbortSignal` and queued fetch cancellation,
+  constructible `Event`/`CustomEvent`/`EventTarget` with bounded bubbling,
+  constructible normalized `Headers` collections shared with responses,
+  constructible and independently cloneable text/byte/JSON `Response` objects,
+  constructible `Request` objects with bounded real header transport,
+  bounded `Blob`/`File` construction, asynchronous FileReader, body readers,
+  Fetch-resolved object URLs, Request mode/credentials/redirect controls,
+  response factories and redirect metadata, kernel-backed Web Crypto
+  randomness and SHA-1/SHA-2 digests, SMP-aware Navigator metadata and queued
+  `sendBeacon()`, CSS-engine-backed `matchMedia()` and viewport metrics,
+  complete Location/document URL metadata and mutation, ordered
+  string/Blob/File `FormData` with bounded multipart HTTP encoding and decoding,
+  bounded same-document History routing, modern DOM traversal/mutation,
+  multi-token class lists, general CSS declaration access, bounded
+  `Map`/`Set`, object-keyed `WeakMap`/`WeakSet`, and common modern
+  Object/Array/Number static and bounded Array/String prototype helpers,
+  explicit Array iterators and bounded `Object.fromEntries()`,
+  Node/Element/HTML/SVG identity, namespace-aware element construction and
+  lookup, a live existing-key DOMStringMap dataset view, comment/child/root
+  APIs, off-document DocumentFragment construction, and bounded Range/
+  Selection editing state,
+  bounded asynchronous MutationObserver records, forwarded timer arguments
+  and cancellable animation/idle callbacks, bounded event capture/bubbling
+  with listener option records, and constructible UI/mouse/keyboard/input/
+  pointer event interfaces,
+  origin-partitioned Web Storage, row/column flex layout subsets,
+  MIME/CORS-checked external modules, bounded
   aspect-preserving inline SVG shapes/paths, and video-poster/media fallbacks
   are present.
 - **Wave D — broader compatibility (future):** tabs, bookmarks, find, zoom,

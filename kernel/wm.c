@@ -56,11 +56,12 @@
 #define WM_MAX_H        WM_WINDOW_MAX_H
 #define WM_EVQ          32                    /* per-window events */
 
-#define WM_TITLE_H      20
+#define WM_TITLE_H      30
 #define WM_BORDER       1
-#define WM_CLOSE_SZ     14
-#define WM_CLOSE_PAD    3                     /* gap right of the close box */
-#define WM_TITLE_PAD    6                     /* gap left of the title text */
+#define WM_BUTTON_SZ    18
+#define WM_BUTTON_GAP   6
+#define WM_BUTTON_PAD   7                     /* gap right of the close box */
+#define WM_TITLE_PAD    10                    /* gap left of the title text */
 
 /* Frames the compositor refuses to eat into, so a huge window request
  * fails instead of starving the kernel (pmm_alloc*() panics when dry). */
@@ -74,19 +75,21 @@
 
 /* ---------------------------------------------------------------- theme */
 
-#define C_DESKTOP       0x00162032
-#define C_BORDER_F      0x004E8CD0
-#define C_BORDER_B      0x00303845
-#define C_TITLE_F       0x002F6FB5
-#define C_TITLE_B       0x0039414E
-#define C_TITLE_EDGE_F  0x001C4A7C
-#define C_TITLE_EDGE_B  0x00262C36
-#define C_TEXT_F        0x00FFFFFF
-#define C_TEXT_B        0x00A2AAB6
-#define C_CLOSE_F       0x00C0392B
-#define C_CLOSE_B       0x004A525E
+#define C_DESKTOP       0x00090D16
+#define C_BORDER_F      0x004B6382
+#define C_BORDER_B      0x00232E3D
+#define C_TITLE_F       0x00172234
+#define C_TITLE_B       0x00131B28
+#define C_TITLE_EDGE_F  0x005BA8FF
+#define C_TITLE_EDGE_B  0x002B394D
+#define C_TEXT_F        0x00EDF4FC
+#define C_TEXT_B        0x008B9AAF
+#define C_BUTTON_F      0x0028394F
+#define C_BUTTON_B      0x001E2938
+#define C_CLOSE_F       0x00E05A65
+#define C_CLOSE_B       0x00314256
 #define C_CLOSE_X_F     0x00FFFFFF
-#define C_CLOSE_X_B     0x00B0B8C4
+#define C_CLOSE_X_B     0x00B6C2D2
 #define C_CURSOR_EDGE   0x00000000
 #define C_CURSOR_FILL   0x00FFFFFF
 
@@ -128,11 +131,13 @@ struct window {
     bool      dying;         /* unlinked; frames not released yet */
     uint32_t  wid;           /* == slot index; fixes the user VA */
     int       pid;           /* owning process */
+    uint32_t  uid;           /* desktop controls stay within this uid */
     uint64_t *pml4;          /* owner address space, for the unmap */
 
     int       x, y;          /* client-area origin on screen */
     int       w, h;          /* client-area size */
     uint32_t  flags;         /* K_WIN_* */
+    bool      minimized;     /* linked but omitted from hit-test/paint */
     char      title[64];
 
     uint64_t  phys;          /* first frame of the pixel run */
@@ -339,22 +344,31 @@ static void win_frame(const struct window *win, struct rect *out)
     out->h = win->h + 2 * WM_BORDER + WM_TITLE_H;
 }
 
-/* Title bar and close box in screen coordinates. close->w is 0 when the
- * window is too narrow to hold a usable close box. */
+/* Title bar and caption buttons in screen coordinates. Button widths are
+ * zero when the window is too narrow to hold usable controls. */
 static void win_title_rects(const struct window *win, struct rect *bar,
-                            struct rect *close)
+                            struct rect *minimize, struct rect *close)
 {
     bar->x = win->x;
     bar->y = win->y - WM_TITLE_H;
     bar->w = win->w;
     bar->h = WM_TITLE_H;
 
-    close->x = bar->x + bar->w - WM_CLOSE_SZ - WM_CLOSE_PAD;
-    close->y = bar->y + (WM_TITLE_H - WM_CLOSE_SZ) / 2;
-    close->w = WM_CLOSE_SZ;
-    close->h = WM_CLOSE_SZ;
+    close->x = bar->x + bar->w - WM_BUTTON_SZ - WM_BUTTON_PAD;
+    close->y = bar->y + (WM_TITLE_H - WM_BUTTON_SZ) / 2;
+    close->w = WM_BUTTON_SZ;
+    close->h = WM_BUTTON_SZ;
+    minimize->x = close->x - WM_BUTTON_GAP - WM_BUTTON_SZ;
+    minimize->y = close->y;
+    minimize->w = WM_BUTTON_SZ;
+    minimize->h = WM_BUTTON_SZ;
 
-    if (bar->w < WM_CLOSE_SZ + 2 * WM_CLOSE_PAD) {
+    if (bar->w < 2 * WM_BUTTON_SZ + WM_BUTTON_GAP +
+                 2 * WM_BUTTON_PAD) {
+        minimize->w = 0;
+        minimize->h = 0;
+    }
+    if (bar->w < WM_BUTTON_SZ + 2 * WM_BUTTON_PAD) {
         close->w = 0;
         close->h = 0;
     }
@@ -448,7 +462,8 @@ static bool z_raise(int idx)
 static int z_top_focusable(void)
 {
     for (int i = nz - 1; i >= 0; i--)
-        if (!(wins[zord[i]].flags & K_WIN_DESKTOP))
+        if (!(wins[zord[i]].flags & K_WIN_DESKTOP) &&
+            !wins[zord[i]].minimized)
             return zord[i];
     return -1;
 }
@@ -508,7 +523,8 @@ static void set_focus(int idx)
     struct rect f;
     int old;
 
-    if (idx >= 0 && (wins[idx].flags & K_WIN_DESKTOP))
+    if (idx >= 0 &&
+        ((wins[idx].flags & K_WIN_DESKTOP) || wins[idx].minimized))
         return;                       /* the desktop layer never takes focus */
     if (focus == idx)
         return;
@@ -597,11 +613,21 @@ static void text_clip(const struct rect *clip, int x, int y, const char *s,
     }
 }
 
+/* A compact rounded caption button. The compositor has no alpha channel, so
+ * the corners are shaped with short horizontal spans over the title colour. */
+static void caption_button(const struct rect *clip, const struct rect *r,
+                           uint32_t bg)
+{
+    fill_clip(clip, r->x + 3, r->y, r->w - 6, r->h, bg);
+    fill_clip(clip, r->x + 1, r->y + 2, r->w - 2, r->h - 4, bg);
+    fill_clip(clip, r->x, r->y + 4, r->w, r->h - 8, bg);
+}
+
 /* ---------------------------------------------------------- compositing */
 
 static void paint_decor(const struct window *win, const struct rect *clip)
 {
-    struct rect frame, bar, close, tclip, o;
+    struct rect frame, bar, minimize, close, tclip, o;
     bool foc = (focus == win_index(win));
     uint32_t border = foc ? C_BORDER_F : C_BORDER_B;
     uint32_t barbg  = foc ? C_TITLE_F  : C_TITLE_B;
@@ -618,28 +644,39 @@ static void paint_decor(const struct window *win, const struct rect *clip)
     fill_clip(clip, frame.x + frame.w - WM_BORDER, frame.y, WM_BORDER,
               frame.h, border);
 
-    win_title_rects(win, &bar, &close);
+    win_title_rects(win, &bar, &minimize, &close);
     fill_clip(clip, bar.x, bar.y, bar.w, bar.h, barbg);
-    fill_clip(clip, bar.x, bar.y + bar.h - 1, bar.w, 1, edge);
+    fill_clip(clip, bar.x, bar.y + bar.h - 2, bar.w, 2, edge);
 
     /* Title text, clipped to the space left of the close box so a long
      * name is cut off rather than scribbled over the button. */
     tclip.x = bar.x + WM_TITLE_PAD;
     tclip.y = bar.y;
     tclip.h = bar.h - 1;
-    tclip.w = (close.w ? close.x - 4 : bar.x + bar.w - 2) - tclip.x;
+    tclip.w = (minimize.w ? minimize.x - 8 :
+               close.w ? close.x - 8 : bar.x + bar.w - 4) - tclip.x;
     if (tclip.w > 0 && rect_isect(&tclip, clip, &o))
         text_clip(&o, tclip.x, bar.y + (WM_TITLE_H - FONT_H) / 2,
                   win->title, text, barbg);
+
+    if (minimize.w) {
+        uint32_t mbg = foc ? C_BUTTON_F : C_BUTTON_B;
+        uint32_t mfg = foc ? C_TEXT_F : C_TEXT_B;
+
+        caption_button(clip, &minimize, mbg);
+        fill_clip(clip, minimize.x + 5, minimize.y + minimize.h - 6,
+                  minimize.w - 10, 2, mfg);
+    }
 
     if (close.w) {
         uint32_t cbg = foc ? C_CLOSE_F : C_CLOSE_B;
         uint32_t cfg = foc ? C_CLOSE_X_F : C_CLOSE_X_B;
 
-        fill_clip(clip, close.x, close.y, close.w, close.h, cbg);
-        for (int i = 4; i < close.w - 4; i++) {
+        caption_button(clip, &close, cbg);
+        for (int i = 5; i < close.w - 5; i++) {
             fill_clip(clip, close.x + i, close.y + i, 2, 1, cfg);
-            fill_clip(clip, close.x + i, close.y + close.h - 1 - i, 2, 1, cfg);
+            fill_clip(clip, close.x + i,
+                      close.y + close.h - 1 - i, 2, 1, cfg);
         }
     }
 }
@@ -703,7 +740,7 @@ static void compose_rect(const struct rect *clip)
 
     for (int i = 0; i < nz; i++) {
         struct window *win = &wins[zord[i]];
-        if (!win->used || win->dying || !win->pix)
+        if (!win->used || win->dying || win->minimized || !win->pix)
             continue;
         paint_window(win, clip);
     }
@@ -717,6 +754,7 @@ enum {
     HIT_NONE = 0,
     HIT_CLIENT,
     HIT_TITLE,
+    HIT_MINIMIZE,
     HIT_CLOSE,
     HIT_FRAME,
 };
@@ -729,9 +767,9 @@ static int hit_test(int mx, int my, int *region)
     for (int i = nz - 1; i >= 0; i--) {
         int idx = zord[i];
         struct window *win = &wins[idx];
-        struct rect frame, client, bar, close;
+        struct rect frame, client, bar, minimize, close;
 
-        if (!win->used || win->dying)
+        if (!win->used || win->dying || win->minimized)
             continue;
 
         win_frame(win, &frame);
@@ -745,9 +783,13 @@ static int hit_test(int mx, int my, int *region)
             return idx;
         }
         if (win_decorated(win)) {
-            win_title_rects(win, &bar, &close);
+            win_title_rects(win, &bar, &minimize, &close);
             if (close.w && rect_contains(&close, mx, my)) {
                 *region = HIT_CLOSE;
+                return idx;
+            }
+            if (minimize.w && rect_contains(&minimize, mx, my)) {
+                *region = HIT_MINIMIZE;
                 return idx;
             }
             if (rect_contains(&bar, mx, my)) {
@@ -780,6 +822,77 @@ static void move_window(int idx, int nx, int ny)
     damage(after.x, after.y, after.w, after.h);
 }
 
+static void minimize_window(int idx)
+{
+    struct window *win = &wins[idx];
+    struct rect frame;
+
+    if (win->minimized || (win->flags & K_WIN_DESKTOP))
+        return;
+    win_frame(win, &frame);
+    if (focus == idx)
+        set_focus(-1);
+    win->minimized = true;
+    damage(frame.x, frame.y, frame.w, frame.h);
+    if (focus < 0)
+        set_focus(z_top_focusable());
+}
+
+static void restore_window(int idx, bool activate)
+{
+    struct window *win = &wins[idx];
+    struct rect frame;
+
+    if (win->flags & K_WIN_DESKTOP)
+        return;
+    win->minimized = false;
+    z_raise(idx);
+    win_frame(win, &frame);
+    damage(frame.x, frame.y, frame.w, frame.h);
+    if (activate)
+        set_focus(idx);
+}
+
+/* Alt-Tab walks backward through the visible stack and restores a minimized
+ * candidate when necessary. Captionless shell popups participate naturally,
+ * which makes the launcher dismissible with the same task-switch shortcut. */
+static void focus_next_window(void)
+{
+    int start = nz - 1;
+
+    for (int i = 0; i < nz; i++) {
+        if (zord[i] == (uint8_t)focus) {
+            start = i - 1;
+            break;
+        }
+    }
+    for (int pass = 0; pass < nz; pass++) {
+        int pos = start - pass;
+        int idx;
+
+        while (pos < 0)
+            pos += nz;
+        idx = zord[pos];
+        if (wins[idx].used && !wins[idx].dying &&
+            !(wins[idx].flags & K_WIN_DESKTOP)) {
+            restore_window(idx, true);
+            return;
+        }
+    }
+}
+
+static void route_to_desktop(uint32_t key)
+{
+    for (int i = nz - 1; i >= 0; i--) {
+        struct window *win = &wins[zord[i]];
+
+        if (win->used && !win->dying && (win->flags & K_WIN_DESKTOP)) {
+            evq_push(win, KEV_KEY, 0, 0, key, 0);
+            return;
+        }
+    }
+}
+
 static void on_press(int mx, int my, uint32_t buttons)
 {
     struct window *win;
@@ -801,6 +914,10 @@ static void on_press(int mx, int my, uint32_t buttons)
     switch (region) {
     case HIT_CLOSE:
         evq_push(win, KEV_CLOSE, 0, 0, 0, buttons);
+        break;
+    case HIT_MINIMIZE:
+        if (buttons & K_MOUSE_LEFT)
+            minimize_window(idx);
         break;
     case HIT_TITLE:
         if (buttons & K_MOUSE_LEFT) {
@@ -897,13 +1014,25 @@ static void pump_mouse(void)
  * console and the shell keep every byte, exactly as without a compositor. */
 static void pump_keyboard(void)
 {
-    if (focus < 0 || !wins[focus].used || wins[focus].dying)
-        return;
-
     for (int i = 0; i < 64; i++) {
         int c = input_trygetc();
         if (c < 0)
             return;
+        if (c == KEY_WM_NEXT) {
+            focus_next_window();
+            continue;
+        }
+        if (c == KEY_WM_CLOSE) {
+            if (focus >= 0 && wins[focus].used && !wins[focus].dying)
+                evq_push(&wins[focus], KEV_CLOSE, 0, 0, 0, 0);
+            continue;
+        }
+        if (c == KEY_LAUNCHER) {
+            route_to_desktop((uint32_t)c);
+            continue;
+        }
+        if (focus < 0 || !wins[focus].used || wins[focus].dying)
+            continue;
         evq_push(&wins[focus], KEV_KEY, 0, 0, (uint32_t)c, 0);
     }
 }
@@ -1213,6 +1342,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
             wins[i].used = true;
             wins[i].wid = (uint32_t)i;
             wins[i].pid = current->pid;
+            wins[i].uid = current->uid;
             break;
         }
     }
@@ -1367,6 +1497,104 @@ long wm_sys_move(uint64_t wid, int x, int y)
         return -1;                    /* the background layer does not move */
     }
     move_window(win_index(win), x, y);
+    wm_unlock();
+    return 0;
+}
+
+/* A desktop window is the capability for shell policy operations. Keeping
+ * this check inside the compositor means an ordinary GUI program cannot list
+ * or manipulate its neighbours merely by guessing their small window ids. */
+static bool caller_is_desktop(void)
+{
+    if (!current)
+        return false;
+    for (int i = 0; i < WM_MAX_WINDOWS; i++)
+        if (wins[i].used && !wins[i].dying &&
+            wins[i].pid == current->pid &&
+            (wins[i].flags & K_WIN_DESKTOP))
+            return true;
+    return false;
+}
+
+long wm_sys_list(uint64_t index, uint64_t uout)
+{
+    struct k_winsummary out;
+    uint64_t seen = 0;
+
+    if (!user_range_ok((const void *)uout, sizeof(out)))
+        return -1;
+
+    wm_lock();
+    if (!caller_is_desktop()) {
+        wm_unlock();
+        return -1;
+    }
+
+    for (int zi = nz - 1; zi >= 0; zi--) {
+        struct window *win = &wins[zord[zi]];
+
+        /* Panels and the desktop's launcher popup are shell surfaces, not
+         * tasks. Only decorated application windows belong in the dock. */
+        if (!win->used || win->dying ||
+            (win->flags & (K_WIN_DESKTOP | K_WIN_NODECOR)) ||
+            win->uid != current->uid)
+            continue;
+        if (seen++ != index)
+            continue;
+
+        memset(&out, 0, sizeof(out));
+        out.wid = win->wid;
+        out.pid = win->pid;
+        out.x = win->x;
+        out.y = win->y;
+        out.width = (uint32_t)win->w;
+        out.height = (uint32_t)win->h;
+        out.flags = win->flags;
+        if (focus == win_index(win))
+            out.state |= K_WIN_STATE_FOCUSED;
+        if (win->minimized)
+            out.state |= K_WIN_STATE_MINIMIZED;
+        strncpy(out.title, win->title, sizeof(out.title) - 1);
+        wm_unlock();
+        return copy_to_user((void *)uout, &out, sizeof(out)) < 0 ? -1 : 0;
+    }
+    wm_unlock();
+    return -1;
+}
+
+long wm_sys_ctl(uint64_t wid, uint64_t action)
+{
+    struct window *win;
+    int idx;
+
+    wm_lock();
+    if (wid >= WM_MAX_WINDOWS || !caller_is_desktop()) {
+        wm_unlock();
+        return -1;
+    }
+    win = &wins[wid];
+    if (!win->used || win->dying || (win->flags & K_WIN_DESKTOP) ||
+        !current || win->uid != current->uid) {
+        wm_unlock();
+        return -1;
+    }
+    idx = win_index(win);
+
+    switch (action) {
+    case K_WIN_CTL_FOCUS:
+    case K_WIN_CTL_RESTORE:
+        restore_window(idx, true);
+        break;
+    case K_WIN_CTL_MINIMIZE:
+        minimize_window(idx);
+        break;
+    case K_WIN_CTL_CLOSE:
+        evq_push(win, KEV_CLOSE, 0, 0, 0, 0);
+        break;
+    default:
+        wm_unlock();
+        return -1;
+    }
     wm_unlock();
     return 0;
 }

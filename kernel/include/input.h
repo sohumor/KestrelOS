@@ -13,6 +13,9 @@
 #define KEY_PGUP   0x86
 #define KEY_PGDN   0x87
 #define KEY_DELETE 0x88
+#define KEY_WM_NEXT  0x89
+#define KEY_WM_CLOSE 0x8A
+#define KEY_LAUNCHER 0x8B
 
 void input_push(uint8_t c);
 bool input_available(void);

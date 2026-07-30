@@ -3039,9 +3039,7 @@ struct flex_item {
 
 /* A bounded single-line flex formatting context.  It covers the common
  * navigation/toolbar/card-row case: row and row-reverse, flex-grow, gap,
- * justify-content and cross-axis start/end/center alignment.  Column flex
- * intentionally continues through normal block flow, which is already its
- * interoperable fallback. */
+ * justify-content and cross-axis start/end/center alignment. */
 static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
                                int32_t y, struct lay_bfc *bfc, int depth)
 {
@@ -3176,6 +3174,122 @@ static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
     return max_h;
 }
 
+/* Column flex uses the same compact item array as row flex, but its natural
+ * bases come from a procedural layout pass.  A definite container height
+ * distributes positive free space through flex-grow; an automatic height
+ * simply becomes the packed item height.  This is intentionally single-line
+ * (no flex-wrap), but unlike the old block fallback it preserves ordering,
+ * gaps, main-axis alignment, growth, and cross-axis alignment. */
+static int32_t layout_flex_column(struct lay_ctx *c, struct lay_box *b,
+                                  int32_t y, int32_t definite_h,
+                                  struct lay_bfc *bfc, int depth)
+{
+    struct flex_item *items;
+    struct lay_box *ch;
+    int count = 0, i, reverse;
+    int64_t total = 0, grow_total = 0;
+    int32_t gap = b->style->gap > 0 ? b->style->gap : 0;
+    int32_t main_size, free_space, start = 0, gap_extra = 0, cursor;
+
+    for (ch = b->first_child; ch; ch = ch->next)
+        if (ch->kind != LAY_BOX_MARKER && !(ch->flags & LAYF_ABSOLUTE))
+            count++;
+    if (!count)
+        return definite_h > 0 ? definite_h : 0;
+    if (count > 512)
+        return -1;
+    items = (struct flex_item *)calloc((unsigned long)count, sizeof(*items));
+    if (!items)
+        return -1;
+
+    i = 0;
+    for (ch = b->first_child; ch; ch = ch->next) {
+        lay_rect r;
+
+        if (ch->kind == LAY_BOX_MARKER)
+            continue;
+        if (ch->flags & LAYF_ABSOLUTE) {
+            record_out_of_flow(c, ch, b->x, y);
+            continue;
+        }
+        layout_standalone(c, ch, b->x, 0, b->w, 0, depth + 1);
+        r = lay_margin_rect(ch);
+        items[i].box = ch;
+        items[i].basis = r.h > 0 ? r.h : 0;
+        items[i].allocated = items[i].basis;
+        total += items[i].basis;
+        grow_total += ch->style->flex_grow;
+        i++;
+    }
+    total += (int64_t)gap * (count - 1);
+    main_size = definite_h >= 0 ? definite_h :
+        (total > 2147483647LL ? 2147483647 : (int32_t)total);
+    free_space = total < main_size ? main_size - (int32_t)total : 0;
+    if (free_space > 0 && grow_total > 0) {
+        int32_t remaining = free_space;
+        int64_t grow_left = grow_total;
+
+        for (i = 0; i < count; i++) {
+            int32_t grow = items[i].box->style->flex_grow;
+            int32_t add;
+
+            if (grow <= 0)
+                continue;
+            add = grow == grow_left ? remaining :
+                (int32_t)((int64_t)remaining * grow / grow_left);
+            items[i].allocated += add;
+            items[i].box->h += add;
+            remaining -= add;
+            grow_left -= grow;
+        }
+        free_space = 0;
+    }
+    if (free_space > 0) {
+        switch (b->style->justify_content) {
+        case CSS_JUSTIFY_END:
+            start = free_space;
+            break;
+        case CSS_JUSTIFY_CENTER:
+            start = free_space / 2;
+            break;
+        case CSS_JUSTIFY_SPACE_BETWEEN:
+            if (count > 1) gap_extra = free_space / (count - 1);
+            break;
+        case CSS_JUSTIFY_SPACE_AROUND:
+            gap_extra = free_space / count;
+            start = gap_extra / 2;
+            break;
+        case CSS_JUSTIFY_SPACE_EVENLY:
+            gap_extra = free_space / (count + 1);
+            start = gap_extra;
+            break;
+        default:
+            break;
+        }
+    }
+
+    reverse = b->style->flex_direction == CSS_FLEXDIR_COLUMN_REVERSE;
+    cursor = y + start;
+    for (i = 0; i < count; i++) {
+        int at = reverse ? count - 1 - i : i;
+        lay_rect r = lay_margin_rect(items[at].box);
+        lay_rect border = lay_border_rect(items[at].box);
+        int32_t x = b->x;
+
+        if (b->style->align_items == CSS_ALIGN_END)
+            x += b->w - border.w;
+        else if (b->style->align_items == CSS_ALIGN_CENTER)
+            x += (b->w - border.w) / 2;
+        if (x < b->x)
+            x = b->x;
+        translate_subtree(items[at].box, x - border.x, cursor - r.y);
+        cursor += items[at].allocated + gap + gap_extra;
+    }
+    free(items);
+    (void)bfc;
+    return main_size;
+}
+
 /* ---- the block box ----------------------------------------------- */
 
 static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
@@ -3294,14 +3408,38 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
         has_lines = h_children > 0;
         flow = content_y + h_children;
         open = marg_of(0);
-    } else if ((cs->display == CSS_DISPLAY_FLEX ||
-                cs->display == CSS_DISPLAY_INLINE_FLEX) &&
-               (cs->flex_direction == CSS_FLEXDIR_ROW ||
-                cs->flex_direction == CSS_FLEXDIR_ROW_REVERSE) &&
-               (h_children = layout_flex_row(c, b, content_y,
-                                             &mine, depth)) >= 0) {
-        flow = content_y + h_children;
-        open = marg_of(0);
+    } else if (cs->display == CSS_DISPLAY_FLEX ||
+               cs->display == CSS_DISPLAY_INLINE_FLEX) {
+        if (cs->flex_direction == CSS_FLEXDIR_ROW ||
+            cs->flex_direction == CSS_FLEXDIR_ROW_REVERSE)
+            h_children = layout_flex_row(c, b, content_y, &mine, depth);
+        else
+            h_children = layout_flex_column(c, b, content_y,
+                                            auto_h ? -1 : definite_h,
+                                            &mine, depth);
+        if (h_children >= 0) {
+            flow = content_y + h_children;
+            open = marg_of(0);
+        } else {
+            /* Allocation failure retains the readable block fallback. */
+            open = marg_of(0);
+            can_skip = 0;
+            for (ch = b->first_child; ch; ch = nx) {
+                nx = ch->next;
+                if (ch->kind == LAY_BOX_MARKER)
+                    continue;
+                if (ch->flags & LAYF_ABSOLUTE) {
+                    record_out_of_flow(c, ch, b->x,
+                                       flow + marg_value(open));
+                    continue;
+                }
+                flow = layout_block_box(c, ch, b->x, b->w,
+                                        auto_h ? -1 : definite_h,
+                                        flow, &mine, &open, 0,
+                                        LAY_MODE_FLOW, depth + 1);
+            }
+            h_children = flow - content_y;
+        }
     } else {
         open = marg_of(0);
         can_skip = block_collapses_with_children(b) && !skip_top ? 1 :

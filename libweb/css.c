@@ -3516,6 +3516,39 @@ int css_set_media(struct css_stylesheet *ss, const struct css_media *m)
     return changed;
 }
 
+int css_media_query_matches(const char *query, unsigned long len,
+                            const struct css_media *media)
+{
+    static const char prefix[] = "@media ";
+    struct css_stylesheet *ss;
+    struct css_media env;
+    char *source;
+    unsigned long i;
+    int matches = 0;
+
+    if (!query || !len || len > 4096)
+        return 0;
+    for (i = 0; i < len; i++)
+        if (query[i] == '{' || query[i] == '}' || query[i] == ';')
+            return 0;
+    source = (char *)malloc(sizeof(prefix) - 1 + len + 3);
+    if (!source)
+        return 0;
+    memcpy(source, prefix, sizeof(prefix) - 1);
+    memcpy(source + sizeof(prefix) - 1, query, len);
+    memcpy(source + sizeof(prefix) - 1 + len, "{}", 3);
+    env = media ? *media : default_media;
+    if (env.dpi <= 0)
+        env.dpi = 96;
+    ss = css_parse(source, sizeof(prefix) - 1 + len + 2,
+                   CSS_ORIGIN_AUTHOR, &env);
+    free(source);
+    if (ss && ss->nmedia > 0)
+        matches = eval_block(ss, 0, &env);
+    css_free(ss);
+    return matches;
+}
+
 static int rule_enabled(const struct css_stylesheet *ss,
                         const struct css_rule *r)
 {

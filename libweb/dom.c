@@ -743,7 +743,35 @@ struct dom_node *dom_create_element(struct dom_document *d,
         return 0;
     n->tag = interned;
     n->tag_id = tid;
+    n->namespace_id = DOM_NS_HTML;
+    n->namespace_uri = DOM_NS_HTML_URI;
     return n;
+}
+
+int dom_set_namespace(struct dom_node *node,
+                      const char *namespace_uri, long length)
+{
+    unsigned long namespace_length;
+    char *copy;
+
+    if (!node || node->type != DOM_ELEMENT)
+        return 0;
+    if (!namespace_uri || !*namespace_uri) {
+        node->namespace_id = DOM_NS_NONE;
+        node->namespace_uri = 0;
+        return 1;
+    }
+    namespace_length = length < 0
+        ? strlen(namespace_uri) : (unsigned long)length;
+    copy = arena_str(node->doc, namespace_uri, namespace_length);
+    if (!copy)
+        return 0;
+    node->namespace_uri = copy;
+    node->namespace_id = !strcmp(copy, DOM_NS_HTML_URI) ? DOM_NS_HTML :
+                         !strcmp(copy, DOM_NS_SVG_URI) ? DOM_NS_SVG :
+                         !strcmp(copy, DOM_NS_MATHML_URI) ? DOM_NS_MATHML :
+                         DOM_NS_NONE;
+    return 1;
 }
 
 static struct dom_node *make_chardata(struct dom_document *d, int type,
@@ -783,6 +811,11 @@ struct dom_node *dom_create_comment(struct dom_document *d,
                                     const char *s, unsigned long n)
 {
     return make_chardata(d, DOM_COMMENT, s, n);
+}
+
+struct dom_node *dom_create_fragment(struct dom_document *d)
+{
+    return d ? node_new(d, DOM_FRAGMENT) : 0;
 }
 
 struct dom_node *dom_create_doctype(struct dom_document *d,
@@ -847,7 +880,8 @@ static int link_ok(struct dom_node *parent, struct dom_node *child)
         return 0;
     if (child->type == DOM_DOCUMENT)
         return 0;
-    if (parent->type != DOM_DOCUMENT && parent->type != DOM_ELEMENT)
+    if (parent->type != DOM_DOCUMENT && parent->type != DOM_ELEMENT &&
+        parent->type != DOM_FRAGMENT)
         return 0;
     cap = dom_limit_depth(parent->doc);
     if (is_ancestor(child, parent, cap))
@@ -880,6 +914,16 @@ static void unlink_node(struct dom_node *child)
 
 int dom_append_child(struct dom_node *parent, struct dom_node *child)
 {
+    if (parent && child && child->type == DOM_FRAGMENT) {
+        struct dom_node *node, *next;
+
+        for (node = child->first_child; node; node = next) {
+            next = node->next_sibling;
+            if (!dom_append_child(parent, node))
+                return 0;
+        }
+        return 1;
+    }
     if (!link_ok(parent, child))
         return 0;
     unlink_node(child);
@@ -897,6 +941,16 @@ int dom_append_child(struct dom_node *parent, struct dom_node *child)
 int dom_insert_before(struct dom_node *parent, struct dom_node *child,
                       struct dom_node *ref)
 {
+    if (parent && child && child->type == DOM_FRAGMENT) {
+        struct dom_node *node, *next;
+
+        for (node = child->first_child; node; node = next) {
+            next = node->next_sibling;
+            if (!dom_insert_before(parent, node, ref))
+                return 0;
+        }
+        return 1;
+    }
     if (!ref)
         return dom_append_child(parent, child);
     if (ref->parent != parent)
@@ -994,7 +1048,12 @@ int dom_set_attr_n(struct dom_node *n, const char *name, long namelen,
         return 0;
 
     for (i = 0; i < n->nattr; i++) {
-        if (n->attr[i].name == iname) {
+        if (!n->attr[i].namespace_uri &&
+            strlen(n->attr[i].name) == nlen &&
+            d_ieq(n->attr[i].name, name, nlen)) {
+            n->attr[i].name = iname;
+            n->attr[i].local_name = iname;
+            n->attr[i].prefix = 0;
             n->attr[i].value = val;
             n->attr[i].len = vallen;
             if (iname[0] == 'i' && iname[1] == 'd' && iname[2] == 0)
@@ -1021,6 +1080,9 @@ int dom_set_attr_n(struct dom_node *n, const char *name, long namelen,
         n->cattr = (unsigned short)ncap;
     }
     n->attr[n->nattr].name = iname;
+    n->attr[n->nattr].local_name = iname;
+    n->attr[n->nattr].prefix = 0;
+    n->attr[n->nattr].namespace_uri = 0;
     n->attr[n->nattr].value = val;
     n->attr[n->nattr].len = vallen;
     n->nattr++;
@@ -1053,6 +1115,145 @@ int dom_remove_attr(struct dom_node *n, const char *name)
         }
     }
     return 0;
+}
+
+static int namespace_equal(const char *left, const char *right)
+{
+    if (!left || !*left)
+        left = 0;
+    if (!right || !*right)
+        right = 0;
+    return (!left && !right) ||
+           (left && right && !strcmp(left, right));
+}
+
+static const struct dom_attr *find_attr_ns(const struct dom_node *n,
+                                           const char *namespace_uri,
+                                           const char *local_name,
+                                           unsigned int *position)
+{
+    unsigned int i;
+
+    if (!n || n->type != DOM_ELEMENT || !local_name)
+        return 0;
+    for (i = 0; i < n->nattr; i++) {
+        const struct dom_attr *attribute = &n->attr[i];
+        const char *local = attribute->local_name
+            ? attribute->local_name : attribute->name;
+
+        if (namespace_equal(attribute->namespace_uri, namespace_uri) &&
+            !strcmp(local, local_name)) {
+            if (position)
+                *position = i;
+            return attribute;
+        }
+    }
+    return 0;
+}
+
+const char *dom_get_attr_ns(const struct dom_node *n,
+                            const char *namespace_uri,
+                            const char *local_name)
+{
+    const struct dom_attr *attribute =
+        find_attr_ns(n, namespace_uri, local_name, 0);
+
+    return attribute ? attribute->value : 0;
+}
+
+int dom_set_attr_ns(struct dom_node *n, const char *namespace_uri,
+                    const char *qualified_name, const char *value)
+{
+    struct dom_document *d;
+    const char *colon, *name_copy, *local_copy, *prefix_copy = 0;
+    const char *namespace_copy = 0;
+    char *value_copy;
+    unsigned long name_length, prefix_length = 0, local_length;
+    unsigned long value_length;
+    unsigned int position;
+    struct dom_attr *attribute;
+
+    if (!n || n->type != DOM_ELEMENT || !qualified_name ||
+        !*qualified_name)
+        return 0;
+    d = n->doc;
+    name_length = strlen(qualified_name);
+    if (name_length > 128)
+        return 0;
+    colon = strchr(qualified_name, ':');
+    if (colon) {
+        prefix_length = (unsigned long)(colon - qualified_name);
+        local_length = name_length - prefix_length - 1;
+        if (!prefix_length || !local_length || strchr(colon + 1, ':'))
+            return 0;
+    } else {
+        local_length = name_length;
+    }
+    if (namespace_uri && !*namespace_uri)
+        namespace_uri = 0;
+    name_copy = arena_str(d, qualified_name, name_length);
+    local_copy = arena_str(d, colon ? colon + 1 : qualified_name,
+                           local_length);
+    if (colon)
+        prefix_copy = arena_str(d, qualified_name, prefix_length);
+    if (namespace_uri)
+        namespace_copy = arena_str(d, namespace_uri,
+                                   strlen(namespace_uri));
+    value_length = value ? strlen(value) : 0;
+    value_copy = arena_str(d, value ? value : "", value_length);
+    if (!name_copy || !local_copy || (colon && !prefix_copy) ||
+        (namespace_uri && !namespace_copy) || !value_copy)
+        return 0;
+
+    attribute = (struct dom_attr *)find_attr_ns(
+        n, namespace_uri, local_copy, &position);
+    if (!attribute) {
+        if (n->nattr >= DOM_MAX_ATTRS) {
+            d->truncated |= DOM_TRUNC_ATTRS;
+            return 0;
+        }
+        if (n->nattr == n->cattr) {
+            unsigned int capacity = n->cattr
+                ? (unsigned int)n->cattr * 2 : 4;
+            struct dom_attr *attributes;
+
+            if (capacity > DOM_MAX_ATTRS)
+                capacity = DOM_MAX_ATTRS;
+            attributes = (struct dom_attr *)arena_alloc(
+                d, (unsigned long)capacity * sizeof *attributes);
+            if (!attributes)
+                return 0;
+            if (n->nattr)
+                memcpy(attributes, n->attr,
+                       (unsigned long)n->nattr * sizeof *attributes);
+            n->attr = attributes;
+            n->cattr = (unsigned short)capacity;
+        }
+        position = n->nattr++;
+        attribute = &n->attr[position];
+    }
+    attribute->name = name_copy;
+    attribute->local_name = local_copy;
+    attribute->prefix = prefix_copy;
+    attribute->namespace_uri = namespace_copy;
+    attribute->value = value_copy;
+    attribute->len = value_length;
+    if (!namespace_uri && !strcmp(local_copy, "id"))
+        id_insert(d, value_copy, n);
+    return 1;
+}
+
+int dom_remove_attr_ns(struct dom_node *n, const char *namespace_uri,
+                       const char *local_name)
+{
+    unsigned int position, index;
+
+    if (!find_attr_ns(n, namespace_uri, local_name, &position))
+        return 0;
+    for (index = position; index + 1 < n->nattr; index++)
+        n->attr[index] = n->attr[index + 1];
+    n->nattr--;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ *

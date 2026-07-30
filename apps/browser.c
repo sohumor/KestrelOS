@@ -34,6 +34,7 @@
 #include "../libweb/paint.h"
 #include "../libweb/url.h"
 #include "../libweb/jsdom.h"
+#include "../libweb/storage.h"
 #include "../libimg/img.h"
 
 TLS_ASSERT_TRANSPORT_LAYOUT();
@@ -52,6 +53,8 @@ TLS_ASSERT_TRANSPORT_LAYOUT();
 #define TEXT_COLS    78
 #define MAX_COLS     200
 #define LINK_MAX     4096
+#define STORAGE_QUOTA (1024UL * 1024UL)
+#define STORAGE_FILE_MAX (8UL * 1024UL * 1024UL)
 
 #define WIN_W   900
 #define WIN_H   620
@@ -86,6 +89,9 @@ struct browser_runtime {
     struct tls_options tls;
     struct http_client *http;
     struct css_stylesheet *ua;
+    struct web_storage *local_storage;
+    struct web_storage *session_storage;
+    char storage_path[96];
     int store_live;
 };
 
@@ -94,6 +100,19 @@ struct browser_image {
     struct image decoded;
     int state;                     /* 1 decoded, -1 failed */
     struct browser_image *next;
+};
+
+enum browser_load_state {
+    PAGE_CREATED = 0,
+    PAGE_NAVIGATING,
+    PAGE_FETCHING,
+    PAGE_RESPONSE,
+    PAGE_PARSING,
+    PAGE_STYLING,
+    PAGE_LAYOUT,
+    PAGE_SCRIPTING,
+    PAGE_COMPLETE,
+    PAGE_FAILED
 };
 
 struct browser_page {
@@ -119,12 +138,67 @@ struct browser_page {
     int is_local;
     int is_html;
     int failed;                    /* transport/local error or non-2xx */
+    enum browser_load_state load_state;
     char error[320];
 };
 
 /* ------------------------------------------------------------------ *
  * Small utilities
  * ------------------------------------------------------------------ */
+
+static const char *page_state_name(enum browser_load_state state)
+{
+    static const char *const names[] = {
+        "created", "navigating", "fetching", "response", "parsing",
+        "styling", "layout", "scripting", "complete", "failed"
+    };
+
+    if ((unsigned int)state >= sizeof(names) / sizeof(names[0]))
+        return "invalid";
+    return names[state];
+}
+
+static int page_state_allows(enum browser_load_state from,
+                             enum browser_load_state to)
+{
+    if (to == PAGE_FAILED)
+        return 1;
+    switch (from) {
+    case PAGE_CREATED:
+        return to == PAGE_NAVIGATING;
+    case PAGE_NAVIGATING:
+        return to == PAGE_FETCHING;
+    case PAGE_FETCHING:
+        return to == PAGE_RESPONSE;
+    case PAGE_RESPONSE:
+    case PAGE_FAILED:
+        return to == PAGE_PARSING;
+    case PAGE_PARSING:
+        return to == PAGE_STYLING;
+    case PAGE_STYLING:
+        return to == PAGE_LAYOUT;
+    case PAGE_LAYOUT:
+        return to == PAGE_SCRIPTING || to == PAGE_COMPLETE;
+    case PAGE_SCRIPTING:
+        return to == PAGE_STYLING || to == PAGE_COMPLETE;
+    case PAGE_COMPLETE:
+        return to == PAGE_STYLING || to == PAGE_NAVIGATING;
+    default:
+        return 0;
+    }
+}
+
+static int page_transition(struct browser_page *p,
+                           enum browser_load_state next)
+{
+    if (!p || !page_state_allows(p->load_state, next)) {
+        if (p)
+            p->load_state = PAGE_FAILED;
+        return -1;
+    }
+    p->load_state = next;
+    return 0;
+}
 
 static char *str_dup(const char *s)
 {
@@ -338,10 +412,79 @@ static BROWSER_NOINLINE int canonicalize_input(const char *input, char *out,
  * Process-lifetime browser services
  * ------------------------------------------------------------------ */
 
+static void runtime_storage_load(struct browser_runtime *rt)
+{
+    struct k_stat st;
+    char *data;
+    unsigned long got = 0;
+    long n;
+    int fd;
+
+    if (!rt || !rt->local_storage ||
+        stat_(rt->storage_path, &st) != 0 || st.is_dir ||
+        st.size <= 0 || (unsigned long)st.size > STORAGE_FILE_MAX)
+        return;
+    fd = open(rt->storage_path, O_RDONLY);
+    if (fd < 0)
+        return;
+    data = (char *)malloc((unsigned long)st.size);
+    if (!data) {
+        close(fd);
+        return;
+    }
+    while (got < (unsigned long)st.size) {
+        n = read(fd, data + got, (unsigned long)st.size - got);
+        if (n <= 0)
+            break;
+        got += (unsigned long)n;
+    }
+    close(fd);
+    if (got == (unsigned long)st.size)
+        web_storage_import(rt->local_storage, data, got);
+    free(data);
+}
+
+static void runtime_storage_save(struct browser_runtime *rt)
+{
+    char *data;
+    unsigned long len = 0, wrote = 0;
+    long n;
+    int fd;
+
+    if (!rt || !rt->local_storage ||
+        !web_storage_dirty(rt->local_storage))
+        return;
+    data = web_storage_export(rt->local_storage, &len);
+    if (!data)
+        return;
+#ifdef JS_HOST
+    fd = open(rt->storage_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#else
+    fd = open(rt->storage_path, O_WRONLY | O_CREAT | O_TRUNC);
+#endif
+    if (fd >= 0) {
+        while (wrote < len) {
+            n = write(fd, data + wrote, len - wrote);
+            if (n <= 0)
+                break;
+            wrote += (unsigned long)n;
+        }
+        close(fd);
+        if (wrote == len)
+            web_storage_clear_dirty(rt->local_storage);
+    }
+    free(data);
+}
+
 static void runtime_destroy(struct browser_runtime *rt)
 {
     if (!rt)
         return;
+    runtime_storage_save(rt);
+    web_storage_free(rt->session_storage);
+    rt->session_storage = 0;
+    web_storage_free(rt->local_storage);
+    rt->local_storage = 0;
     if (rt->http) {
         struct cookie_jar *jar = http_client_jar(rt->http);
         long now = syscall(SYS_TIME, 0, 0, 0, 0);
@@ -368,6 +511,17 @@ static BROWSER_NOINLINE int runtime_init(struct browser_runtime *rt, char *err,
     int rc;
 
     memset(rt, 0, sizeof(*rt));
+    snprintf(rt->storage_path, sizeof(rt->storage_path),
+             "/tmp/.kestrel-browser-%ld.storage",
+             syscall(SYS_GETUID, 0, 0, 0, 0));
+    rt->local_storage = web_storage_new(STORAGE_QUOTA, 2048);
+    rt->session_storage = web_storage_new(STORAGE_QUOTA, 1024);
+    if (!rt->local_storage || !rt->session_storage) {
+        snprintf(err, errsz, "out of memory creating browser storage");
+        runtime_destroy(rt);
+        return -1;
+    }
+    runtime_storage_load(rt);
     tls_options_default(&rt->tls);
     rt->tls.verify = TLS_VERIFY_REQUIRED;
     rt->tls.alpn = "http/1.1";
@@ -1320,7 +1474,9 @@ static void script_fetch_result_free(struct jsdom_fetch_response *out)
 static int script_fetch_method_allowed(const char *method)
 {
     return !strcmp(method, "GET") || !strcmp(method, "HEAD") ||
-           !strcmp(method, "POST");
+           !strcmp(method, "POST") || !strcmp(method, "PUT") ||
+           !strcmp(method, "PATCH") || !strcmp(method, "DELETE") ||
+           !strcmp(method, "OPTIONS");
 }
 
 static int script_fetch_redirect(int status)
@@ -1337,8 +1493,43 @@ static int script_fetch_cors_allows(const struct http_response *res,
     return allow && (!strcmp(allow, "*") || str_ci_eq(allow, origin));
 }
 
+static int script_fetch_simple_content_type(const char *value)
+{
+    static const char *const allowed[] = {
+        "application/x-www-form-urlencoded",
+        "multipart/form-data",
+        "text/plain"
+    };
+    unsigned long i;
+
+    if (!value || !*value)
+        return 1;
+    while (*value == ' ' || *value == '\t')
+        value++;
+    for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        unsigned long n = strlen(allowed[i]);
+        unsigned long j;
+
+        for (j = 0; j < n; j++)
+            if (ascii_lower((unsigned char)value[j]) !=
+                ascii_lower((unsigned char)allowed[i][j]))
+                break;
+        if (j == n &&
+            (!value[n] || value[n] == ';' ||
+             value[n] == ' ' || value[n] == '\t'))
+            return 1;
+    }
+    return 0;
+}
+
 static int script_fetch(void *user, const char *url, const char *method,
                         const void *body, unsigned long body_len,
+                        const char *request_content_type,
+                        const char *request_accept,
+                        const char *request_headers,
+                        const char *request_mode,
+                        const char *request_credentials,
+                        const char *request_redirect,
                         struct jsdom_fetch_response *out,
                         char *err, unsigned long errsz)
 {
@@ -1383,7 +1574,7 @@ static int script_fetch(void *user, const char *url, const char *method,
 
         if (!script_fetch_method_allowed(method)) {
             snprintf(err, errsz,
-                     "fetch currently supports GET, HEAD, and POST");
+                     "fetch request method is not supported");
             return -1;
         }
         page_has_origin =
@@ -1410,17 +1601,42 @@ static int script_fetch(void *user, const char *url, const char *method,
             }
             cross_origin = !page_has_origin ||
                            !url_same_origin(&page_url, &request_url);
+            if (cross_origin &&
+                !strcmp(request_mode, "same-origin")) {
+                snprintf(err, errsz,
+                         "cross-origin request blocked by same-origin mode");
+                return -1;
+            }
+            if (cross_origin && !strcmp(request_mode, "no-cors")) {
+                snprintf(err, errsz,
+                         "opaque no-cors responses are not implemented");
+                return -1;
+            }
+            if (cross_origin &&
+                ((request_headers && *request_headers) ||
+                 !script_fetch_simple_content_type(
+                     request_content_type))) {
+                snprintf(err, errsz,
+                         "cross-origin request requires CORS preflight");
+                return -1;
+            }
             memset(&req, 0, sizeof(req));
             memset(&res, 0, sizeof(res));
             req.method = send_method;
             req.url = current;
             req.body = send_body_len ? send_body : 0;
             req.body_len = send_body_len;
-            req.content_type =
-                send_body_len ? "text/plain;charset=UTF-8" : 0;
-            req.accept = "*/*";
-            req.flags = HTTP_F_NO_REDIRECT |
-                        (cross_origin ? HTTP_F_NO_COOKIES : 0);
+            req.content_type = send_body_len
+                ? (request_content_type
+                   ? request_content_type : "text/plain;charset=UTF-8")
+                : 0;
+            req.accept = request_accept ? request_accept : "*/*";
+            req.extra_headers = request_headers;
+            req.flags = HTTP_F_NO_REDIRECT;
+            if (!strcmp(request_credentials, "omit") ||
+                (cross_origin &&
+                 !strcmp(request_credentials, "same-origin")))
+                req.flags |= HTTP_F_NO_COOKIES;
             if (cross_origin) {
                 snprintf(origin_header, sizeof(origin_header),
                          "Origin: %s\r\n", page_origin);
@@ -1432,13 +1648,28 @@ static int script_fetch(void *user, const char *url, const char *method,
                 snprintf(err, errsz, "%s", http_error_text(rc));
                 return -1;
             }
-            if (cross_origin &&
-                !script_fetch_cors_allows(&res, page_origin)) {
-                snprintf(err, errsz,
-                         "cross-origin response did not allow %s",
-                         page_origin);
-                http_response_free(&res);
-                return -1;
+            if (cross_origin) {
+                const char *allow_origin =
+                    http_header_get(&res,
+                                    "Access-Control-Allow-Origin");
+                const char *allow_credentials =
+                    http_header_get(&res,
+                                    "Access-Control-Allow-Credentials");
+                int cors_allowed =
+                    script_fetch_cors_allows(&res, page_origin);
+
+                if (!strcmp(request_credentials, "include"))
+                    cors_allowed = allow_origin &&
+                        !strcmp(allow_origin, page_origin) &&
+                        allow_credentials &&
+                        str_ci_eq(allow_credentials, "true");
+                if (!cors_allowed) {
+                    snprintf(err, errsz,
+                             "cross-origin response did not allow %s",
+                             page_origin);
+                    http_response_free(&res);
+                    return -1;
+                }
             }
             if (script_fetch_redirect(res.status)) {
                 const char *location = http_header_get(&res, "Location");
@@ -1447,6 +1678,15 @@ static int script_fetch(void *user, const char *url, const char *method,
                 if (!location || !*location) {
                     /* A redirect status without Location is an ordinary
                      * Response, as required by the Fetch redirect rules. */
+                } else if (!strcmp(request_redirect, "error")) {
+                    snprintf(err, errsz,
+                             "redirect blocked by Request policy");
+                    http_response_free(&res);
+                    return -1;
+                } else if (!strcmp(request_redirect, "manual")) {
+                    /* Return the redirect response without following it.
+                     * The current response surface does not yet expose the
+                     * filtered Location header of an opaqueredirect. */
                 } else if (redirects >= 8) {
                     snprintf(err, errsz, "too many fetch redirects");
                     http_response_free(&res);
@@ -1480,6 +1720,7 @@ static int script_fetch(void *user, const char *url, const char *method,
                                        http_reason_phrase(res.status));
             out->url = str_dup(current);
             out->content_type = str_dup(content_type ? content_type : "");
+            out->redirected = redirects > 0;
             out->body = (char *)malloc(res.body_len + 1);
             if (out->body) {
                 if (res.body_len)
@@ -1691,7 +1932,8 @@ module_external(struct module_loader *l, const char *base, const char *ref,
     if (m)
         return m;
     memset(&fetched, 0, sizeof(fetched));
-    if (script_fetch(l->page, absolute, "GET", 0, 0, &fetched,
+    if (script_fetch(l->page, absolute, "GET", 0, 0, 0, 0, 0,
+                     "cors", "same-origin", "follow", &fetched,
                      err, errsz) != 0)
         return 0;
     if (fetched.status < 200 || fetched.status >= 300) {
@@ -2411,23 +2653,63 @@ static int script_type_supported(const char *type)
            str_ci_contains(type, "ecmascript");
 }
 
-static int execute_page_scripts(struct browser_page *p)
+static int page_sync_document_url(struct browser_page *p)
+{
+    const char *current;
+    char *url_copy, *base_copy = 0;
+    int base_follows;
+
+    if (!p || !p->js)
+        return 0;
+    current = jsdom_document_url(p->js);
+    if (!current || !strcmp(current, p->url))
+        return 0;
+    base_follows = p->base_url && !strcmp(p->base_url, p->url);
+    url_copy = str_dup(current);
+    if (base_follows)
+        base_copy = str_dup(current);
+    if (!url_copy || (base_follows && !base_copy)) {
+        free(base_copy);
+        free(url_copy);
+        return -1;
+    }
+    free(p->url);
+    p->url = url_copy;
+    if (base_follows) {
+        free(p->base_url);
+        p->base_url = base_copy;
+    }
+    return 1;
+}
+
+static int execute_page_scripts(struct browser_page *p,
+                                int viewport_width, int viewport_height)
 {
     struct jsdom_config cfg;
+    struct k_cpuinfo cpu;
     struct dom_node *n;
     struct module_loader modules;
     unsigned int inline_module = 0;
 
     memset(&cfg, 0, sizeof(cfg));
+    memset(&cpu, 0, sizeof(cpu));
     cfg.url = p->url;
     cfg.base_url = p->base_url;
     cfg.print = script_print;
     cfg.cookie_get = script_cookie_get;
     cfg.cookie_set = script_cookie_set;
     cfg.fetch = script_fetch;
+    cfg.local_storage = p->runtime->local_storage;
+    cfg.session_storage = p->runtime->session_storage;
     cfg.user = p;
     cfg.max_heap = 16UL * 1024UL * 1024UL;
     cfg.max_steps = 4000000UL;
+    cfg.viewport_width = viewport_width > 0
+        ? (unsigned int)viewport_width : 1;
+    cfg.viewport_height = viewport_height > 0
+        ? (unsigned int)viewport_height : 1;
+    if (cpuinfo(&cpu) == 0 && cpu.online)
+        cfg.hardware_concurrency = cpu.online;
     p->js = jsdom_new(p->doc, &cfg);
     if (!p->js)
         return -1;
@@ -2522,23 +2804,19 @@ static int execute_page_scripts(struct browser_page *p)
     module_loader_free(&modules);
     {
         char err[256];
-        int rounds;
+        int ran;
 
         jsdom_dispatch_document(p->js, "DOMContentLoaded",
                                 err, sizeof(err));
         jsdom_dispatch_document(p->js, "load", err, sizeof(err));
-        for (rounds = 0; rounds < 8; rounds++) {
-            int ran = jsdom_pump(p->js, err, sizeof(err));
-
-            if (ran <= 0) {
-                if (ran < 0) {
-                    printf("[browser timer error] %s\n", err);
-                    p->script_errors++;
-                }
-                break;
-            }
+        ran = jsdom_pump(p->js, err, sizeof(err));
+        if (ran < 0) {
+            printf("[browser timer error] %s\n", err);
+            p->script_errors++;
         }
     }
+    if (page_sync_document_url(p) < 0)
+        return -1;
     return 0;
 }
 
@@ -2623,8 +2901,14 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
     struct css_stylesheet *sheets[2];
     struct lay_opts lo;
     const struct lay_paint_item *paint_items;
+    enum browser_load_state entry_state;
     int styled;
 
+    entry_state = p->load_state;
+    if (page_transition(p, PAGE_STYLING) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition to styling");
+        return -1;
+    }
     lay_free(p->layout);
     p->layout = 0;
     if (p->doc)
@@ -2643,6 +2927,7 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
     sheets[1] = p->author;
     p->styles = style_engine_new(sheets, 2, css_dom_ops());
     if (!p->styles) {
+        page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory creating the style engine");
         return -1;
     }
@@ -2650,15 +2935,21 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
     styled = style_compute_tree(p->styles, p->doc->root, 0,
                                 css_style_dom_sink, 0);
     if (styled <= 0) {
+        page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory computing page styles");
         return -1;
     }
 
+    if (page_transition(p, PAGE_LAYOUT) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition to layout");
+        return -1;
+    }
     lay_opts_init(&lo, viewport_w, viewport_h);
     lo.image_size = page_image_size;
     lo.image_ctx = p;
     p->layout = lay_layout(p->doc, &lo);
     if (!p->layout) {
+        page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory starting page layout");
         return -1;
     }
@@ -2667,7 +2958,13 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
      * more substantial must have at least one background/content item. */
     if (lay_box_count(p->layout) > 1 &&
         lay_paint_order(p->layout, &paint_items) <= 0) {
+        page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory building page paint order");
+        return -1;
+    }
+    if (entry_state == PAGE_COMPLETE &&
+        page_transition(p, PAGE_COMPLETE) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition after reflow");
         return -1;
     }
     return 0;
@@ -2682,6 +2979,10 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
     struct bytebuf css;
 
     p->runtime = rt;
+    if (page_transition(p, PAGE_PARSING) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition to parsing");
+        return -1;
+    }
     p->doc = html_parse_document(src, len);
     if (!p->doc) {
         snprintf(err, errsz, "out of memory parsing %lu bytes", len);
@@ -2713,7 +3014,12 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
     }
     if (page_reflow(rt, p, viewport_w, viewport_h, err, errsz) != 0)
         return -1;
-    if (execute_page_scripts(p) != 0) {
+    if (page_transition(p, PAGE_SCRIPTING) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition to scripting");
+        return -1;
+    }
+    if (execute_page_scripts(p, viewport_w, viewport_h) != 0) {
+        page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory creating the JavaScript runtime");
         return -1;
     }
@@ -2721,6 +3027,10 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
         page_reflow(rt, p, viewport_w, viewport_h, err, errsz) != 0)
         return -1;
     jsdom_clear_dirty(p->js);
+    if (page_transition(p, PAGE_COMPLETE) != 0) {
+        snprintf(err, errsz, "invalid page lifecycle transition to complete");
+        return -1;
+    }
     return 0;
 }
 
@@ -2806,9 +3116,18 @@ page_load_request(struct browser_runtime *rt, const char *target,
         return 0;
     }
 
+    if (page_transition(p, PAGE_NAVIGATING) != 0) {
+        snprintf(fatal, fatalsz, "invalid initial navigation state");
+        page_load_work_destroy(w);
+        page_destroy(p);
+        return 0;
+    }
     if (!url_supported(target)) {
         snprintf(w->primary_error, sizeof(w->primary_error),
                  "unsupported URL scheme (use file, http, or https)");
+    } else if (page_transition(p, PAGE_FETCHING) != 0) {
+        snprintf(w->primary_error, sizeof(w->primary_error),
+                 "invalid page lifecycle transition to fetching");
     } else if (url_is_scheme(target, "file")) {
         p->is_local = 1;
         if (read_local_url(target, &w->local_body, &w->body_len,
@@ -2881,6 +3200,7 @@ page_load_request(struct browser_runtime *rt, const char *target,
     }
 
     if (w->primary_error[0]) {
+        page_transition(p, PAGE_FAILED);
         if (build_error_page(rt, p, viewport_w, viewport_h,
                              w->primary_error, fatal, fatalsz) != 0) {
             page_load_work_destroy(w);
@@ -2891,6 +3211,10 @@ page_load_request(struct browser_runtime *rt, const char *target,
         return p;
     }
 
+    if (page_transition(p, PAGE_RESPONSE) != 0) {
+        snprintf(w->primary_error, sizeof(w->primary_error),
+                 "invalid page lifecycle transition after response");
+    }
     p->bytes = w->body_len;
     p->is_html = w->is_html;
     if (!w->is_html) {
@@ -2917,9 +3241,13 @@ page_load_request(struct browser_runtime *rt, const char *target,
                        w->source_len, viewport_w, viewport_h,
                        w->primary_error,
                        sizeof(w->primary_error)) != 0) {
+        page_transition(p, PAGE_FAILED);
         page_content_destroy(p);
     }
 
+    if (w->primary_error[0]) {
+        page_transition(p, PAGE_FAILED);
+    }
     if (w->primary_error[0] &&
         build_error_page(rt, p, viewport_w, viewport_h, w->primary_error,
                          fatal, fatalsz) != 0) {
@@ -3243,6 +3571,7 @@ text_present(struct browser_page *p, int cols, int viewport_w,
                p->resources, p->resource_bytes, p->resource_errors);
         printf("stylesheets: %u  scripts: %u  script-errors: %u\n",
                p->stylesheets, p->scripts, p->script_errors);
+        printf("lifecycle: %s\n", page_state_name(p->load_state));
         if (p->doc->title && p->doc->title[0])
             printf("title: %s\n", p->doc->title);
         printf("\n");
@@ -3898,21 +4227,19 @@ static int sync_script_page(struct bstate *b)
     char err[256];
     const char *pending;
     char *target;
+    int url_sync;
 
     if (!b->page || !b->page->js)
         return 0;
-    {
-        int rounds;
-        for (rounds = 0; rounds < 8; rounds++) {
-            int ran = jsdom_pump(b->page->js, err, sizeof(err));
-
-            if (ran <= 0) {
-                if (ran < 0)
-                    set_status(b, 1, "page timer failed:", err);
-                break;
-            }
-        }
+    if (jsdom_pump(b->page->js, err, sizeof(err)) < 0)
+        set_status(b, 1, "page timer failed:", err);
+    url_sync = page_sync_document_url(b->page);
+    if (url_sync < 0) {
+        set_status(b, 1, "cannot update script history URL", "");
+        return -1;
     }
+    if (url_sync > 0 && !b->addr_focus)
+        restore_address(b);
     if (jsdom_dirty(b->page->js)) {
         if (page_reflow(b->rt, b->page, b->view_w, b->view_h,
                         err, sizeof(err)) != 0) {
@@ -4357,8 +4684,12 @@ gui_mode(struct browser_runtime *rt, const char *start_url)
 
         if (r < 0)
             break;
-        if (r == 0)
+        if (r == 0) {
+            if (sync_script_page(b) != 0)
+                result = 1;
+            draw(b);
             continue;
+        }
         /* Event timing is useful extra input on machines without a hardware
          * random instruction; it never replaces the DRBG's other sources. */
         tls_add_entropy(&ev, sizeof(ev));

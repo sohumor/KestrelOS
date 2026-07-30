@@ -9,6 +9,7 @@
  */
 
 #include "dom.h"
+#include "storage.h"
 #include "../libjs/js.h"
 
 struct jsdom;
@@ -20,6 +21,7 @@ struct jsdom_fetch_response {
     char *content_type;
     char *body;
     unsigned long body_len;
+    int redirected;
 };
 
 struct jsdom_config {
@@ -33,11 +35,24 @@ struct jsdom_config {
      * DOM binding. */
     int (*fetch)(void *user, const char *url, const char *method,
                  const void *body, unsigned long body_len,
+                 const char *content_type, const char *accept,
+                 const char *extra_headers,
+                 const char *mode, const char *credentials,
+                 const char *redirect,
                  struct jsdom_fetch_response *out,
                  char *err, unsigned long errsz);
+    /* Runtime-owned services composed into each page.  Passing NULL creates
+     * a private, non-persistent bounded store for that page. */
+    struct web_storage *local_storage;
+    struct web_storage *session_storage;
     void *user;
     unsigned long max_heap;
     unsigned long max_steps;
+    /* Zero selects the conservative single-processor fallback. */
+    unsigned int hardware_concurrency;
+    /* Zero selects the browser's 900x620 compatibility viewport. */
+    unsigned int viewport_width;
+    unsigned int viewport_height;
 };
 
 struct jsdom *jsdom_new(struct dom_document *doc,
@@ -63,3 +78,7 @@ void jsdom_clear_dirty(struct jsdom *j);
  * inside the interpreter.  The browser consumes it after the script returns. */
 const char *jsdom_pending_navigation(const struct jsdom *j);
 void jsdom_clear_navigation(struct jsdom *j);
+
+/* The current document URL may change without a navigation through
+ * history.pushState()/replaceState(). */
+const char *jsdom_document_url(const struct jsdom *j);

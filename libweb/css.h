@@ -542,6 +542,12 @@ uint32_t css_set_order_base(struct css_stylesheet *ss, uint32_t base);
  * window resize). Returns the number of blocks whose state changed. */
 int css_set_media(struct css_stylesheet *ss, const struct css_media *m);
 
+/* Evaluate one standalone media-query list with the same parser and
+ * environment used by @media rules. Invalid or over-complex input does not
+ * match. */
+int css_media_query_matches(const char *query, unsigned long len,
+                            const struct css_media *media);
+
 /* ------------------------------------------------------------------ *
  * The element interface.
  *

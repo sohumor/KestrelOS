@@ -281,6 +281,215 @@ void gui_vgradient(gui_window *win, gui_rc r, uint32_t top, uint32_t bottom)
     }
 }
 
+void gui_hgradient(gui_window *win, gui_rc r, uint32_t left, uint32_t right)
+{
+    int i;
+
+    if (r.w <= 0)
+        return;
+    for (i = 0; i < r.w; i++) {
+        int t = r.w > 1 ? (i * 256) / (r.w - 1) : 0;
+
+        gui_rect(win, r.x + i, r.y, 1, r.h, gui_mix(left, right, t));
+    }
+}
+
+void gui_round_rect(gui_window *win, gui_rc r, int radius, uint32_t color)
+{
+    int row;
+
+    if (r.w <= 0 || r.h <= 0)
+        return;
+    if (radius < 1) {
+        gui_rect(win, r.x, r.y, r.w, r.h, color);
+        return;
+    }
+    if (radius > r.w / 2)
+        radius = r.w / 2;
+    if (radius > r.h / 2)
+        radius = r.h / 2;
+    for (row = 0; row < r.h; row++) {
+        int inset = 0;
+
+        if (row < radius) {
+            int dy = radius - 1 - row;
+            inset = radius - isqrt_i(radius * radius - dy * dy);
+        } else if (row >= r.h - radius) {
+            int dy = row - (r.h - radius);
+            inset = radius - isqrt_i(radius * radius - dy * dy);
+        }
+        span(win, r.x + inset, r.y + row, r.w - inset * 2, color);
+    }
+}
+
+void gui_round_frame(gui_window *win, gui_rc r, int radius, uint32_t color)
+{
+    int row;
+
+    if (r.w <= 0 || r.h <= 0)
+        return;
+    if (radius < 1) {
+        gui_frame(win, r.x, r.y, r.w, r.h, color);
+        return;
+    }
+    if (radius > r.w / 2)
+        radius = r.w / 2;
+    if (radius > r.h / 2)
+        radius = r.h / 2;
+    for (row = 0; row < r.h; row++) {
+        int inset = 0;
+
+        if (row < radius) {
+            int dy = radius - 1 - row;
+            inset = radius - isqrt_i(radius * radius - dy * dy);
+        } else if (row >= r.h - radius) {
+            int dy = row - (r.h - radius);
+            inset = radius - isqrt_i(radius * radius - dy * dy);
+        }
+        if (row == 0 || row == r.h - 1)
+            span(win, r.x + inset, r.y + row, r.w - inset * 2, color);
+        else {
+            gui_pixel(win, r.x + inset, r.y + row, color);
+            gui_pixel(win, r.x + r.w - 1 - inset, r.y + row, color);
+        }
+    }
+}
+
+void gui_shadow(gui_window *win, gui_rc r, int radius, uint32_t color)
+{
+    gui_round_rect(win, gui_mkrc(r.x + 4, r.y + 6, r.w, r.h),
+                   radius + 2, gui_mix(color, 0x000000U, 90));
+    gui_round_rect(win, gui_mkrc(r.x + 2, r.y + 3, r.w, r.h),
+                   radius + 1, color);
+}
+
+/* ---------------------------------------------------------------- icons */
+
+void gui_icon(gui_window *win, int x, int y, int size, enum gui_icon icon,
+              uint32_t color)
+{
+    int p, x0, y0, x1, y1, cx, cy;
+    uint32_t cutout;
+
+    if (!win || size < 10)
+        return;
+    p = size / 6;
+    if (p < 2)
+        p = 2;
+    x0 = x + p;
+    y0 = y + p;
+    x1 = x + size - p - 1;
+    y1 = y + size - p - 1;
+    cx = x + size / 2;
+    cy = y + size / 2;
+    cutout = gui_peek(win, cx, cy);
+
+    switch (icon) {
+    case GUI_ICON_APPS:
+        for (int iy = 0; iy < 2; iy++)
+            for (int ix = 0; ix < 2; ix++)
+                gui_round_rect(win,
+                    gui_mkrc(x0 + ix * (size / 2 - 1),
+                             y0 + iy * (size / 2 - 1), p + 3, p + 3),
+                    2, color);
+        break;
+    case GUI_ICON_TERMINAL:
+        gui_round_frame(win, gui_mkrc(x0, y0, x1 - x0 + 1, y1 - y0 + 1),
+                        3, color);
+        gui_line_w(win, x0 + 3, y0 + 4, x0 + 7, y0 + 7, color, 1);
+        gui_line_w(win, x0 + 7, y0 + 7, x0 + 3, y0 + 10, color, 1);
+        gui_line_w(win, x0 + 9, y0 + 11, x1 - 2, y0 + 11, color, 1);
+        break;
+    case GUI_ICON_FILES:
+        gui_round_rect(win, gui_mkrc(x0, y0 + 3, x1 - x0 + 1,
+                                     y1 - y0 - 2), 3, color);
+        gui_round_rect(win, gui_mkrc(x0 + 2, y0, size / 3, 6), 2, color);
+        break;
+    case GUI_ICON_BROWSER:
+        gui_circle(win, cx, cy, size / 2 - p, color);
+        gui_line(win, x0, cy, x1, cy, color);
+        gui_line(win, cx, y0, cx, y1, color);
+        gui_circle(win, cx, cy, size / 4, color);
+        break;
+    case GUI_ICON_PAINT:
+        gui_circle(win, cx, cy, size / 2 - p, color);
+        gui_disc(win, x0 + 4, cy, 2, cutout);
+        gui_disc(win, cx, y0 + 4, 2, cutout);
+        gui_disc(win, x1 - 4, cy, 2, cutout);
+        gui_line_w(win, cx + 2, cy + 2, x1, y1, cutout, 3);
+        break;
+    case GUI_ICON_CLOCK:
+        gui_circle(win, cx, cy, size / 2 - p, color);
+        gui_line_w(win, cx, cy, cx, y0 + 3, color, 2);
+        gui_line_w(win, cx, cy, x1 - 3, cy + 3, color, 2);
+        break;
+    case GUI_ICON_SETTINGS:
+        gui_circle(win, cx, cy, size / 3, color);
+        gui_circle(win, cx, cy, size / 7, cutout);
+        for (int i = 0; i < 8; i++) {
+            int a = i * 450;
+            int ax = cx + (int)(((long long)gui_sin_q16(a) *
+                                 (size / 2 - p)) >> 16);
+            int ay = cy - (int)(((long long)gui_cos_q16(a) *
+                                 (size / 2 - p)) >> 16);
+            gui_disc(win, ax, ay, 2, color);
+        }
+        break;
+    case GUI_ICON_INFO:
+        gui_circle(win, cx, cy, size / 2 - p, color);
+        gui_disc(win, cx, y0 + 4, 1, color);
+        gui_line_w(win, cx, cy - 1, cx, y1 - 3, color, 2);
+        break;
+    case GUI_ICON_CALCULATOR:
+        gui_round_frame(win, gui_mkrc(x0, y0, x1 - x0 + 1, y1 - y0 + 1),
+                        3, color);
+        gui_rect(win, x0 + 3, y0 + 3, x1 - x0 - 5, 3, color);
+        for (int iy = 0; iy < 2; iy++)
+            for (int ix = 0; ix < 3; ix++)
+                gui_disc(win, x0 + 4 + ix * 5, y0 + 10 + iy * 5, 1, color);
+        break;
+    case GUI_ICON_MONITOR:
+        gui_round_frame(win, gui_mkrc(x0, y0, x1 - x0 + 1,
+                                      y1 - y0 - 3), 3, color);
+        gui_line_w(win, cx, y1 - 3, cx, y1, color, 2);
+        gui_line_w(win, cx - 5, y1, cx + 5, y1, color, 2);
+        gui_line(win, x0 + 3, cy + 1, x0 + 7, cy - 3, color);
+        gui_line(win, x0 + 7, cy - 3, x0 + 11, cy + 2, color);
+        gui_line(win, x0 + 11, cy + 2, x1 - 3, cy - 5, color);
+        break;
+    case GUI_ICON_NETWORK:
+        gui_circle(win, cx, y1 - 2, 2, color);
+        gui_circle(win, cx, y1 - 2, size / 4, color);
+        gui_circle(win, cx, y1 - 2, size / 2 - p, color);
+        gui_rect(win, x0 - 1, cy, size, size / 2, cutout);
+        gui_disc(win, cx, y1 - 2, 2, color);
+        break;
+    case GUI_ICON_POWER:
+        gui_circle(win, cx, cy + 1, size / 2 - p, color);
+        gui_rect(win, cx - 3, y0 - 1, 7, size / 2, cutout);
+        gui_line_w(win, cx, y0, cx, cy + 1, color, 2);
+        break;
+    case GUI_ICON_SEARCH:
+        gui_circle(win, cx - 2, cy - 2, size / 4, color);
+        gui_line_w(win, cx + size / 6, cy + size / 6, x1, y1, color, 2);
+        break;
+    case GUI_ICON_HOME:
+        gui_line_w(win, x0, cy, cx, y0, color, 2);
+        gui_line_w(win, cx, y0, x1, cy, color, 2);
+        gui_round_frame(win, gui_mkrc(x0 + 3, cy - 1,
+                                      x1 - x0 - 5, y1 - cy + 2), 2, color);
+        break;
+    case GUI_ICON_CLOSE:
+        gui_line_w(win, x0 + 2, y0 + 2, x1 - 2, y1 - 2, color, 2);
+        gui_line_w(win, x1 - 2, y0 + 2, x0 + 2, y1 - 2, color, 2);
+        break;
+    case GUI_ICON_CHECK:
+        gui_line_w(win, x0, cy, cx - 2, y1 - 2, color, 2);
+        gui_line_w(win, cx - 2, y1 - 2, x1, y0 + 1, color, 2);
+        break;
+    }
+}
+
 /* ----------------------------------------------------------------- text */
 
 int gui_char(gui_window *win, int x, int y, char c, uint32_t fg, long bg)

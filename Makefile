@@ -86,11 +86,12 @@ PKG_DATA  := $(shell find packages -path '*/root/*' -type f 2>/dev/null)
 
 ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
 
+
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
-        test-random test-browser-host \
+        test-random test-browser-host test-gui-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -275,6 +276,11 @@ $(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_S
 	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
+	# Keep symbol-bearing build artifacts for debugging, but do not spend KFS
+	# file blocks on DWARF sections that the target loader never reads.
+	for app in $(notdir $(APP_BINS)); do \
+	  $(OBJCOPY) --strip-debug $(BUILD)/rootfs/bin/$$app; \
+	done
 	cp $(DYNAMIC_LIB) $(BUILD)/rootfs/lib/
 	cp $(MOD_BINS) $(BUILD)/rootfs/lib/modules/
 	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
@@ -316,6 +322,9 @@ test-browser-host:
 	sh tools/run-jsdom-tests.sh
 	sh tools/run-browser-stack.sh
 
+test-gui-host:
+	sh tools/run-gui-tests.sh
+
 test-kfs-journal:
 	$(PY) tools/test_kfs_journal.py
 
@@ -349,6 +358,7 @@ help:
 	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
 	@echo "  make test-net   run host TCP + network checksum tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
+	@echo "  make test-gui-host   run libgui raster regression tests"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
 	@echo "  make test-kfs-boot-recovery   boot a committed journal through recovery"
 	@echo "  make test-kfs   run both KFS recovery suites"

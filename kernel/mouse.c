@@ -36,6 +36,8 @@
 #define CFG_AUX_CLK    0x20 /* set = mouse clock disabled */
 
 #define MOUSE_ACK      0xFA
+#define MOUSE_SENSITIVITY_NUM 3
+#define MOUSE_SENSITIVITY_DEN 2
 
 #define EVQ_SIZE       64
 
@@ -166,8 +168,8 @@ static void handle_packet(void)
     int dx = (flags & 0x10) ? (int)ms.pkt[1] - 256 : (int)ms.pkt[1];
     int dy = (flags & 0x20) ? (int)ms.pkt[2] - 256 : (int)ms.pkt[2];
 
-    int nx = ms.x + dx;
-    int ny = ms.y - dy;                 /* device Y grows upward */
+int nx = ms.x + (dx * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
+int ny = ms.y - (dy * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
 
     if (nx < 0) nx = 0;
     if (ny < 0) ny = 0;

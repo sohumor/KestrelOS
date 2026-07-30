@@ -40,28 +40,50 @@ const uint8_t *gui_glyph(unsigned char c);
 #define GUI_GREEN(c) (((c) >> 8) & 0xFF)
 #define GUI_BLUE(c)  ((c) & 0xFF)
 
-/* The desktop theme: a cool slate/blue-grey scheme with one azure accent.
- * Chosen so text sits at a comfortable contrast on the surfaces rather
- * than the eye-watering primaries a first pass usually reaches for. */
-#define GUI_DESK_TOP     0x1B2A3AU   /* desktop gradient, top    */
-#define GUI_DESK_BOTTOM  0x0C1219U   /* desktop gradient, bottom */
-#define GUI_PANEL        0x1E2A38U   /* taskbar, toolbars        */
-#define GUI_PANEL_HI     0x2A3A4CU   /* raised panel element     */
-#define GUI_SURFACE      0x27333FU   /* ordinary window body     */
-#define GUI_SURFACE_ALT  0x30404FU   /* alternating rows, hover  */
-#define GUI_SUNKEN       0x161E27U   /* lists, text boxes, canvas*/
-#define GUI_BORDER       0x0E141BU   /* outer edges, shadows     */
-#define GUI_EDGE         0x44586CU   /* light bevel edge         */
-#define GUI_TEXT         0xD6DFE8U
-#define GUI_TEXT_DIM     0x8B9DAEU
-#define GUI_TEXT_INV     0x0E141BU
-#define GUI_ACCENT       0x5BA3D0U   /* selection, focus, links  */
-#define GUI_ACCENT_DARK  0x3B7CA5U
-#define GUI_OK           0x7FB07FU
-#define GUI_WARN         0xD4A45CU
-#define GUI_ERROR        0xC4706AU
-#define GUI_WHITE        0xEFF3F7U
-#define GUI_BLACK        0x080B0FU
+/* The palette is process-local but live: gui_next_event() polls
+ * /etc/desktop.conf, so open applications adopt an appearance change without
+ * restarting. Macros preserve the original call-site API. */
+typedef struct gui_theme {
+    uint32_t desk_top, desk_bottom;
+    uint32_t panel, panel_hi;
+    uint32_t surface, surface_alt, sunken;
+    uint32_t border, edge;
+    uint32_t text, text_dim, text_inv;
+    uint32_t accent, accent_dark;
+    uint32_t ok, warn, error, white, black;
+} gui_theme;
+
+typedef struct gui_settings {
+    int light;       /* 0 = dark, 1 = light */
+    int accent;      /* 0..5 */
+    int wallpaper;   /* 0..3 */
+    int compact;     /* compact dock */
+} gui_settings;
+
+const gui_theme *gui_theme_current(void);
+void gui_settings_get(gui_settings *out);
+int gui_settings_save(const gui_settings *settings);
+void gui_settings_reload(void);
+
+#define GUI_DESK_TOP     (gui_theme_current()->desk_top)
+#define GUI_DESK_BOTTOM  (gui_theme_current()->desk_bottom)
+#define GUI_PANEL        (gui_theme_current()->panel)
+#define GUI_PANEL_HI     (gui_theme_current()->panel_hi)
+#define GUI_SURFACE      (gui_theme_current()->surface)
+#define GUI_SURFACE_ALT  (gui_theme_current()->surface_alt)
+#define GUI_SUNKEN       (gui_theme_current()->sunken)
+#define GUI_BORDER       (gui_theme_current()->border)
+#define GUI_EDGE         (gui_theme_current()->edge)
+#define GUI_TEXT         (gui_theme_current()->text)
+#define GUI_TEXT_DIM     (gui_theme_current()->text_dim)
+#define GUI_TEXT_INV     (gui_theme_current()->text_inv)
+#define GUI_ACCENT       (gui_theme_current()->accent)
+#define GUI_ACCENT_DARK  (gui_theme_current()->accent_dark)
+#define GUI_OK           (gui_theme_current()->ok)
+#define GUI_WARN         (gui_theme_current()->warn)
+#define GUI_ERROR        (gui_theme_current()->error)
+#define GUI_WHITE        (gui_theme_current()->white)
+#define GUI_BLACK        (gui_theme_current()->black)
 
 /* bg argument to the text calls: >= 0 is a colour, this is "leave the
  * pixels behind the glyph alone". */
@@ -107,6 +129,8 @@ void gui_close(gui_window *win);
  * (which also clears win->open, so event loops fall out). */
 int gui_flush(gui_window *win);
 int gui_move(gui_window *win, int x, int y);
+int gui_window_list(int index, struct k_winsummary *out);
+int gui_window_control(uint32_t wid, int action);
 
 /* Wait up to timeout_ms for an event: 1 = *ev filled, 0 = timed out,
  * -1 = the window/compositor is gone (win->open is cleared). A timeout
@@ -170,6 +194,34 @@ void gui_line_w(gui_window *win, int x0, int y0, int x1, int y1,
 void gui_circle(gui_window *win, int cx, int cy, int r, uint32_t color);
 void gui_disc(gui_window *win, int cx, int cy, int r, uint32_t color);
 void gui_vgradient(gui_window *win, gui_rc r, uint32_t top, uint32_t bottom);
+void gui_hgradient(gui_window *win, gui_rc r, uint32_t left, uint32_t right);
+void gui_round_rect(gui_window *win, gui_rc r, int radius, uint32_t color);
+void gui_round_frame(gui_window *win, gui_rc r, int radius, uint32_t color);
+void gui_shadow(gui_window *win, gui_rc r, int radius, uint32_t color);
+
+enum gui_icon {
+    GUI_ICON_APPS,
+    GUI_ICON_TERMINAL,
+    GUI_ICON_FILES,
+    GUI_ICON_BROWSER,
+    GUI_ICON_PAINT,
+    GUI_ICON_CLOCK,
+    GUI_ICON_SETTINGS,
+    GUI_ICON_INFO,
+    GUI_ICON_CALCULATOR,
+    GUI_ICON_MONITOR,
+    GUI_ICON_NETWORK,
+    GUI_ICON_POWER,
+    GUI_ICON_SEARCH,
+    GUI_ICON_HOME,
+    GUI_ICON_CLOSE,
+    GUI_ICON_CHECK
+};
+
+/* Small line icons used by the desktop and applications. The drawing stays
+ * crisp at 16..32 pixels and has no image-file dependency. */
+void gui_icon(gui_window *win, int x, int y, int size, enum gui_icon icon,
+              uint32_t color);
 
 /* Blend a into b, t = 0..256 (0 = a, 256 = b); gui_shade lightens for a
  * positive percentage and darkens for a negative one. */
@@ -230,6 +282,8 @@ int gui_button(gui_window *win, gui_rc r, const char *label, gui_ui *ui);
  * latched/selected button. */
 int gui_button_ex(gui_window *win, gui_rc r, const char *label, gui_ui *ui,
                   int enabled, int active);
+int gui_icon_button(gui_window *win, gui_rc r, enum gui_icon icon,
+                    const char *label, gui_ui *ui, int enabled, int active);
 
 void gui_label(gui_window *win, int x, int y, const char *s, uint32_t fg);
 
@@ -268,6 +322,11 @@ int gui_scrollbar(gui_window *win, gui_rc r, int total, int visible,
 
 int gui_checkbox(gui_window *win, int x, int y, const char *label, int *on,
                  gui_ui *ui);
+int gui_toggle(gui_window *win, int x, int y, const char *label, int *on,
+               gui_ui *ui);
+void gui_card(gui_window *win, gui_rc r);
+void gui_progress(gui_window *win, gui_rc r, int percent, uint32_t fill);
+void gui_badge(gui_window *win, gui_rc r, const char *text, uint32_t color);
 
 typedef struct gui_menu_state {
     int open;

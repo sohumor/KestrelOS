@@ -60,13 +60,38 @@ UDP, DNS, and **TCP with selective acknowledgements**, with HTTP/1.1 and
 verified TLS 1.3 HTTPS clients on top.
 
 **Desktop** — a kernel compositor where each window is an object whose pixel
-buffer is mapped into the owning process, with stacking, focus, draggable title
-bars and routed input; a userspace widget toolkit; and a desktop shell with a
-taskbar, a graphical terminal, file manager, clock, paint program and browser.
-The browser has verified HTTPS, persistent cookies and cache, linked/imported
-CSS, PNG/GIF/JPEG/BMP images, a live DOM with guarded ES5 JavaScript, bounded
-static modules, Promise/fetch support, a small i32 WebAssembly core, native
-form controls, and GET/POST submission. Rendering includes a flex-row subset,
+buffer is mapped into the owning process, with stacking, focus, draggable
+modern title bars, minimize/restore, same-user task controls and routed input.
+The live-themed userspace toolkit provides rounded controls, cards, toggles,
+progress indicators and vector icons. The desktop environment adds a searchable
+Super-key launcher, task dock, notifications, quick settings and system status,
+plus Settings, System Monitor, Calculator, Terminal, Files, Clock, Paint, About
+and Browser applications. Alt-Tab switches tasks and Alt-F4 closes the focused
+window.
+The browser has verified HTTPS, persistent cookies/cache/origin storage,
+linked/imported CSS, PNG/GIF/JPEG/BMP images, a live DOM with guarded
+JavaScript and arrow functions, bounded static modules, Promise/fetch support,
+`Uint8Array`, UTF-8 text codecs, live `URL`/`URLSearchParams`,
+`AbortController` cancellation, constructible UI/mouse/keyboard/input/pointer
+events with bounded capture/bubbling and listener options,
+constructible `Headers`, `Request`, and `Response` objects with real
+request-header transport and policy controls, bounded `Blob`/`File` bodies,
+asynchronous `FileReader`, object URLs, kernel-backed `crypto` randomness and
+SHA-1/SHA-2 digests, SMP-aware navigator capabilities, queued `sendBeacon()`,
+CSS-engine-backed `matchMedia()`, complete Location URL components, a small
+i32 WebAssembly core, bounded `Map`/`Set` and object-keyed
+`WeakMap`/`WeakSet`, common modern Object/Array/Number static helpers, bounded
+Array/String search, flattening, replacement, and padding helpers,
+explicit collection iterators, same-document History routing, modern DOM
+interface identity, HTML/SVG namespace-aware element construction,
+data-attribute access, traversal/mutation and general CSS declaration
+access, comments, off-document fragments, iterator/tree-walker traversal,
+bounded Range editing and singleton Selection state,
+bounded asynchronous mutation
+observation, multipart `FormData`,
+timer arguments plus cancellable animation/idle callbacks, native form
+controls, and GET/POST submission. Rendering includes
+bounded flex-row and flex-column subsets,
 bounded aspect-preserving inline SVG shapes/paths, and video-poster/media
 fallbacks. External modules enforce JavaScript MIME and fetch-style CORS/cookie
 rules.
@@ -148,6 +173,7 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 | [docs/users.md](docs/users.md) | accounts, password hashing, and its limits |
 | [docs/packages.md](docs/packages.md) | the .kpkg format and the package manager |
 | [docs/browser.md](docs/browser.md) | the HTML engine and what it does not do |
+| [docs/DESIGN-browser-runtime.md](docs/DESIGN-browser-runtime.md) | browser ownership, data flow, events, and lifecycle state machines |
 | [docs/RUNNING.md](docs/RUNNING.md) | building and running in each hypervisor |
 
 ## Known limitations

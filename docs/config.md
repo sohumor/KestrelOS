@@ -63,7 +63,7 @@ changes:
 ```make
 CONFIG_KERNEL_EXCLUDE := kernel/wm.c
 CONFIG_KERNEL_MODULES := kernel/e1000.c
-CONFIG_APPS_EXCLUDE   := desktop gclock gfiles gpaint snake terminal
+CONFIG_APPS_EXCLUDE   := about browser desktop gcalc gclock gfiles gpaint settings snake sysmon terminal
 CONFIG_NET_RTL8139 := y
 ...
 ```
@@ -136,7 +136,7 @@ name, and each can be `y`, `m` or `n` independently of the other.
 | option | form | what it controls |
 | ------ | ---- | ---------------- |
 | `CONFIG_GRAPHICS` | y/n | Linear framebuffer and the graphical console backend. Off means VGA text mode only. |
-| `CONFIG_WM`       | y/n | Compositor, window manager, and the GUI apps (`desktop`, `terminal`, `gclock`, `gfiles`, `gpaint`). Needs `CONFIG_GRAPHICS`. |
+| `CONFIG_WM`       | y/n | Compositor, window manager, and the graphical desktop suite (`desktop`, `settings`, `sysmon`, `gcalc`, `terminal`, `browser`, and the other GUI apps). Needs `CONFIG_GRAPHICS`. |
 | `CONFIG_MOUSE`    | y/n | PS/2 mouse driver. Independent of the compositor: the rescue console can use a pointer too. |
 
 ### Userspace

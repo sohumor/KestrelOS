@@ -27,8 +27,8 @@
 
 /* Decoration metrics, in case a panel or a shell wants to reason about the
  * space a decorated window occupies. The frame of a decorated window is
- * (x - 1, y - 1 - 20) sized (w + 2, h + 2 + 20). */
-#define WM_DECOR_TITLE_H  20
+ * (x - 1, y - 1 - 30) sized (w + 2, h + 2 + 30). */
+#define WM_DECOR_TITLE_H  30
 #define WM_DECOR_BORDER   1
 
 /* Geometry contract: struct k_wincreate's x/y and wm_sys_move's x/y are the
@@ -55,3 +55,5 @@ long wm_sys_destroy(uint64_t wid);
 long wm_sys_flush(uint64_t wid);
 long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms);
 long wm_sys_move(uint64_t wid, int x, int y);
+long wm_sys_list(uint64_t index, uint64_t uout);
+long wm_sys_ctl(uint64_t wid, uint64_t action);

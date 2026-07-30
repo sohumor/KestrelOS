@@ -90,6 +90,8 @@
 #define SYS_SIGPROCMASK 64 /* (how, set, oldset) -> 0/-1 */
 #define SYS_SIGRETURN   65 /* internal signal restorer; no ordinary return */
 #define SYS_CPUINFO     66 /* (struct k_cpuinfo*) -> 0/-1 */
+#define SYS_WIN_LIST    67 /* (index, struct k_winsummary*) -> 0/-1 */
+#define SYS_WIN_CTL     68 /* (wid, K_WIN_CTL_*) -> 0/-1 */
 
 /* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
  * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
@@ -249,6 +251,11 @@ struct k_netinfo {
 #define KEY_PGUP   0x86
 #define KEY_PGDN   0x87
 #define KEY_DELETE 0x88
+/* Window-manager shortcuts synthesized by the keyboard driver. Applications
+ * ordinarily never see the first two: the compositor consumes them. */
+#define KEY_WM_NEXT  0x89  /* Alt-Tab */
+#define KEY_WM_CLOSE 0x8A  /* Alt-F4 */
+#define KEY_LAUNCHER 0x8B  /* Super key; routed to the desktop shell */
 
 /* --- kernel log ---------------------------------------------------- */
 
@@ -346,6 +353,27 @@ struct k_wininfo {
     uint32_t width, height;   /* client area actually granted */
     uint64_t buffer;          /* user virtual address of the pixel buffer */
 };
+
+/* Desktop-shell view of one ordinary application window. The compositor
+ * exposes these records only to a process that owns a K_WIN_DESKTOP window,
+ * and only for windows belonging to the same uid. */
+#define K_WIN_STATE_FOCUSED   0x01U
+#define K_WIN_STATE_MINIMIZED 0x02U
+
+struct k_winsummary {
+    uint32_t wid;
+    int32_t pid;
+    int32_t x, y;
+    uint32_t width, height;
+    uint32_t flags;
+    uint32_t state;
+    char title[64];
+};
+
+#define K_WIN_CTL_FOCUS    0
+#define K_WIN_CTL_MINIMIZE 1
+#define K_WIN_CTL_RESTORE  2
+#define K_WIN_CTL_CLOSE    3
 
 /* Window event types */
 #define KEV_NONE       0

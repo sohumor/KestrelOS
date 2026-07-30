@@ -968,6 +968,12 @@ static void syscall_dispatch(struct regs *r)
     case SYS_WIN_MOVE:
         ret = wm_sys_move(a1, (int)(int64_t)a2, (int)(int64_t)a3);
         break;
+    case SYS_WIN_LIST:
+        ret = wm_sys_list(a1, a2);
+        break;
+    case SYS_WIN_CTL:
+        ret = wm_sys_ctl(a1, a2);
+        break;
 
     /* --- TCP --- */
     case SYS_TCP_CONNECT:

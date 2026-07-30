@@ -12,6 +12,13 @@ FIFO="$(mktemp -u)"
 mkfifo "$FIFO"
 rm -f "$PPM"
 
+# Keep requested screenshot coordinates in guest pixels even when the PS/2
+# driver uses a custom sensitivity multiplier.
+SENS_NUM="$(awk '/^#define MOUSE_SENSITIVITY_NUM / { print $3 }' kernel/mouse.c)"
+SENS_DEN="$(awk '/^#define MOUSE_SENSITIVITY_DEN / { print $3 }' kernel/mouse.c)"
+: "${SENS_NUM:=1}"
+: "${SENS_DEN:=1}"
+
 {
     sleep 10
     printf 'root\r'
@@ -31,11 +38,12 @@ qemu-system-x86_64 -m 512M \
     < "$FIFO" > /dev/null 2>&1 &
 QEMU=$!
 
-python3 - "$MON" "$PPM" "$@" <<'PY' || true
+python3 - "$MON" "$PPM" "$SENS_NUM" "$SENS_DEN" "$@" <<'PY' || true
 import os, socket, sys, time
 
 mon, ppm = sys.argv[1], sys.argv[2]
-coords = [int(v) for v in sys.argv[3:]]
+sens_num, sens_den = int(sys.argv[3]), int(sys.argv[4])
+coords = [int(v) for v in sys.argv[5:]]
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 deadline = time.time() + 30
@@ -66,11 +74,19 @@ def move_to(x, y):
         cmd("mouse_move -200 -200")
     cx = cy = 0
     while cx != x or cy != y:
-        dx = max(-STEP, min(STEP, x - cx))
-        dy = max(-STEP, min(STEP, y - cy))
-        cmd("mouse_move %d %d" % (dx, dy))
-        cx += dx
-        cy += dy
+        # The driver applies trunc(delta * num / den). Pick a raw delta whose
+        # transformed movement approaches the requested guest coordinate.
+        rx = int((x - cx) * sens_den / sens_num)
+        ry = int((y - cy) * sens_den / sens_num)
+        if rx == 0 and x != cx:
+            rx = 1 if x > cx else -1
+        if ry == 0 and y != cy:
+            ry = 1 if y > cy else -1
+        rx = max(-STEP, min(STEP, rx))
+        ry = max(-STEP, min(STEP, ry))
+        cmd("mouse_move %d %d" % (rx, ry))
+        cx += int(rx * sens_num / sens_den)
+        cy += int(ry * sens_num / sens_den)
 
 for i in range(0, len(coords), 2):
     move_to(coords[i], coords[i + 1])

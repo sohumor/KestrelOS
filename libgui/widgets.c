@@ -150,20 +150,16 @@ int gui_button_ex(gui_window *win, gui_rc r, const char *label, gui_ui *ui,
 
     text = enabled ? (active ? GUI_WHITE : GUI_TEXT) : GUI_TEXT_DIM;
 
-    gui_rect(win, r.x, r.y, r.w, r.h, body);
-    if (held)
-        gui_bevel(win, r, gui_shade(body, -25), gui_shade(body, 12));
-    else
-        gui_bevel(win, r, gui_shade(body, 16), gui_shade(body, -28));
-    gui_frame(win, r.x, r.y, r.w, r.h, GUI_BORDER);
+    gui_round_rect(win, r, r.h > 12 ? 6 : 3, body);
+    gui_round_frame(win, r, r.h > 12 ? 6 : 3,
+                    active ? gui_shade(GUI_ACCENT, 12) :
+                    hover && enabled ? GUI_EDGE : GUI_BORDER);
 
     if (label) {
         tx = r.x + (r.w - gui_text_w(label)) / 2;
         ty = r.y + (r.h - GUI_FONT_H) / 2;
-        if (held) {
-            tx++;
+        if (held)
             ty++;
-        }
         gui_clip(win, gui_mkrc(r.x + 2, r.y, r.w - 4, r.h));
         gui_text(win, tx, ty, label, text, GUI_TRANSPARENT);
         gui_unclip(win);
@@ -174,6 +170,32 @@ int gui_button_ex(gui_window *win, gui_rc r, const char *label, gui_ui *ui,
 int gui_button(gui_window *win, gui_rc r, const char *label, gui_ui *ui)
 {
     return gui_button_ex(win, r, label, ui, 1, 0);
+}
+
+int gui_icon_button(gui_window *win, gui_rc r, enum gui_icon icon,
+                    const char *label, gui_ui *ui, int enabled, int active)
+{
+    int clicked, isz, ix, iy, tx;
+    uint32_t fg;
+
+    clicked = gui_button_ex(win, r, 0, ui, enabled, active);
+    isz = r.h - 8;
+    if (isz > 24)
+        isz = 24;
+    if (isz < 12)
+        isz = 12;
+    ix = label ? r.x + 8 : r.x + (r.w - isz) / 2;
+    iy = r.y + (r.h - isz) / 2;
+    fg = enabled ? (active ? GUI_WHITE : GUI_TEXT) : GUI_TEXT_DIM;
+    gui_icon(win, ix, iy, isz, icon, fg);
+    if (label) {
+        tx = ix + isz + 7;
+        gui_clip(win, gui_mkrc(tx, r.y, r.x + r.w - tx - 4, r.h));
+        gui_text(win, tx, r.y + (r.h - GUI_FONT_H) / 2, label, fg,
+                 GUI_TRANSPARENT);
+        gui_unclip(win);
+    }
+    return clicked;
 }
 
 void gui_label(gui_window *win, int x, int y, const char *s, uint32_t fg)
@@ -298,10 +320,8 @@ int gui_textbox(gui_window *win, gui_rc r, gui_textbox_state *tb, gui_ui *ui)
     if (tb->scroll < 0)
         tb->scroll = 0;
 
-    gui_rect(win, r.x, r.y, r.w, r.h, GUI_SUNKEN);
-    gui_bevel(win, r, gui_shade(GUI_SUNKEN, -30), gui_shade(GUI_SUNKEN, 20));
-    gui_frame(win, r.x, r.y, r.w, r.h,
-              tb->focus ? GUI_ACCENT : GUI_BORDER);
+    gui_round_rect(win, r, 6, GUI_SUNKEN);
+    gui_round_frame(win, r, 6, tb->focus ? GUI_ACCENT : GUI_EDGE);
 
     gui_clip(win, gui_mkrc(r.x + 3, r.y + 1, r.w - 6, r.h - 2));
     tx = r.x + 4;
@@ -340,11 +360,11 @@ int gui_scrollbar(gui_window *win, gui_rc r, int total, int visible,
     if (*top < 0)
         *top = 0;
 
-    gui_rect(win, r.x, r.y, r.w, r.h, gui_shade(GUI_SUNKEN, -10));
-    gui_frame(win, r.x, r.y, r.w, r.h, GUI_BORDER);
+    gui_round_rect(win, r, r.w / 2, gui_shade(GUI_SUNKEN, -10));
 
     if (max_top == 0) {
-        gui_rect(win, r.x + 2, r.y + 2, r.w - 4, r.h - 4, GUI_PANEL);
+        gui_round_rect(win, gui_mkrc(r.x + 3, r.y + 3, r.w - 6, r.h - 6),
+                       (r.w - 6) / 2, GUI_PANEL);
         return *top != old;
     }
 
@@ -373,9 +393,9 @@ int gui_scrollbar(gui_window *win, gui_rc r, int total, int visible,
     }
 
     thumb_y = r.y + ((r.h - thumb_h) * (*top)) / max_top;
-    gui_rect(win, r.x + 2, thumb_y + 1, r.w - 4, thumb_h - 2, GUI_PANEL_HI);
-    gui_bevel(win, gui_mkrc(r.x + 2, thumb_y + 1, r.w - 4, thumb_h - 2),
-              gui_shade(GUI_PANEL_HI, 18), gui_shade(GUI_PANEL_HI, -25));
+    gui_round_rect(win, gui_mkrc(r.x + 2, thumb_y + 1,
+                                 r.w - 4, thumb_h - 2),
+                   (r.w - 4) / 2, GUI_PANEL_HI);
     return changed || *top != old;
 }
 
@@ -391,8 +411,8 @@ int gui_listbox(gui_window *win, gui_rc r, gui_list *ls, gui_ui *ui)
     row_h = ls->row_h > 0 ? ls->row_h : GUI_FONT_H + 4;
     ls->row_h = row_h;
 
-    gui_rect(win, r.x, r.y, r.w, r.h, GUI_SUNKEN);
-    gui_frame(win, r.x, r.y, r.w, r.h, GUI_BORDER);
+    gui_round_rect(win, r, 7, GUI_SUNKEN);
+    gui_round_frame(win, r, 7, GUI_BORDER);
 
     rows = gui_mkrc(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
     visible = rows.h / row_h;
@@ -500,7 +520,9 @@ int gui_listbox(gui_window *win, gui_rc r, gui_list *ls, gui_ui *ui)
             text = "";
         fg = ls->tint ? ls->tint(ls->ctx, idx) : GUI_TEXT;
         if (idx == ls->sel) {
-            gui_rect(win, rows.x, y, rows.w, row_h, GUI_ACCENT_DARK);
+            gui_round_rect(win, gui_mkrc(rows.x + 2, y + 1,
+                                         rows.w - 4, row_h - 2),
+                           5, GUI_ACCENT_DARK);
             fg = GUI_WHITE;
         } else if (idx & 1) {
             gui_rect(win, rows.x, y, rows.w, row_h,
@@ -531,19 +553,85 @@ int gui_checkbox(gui_window *win, int x, int y, const char *label, int *on,
         toggled = 1;
     }
 
-    gui_rect(win, box.x, box.y, box.w, box.h, GUI_SUNKEN);
-    gui_bevel(win, box, gui_shade(GUI_SUNKEN, -30), gui_shade(GUI_SUNKEN, 20));
-    gui_frame(win, box.x, box.y, box.w, box.h, GUI_BORDER);
+    gui_round_rect(win, box, 4, *on ? GUI_ACCENT : GUI_SUNKEN);
+    gui_round_frame(win, box, 4, *on ? gui_shade(GUI_ACCENT, 15) : GUI_EDGE);
     if (*on) {
         gui_line_w(win, box.x + 4, box.y + 8, box.x + 7, box.y + 11,
-                   GUI_ACCENT, 2);
+                   GUI_WHITE, 2);
         gui_line_w(win, box.x + 7, box.y + 11, box.x + 12, box.y + 4,
-                   GUI_ACCENT, 2);
+                   GUI_WHITE, 2);
     }
     if (label)
         gui_text(win, x + 22, y + (16 - GUI_FONT_H) / 2, label, GUI_TEXT,
                  GUI_TRANSPARENT);
     return toggled;
+}
+
+int gui_toggle(gui_window *win, int x, int y, const char *label, int *on,
+               gui_ui *ui)
+{
+    gui_rc track = gui_mkrc(x, y, 38, 20);
+    gui_rc hot;
+    int changed = 0;
+
+    if (!win || !on || !ui)
+        return 0;
+    hot = gui_mkrc(x, y, track.w + (label ? gui_text_w(label) + 10 : 0),
+                   track.h);
+    if (clicked_in(ui, hot)) {
+        *on = !*on;
+        changed = 1;
+    }
+    gui_round_rect(win, track, 10, *on ? GUI_ACCENT : GUI_SUNKEN);
+    gui_round_frame(win, track, 10, *on ? gui_shade(GUI_ACCENT, 18)
+                                        : GUI_EDGE);
+    gui_disc(win, *on ? x + 28 : x + 10, y + 10, 7,
+             *on ? GUI_WHITE : GUI_TEXT_DIM);
+    if (label)
+        gui_text(win, x + 48, y + 2, label, GUI_TEXT, GUI_TRANSPARENT);
+    return changed;
+}
+
+void gui_card(gui_window *win, gui_rc r)
+{
+    if (!win || r.w <= 0 || r.h <= 0)
+        return;
+    gui_shadow(win, r, 9, gui_shade(GUI_BORDER, 12));
+    gui_round_rect(win, r, 9, GUI_SURFACE_ALT);
+    gui_round_frame(win, r, 9, GUI_EDGE);
+}
+
+void gui_progress(gui_window *win, gui_rc r, int percent, uint32_t fill)
+{
+    gui_rc inside;
+
+    if (!win || r.w <= 0 || r.h <= 0)
+        return;
+    if (percent < 0)
+        percent = 0;
+    if (percent > 100)
+        percent = 100;
+    gui_round_rect(win, r, r.h / 2, GUI_SUNKEN);
+    inside = gui_mkrc(r.x + 2, r.y + 2,
+                      ((r.w - 4) * percent) / 100, r.h - 4);
+    if (inside.w > 0)
+        gui_round_rect(win, inside, inside.h / 2, fill);
+    gui_round_frame(win, r, r.h / 2, GUI_BORDER);
+}
+
+void gui_badge(gui_window *win, gui_rc r, const char *text, uint32_t color)
+{
+    int tx;
+
+    if (!win || !text || r.w <= 0 || r.h <= 0)
+        return;
+    gui_round_rect(win, r, r.h / 2, gui_mix(color, GUI_SURFACE, 76));
+    gui_round_frame(win, r, r.h / 2, color);
+    tx = r.x + (r.w - gui_text_w(text)) / 2;
+    gui_clip(win, r);
+    gui_text(win, tx, r.y + (r.h - GUI_FONT_H) / 2, text, GUI_TEXT,
+             GUI_TRANSPARENT);
+    gui_unclip(win);
 }
 
 /* ------------------------------------------------------------------ menu */
@@ -577,12 +665,9 @@ int gui_menu(gui_window *win, gui_rc r, const char *title,
         !gui_hit(r, ui->down_x, ui->down_y))
         st->open = 0;
 
-    gui_rect(win, drop.x + 3, drop.y + 3, drop.w, drop.h,
-             gui_shade(GUI_BORDER, -40));
-    gui_rect(win, drop.x, drop.y, drop.w, drop.h, GUI_PANEL);
-    gui_frame(win, drop.x, drop.y, drop.w, drop.h, GUI_BORDER);
-    gui_bevel(win, gui_mkrc(drop.x + 1, drop.y + 1, drop.w - 2, drop.h - 2),
-              GUI_EDGE, gui_shade(GUI_PANEL, -20));
+    gui_shadow(win, drop, 7, gui_shade(GUI_BORDER, 10));
+    gui_round_rect(win, drop, 7, GUI_PANEL);
+    gui_round_frame(win, drop, 7, GUI_EDGE);
 
     st->hover = -1;
     for (i = 0; i < n; i++) {
@@ -591,7 +676,7 @@ int gui_menu(gui_window *win, gui_rc r, const char *title,
         uint32_t fg = GUI_TEXT;
 
         if (gui_hit(row, ui->mx, ui->my)) {
-            gui_rect(win, row.x, row.y, row.w, row.h, GUI_ACCENT_DARK);
+            gui_round_rect(win, row, 5, GUI_ACCENT_DARK);
             fg = GUI_WHITE;
             st->hover = i;
         }

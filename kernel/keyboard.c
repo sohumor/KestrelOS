@@ -21,7 +21,7 @@ static const char map_shift[0x40] = {
     '*', 0, ' ', 0,
 };
 
-static bool shift, ctrl, caps, ext;
+static bool shift, ctrl, alt, caps, ext;
 
 static void kbd_irq(struct regs *r)
 {
@@ -45,6 +45,15 @@ static void kbd_irq(struct regs *r)
             ctrl = !release;
             return;
         }
+        if (sc == 0x38) {
+            alt = !release;
+            return;
+        }
+        if (sc == 0x5B || sc == 0x5C) {
+            if (!release)
+                input_push(KEY_LAUNCHER);
+            return;
+        }
         if (release)
             return;
         switch (sc) {
@@ -65,11 +74,21 @@ static void kbd_irq(struct regs *r)
     switch (sc) {
     case 0x2A: case 0x36: shift = !release; return;
     case 0x1D: ctrl = !release; return;
+    case 0x38: alt = !release; return;
     case 0x3A: if (!release) caps = !caps; return;
     }
 
     if (release || sc >= 0x40)
         return;
+
+    if (alt && sc == 0x0F) {
+        input_push(KEY_WM_NEXT);
+        return;
+    }
+    if (alt && sc == 0x3E) {
+        input_push(KEY_WM_CLOSE);
+        return;
+    }
 
     char c = shift ? map_shift[sc] : map_normal[sc];
     if (!c)

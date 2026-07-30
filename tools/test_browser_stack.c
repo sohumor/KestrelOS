@@ -37,6 +37,7 @@
 /* Stop the host seam macros from affecting the shim implementations below. */
 #undef stat_
 #undef netinfo
+#undef cpuinfo
 #undef syscall
 
 #define TEST_STACK_BYTES (64UL * 1024UL)
@@ -69,6 +70,16 @@ int browser_host_netinfo(struct k_netinfo *out)
 {
     if (out)
         memset(out, 0, sizeof(*out));
+    return 0;
+}
+
+int browser_host_cpuinfo(struct k_cpuinfo *out)
+{
+    if (!out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    out->discovered = 4;
+    out->online = 4;
     return 0;
 }
 
@@ -408,7 +419,7 @@ static void *run_browser(void *opaque)
 
     if (strcmp(a->mode, "text") == 0) {
         char *argv[] = {
-            (char *)"browser", (char *)"-t", (char *)"-l",
+            (char *)"browser", (char *)"-t", (char *)"-l", (char *)"-v",
             (char *)a->path, 0
         };
 
@@ -416,7 +427,7 @@ static void *run_browser(void *opaque)
          * startup frames above this point.  The inaccessible lower guard
          * still protects the complete 64 KiB mapping. */
         a->entry_sp = current_stack_pointer();
-        a->rc = browser_program_main(4, argv);
+        a->rc = browser_program_main(5, argv);
     } else {
         char *argv[] = {
             (char *)"browser", (char *)a->path, 0
