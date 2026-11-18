@@ -1250,7 +1250,8 @@ static void pump_mouse(void)
 static void pump_keyboard(void)
 {
     for (int i = 0; i < 64; i++) {
-        int c = input_trygetc();
+        bool focused = (focus >= 0 && wins[focus].used && !wins[focus].dying);
+        int c = focused ? input_trygetc() : input_trygetc_wm_hotkey();
         if (c < 0)
             return;
         if (c == KEY_WM_NEXT) {
@@ -1867,15 +1868,10 @@ long wm_sys_list(uint64_t index, uint64_t uout)
     struct k_winsummary out;
     uint64_t seen = 0;
 
-    if (!user_range_ok((const void *)uout, sizeof(out)))
+    if (!user_range_ok((const void *)uout, sizeof(out)) || !current)
         return -1;
 
     wm_lock();
-    if (!caller_is_desktop()) {
-        wm_unlock();
-        return -1;
-    }
-
     for (int zi = nz - 1; zi >= 0; zi--) {
         struct window *win = &wins[zord[zi]];
 
@@ -1883,7 +1879,7 @@ long wm_sys_list(uint64_t index, uint64_t uout)
          * tasks. Only decorated application windows belong in the dock. */
         if (!win->used || win->dying ||
             (win->flags & (K_WIN_DESKTOP | K_WIN_NODECOR)) ||
-            win->uid != current->uid)
+            (win->uid != current->uid && current->uid != 0))
             continue;
         if (seen++ != index)
             continue;
@@ -1941,12 +1937,13 @@ long wm_sys_ctl(uint64_t wid, uint64_t action)
     int idx;
 
     wm_lock();
-    if (!caller_is_desktop() || !current) {
+    if (!current) {
         wm_unlock();
         return -1;
     }
     if (action == K_WIN_CTL_SWITCH_WS) {
-        if (wid >= K_WM_MAX_WORKSPACES) {
+        if (wid >= K_WM_MAX_WORKSPACES ||
+            (!caller_is_desktop() && current->uid != 0 && !wm_active())) {
             wm_unlock();
             return -1;
         }
@@ -1960,7 +1957,7 @@ long wm_sys_ctl(uint64_t wid, uint64_t action)
     }
     win = &wins[wid];
     if (!win->used || win->dying || (win->flags & K_WIN_DESKTOP) ||
-        win->uid != current->uid) {
+        (win->uid != current->uid && current->uid != 0)) {
         wm_unlock();
         return -1;
     }

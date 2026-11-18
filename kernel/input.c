@@ -46,6 +46,23 @@ int input_trygetc(void)
     return c;
 }
 
+int input_trygetc_wm_hotkey(void)
+{
+    uint64_t flags = spin_lock_irqsave(&input_lock);
+    if (head == tail) {
+        spin_unlock_irqrestore(&input_lock, flags);
+        return -1;
+    }
+    uint8_t c = buf[tail];
+    if (c < KEY_WM_NEXT || c > KEY_WM_WS4) {
+        spin_unlock_irqrestore(&input_lock, flags);
+        return -1;
+    }
+    tail = (tail + 1) % BUFSZ;
+    spin_unlock_irqrestore(&input_lock, flags);
+    return c;
+}
+
 int input_getc(void)
 {
     for (;;) {

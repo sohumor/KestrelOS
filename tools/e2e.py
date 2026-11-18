@@ -2392,6 +2392,24 @@ def t_talon_cli(h):
     wait_prompt(h)
 
 
+def t_inspect_cli(h):
+    h.send('inspect -r procs | where "name == init" | pick name,state')
+    h.expect(r"\ninit\s+\S+\n", regex=True)
+    wait_prompt(h)
+    h.send("inspect fs:/bin/kjs")
+    h.expect("/bin/kjs")
+    h.expect("file")
+    wait_prompt(h)
+
+
+def t_kjs_cli(h):
+    h.send('kjs -e "var m = Kestrel.memInfo(); '
+           "Kestrel.parcelPut('text', 'kjs', 'JS-OK-' + (m.totalKb > 0)); "
+           'print(Kestrel.parcelGet(0).text);"')
+    h.expect("\nJS-OK-true\n", regex=True)
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("login", t_login),
@@ -2433,6 +2451,8 @@ TESTS = [
     ("pipe", t_pipe),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
+    ("inspect-cli", t_inspect_cli),
+    ("kjs-cli", t_kjs_cli),
     ("dev", t_dev),
     ("dmesg", t_dmesg),
     ("service-list", t_service_list),

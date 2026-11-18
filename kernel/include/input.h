@@ -16,8 +16,13 @@
 #define KEY_WM_NEXT  0x89
 #define KEY_WM_CLOSE 0x8A
 #define KEY_LAUNCHER 0x8B
+#define KEY_WM_WS1   0x8C
+#define KEY_WM_WS2   0x8D
+#define KEY_WM_WS3   0x8E
+#define KEY_WM_WS4   0x8F
 
 void input_push(uint8_t c);
 bool input_available(void);
-int  input_getc(void);         /* blocking */
-int  input_trygetc(void);      /* -1 if empty */
+int  input_getc(void);               /* blocking */
+int  input_trygetc(void);            /* -1 if empty */
+int  input_trygetc_wm_hotkey(void);  /* consume only if next is WM hotkey */

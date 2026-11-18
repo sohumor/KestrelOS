@@ -376,6 +376,10 @@ def build_all(tc):
             deps = [obj, crt0, libc_a, libgui_a, lib_archives["libtls"], user_ld]
             cmd = [tc["ld"], "-nostdlib", "-z", "max-page-size=0x1000", "-T", user_ld, "-o", out,
                    crt0, obj, libgui_a, lib_archives["libtls"], libc_a]
+        elif name == "kjs":
+            deps = [obj, crt0, libc_a, libgui_a, lib_archives["libjs"], user_ld]
+            cmd = [tc["ld"], "-nostdlib", "-z", "max-page-size=0x1000", "-T", user_ld, "-o", out,
+                   crt0, obj, lib_archives["libjs"], libgui_a, libc_a]
         elif name in HTTP_TLS_APPS:
             deps = [obj, crt0, libc_a, libgui_a, lib_archives["libtls"], user_ld]
             cmd = [tc["ld"], "-nostdlib", "-z", "max-page-size=0x1000", "-T", user_ld, "-o", out,

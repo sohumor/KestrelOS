@@ -227,6 +227,12 @@ static void format_core(struct fmt_sink *s, const char *fmt, va_list ap)
             sink_num(s, v, 10, 0, 0, width, zero, left);
             break;
         }
+        case 'o': {
+            unsigned long long v = longs ? va_arg(ap, unsigned long long)
+                                         : (unsigned long long)va_arg(ap, unsigned int);
+            sink_num(s, v, 8, 0, 0, width, zero, left);
+            break;
+        }
         case 'x':
         case 'X': {
             unsigned long long v = longs ? va_arg(ap, unsigned long long)

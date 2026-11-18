@@ -236,6 +236,12 @@ $(BUILD)/apps/tlstest: $(BUILD)/apps/tlstest.o $(CRT0) $(LIBC_A) \
 	$(USER_LINK) $(CRT0) $(BUILD)/apps/tlstest.o $(LIBGUI_A) \
 	  $(BUILD)/libtls.a $(LIBC_A)
 
+# kjs links libjs for CLI and immediate-mode native GUI JS scripting.
+$(BUILD)/apps/kjs: $(BUILD)/apps/kjs.o $(CRT0) $(LIBC_A) \
+                   $(LIBGUI_A) $(BUILD)/libjs.a apps/user.ld
+	$(USER_LINK) $(CRT0) $(BUILD)/apps/kjs.o $(BUILD)/libjs.a \
+	  $(LIBGUI_A) $(LIBC_A)
+
 # libc/http.c supports both TCP and verified TLS. These clients pull that
 # object from libc.a, so resolve the intentional libc<->libtls references
 # as one archive group.
