@@ -87,11 +87,16 @@ The shell provides:
 - per-user preferences (root's defaults live in `/etc/desktop.conf`);
 - transient notifications and keyboard task switching with `Alt-Tab`/`Alt-F4`.
 
-The graphical suite includes Settings, System Monitor (`sysmon`), Calculator
-(`gcalc`), Terminal (`terminal`), Files (`gfiles`), Clock (`gclock`), Paint
-(`gpaint`), Notes (`notes`), Sight (`sight`), About (`about`), and Kestrel
-Browser (`browser`). All use `libgui` 2.0 and adopt `SYS_WM_THEME` / `KEV_THEME`
-updates immediately without polling config files or restarting.
+The graphical suite includes Settings, System Monitor (`sysmon`, adding a 4th
+**Flight Deck** tab with `Events`, `Sockets`, and `Caps & Parcels` sub-views
+backed by `/dev/flight`, `/dev/sockets`, `/dev/caps`, and `/dev/parcels`
+`@krec` tables), Calculator (`gcalc`), Terminal (`terminal`), Files (`gfiles`),
+Clock (`gclock`), Paint (`gpaint`), Notes (`notes`), Sight (`sight`), About
+(`about`), and Kestrel Browser (`browser`, with 16x16 tab favicons, `Ctrl-U`
+`view-source:`, per-tab zoom `90%`–`150%`, `/home/.browser_session` restore,
+interactive `<details>`/`<dialog>`, Web Crypto, Canvas `ImageData`/gradients,
+and `/doc/flightdeck.html`). All use `libgui` 2.0 and adopt `SYS_WM_THEME` /
+`KEV_THEME` updates immediately without polling config files or restarting.
 
 Window resize support uses `SYS_WIN_RESIZE` (77), which reallocates/remaps the
 window's shared pixel backing in `kernel/wm.c` up to `USER_WIN_STRIDE` (16 MiB)
@@ -104,8 +109,9 @@ When multi-user permissions arrived in KFS v2, the inode shrank the direct block
 table from 12 entries to 10 to fit `uid`/`gid`/`mode`/`mtime` while bumping
 the superblock magic so older images are cleanly rejected rather than misread.
 KFS v3 (`KFS3`, `0x3353464B`) extends the on-disk format further with a
-checksummed 33-block full-data and metadata redo journal and atomic cross-directory
-`SYS_RENAME` (71).
+checksummed 33-block full-data and metadata redo journal, recursive FIFO ticket
+mutex (`fs_lock` in `kernel/kfs.c`) serialization for multi-CPU fairness, and
+atomic cross-directory `SYS_RENAME` (71).
 
 Permission checks live in the VFS, not in KFS: the filesystem stores the
 metadata, the VFS enforces it against the calling task's credentials, and root
@@ -132,14 +138,19 @@ and Canvas 2D surface rendered into a window by our own compositor. That is what
 
 ## Deliberately bounded
 
-The implementation now includes xAPIC SMP, demand paging with a dynamically sized
-raw swap extent (`SWAP_MAX_PAGES` = 4096 past KFS superblock), Kernel Pulses,
-Talon typed clipboard parcels, capability-scoped process spawn and monotonic
-sandboxing (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`), traditional signals, a dynamic
-linker, KFS v3 data+metadata journaling and atomic rename, live window resize and
-theme broadcasting, TCP out-of-order reassembly + SACK, verified 128-SAN TLS 1.3,
-and a kernel ChaCha20 CSPRNG. Its boundaries remain intentional: legacy-PIC IRQ
-routing is BSP-centric, the scheduler uses one global run queue, the dynamic
-loader accepts only Kestrel's supported ABI/relocations, KFS transactions are
-capped at 32 blocks (+1 commit block), networking is IPv4-only, and none of the
-security code has had a professional audit.
+The implementation now includes xAPIC SMP (`proc_mark_current_idle()` for BSP
+idle accounting), demand paging with a dynamically sized raw swap extent
+(`SWAP_MAX_PAGES` = 4096 past KFS superblock), Kernel Pulses, Talon typed
+clipboard parcels, Avionics Flight Recorder (`/dev/flight` + `/bin/flight`),
+Aerie live `@krec` kernel tables (`/dev/procs`, `/dev/sockets`, `/dev/caps`,
+`/dev/parcels`), Wave 9 DNS TTL cache and network `@krec` telemetry
+(`/dev/net`, `/dev/arp`, `/dev/dns` consumed by `/bin/netstat`), capability-scoped
+process spawn and monotonic sandboxing (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`),
+traditional signals, a dynamic linker, KFS v3 data+metadata journaling and
+atomic rename, live window resize and theme broadcasting, TCP out-of-order
+reassembly + SACK, verified 128-SAN TLS 1.3, and a kernel ChaCha20 CSPRNG. Its
+boundaries remain intentional: legacy-PIC IRQ routing is BSP-centric, the
+scheduler uses one global run queue, the dynamic loader accepts only Kestrel's
+supported ABI/relocations, KFS transactions are capped at 32 blocks (+1 commit
+block), networking is IPv4-only, and none of the security code has had a
+professional audit.

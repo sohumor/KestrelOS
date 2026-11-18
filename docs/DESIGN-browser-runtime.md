@@ -38,14 +38,15 @@ browser_runtime
 
 browser_tab
   +-- history stack, address buffer, scroll/focus/hover/active/reader state
+  +-- per-tab zoom_pct (90/100/125/150%), favicon_url, 16-entry LRU favicon cache on bstate
   +-- console log ring (CONSOLE_LOG_MAX) + network log ring (NET_LOG_MAX)
   `-- active browser_page
-        +-- URL/base URL and response metadata
-        +-- DOM document (including <canvas> pixel buffers)
+        +-- URL/base URL (incl. view-source: wrapper) and response metadata
+        +-- DOM document (including <canvas> pixel buffers & <details>/<dialog>)
         +-- author stylesheet + computed style engine
         +-- layout document + flat paint order
         +-- JavaScript/DOM realm (ES6+ libjs + jsdom)
-        `-- decoded image resources
+        `-- decoded image resources (libimg: PNG/GIF/BMP/JPEG/ICO/CUR/SVG/QOI/Netpbm)
 ```
 
 The page receives references to runtime and host services through
@@ -140,13 +141,16 @@ origin/key/value strings, and its versioned percent-escaped persistence format
 is imported transactionally.
 
 The separate `libjs/webapi.c` module operates directly on owned byte spans.
-Text codecs consume `ArrayBuffer`/`Uint8Array` views without intermediate
-number arrays. `URLSearchParams` uses one dense JavaScript array with
-alternating key/value entries, preserving order while keeping lookup,
-mutation, sorting, and serialization as bounded procedural passes.
-`URL` owns a parsed URL record and composes it with one live parameter object;
-snapshot comparison synchronizes changes without introducing inheritance or a
-second query representation.
+Text codecs consume `ArrayBuffer`/TypedArray views without intermediate number
+arrays, and `libjs/builtin.c` backs `Int8Array`, `Uint8Array`,
+`Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`,
+`Float32Array`, `Float64Array`, and `DataView` over shared `ArrayBuffer` byte
+slices, along with `structuredClone()` cycle tracking (`sc_map`). `URLSearchParams`
+uses one dense JavaScript array with alternating key/value entries, preserving
+order while keeping lookup, mutation, sorting, and serialization as bounded
+procedural passes. `URL` owns a parsed URL record and composes it with one live
+parameter object; snapshot comparison synchronizes changes without introducing
+inheritance or a second query representation.
 
 Fetch header sets use a compact fixed-capacity table of unique normalized
 names and owned values. Script-created sets and response wrappers share the
@@ -158,9 +162,12 @@ same-origin, cookie, credentialed-CORS, and redirect decisions at transport time
 bodies; `FileReader` and Blob object URLs tie directly into the per-realm task
 and registry lifecycle.
 
-Web `crypto` fills mutable typed-array views through OS `getrandom()` (backed by
-the SHA-256 entropy pool and ChaCha20 CSPRNG) and shares the TLS SHA-256/384/512
-primitives for `crypto.subtle.digest()`. `navigator.hardwareConcurrency` reads
+Web `crypto` (`libjs/crypto.c`) is completely self-contained so `libjs` builds
+standalone without `libtls`: it implements circular 16-word-schedule FIPS 180-4
+SHA-1/256/384/512 for `crypto.subtle.digest()`, RFC 4122 v4 `randomUUID()`, and
+`getRandomValues()`, delegating entropy generation through an optional
+`js_config.random_bytes` hook wired in `jsdom.c` to OS `getrandom()` (backed by
+the SHA-256 entropy pool and ChaCha20 CSPRNG). `navigator.hardwareConcurrency` reads
 from `SYS_CPUINFO`. `navigator.clipboard` delegates `writeText()` / `readText()`
 through the `clipboard_write` / `clipboard_read` seams in `struct jsdom_config`
 (falling back to an internal realm clipboard buffer in headless host tests).
@@ -168,26 +175,36 @@ through the `clipboard_write` / `clipboard_read` seams in `struct jsdom_config`
 `matchMedia()` and stylesheet `@media` evaluation share the CSS parser's bounded
 media-query evaluator (`width`/`height` ranges, `prefers-color-scheme`,
 `scripting`). Custom property (`--*`) inheritance, recursive-descent
-`calc()`/`min()`/`max()`/`clamp()`, `light-dark()`, `box-shadow`, and
-`linear-gradient()` resolve procedurally during style computation without
-floating-point dependencies.
+`calc()`/`min()`/`max()`/`clamp()`, `light-dark()`, `box-shadow`, `outline`,
+`aspect-ratio`, `object-fit`, `text-overflow: ellipsis`, 2D `transform`
+(`translate`/`scale`), and `linear-gradient()` resolve procedurally during style
+computation and layout without floating-point dependencies.
 
 Flex and Grid layout operate over flat item arrays rather than polymorphic layout
 objects: Flex computes row/column wrapping, `flex-grow`, `flex-shrink`,
-`flex-basis`, `align-items: baseline`, and gaps; Grid computes explicit/fraction
-(`fr`) / `repeat()` / `minmax()` tracks and item placements. `position: sticky`
+`flex-basis`, `align-items: baseline`, `align-self`, `order`, and gaps; Grid
+computes explicit/fraction (`fr`) / `repeat()` / `minmax()` column and
+`grid-template-rows` tracks and item placements. `position: sticky`
 offsets are evaluated against scrolled viewport coordinates using the shared
 box tree, and `lay_paint_order()` feeds both `libweb/paint.c` (anti-aliased
-rounded corners, gradients, inset/outer shadows, multi-subpath SVG, `<canvas>`
-bitmaps) and `lay_hit_test_view()`.
+rounded corners, gradients, inset/outer shadows, `outline`, `object-fit`
+replaced image crops, multi-subpath SVG, `<canvas>` bitmaps) and
+`lay_hit_test_view()`.
 
 Software `<canvas>` 2D backing stores (`struct dom_canvas` attached directly to
 `HTAG_CANVAS` DOM nodes) stay decoupled from layout: `canvas_2d_state` tracks
-affine transform stacks, polygon/arc path arrays, styles, and font state,
-rasterizes into bounded RGBA buffers (`JSDOM_CANVAS_MAX_DIM = 2048`), marks
-the DOM dirty on draw, and serializes uncompressed RGBA PNGs for
-`toDataURL('image/png')`. Layout and `paint.c` blit the resulting bitmap
-whenever present.
+affine transform stacks, polygon/arc path arrays, `CanvasGradient`
+(`createLinearGradient`/`createRadialGradient`), styles, and font state,
+rasterizes into bounded RGBA buffers (`JSDOM_CANVAS_MAX_DIM = 2048`), supports
+`ImageData` (`new ImageData(...)`, `createImageData`, `getImageData`,
+`putImageData` with dirty-rect compositing), marks the DOM dirty on draw, and
+serializes uncompressed RGBA PNGs for `toDataURL('image/png')`. Layout and
+`paint.c` blit the resulting bitmap whenever present.
+
+GUI session state (`/home/.browser_session`) records open tab URLs, per-tab
+zoom (`90%`/`100%`/`125%`/`150%`), and the active tab index when launched
+without an explicit CLI URL, while clicking `<details> > summary` toggles `[open]`
+in the DOM and triggers restyle/relayout.
 
 `DOMParser` parses HTML, SVG, or XML strings directly via `html_parse_document()`
 into standalone documents; `<template>` elements retain inert parsed contents in

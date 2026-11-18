@@ -25,8 +25,8 @@ The major components are:
 | `libweb/css.c`, `style.c` | selectors, cascade, `@media` queries, `--*` custom properties, `calc()`/`light-dark()`, computed values |
 | `libweb/layout.c`, `paint.c` | Grid, Flexbox, tables, floats, sticky/fixed positioning, controls, gradients/shadows/AA corners, SVG & Canvas painting |
 | `libweb/http.c`, `cache.c`, `cookie.c` | HTTP/1.1 Keep-Alive connection pool, redirects, compression, cache, cookies |
-| `libweb/jsdom.c`, `libweb/storage.c`, `libjs/` | ES6+ JavaScript, Canvas 2D, `DOMParser`, observers, geometry, clipboard, origin storage, bounded WebAssembly, and live DOM bindings |
-| `libimg/` | PNG, GIF, baseline and progressive (`SOF2`) JPEG, and BMP decoding |
+| `libweb/jsdom.c`, `libweb/storage.c`, `libjs/` | ES6+ JavaScript (`libjs/crypto.c` SHA-1/256/384/512, TypedArrays + `DataView`, `URL`, `structuredClone`, `AbortController`, `Blob`/`FormData`), Canvas 2D (`CanvasGradient`, `ImageData`), `DOMParser`, observers, geometry, clipboard, origin storage, bounded WebAssembly, and live DOM bindings |
+| `libimg/` | PNG, GIF, baseline and progressive (`SOF2`) JPEG, BMP, ICO/CUR (PNG + 1/4/8/24/32-bpp DIB), standalone fixed-point SVG rasterizer, QOI, and Netpbm (`P1`–`P6`) decoding |
 | `libtls/` | verified TLS 1.3 and X.509 (up to 128 SANs) |
 
 All response bodies and subresources have hard memory, nesting, execution,
@@ -41,8 +41,10 @@ asynchronous work use explicit bounded state machines.
 
 ## Navigation and networking
 
-The browser accepts `file:`, `http:`, and `https:` URLs. A bare hostname is
-treated as HTTP and an existing path is treated as a local file.
+The browser accepts `file:`, `http:`, `https:`, and `view-source:` URLs (where
+`view-source:<url>` fetches the inner `file:`, `http:`, or `https:` resource
+and renders HTML-escaped, line-numbered source). A bare hostname is treated as
+HTTP and an existing path is treated as a local file.
 
 Network navigation supports:
 
@@ -55,7 +57,9 @@ Network navigation supports:
 - verified TLS 1.3, SNI, hostname validation (up to `X509_MAX_SAN` = 128 SANs),
   and trusted roots;
 - linked stylesheets, recursive bounded `@import`, scripts, and images
-  (including PNG, GIF, BMP, and baseline/progressive `SOF2` JPEG);
+  (`Accept: image/png,image/jpeg,image/gif,image/bmp,image/svg+xml,image/x-icon,*/*;q=0.5`,
+  covering PNG, GIF, BMP, baseline/progressive `SOF2` JPEG, ICO/CUR, SVG, QOI,
+  and Netpbm `P1`–`P6`);
 - relative resource URLs, `<base href>`, and CSS URLs relative to their
   stylesheet response URL;
 - mixed-content blocking on HTTPS pages.
@@ -92,49 +96,61 @@ The CSS engine implements:
 - `color-scheme` and `light-dark()` color selection;
 - `@media` width/height range queries (`min-width`, `max-width`, comparisons),
   `prefers-color-scheme`, and `scripting` queries;
-- **CSS Grid** (`display: grid` / `inline-grid`, `grid-template-columns` with
-  `fr`, fixed/percent lengths, `repeat()`, `minmax()`, explicit column/row lines
-  and spans, and `gap`/`row-gap`/`column-gap`);
+- **CSS Grid** (`display: grid` / `inline-grid`, `grid-template-columns` and
+  `grid-template-rows` with `fr`, fixed/percent lengths, `repeat()`, `minmax()`,
+  explicit column/row lines and spans, `order`, and `gap`/`row-gap`/`column-gap`);
 - **Flexbox** (`row`, `row-reverse`, `column`, `column-reverse`, `flex-wrap`,
   `flex-grow`, `flex-shrink`, `flex-basis`, `justify-content`, `align-items`
-  including `baseline`, and gaps);
-- the box model, typography, `opacity`, anti-aliased `border-radius` with
-  rounded clipping, outer and inset `box-shadow`, `linear-gradient()`,
-  backgrounds, borders, lists, automatic and fixed tables with spans, floats,
-  overflow, and `relative`/`absolute`/`fixed`/`sticky` positioning with z-order.
+  including `baseline`, `align-self`, `order`, and gaps);
+- the box model, `aspect-ratio`, `object-fit` (`fill`, `contain`, `cover`,
+  `none`, `scale-down`), `outline` (`outline-width`, `outline-style`,
+  `outline-color`, `outline-offset`), typography (`letter-spacing`, `word-break`,
+  `overflow-wrap` / `word-wrap`, `text-overflow: ellipsis`), 2D `transform`
+  (`translate`, `translateX`, `translateY`, `translate3d`, `scale`, `scaleX`,
+  `scaleY`), `opacity`, anti-aliased `border-radius` with rounded clipping,
+  outer and inset `box-shadow`, `linear-gradient()`, backgrounds, borders, lists,
+  automatic and fixed tables with spans, floats, overflow, `<details>`/`<summary>`
+  and `<dialog[open]>` UA rules, and `relative`/`absolute`/`fixed`/`sticky`
+  positioning with z-order.
 
 Painting supports alpha compositing against the framebuffer, image scaling,
 form controls, selection/caret hooks, hover/active updates, dirty rectangles,
 and compositing software `<canvas>` bitmaps.
 
-Inline SVG has a bounded vector painter for nested groups, `rect`, `line`,
+Inline `<svg>` has a bounded vector painter for nested groups, `rect`, `line`,
 `circle`, `ellipse`, `polygon`, `polyline`, and text, with `viewBox` scaling,
 `preserveAspectRatio` modes (`none`, alignments, `meet`/`slice`), `currentColor`,
 opacity, and presentation `fill`, `stroke`, and `stroke-width` attributes.
 Multi-subpath paths accept `M/m`, `L/l`, `H/h`, `V/v`, `Q/q`, `T/t`, `C/c`,
 `S/s`, `A/a`, and `Z/z`; quadratic/cubic/smooth curves are flattened cleanly,
-while `A/a` elliptical-arc commands currently use an endpoint straight-segment
-fallback. Coordinates, point counts, shapes, recursion, path flattening, raster
-pixels, and total raster work are capped. SVG transforms, filter effects, masks,
-vector gradients, animation, and external SVG resources are not implemented.
+while inline `<svg>` `A/a` elliptical-arc commands currently use an endpoint
+straight-segment fallback. Standalone SVG images (`<img>` or `data:image/svg+xml`)
+are rasterized by `libimg/svg_img.c`, which supports `transform` (`translate`,
+`scale`, `rotate`, `matrix`) and elliptical arcs. Coordinates, point counts,
+shapes, recursion, path flattening, raster pixels, and total raster work are
+capped. Inline `<svg>` vector gradients, CSS-style inline SVG transforms,
+filter effects, masks, and animation remain unimplemented.
 
 `<canvas>` provides a software 2D rendering context (`getContext('2d')`) capped
 at `2048` px per dimension (`4 MiB` total pixels per canvas): `save`/`restore`,
 affine transforms (`translate`, `scale`, `rotate`, `transform`, `setTransform`,
 `resetTransform`), `fillStyle`/`strokeStyle`/`lineWidth`/`globalAlpha`/`font`,
-`fillRect`/`strokeRect`/`clearRect`, path drawing (`beginPath`, `closePath`,
-`moveTo`, `lineTo`, `rect`, `arc`, `quadraticCurveTo`, `bezierCurveTo`, `fill`,
-`stroke`), `fillText`/`strokeText`/`measureText`, `ImageData` pixel
-manipulation (`createImageData`, `getImageData`, `putImageData`), and
-uncompressed RGBA PNG serialization via `toDataURL('image/png')`.
+`CanvasGradient` (`createLinearGradient`, `createRadialGradient`, and
+`addColorStop`), `fillRect`/`strokeRect`/`clearRect`, path drawing
+(`beginPath`, `closePath`, `moveTo`, `lineTo`, `rect`, `arc`,
+`quadraticCurveTo`, `bezierCurveTo`, `fill`, `stroke`),
+`fillText`/`strokeText`/`measureText`, `ImageData` pixel manipulation
+(`new ImageData(...)` overloads, `createImageData`, `getImageData`,
+`putImageData` with dirty-rect compositing), and uncompressed RGBA PNG
+serialization via `toDataURL('image/png')`.
 
 `<video poster>` uses the ordinary bounded image pipeline, and video without a
 usable poster and `<audio>` receive readable fallback boxes. There are no
 audio/video codecs, demuxers, streaming buffers, controls, or playback.
 
 The framebuffer uses built-in bitmap fonts. Complex text shaping,
-downloadable webfonts (including WOFF/WOFF2), CSS transforms, and CSS filters
-are not provided.
+downloadable webfonts (including WOFF/WOFF2), rotation/skew/3D CSS transforms,
+CSS transitions/animations, and CSS filters are not provided.
 
 ## JavaScript and DOM
 
@@ -184,23 +200,28 @@ page realm is region-allocated and freed as a unit, weak entries share the realm
 lifetime rather than participating in tracing-GC ephemeron collection.
 
 Common static compatibility helpers include `Object.assign()`, `Object.is()`,
-`Object.values()`, `Object.entries()`, `Object.fromEntries()`,
+`Object.hasOwn()`, `Object.values()`, `Object.entries()`, `Object.fromEntries()`,
 `Object.freeze()`, `Object.seal()`, `Object.isFrozen()`, `Object.isSealed()`,
-`Array.from()`, `Array.of()`, strict
-`Number.isFinite()`/`isNaN()`/`isInteger()`/`isSafeInteger()`, Number parsing
-aliases, and safe-integer/`EPSILON` constants.
+`Array.from()`, `Array.of()`, `structuredClone()` (preserving cyclic object
+references and `ArrayBuffer`s), strict `Number.isFinite()`/`isNaN()`/`isInteger()`/
+`isSafeInteger()`, Number parsing aliases, and safe-integer/`EPSILON` constants.
 
-Common prototype helpers include SameValueZero `Array.includes()`, callback-
-based `find()`/`findIndex()`, `flat()`/`flatMap()`, and String `includes()`,
+Common prototype helpers include SameValueZero `Array.includes()`, `.at()`
+(on `Array` and `String`), callback-based `find()`/`findIndex()`/`findLast()`/
+`findLastIndex()`, non-mutating `toReversed()`/`toSorted()`/`toSpliced()`/`with()`,
+`flat()`/`flatMap()`, `RegExp.prototype.flags`, and String `includes()`,
 `startsWith()`, `endsWith()`, `repeat()`, `padStart()`, `padEnd()`,
 `replaceAll()`, and start/end trim aliases. Repetition and padding are capped at
 1 MiB results, and flattening is capped at depth 32 and one million result
 elements. String indexing follows the interpreter's byte-string model.
 
-`queueMicrotask()` feeds the bounded Promise job queue. `ArrayBuffer` and
-`Uint8Array` views support indexed byte access, `set`, `subarray`, `slice`, and
-`fill` with shared backing buffers. Other typed arrays (`Int32Array`, etc.),
-`DataView`, shared memory, atomics, and resizable buffers are not implemented.
+`queueMicrotask()` feeds the bounded Promise job queue. `ArrayBuffer`
+(`isView`, `prototype.slice`), all 9 TypedArray types (`Int8Array`, `Uint8Array`,
+`Uint8ClampedArray`, `Int16Array`, `Uint16Array`, `Int32Array`, `Uint32Array`,
+`Float32Array`, `Float64Array`), and `DataView` (16 big/little-endian getters
+and setters with `RangeError` bounds checks) support shared backing buffers.
+`BigInt64Array`/`BigUint64Array`, shared memory (`SharedArrayBuffer`), atomics,
+and resizable buffers are not implemented.
 
 `TextEncoder` produces UTF-8 `Uint8Array` data with bounded `encodeInto()`.
 `TextDecoder` accepts `ArrayBuffer` or `Uint8Array`, strips a leading UTF-8 BOM
@@ -296,11 +317,11 @@ GET and POST supported. Script handlers can cancel submission with
 The graphical controls in `apps/browser.c` support up to 8 tabs and live
 Avionics desktop integration:
 
-- clickable tab bar with tab titles, `[x]` close, and `[+]` new tab (`Ctrl-T` new tab, `Ctrl-W` close tab, `Ctrl-N` / `Ctrl-P` next/previous tab);
-- click links, buttons, and form controls, with clickable `<select>` dropdown menus and `<input>` / `<textarea>` Talon clipboard (`Ctrl-C` / `Ctrl-V`) + caret editing;
+- clickable tab bar with 16x16 tab favicons (16-entry LRU cache using `<link rel="icon|shortcut icon">` or HTTP(S) `/favicon.ico` fallback via `img_decode`/`img_scale`), tab titles, `[x]` close, and `[+]` new tab (`Ctrl-T` new tab, `Ctrl-W` close tab, `Ctrl-N` / `Ctrl-P` next/previous tab);
+- click links, buttons, `<details>`/`<summary>` disclosures (toggling `[open]` and reflowing), and form controls, with clickable `<select>` dropdown menus and `<input>` / `<textarea>` Talon clipboard (`Ctrl-C` / `Ctrl-V`) + caret editing;
 - hovered link URL preview in the bottom status bar and dynamic `:hover` / `:active` / `:focus` styling;
-- Back (`Ctrl-B`), Fwd (`Ctrl-E`), Reload (`Ctrl-R`), Star (`Ctrl-D` persistent `/home/.browser_bookmarks` bar), `Pin` (copy URL to Talon shelf), Reader (`Ctrl-O` distraction-free Reader Mode and local `.md` Markdown rendering), Find (`Ctrl-F` / `Ctrl-G` match search), and Dev (`Ctrl-K` bottom Web Inspector drawer with Elements tree, interactive Console REPL, and Network request waterfall);
-- `Ctrl-L` to focus the address bar, `Ctrl-U` to clear, arrows / Page Up / Page Down / Home / End / Space / mouse wheel to scroll, live `KEV_RESIZE` and `KEV_THEME` updates, binary/`<a download>` saves to `/home/Downloads/`, and `Ctrl-Q` to quit.
+- Back (`Ctrl-B`), Fwd (`Ctrl-E`), Reload (`Ctrl-R`), Star (`Ctrl-D` persistent `/home/.browser_bookmarks` bar), `Pin` (copy URL to Talon shelf), Reader (`Ctrl-O` distraction-free Reader Mode and local `.md` Markdown rendering), Zoom toolbar pill (`90%` / `100%` / `125%` / `150%`, or `0` / `+`/`=` / `-`/`_` keys outside inputs), Find (`Ctrl-F` / `Ctrl-G` match search), and Dev (`Ctrl-K` bottom Web Inspector drawer with `Elements` tree, interactive `Console` REPL, and `Network` request waterfall);
+- `Ctrl-L` to focus the address bar; `Ctrl-U` clears the active line input when editing the address bar, Console REPL, or Find bar, or opens `view-source:<current_url>` in a new tab (or current tab when all 8 tabs are open) when browsing; `Esc` closes dropdowns/inputs/Find; arrows / Page Up / Page Down / Home / End / Space / mouse wheel scroll; live `KEV_RESIZE` and `KEV_THEME` updates; GUI session persistence in `/home/.browser_session` (restored when launched without an explicit URL); binary/`<a download>` saves to `/home/Downloads/`; and `Ctrl-Q` to quit.
 
 ## Text mode
 
@@ -311,18 +332,18 @@ browser [-t] [-w columns] [-l] [-v] <url|file>
 `-t` runs the same fetch, HTML, CSS, script, DOM, and layout pipeline and
 projects the resulting layout to the terminal. `-l` lists resolved links and
 `-v` prints the final URL, status, size, lifecycle state, and title. Local start
-pages include `/doc/home.html` and the interactive `/doc/playground.html`
-Web Capabilities showcase.
+pages include `/doc/home.html`, `/doc/playground.html`, and the offline
+`/doc/flightdeck.html` SPA diagnostics showcase.
 
 ## Testing
 
 The browser has four complementary validation layers:
 
-- `python3 tools/build.py test-host` builds and runs the 12 host C suites
+- `python3 tools/build.py test-host` builds and runs the 13 host C suites
   (`test_random_core`, `test_tcp_reassembly`, `test_net_checksum`,
-  `test_gui_primitives`, `test_cryptosym`, `test_jpeg_prog`, `test_js`,
-  `test_dom`, `test_css`, `test_font`, `test_layout`, `test_jsdom`) plus
-  `kfsck.py` and `test_kfs_journal.py`;
+  `test_gui_primitives`, `test_cryptosym`, `test_jpeg_prog`,
+  `test_img_formats`, `test_js`, `test_dom`, `test_css`, `test_font`,
+  `test_layout`, `test_jsdom`) plus `kfsck.py` and `test_kfs_journal.py`;
 - `tools/run-jsdom-tests.sh` tests live DOM mutation, Canvas 2D, `DOMParser`,
   observers, geometry, selectors, events, timers, Promise/async jobs, Web
   Storage, fetch, WebAssembly, and navigation;
