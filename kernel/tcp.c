@@ -1191,3 +1191,89 @@ int tcp_close(int handle)
     }
     return 0;
 }
+
+struct tcp_snap_row {
+    int slot;
+    int pid;
+    int state;
+    uint16_t local_port;
+    uint16_t peer_port;
+    uint32_t peer_ip;
+    int rx_bytes;
+    int tx_bytes;
+};
+
+static const char *tcp_state_name(int st)
+{
+    switch (st) {
+    case TCP_CLOSED:      return "CLOSED";
+    case TCP_SYN_SENT:    return "SYN_SENT";
+    case TCP_ESTABLISHED: return "ESTABLISHED";
+    case TCP_FIN_WAIT_1:  return "FIN_WAIT_1";
+    case TCP_FIN_WAIT_2:  return "FIN_WAIT_2";
+    case TCP_CLOSE_WAIT:  return "CLOSE_WAIT";
+    case TCP_LAST_ACK:    return "LAST_ACK";
+    case TCP_TIME_WAIT:   return "TIME_WAIT";
+    default:              return "UNKNOWN";
+    }
+}
+
+uint32_t tcp_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+    struct tcp_snap_row snap[TCP_CONNS];
+    int n = 0;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec slot:int pid:int state:str local_port:int peer_ip:str peer_port:int rx_bytes:int tx_bytes:int\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
+    for (int i = 0; i < TCP_CONNS; i++) {
+        const struct tcp_conn *c = &conns[i];
+        if (!c->used)
+            continue;
+        snap[n].slot = i;
+        snap[n].pid = c->owner_pid;
+        snap[n].state = c->state;
+        snap[n].local_port = c->local_port;
+        snap[n].peer_port = c->peer_port;
+        snap[n].peer_ip = c->peer_ip;
+        snap[n].rx_bytes = c->rx_len;
+        snap[n].tx_bytes = c->tx_len;
+        n++;
+    }
+    spin_unlock_irqrestore(&tcp_lock, f);
+
+    for (int i = 0; i < n; i++) {
+        uint32_t mark = b.len;
+        krec_kbuf_put_i64(&b, snap[i].slot);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, snap[i].pid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_puts(&b, tcp_state_name(snap[i].state));
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, snap[i].local_port);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_ip4(&b, snap[i].peer_ip);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, snap[i].peer_port);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, snap[i].rx_bytes);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, snap[i].tx_bytes);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow) {
+            b.len = mark;
+            break;
+        }
+    }
+
+    return krec_kbuf_finish(&b);
+}

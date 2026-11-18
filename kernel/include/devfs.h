@@ -33,6 +33,10 @@
 #define DEV_BLOCKS   9
 #define DEV_BLOCKDEV 10         /* any registered struct blockdev */
 #define DEV_FLIGHT   11         /* flight recorder @krec snapshot */
+#define DEV_PROCS    12         /* live process table @krec snapshot */
+#define DEV_SOCKETS  13         /* active TCP sockets @krec snapshot */
+#define DEV_CAPS     14         /* process capability & unveil @krec snapshot */
+#define DEV_PARCELS  15         /* active Talon parcels @krec snapshot */
 
 /* Register the "devfs" filesystem type. Idempotent. */
 void devfs_init(void);

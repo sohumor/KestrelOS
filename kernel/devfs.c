@@ -21,6 +21,8 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "kestrel_abi.h"
 #include "spinlock.h"
 #include "flight.h"
+#include "tcp.h"
+#include "parcel.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -28,13 +30,14 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
  * directory itself and "/null" is a device, so this file never mentions
  * the string "/dev" and would work just as well mounted somewhere else.
  *
- * Everything is synthesised on demand except the two table views, which
- * are rendered into a private buffer at open() so that a reader sees one
+ * Everything is synthesised on demand except the table views, which are
+ * rendered into a private buffer at open() so that a reader sees one
  * consistent snapshot rather than a table mutating under it. */
 
 #define DEVFS_MAX_OPEN   32
 #define DEVFS_LINE_MAX   192
 #define DEVFS_TEXT_MAX   1024
+#define DEVFS_KREC_MAX   16376
 #define DEVFS_FLIGHT_MAX 24568
 
 struct devfile {
@@ -70,6 +73,10 @@ static const struct devdesc devtab[] = {
     { "mounts",  DEV_MOUNTS,  0444 },
     { "blocks",  DEV_BLOCKS,  0444 },
     { "flight",  DEV_FLIGHT,  0444 },
+    { "procs",   DEV_PROCS,   0444 },
+    { "sockets", DEV_SOCKETS, 0444 },
+    { "caps",    DEV_CAPS,    0444 },
+    { "parcels", DEV_PARCELS, 0444 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -257,16 +264,58 @@ static uint32_t blk_size_bytes(struct blockdev *bd)
     return bytes > 0xFFFFFFFFULL ? 0xFFFFFFFFu : (uint32_t)bytes;
 }
 
+static bool is_krec_dev(int id)
+{
+    return id == DEV_FLIGHT || id == DEV_PROCS || id == DEV_SOCKETS ||
+           id == DEV_CAPS || id == DEV_PARCELS;
+}
+
+static uint32_t krec_dev_cap(int id)
+{
+    return id == DEV_FLIGHT ? DEVFS_FLIGHT_MAX : DEVFS_KREC_MAX;
+}
+
+static uint32_t render_krec_view(int id, char *buf, uint32_t cap)
+{
+    switch (id) {
+    case DEV_FLIGHT:
+        return flight_render_krec(buf, cap);
+    case DEV_PROCS:
+        return proc_snapshot_krec(buf, cap);
+    case DEV_SOCKETS:
+#ifdef CONFIG_TCP
+        return tcp_snapshot_krec(buf, cap);
+#else
+    {
+        struct krec_kbuf b;
+        if (cap == 0)
+            return 0;
+        krec_kbuf_init(&b, buf, cap);
+        krec_kbuf_puts(&b, "@krec slot:int pid:int state:str local_port:int peer_ip:str peer_port:int rx_bytes:int tx_bytes:int\n");
+        if (b.overflow)
+            b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+#endif
+    case DEV_CAPS:
+        return proc_caps_snapshot_krec(buf, cap);
+    case DEV_PARCELS:
+        return parcel_snapshot_krec(buf, cap);
+    default:
+        return 0;
+    }
+}
+
 static uint32_t dev_size(int id)
 {
+    if (is_krec_dev(id))
+        return render_krec_view(id, NULL, krec_dev_cap(id));
     switch (id) {
     case DEV_KLOG:
         return klog_size();
     case DEV_MOUNTS:
     case DEV_BLOCKS:
         return text_size(id);
-    case DEV_FLIGHT:
-        return flight_render_krec(NULL, DEVFS_FLIGHT_MAX);
     default:
         return 0;
     }
@@ -363,13 +412,14 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
             df->textlen = (d->id == DEV_MOUNTS)
                             ? render_mounts(df->text, DEVFS_TEXT_MAX)
                             : render_blocks(df->text, DEVFS_TEXT_MAX);
-        } else if (d->id == DEV_FLIGHT) {
-            df->text = kmalloc(DEVFS_FLIGHT_MAX);
+        } else if (is_krec_dev(d->id)) {
+            uint32_t cap = krec_dev_cap(d->id);
+            df->text = kmalloc(cap);
             if (df->text == NULL) {
                 devfile_free(df);
                 return NULL;
             }
-            df->textlen = flight_render_krec(df->text, DEVFS_FLIGHT_MAX);
+            df->textlen = render_krec_view(d->id, df->text, cap);
         }
         if (handle_register(df) < 0) {
             devfile_free(df);
@@ -560,6 +610,10 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
     case DEV_MOUNTS:
     case DEV_BLOCKS:
     case DEV_FLIGHT:
+    case DEV_PROCS:
+    case DEV_SOCKETS:
+    case DEV_CAPS:
+    case DEV_PARCELS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);
@@ -699,7 +753,7 @@ static long devfs_op_seek(struct file *f, long off, int whence)
     if (df->dev == DEV_BLOCKDEV)
         return seek_bounded(df, off, whence, blk_size_bytes(df->bd));
     if (df->dev == DEV_MOUNTS || df->dev == DEV_BLOCKS ||
-        df->dev == DEV_FLIGHT)
+        is_krec_dev(df->dev))
         return seek_bounded(df, off, whence, df->textlen);
     if (df->dev == DEV_KLOG && whence == 0 && off == 0) {
         df->ent = 0;

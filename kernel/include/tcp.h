@@ -32,3 +32,6 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len);
 
 /* Task context: retransmit / timeout / delayed-ACK pump. Call ~10x/s. */
 void tcp_tick(void);
+
+/* Render active TCP socket table as a @krec stream (buf may be NULL to measure). */
+uint32_t tcp_snapshot_krec(char *buf, uint32_t cap);

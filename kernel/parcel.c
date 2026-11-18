@@ -224,3 +224,86 @@ long parcel_list(uint32_t index, struct k_parcel_info *info_out)
     spin_unlock_irqrestore(&parcel_lock, f);
     return 0;
 }
+
+struct parcel_snap_row {
+    uint32_t uid;
+    struct k_parcel_info info;
+};
+
+static const char *parcel_type_str(uint32_t type)
+{
+    switch (type) {
+    case K_PARCEL_TEXT:   return "text";
+    case K_PARCEL_PATH:   return "path";
+    case K_PARCEL_URL:    return "url";
+    case K_PARCEL_COLOR:  return "color";
+    case K_PARCEL_NUMBER: return "number";
+    case K_PARCEL_KREC:   return "krec";
+    case K_PARCEL_IMAGE:  return "image";
+    default:              return "unknown";
+    }
+}
+
+uint32_t parcel_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+    int max_rows = PARCEL_MAX_UIDS * K_PARCEL_MAX_SLOTS;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec id:int uid:int pid:int type:str size:int mime:str label:str\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    struct parcel_snap_row *snap = kmalloc((size_t)max_rows * sizeof(*snap));
+    if (!snap)
+        return krec_kbuf_finish(&b);
+
+    int n = 0;
+    uint64_t f = spin_lock_irqsave(&parcel_lock);
+    for (int i = 0; i < PARCEL_MAX_UIDS; i++) {
+        struct parcel_bucket *pb = buckets[i];
+        if (!pb)
+            continue;
+        for (int s = 0; s < K_PARCEL_MAX_SLOTS; s++) {
+            if (!pb->slots[s].valid || n >= max_rows)
+                continue;
+            snap[n].uid = pb->uid;
+            snap[n].info = pb->slots[s].info;
+            n++;
+        }
+    }
+    spin_unlock_irqrestore(&parcel_lock, f);
+
+    for (int i = 0; i < n; i++) {
+        uint32_t mark = b.len;
+        snap[i].info.mime[sizeof(snap[i].info.mime) - 1] = '\0';
+        snap[i].info.label[sizeof(snap[i].info.label) - 1] = '\0';
+
+        krec_kbuf_put_u64(&b, snap[i].info.id);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, snap[i].uid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, snap[i].info.src_pid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_puts(&b, parcel_type_str(snap[i].info.type));
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, snap[i].info.size);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_escape(&b, snap[i].info.mime);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_escape(&b, snap[i].info.label);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow) {
+            b.len = mark;
+            break;
+        }
+    }
+
+    kfree(snap);
+    return krec_kbuf_finish(&b);
+}

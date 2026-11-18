@@ -575,3 +575,304 @@ void proc_mark_current_idle(void)
         current->idle = true;
     spin_unlock_irqrestore(&sched_lock, flags);
 }
+
+/* --- shared @krec kernel table formatter ------------------------------ */
+
+void krec_kbuf_init(struct krec_kbuf *b, char *out, uint32_t cap)
+{
+    b->out = out;
+    b->len = 0;
+    b->cap = cap;
+    b->overflow = false;
+}
+
+void krec_kbuf_putc(struct krec_kbuf *b, char c)
+{
+    if (b->len + 1 < b->cap) {
+        if (b->out)
+            b->out[b->len] = c;
+        b->len++;
+    } else {
+        b->overflow = true;
+    }
+}
+
+void krec_kbuf_puts(struct krec_kbuf *b, const char *s)
+{
+    if (!s)
+        return;
+    while (*s)
+        krec_kbuf_putc(b, *s++);
+}
+
+void krec_kbuf_escape(struct krec_kbuf *b, const char *s)
+{
+    if (!s || !s[0]) {
+        krec_kbuf_putc(b, '-');
+        return;
+    }
+    for (; *s; s++) {
+        unsigned char uc = (unsigned char)*s;
+        switch (*s) {
+        case '\\': krec_kbuf_putc(b, '\\'); krec_kbuf_putc(b, '\\'); break;
+        case '\t': krec_kbuf_putc(b, '\\'); krec_kbuf_putc(b, 't');  break;
+        case '\n': krec_kbuf_putc(b, '\\'); krec_kbuf_putc(b, 'n');  break;
+        case '\r': krec_kbuf_putc(b, '\\'); krec_kbuf_putc(b, 'r');  break;
+        default:
+            krec_kbuf_putc(b, (uc < 0x20 || uc >= 0x7f) ? '?' : *s);
+            break;
+        }
+    }
+}
+
+void krec_kbuf_put_u64(struct krec_kbuf *b, uint64_t v)
+{
+    char tmp[24];
+    int i = 0;
+
+    if (v == 0) {
+        krec_kbuf_putc(b, '0');
+        return;
+    }
+    while (v > 0 && i < (int)sizeof(tmp)) {
+        tmp[i++] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    while (i > 0)
+        krec_kbuf_putc(b, tmp[--i]);
+}
+
+void krec_kbuf_put_i64(struct krec_kbuf *b, int64_t v)
+{
+    if (v < 0) {
+        krec_kbuf_putc(b, '-');
+        krec_kbuf_put_u64(b, (uint64_t)(-(v + 1)) + 1ULL);
+    } else {
+        krec_kbuf_put_u64(b, (uint64_t)v);
+    }
+}
+
+void krec_kbuf_put_hex(struct krec_kbuf *b, uint64_t v)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[16];
+    int i = 0;
+
+    krec_kbuf_puts(b, "0x");
+    if (v == 0) {
+        krec_kbuf_putc(b, '0');
+        return;
+    }
+    while (v > 0 && i < (int)sizeof(tmp)) {
+        tmp[i++] = hex[v & 0xFULL];
+        v >>= 4;
+    }
+    while (i > 0)
+        krec_kbuf_putc(b, tmp[--i]);
+}
+
+void krec_kbuf_put_ip4(struct krec_kbuf *b, uint32_t ip_be)
+{
+    krec_kbuf_put_u64(b, ip_be & 0xFFU);
+    krec_kbuf_putc(b, '.');
+    krec_kbuf_put_u64(b, (ip_be >> 8) & 0xFFU);
+    krec_kbuf_putc(b, '.');
+    krec_kbuf_put_u64(b, (ip_be >> 16) & 0xFFU);
+    krec_kbuf_putc(b, '.');
+    krec_kbuf_put_u64(b, (ip_be >> 24) & 0xFFU);
+}
+
+uint32_t krec_kbuf_finish(struct krec_kbuf *b)
+{
+    if (b->out && b->cap > 0)
+        b->out[b->len] = '\0';
+    return b->len;
+}
+
+/* --- /dev/procs & /dev/caps @krec snapshots --------------------------- */
+
+struct proc_snap_row {
+    int pid;
+    int ppid;
+    uint32_t uid;
+    int cpu;
+    enum task_state state;
+    char name[TASK_NAME_MAX];
+    uint64_t cap_mask;
+    char unveil_prefix[64];
+};
+
+static const char *task_state_name(enum task_state s)
+{
+    switch (s) {
+    case TASK_RUNNABLE: return "runnable";
+    case TASK_RUNNING:  return "running";
+    case TASK_SLEEPING: return "sleeping";
+    case TASK_STOPPED:  return "stopped";
+    case TASK_ZOMBIE:   return "zombie";
+    default:            return "unknown";
+    }
+}
+
+static struct proc_snap_row *snapshot_all_tasks(int *count_out)
+{
+    int cap = 63; /* 63 * 128 + 8 <= 8192 (2 pages) */
+
+    *count_out = 0;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct proc_snap_row *arr = kmalloc((size_t)cap * sizeof(*arr));
+        if (!arr)
+            return NULL;
+
+        uint64_t flags = spin_lock_irqsave(&sched_lock);
+        int total = 0;
+        int n = 0;
+        for (struct task *t = all_tasks; t; t = t->allnext) {
+            total++;
+            if (n < cap) {
+                arr[n].pid = t->pid;
+                arr[n].ppid = t->parent_pid;
+                arr[n].uid = t->uid;
+                arr[n].cpu = t->cpu;
+                arr[n].state = t->state;
+                arr[n].cap_mask = t->cap_mask;
+                memcpy(arr[n].name, t->name, TASK_NAME_MAX);
+                arr[n].name[TASK_NAME_MAX - 1] = '\0';
+                memcpy(arr[n].unveil_prefix, t->unveil_prefix,
+                       sizeof(arr[n].unveil_prefix));
+                arr[n].unveil_prefix[sizeof(arr[n].unveil_prefix) - 1] = '\0';
+                n++;
+            }
+        }
+        spin_unlock_irqrestore(&sched_lock, flags);
+
+        if (total <= cap || attempt == 1) {
+            *count_out = n;
+            return arr;
+        }
+        kfree(arr);
+        cap = total + 16;
+    }
+    return NULL;
+}
+
+uint32_t proc_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec pid:int ppid:int uid:int cpu:int state:str name:str caps:hex\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    int count = 0;
+    struct proc_snap_row *rows = snapshot_all_tasks(&count);
+    if (!rows)
+        return krec_kbuf_finish(&b);
+
+    for (int i = 0; i < count; i++) {
+        uint32_t mark = b.len;
+        krec_kbuf_put_i64(&b, rows[i].pid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, rows[i].ppid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, rows[i].uid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, rows[i].cpu);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_puts(&b, task_state_name(rows[i].state));
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_escape(&b, rows[i].name);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_hex(&b, rows[i].cap_mask);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow) {
+            b.len = mark;
+            break;
+        }
+    }
+
+    kfree(rows);
+    return krec_kbuf_finish(&b);
+}
+
+static void format_caps_str(struct krec_kbuf *b, uint64_t cap_mask)
+{
+    static const struct {
+        uint64_t bit;
+        const char *name;
+    } cap_tab[] = {
+        { KCAP_FS_READ,  "fs_read"  },
+        { KCAP_FS_WRITE, "fs_write" },
+        { KCAP_NET,      "net"      },
+        { KCAP_WM,       "wm"       },
+        { KCAP_SPAWN,    "spawn"    },
+        { KCAP_IPC,      "ipc"      },
+        { KCAP_ADMIN,    "admin"    },
+    };
+    uint64_t m = cap_mask & KCAP_ALL;
+    bool first = true;
+
+    if (m == KCAP_ALL) {
+        krec_kbuf_puts(b, "all");
+        return;
+    }
+    if (m == 0) {
+        krec_kbuf_puts(b, "none");
+        return;
+    }
+    for (size_t i = 0; i < sizeof(cap_tab) / sizeof(cap_tab[0]); i++) {
+        if (m & cap_tab[i].bit) {
+            if (!first)
+                krec_kbuf_putc(b, ',');
+            krec_kbuf_puts(b, cap_tab[i].name);
+            first = false;
+        }
+    }
+}
+
+uint32_t proc_caps_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec pid:int uid:int cap_mask:hex caps:str unveil:str\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    int count = 0;
+    struct proc_snap_row *rows = snapshot_all_tasks(&count);
+    if (!rows)
+        return krec_kbuf_finish(&b);
+
+    for (int i = 0; i < count; i++) {
+        uint32_t mark = b.len;
+        krec_kbuf_put_i64(&b, rows[i].pid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, rows[i].uid);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_hex(&b, rows[i].cap_mask);
+        krec_kbuf_putc(&b, '\t');
+        format_caps_str(&b, rows[i].cap_mask);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_escape(&b, rows[i].unveil_prefix);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow) {
+            b.len = mark;
+            break;
+        }
+    }
+
+    kfree(rows);
+    return krec_kbuf_finish(&b);
+}

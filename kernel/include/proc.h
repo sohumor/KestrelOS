@@ -101,6 +101,27 @@ int task_signal_pid(int pid, int sig, uint32_t sender_uid,
 int task_kill(struct task *t);
 void task_check_kill(void);
 
+/* Bounded @krec text formatter shared by kernel table views. */
+struct krec_kbuf {
+    char *out;
+    uint32_t len;
+    uint32_t cap;
+    bool overflow;
+};
+
+void krec_kbuf_init(struct krec_kbuf *b, char *out, uint32_t cap);
+void krec_kbuf_putc(struct krec_kbuf *b, char c);
+void krec_kbuf_puts(struct krec_kbuf *b, const char *s);
+void krec_kbuf_escape(struct krec_kbuf *b, const char *s);
+void krec_kbuf_put_u64(struct krec_kbuf *b, uint64_t v);
+void krec_kbuf_put_i64(struct krec_kbuf *b, int64_t v);
+void krec_kbuf_put_hex(struct krec_kbuf *b, uint64_t v);
+void krec_kbuf_put_ip4(struct krec_kbuf *b, uint32_t ip_be);
+uint32_t krec_kbuf_finish(struct krec_kbuf *b);
+
+uint32_t proc_snapshot_krec(char *buf, uint32_t cap);
+uint32_t proc_caps_snapshot_krec(char *buf, uint32_t cap);
+
 static inline uint64_t irq_save(void)
 {
     uint64_t f;
