@@ -50,54 +50,62 @@ the mouse, and the keyboard; putting the compositor there means a window is just
 a kernel object with a pixel buffer mapped into the owning process, and drawing
 is a plain memory write with no message passing at all.
 
-Applications get a small set of syscalls (create, flush, event, move, destroy)
-and a userspace widget toolkit is layered on top in libgui. The window manager
-policy — stacking, focus, dragging, close and minimize — is kernel-side too,
-which is the classic tradeoff: less flexible, much simpler, and impossible to
-deadlock.
+Applications get a compact set of syscalls (create, flush, event, move,
+resize, destroy, theme) and the Avionics `libgui` 2.0 toolkit is layered on top
+with anti-aliased fonts, rounded surfaces, gradients, shadows, sparklines, Talon
+clipboard helpers, and `gui_editor`. The window manager policy — stacking,
+focus, dragging, maximize/restore (`SYS_WIN_RESIZE` + `KEV_RESIZE`), 4 virtual
+workspaces (`Alt+1..4`), pinning, close and minimize — is kernel-side too, which
+is the classic tradeoff: less flexible than an IPC display server, much
+simpler, and impossible to deadlock.
 
-The desktop shell has two additional calls: enumerate ordinary same-user
-windows and request focus, minimize, restore or close. Those calls are a
-capability rather than a global control channel: the kernel accepts them only
-from a process that already owns a `K_WIN_DESKTOP` surface, and never returns a
-window belonging to another uid. This is what makes the dock a real task
-switcher without making window ids an ambient authority.
+The desktop shell has additional calls (`SYS_WIN_LIST`, `SYS_WIN_CTL`,
+`SYS_WM_THEME`): enumerate ordinary same-user windows, request focus, minimize,
+restore, maximize, workspace migration, pin, close, or update the active
+compositor theme (`k_wm_theme`) and broadcast `KEV_THEME` events. Those calls
+are capability-gated: the kernel accepts them only from a process that already
+owns a `K_WIN_DESKTOP` surface (or `wm_theme` capability paths), and never
+exposes windows belonging to another uid. This makes the dock and workspace switcher real task controllers without making window ids an ambient authority.
 
-### The shell is a desktop environment, not one large mock-up
+### The shell is an Avionics desktop environment, not a mock-up
 
-The background remains a full-screen `K_WIN_DESKTOP` layer. The top panel,
-wallpaper, shortcuts, dock and notifications are painted into that layer, while
-the searchable launcher and quick-settings panel are temporary undecorated
-windows. A popup can therefore accept keyboard input and sit above applications
-without allowing the background itself to steal focus from the console.
+The background remains a full-screen `K_WIN_DESKTOP` layer. The top telemetry
+panel (displaying live CPU/RAM sparklines fed by non-blocking Kernel Pulses via
+`SYS_PULSE_POLL`), wallpaper, workspace indicators, dock, and notifications are
+painted into that layer, while the **Kestrel Perch** launcher/evaluator,
+**Talon Visual Shelf**, and **Quick Control** panel open as interactive overlay
+windows that accept keyboard input above ordinary applications.
 
 The shell provides:
 
-- a searchable application grid opened by the Super key;
-- a live dock backed by the compositor's real window list;
-- click-to-focus, click-again-to-minimize and click-to-restore behavior;
-- network, memory, CPU and clock status, with confirmed power actions;
-- four generated wallpapers, dark/light modes, six accents and dock density;
+- **Kestrel Perch** (`Super`): a searchable application launcher and inline expression evaluator;
+- **Talon Visual Shelf** (`Ctrl+T`): structured inspection and recall of typed clipboard parcels (`SYS_PARCEL_PUT`/`GET`/`LIST`);
+- **Quick Control** (`Ctrl+Q`): theme presets, network/power actions, and live status;
+- a live dock backed by the compositor's real window list across 4 workspaces (`Alt+1..4`) and pinned windows;
+- click-to-focus, click-again-to-minimize, click-to-restore, and window maximize/resize (`SYS_WIN_RESIZE` / `KEV_RESIZE`);
+- live compositor theme propagation (`SYS_WM_THEME`, `KEV_THEME`, and `K_TOPIC_THEME` pulses);
 - per-user preferences (root's defaults live in `/etc/desktop.conf`);
-- transient notifications and keyboard task switching with Alt-Tab/Alt-F4.
+- transient notifications and keyboard task switching with `Alt-Tab`/`Alt-F4`.
 
-The graphical suite includes Settings, System Monitor and Calculator alongside
-Terminal, Files, Clock, Paint, About and Browser. All use the same immediate-mode
-toolkit palette and widgets; open applications poll the preference file and
-adopt theme changes without restarting.
+The graphical suite includes Settings, System Monitor (`sysmon`), Calculator
+(`gcalc`), Terminal (`terminal`), Files (`gfiles`), Clock (`gclock`), Paint
+(`gpaint`), Notes (`notes`), Sight (`sight`), About (`about`), and Kestrel
+Browser (`browser`). All use `libgui` 2.0 and adopt `SYS_WM_THEME` / `KEV_THEME`
+updates immediately without polling config files or restarting.
 
-The pixel buffers remain fixed-size mappings. That is why this version offers a
-correct minimize/restore path but not a pretend maximize button: safely resizing
-a mapping while an application may be drawing on another CPU needs a separate
-buffer-generation protocol and acknowledgement handshake.
+Window resize support uses `SYS_WIN_RESIZE` (77), which reallocates/remaps the
+window's shared pixel backing in `kernel/wm.c` up to `USER_WIN_STRIDE` (16 MiB)
+and delivers `KEV_RESIZE` with the new width/height to the owning process so
+applications such as `terminal` and `notes` reflow dynamically.
 
-### Permissions are an on-disk format change
+### Permissions and KFS v3 redo journaling
 
-The KFS inode had no room for uid/gid/mode/mtime, so v2 shrinks the direct block
-table from 12 entries to 10 to make space, and the superblock magic changed so a
-v1 image is rejected with a clear message instead of being silently misread. The
-maximum file size drops from ~4.2 MB to ~4.2 MB (the indirect block dominates),
-which is irrelevant at this scale.
+When multi-user permissions arrived in KFS v2, the inode shrank the direct block
+table from 12 entries to 10 to fit `uid`/`gid`/`mode`/`mtime` while bumping
+the superblock magic so older images are cleanly rejected rather than misread.
+KFS v3 (`KFS3`, `0x3353464B`) extends the on-disk format further with a
+checksummed 33-block full-data and metadata redo journal and atomic cross-directory
+`SYS_RENAME` (71).
 
 Permission checks live in the VFS, not in KFS: the filesystem stores the
 metadata, the VFS enforces it against the calling task's credentials, and root
@@ -106,26 +114,32 @@ metadata, the VFS enforces it against the calling task's credentials, and root
 ### TCP is a real implementation, not a shortcut
 
 Sequence arithmetic uses wrapping comparisons, retransmission backs off, the
-pseudo-header checksum is verified on receive, and RST is honoured. What it does
-*not* do is reassemble out-of-order segments — anything not exactly at `rcv_nxt`
-is dropped and left to the peer's retransmit. That is a real limitation and it is
-documented rather than hidden; over a local NAT it never triggers.
+pseudo-header checksum is verified on receive, out-of-order segments are queued
+and reassembled (`kernel/tcp_reassembly.c`), Selective Acknowledgements (SACK)
+are parsed and generated, and `RST` is honoured. Connection pooling in
+`libweb/http.c` reuses persistent HTTP/1.1 Keep-Alive sockets across subresource
+requests on the same origin.
 
 ### There is no Chrome, and there cannot be
 
 Running Chrome means implementing the Linux syscall ABI, glibc, X11 or Wayland,
 GPU drivers, and a JIT-capable memory model — vastly more work than this entire
 operating system, and none of it would teach anything about how an OS works. The
-honest equivalent is to write our own browser: HTTP/1.1 over our own TCP, our own
-HTML tokenizer and layout, rendered in a window by our own compositor. That is
-what `browser` is.
+honest equivalent is to write our own browser: HTTP/1.1 Keep-Alive over our own
+TCP and TLS 1.3, our own HTML5 tokenizer, CSS Grid/Flexbox layout, ES6+ runtime,
+and Canvas 2D surface rendered into a window by our own compositor. That is what
+`browser` is.
 
 ## Deliberately bounded
 
-The implementation now includes xAPIC SMP, demand paging and a raw swap extent,
-traditional signals, a small dynamic linker, file-data journaling, TCP SACK,
-verified HTTPS, and a kernel CSPRNG. Its boundaries remain intentional:
-legacy-PIC IRQ routing is BSP-centric, the scheduler uses one global run queue,
-the dynamic loader accepts only Kestrel's supported ABI/relocations, KFS has a
-fixed transaction budget, networking is IPv4-only, and none of the security
-code has had a professional audit.
+The implementation now includes xAPIC SMP, demand paging with a dynamically sized
+raw swap extent (`SWAP_MAX_PAGES` = 4096 past KFS superblock), Kernel Pulses,
+Talon typed clipboard parcels, capability-scoped process spawn and monotonic
+sandboxing (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`), traditional signals, a dynamic
+linker, KFS v3 data+metadata journaling and atomic rename, live window resize and
+theme broadcasting, TCP out-of-order reassembly + SACK, verified 128-SAN TLS 1.3,
+and a kernel ChaCha20 CSPRNG. Its boundaries remain intentional: legacy-PIC IRQ
+routing is BSP-centric, the scheduler uses one global run queue, the dynamic
+loader accepts only Kestrel's supported ABI/relocations, KFS transactions are
+capped at 32 blocks (+1 commit block), networking is IPv4-only, and none of the
+security code has had a professional audit.

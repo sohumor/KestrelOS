@@ -336,6 +336,75 @@ int gui_next_event(gui_window *win, struct k_event *ev, int timeout_ms)
     return -1;
 }
 
+const gui_theme *gui_theme_current(void)
+{
+    static const gui_theme light_theme = {
+        0xE5ECF6u, 0xC4D2E6u,
+        0xF4F7FCu, 0xFFFFFFu,
+        0xEDF2F8u, 0xDFE7F2u, 0xD5DFECu,
+        0x94A4BCu, 0xBDCADDu,
+        0x131C2Eu, 0x5A6A82u, 0xF8FAFCu,
+        0x60A5FAu, 0x355C93u,
+        0x16A34Au, 0xD97706u, 0xE11D48u,
+        0xFFFFFFu, 0x0A101Eu
+    };
+
+    return &light_theme;
+}
+
+void gui_settings_get(gui_settings *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    out->light = 1;
+    out->preset = GUI_THEME_DAYLIGHT;
+}
+
+void gui_window_resized(gui_window *win, int w, int h)
+{
+    if (!win || w <= 0 || h <= 0)
+        return;
+    win->w = w;
+    win->h = h;
+    win->clip_depth = 0;
+    win->clip = gui_mkrc(0, 0, w, h);
+}
+
+static char host_clip_buf[4096];
+static int host_clip_len;
+
+int gui_clipboard_copy(const char *text, int len, const char *label)
+{
+    (void)label;
+    if (!text)
+        return -1;
+    if (len < 0)
+        len = (int)strlen(text);
+    if (len <= 0)
+        return -1;
+    if (len >= (int)sizeof(host_clip_buf))
+        len = (int)sizeof(host_clip_buf) - 1;
+    memcpy(host_clip_buf, text, (size_t)len);
+    host_clip_buf[len] = 0;
+    host_clip_len = len;
+    return 0;
+}
+
+int gui_clipboard_paste(char *out, int cap)
+{
+    int n;
+
+    if (!out || cap <= 1 || host_clip_len <= 0)
+        return 0;
+    n = host_clip_len;
+    if (n >= cap)
+        n = cap - 1;
+    memcpy(out, host_clip_buf, (size_t)n);
+    out[n] = 0;
+    return n;
+}
+
 /* ------------------------------------------------------------------ *
  * Fixture and guarded-stack runner
  * ------------------------------------------------------------------ */

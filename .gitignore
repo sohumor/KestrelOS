@@ -6,3 +6,6 @@ build/
 *.log
 __pycache__/
 .claude/settings.local.json
+compile_commands.json
+.clangd/
+.cache/

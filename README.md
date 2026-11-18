@@ -41,76 +41,84 @@ kernel log ring, and an in-kernel rescue console for when userspace can't start.
 
 **Memory** — a bitmap physical allocator driven by the E820 map, 4-level paging
 with a full direct map, per-process address spaces, lazy executable/heap/stack
-faults, page eviction to a raw swap extent, and a kernel heap.
+faults, dynamic raw swap sizing derived from the KFS superblock (`SWAP_MAX_PAGES` =
+4096), and a kernel heap.
 
 **Processes** — ACPI/xAPIC SMP startup and preemptive scheduling across up to
 16 CPUs, kernel threads, ring-3 processes with per-task FPU state and
-credentials, traditional signals, static and dynamically linked ELF64
-programs, pipes, I/O redirection, process control, and a 60-plus call syscall
-interface.
+credentials, monotonic process sandboxing and capability masks (`SYS_SPAWN_CAPS`,
+`SYS_SANDBOX`), Kernel Pulses event telemetry (`SYS_PULSE_POLL`), Talon typed
+clipboard parcels (`SYS_PARCEL_*`), traditional signals, static and dynamically
+linked ELF64 programs, pipes, I/O redirection, process control, and a 78-call
+syscall interface (`0..77`).
 
-**Storage** — an ATA driver and **KFS**, a custom filesystem with a checksummed
-file-data redo journal, directories, indirect blocks, and per-file ownership,
-permissions and timestamps, enforced by the VFS against each task's
-credentials. Plus `/dev` with real device files.
+**Storage** — an ATA driver and **KFS v3** (`KFS3`), a custom filesystem with a
+checksummed 33-block full-data and metadata redo journal, atomic cross-directory
+`rename`, indirect blocks, and per-file ownership, permissions and timestamps,
+enforced by the VFS against each task's credentials. Plus `/dev` with real
+device files.
 
 **Networking** — PCI enumeration, two NIC drivers (RTL8139 and Intel e1000)
-behind a common interface, and a from-scratch stack: Ethernet, ARP, IPv4, ICMP,
-UDP, DNS, and **TCP with selective acknowledgements**, with HTTP/1.1 and
-verified TLS 1.3 HTTPS clients on top.
+behind a common interface, DHCP configuration with static QEMU fallback, and a
+from-scratch stack: Ethernet, ARP, IPv4, ICMP, UDP, DNS, and **TCP with
+out-of-order reassembly and selective acknowledgements (SACK)**, with persistent
+HTTP/1.1 Keep-Alive connection pooling and verified TLS 1.3 HTTPS clients on
+top (128-SAN X.509 parsing).
 
-**Desktop** — a kernel compositor where each window is an object whose pixel
-buffer is mapped into the owning process, with stacking, focus, draggable
-modern title bars, minimize/restore, same-user task controls and routed input.
-The live-themed userspace toolkit provides rounded controls, cards, toggles,
-progress indicators and vector icons. The desktop environment adds a searchable
-Super-key launcher, task dock, notifications, quick settings and system status,
-plus Settings, System Monitor, Calculator, Terminal, Files, Clock, Paint, About
-and Browser applications. Alt-Tab switches tasks and Alt-F4 closes the focused
-window.
-The browser has verified HTTPS, persistent cookies/cache/origin storage,
-linked/imported CSS, PNG/GIF/JPEG/BMP images, a live DOM with guarded
-JavaScript and arrow functions, bounded static modules, Promise/fetch support,
-`Uint8Array`, UTF-8 text codecs, live `URL`/`URLSearchParams`,
-`AbortController` cancellation, constructible UI/mouse/keyboard/input/pointer
-events with bounded capture/bubbling and listener options,
-constructible `Headers`, `Request`, and `Response` objects with real
-request-header transport and policy controls, bounded `Blob`/`File` bodies,
-asynchronous `FileReader`, object URLs, kernel-backed `crypto` randomness and
-SHA-1/SHA-2 digests, SMP-aware navigator capabilities, queued `sendBeacon()`,
-CSS-engine-backed `matchMedia()`, complete Location URL components, a small
-i32 WebAssembly core, bounded `Map`/`Set` and object-keyed
-`WeakMap`/`WeakSet`, common modern Object/Array/Number static helpers, bounded
-Array/String search, flattening, replacement, and padding helpers,
-explicit collection iterators, same-document History routing, modern DOM
-interface identity, HTML/SVG namespace-aware element construction,
-data-attribute access, traversal/mutation and general CSS declaration
-access, comments, off-document fragments, iterator/tree-walker traversal,
-bounded Range editing and singleton Selection state,
-bounded asynchronous mutation
-observation, multipart `FormData`,
-timer arguments plus cancellable animation/idle callbacks, native form
-controls, and GET/POST submission. Rendering includes
-bounded flex-row and flex-column subsets,
-bounded aspect-preserving inline SVG shapes/paths, and video-poster/media
-fallbacks. External modules enforce JavaScript MIME and fetch-style CORS/cookie
-rules.
+**Desktop** — the Avionics kernel compositor where each window's pixel buffer is
+mapped into the owning process, featuring 4 workspaces (`Alt+1..4`), window
+pinning, live compositor-backed `SYS_WIN_RESIZE` / maximize/restore (`KEV_RESIZE`),
+live compositor theme broadcast (`SYS_WM_THEME` / `KEV_THEME`), draggable
+title bars, minimize/restore, mouse wheel routing, and same-user task controls.
+`libgui` 2.0 provides anti-aliased fonts, rounded controls, gradients, shadows,
+sparklines, Talon clipboard integration, and `gui_editor`. The Avionics shell
+(`desktop`) adds a top telemetry bar with pulse-driven CPU/RAM sparklines,
+**Kestrel Perch** (`Super` launcher and live evaluator), **Talon Visual Shelf**
+(`Ctrl+T`), **Quick Control** (`Ctrl+Q`), and applications including Browser,
+Terminal, Notes (`notes`), Sight (`sight`), Files (`gfiles`), Paint (`gpaint`),
+System Monitor (`sysmon`), Calculator (`gcalc`), Clock (`gclock`), Settings, and
+About. `Alt-Tab` switches tasks and `Alt-F4` closes the focused window.
+
+**Browser** — verified TLS 1.3 HTTPS, persistent cookies/cache/origin storage,
+linked/imported CSS (`--custom-props`, `var()`, `calc()`/`min()`/`max()`/`clamp()`,
+`light-dark()`, `color-scheme`, `@media` ranges/`prefers-color-scheme`/`scripting`,
+CSS Grid, full Flexbox wrap/shrink/basis/baseline, `position: sticky`, `opacity`,
+AA `border-radius`, `box-shadow`, `linear-gradient()`), baseline and progressive
+(`SOF2`) JPEG/PNG/GIF/BMP decoding, multi-subpath inline SVG (`M/L/H/V/C/S/Q/T/Z`,
+`currentColor`, `viewBox`, `preserveAspectRatio`), software `<canvas>` 2D with
+PNG `toDataURL()`, and an ES6+ runtime (`libjs`) with real block-scoped
+`let`/`const` (TDZ and per-iteration closures), `class`/`extends`/`super`,
+`async`/`await`, template/tagged literals, destructuring, spread/rest, `for..of`
+and `Symbol`, `?.`/`??`/`**`, `Promise`/fetch/`AbortController`, `Map`/`Set`/
+`WeakMap`/`WeakSet`, `DOMParser`, `<template>`, `getComputedStyle()`,
+`ResizeObserver`/`IntersectionObserver`, `getBoundingClientRect()`,
+`scrollTo`/`scrollBy`, `navigator.clipboard`, two-way `dataset`, live `classList`,
+a small i32 WebAssembly core, and bounded static/dynamic `import()`.
 
 **System** — multi-user logins with salted iterated SHA-256 password hashes
-(written from the specification), a service-supervising init with readiness,
-hard dependencies, restart policies and backoff, a package manager with
-dependency resolution and integrity verification, and around 70 userspace
-programs. Kernel randomness uses RDSEED/RDRAND and interrupt timing inputs,
-a SHA-256 mixing pool, and a ChaCha20 CSPRNG exposed through `getrandom()`,
+(written from the specification), a non-blocking readiness-polling `init`
+supervisor with hard dependencies, restart policies and backoff, a `.kpkg`
+package manager with dependency resolution and integrity verification, an `@krec`
+typed structured record library (`-r` shell pipelines across `ls`, `ps`, `df`,
+`dmesg`, `lsdev`, `lsmod`, `netstat`, `service`, `talon`, `inspect`),
+`where`/`sortby`/`pick` filters, standalone `/bin/kjs`, and 89 userspace programs
+in `apps/`. Kernel randomness uses RDSEED/RDRAND and interrupt timing inputs, a
+SHA-256 mixing pool, and a ChaCha20 CSPRNG exposed through `getrandom()`,
 `/dev/random`, and `/dev/urandom`.
 
 ## Building
 
-Needs a Linux environment (WSL2 Ubuntu works):
+Cross-platform via `tools/build.py` (supports **Windows** with LLVM/Clang/LLD +
+NASM + QEMU, **Linux/WSL2**, and **macOS** cross-toolchains):
 
 ```bash
-sudo apt install build-essential nasm make python3 qemu-system-x86
+python3 tools/build.py all       # build OS image, host C unit suites, fsck, & E2E
+python3 tools/build.py test-host # build & run the 12 host C suites + KFS checks
+python3 tools/build.py e2e       # headless QEMU E2E suite over serial/TCP
 ```
+
+Or on Linux / WSL2 using the `Makefile` (`build-essential nasm make python3
+qemu-system-x86`):
 
 ```bash
 make            # build build/os.img (bootable raw disk image)
@@ -147,13 +155,18 @@ troubleshooting.
 boot/      stage 1 + stage 2 bootloader (NASM)
 kernel/    the kernel (C + a little NASM)
 abi/       the user/kernel ABI, shared by both sides
-libc/      userspace C library
-libgui/    userspace GUI toolkit
+libc/      userspace C library (incl. @krec structured records)
+libgui/    Avionics 2.0 userspace GUI toolkit + gui_editor
+libweb/    HTML5 parser, DOM, CSS engine, layout, paint, Canvas/Web APIs
+libjs/     ES6+ JavaScript engine
+libtls/    TLS 1.3 client, X.509 validator, ChaCha20/SHA-2/AES-GCM
+libimg/    PNG, BMP, GIF, baseline/progressive JPEG decoders
+libz/      deflate/inflate, CRC32, Adler32
 apps/      userspace programs (each becomes /bin/<name>)
 modules/   loadable kernel modules
 packages/  sources for the shipped .kpkg packages
 rootfs/    files copied into the disk image
-tools/     mkfs, image builder, fsck, font generator, test harness, screenshots
+tools/     build.py runner, mkfs, image builder, fsck, host C suites, E2E
 docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 ```
 
@@ -179,25 +192,28 @@ docs/      architecture, ABI, filesystem, networking, drivers, running, testing
 ## Known limitations
 
 SMP currently uses xAPIC and the legacy PIC: external hardware interrupts land
-on the BSP, while reschedule IPIs distribute runnable work. Swap is one fixed
-raw extent with a simple local second-chance policy, not a general block-backed
-pager. The dynamic linker supports the relocation set emitted by this tree,
-not arbitrary System V binaries. Signals are the traditional non-realtime
-subset. KFS transactions are capped at 32 full blocks, networking is IPv4-only,
-and TLS is 1.3-only. The from-scratch TLS, CSPRNG, and filesystem code are
-educational implementations and have not had a professional security audit.
+on the BSP, while reschedule IPIs distribute runnable work. Swap is one raw
+extent sized past the KFS superblock (`SWAP_MAX_PAGES` = 4096) with a simple
+local second-chance policy, not a general multi-device block pager. The dynamic
+linker supports the relocation set emitted by this tree, not arbitrary System V
+binaries. Signals are the traditional non-realtime subset. KFS v3 redo
+transactions are capped at 32 blocks (plus commit block in the 33-block journal),
+networking is IPv4-only, and TLS is 1.3-only. The from-scratch TLS, CSPRNG, and
+filesystem code are educational implementations and have not had a professional
+security audit.
 
 The browser is intentionally a bounded compatibility subset, not a claim of
-support for every website. Its module bindings are not live, `let`/`const`
-currently have `var` semantics, and literal-string `import()` is eagerly
-resolved rather than truly on demand; `import.meta.url` is supported, but
-computed imports are not. Inline `import.meta.url` is the document URL. SVG has
-only a bounded single-subpath shape/path subset with coordinate and raster-work
-caps; its default `viewBox` uses centered meet scaling, but full arcs,
-transforms, effects, and complete `preserveAspectRatio` behavior are absent.
-Full modern JavaScript, downloadable webfonts, media codecs/playback, HTTP/2,
-and HTTP/3 are not implemented. HTTPS currently carries HTTP/1.1 over verified
-TLS 1.3.
+support for every website. Its static ES module bindings are copy-by-value rather
+than live bindings, literal-string `import()` is eagerly resolved rather than
+truly on demand, and computed `import()` or top-level `await` are not supported
+(`import.meta.url` is supported, and resolves to the document URL for inline
+modules). Inline SVG supports multi-subpath paths (`M/L/H/V/C/S/Q/T/Z`),
+`currentColor`, `viewBox`, and `preserveAspectRatio`, but elliptical arc (`A/a`)
+curves are straight segments and SVG transforms, filter effects, and vector
+gradients are absent. Generators, `Proxy`, `eval()`, `Function()`, typed arrays
+beyond `Uint8Array`, tracing GC, downloadable webfonts, audio/video codecs,
+HTTP/2, and HTTP/3 are not implemented. HTTPS currently carries HTTP/1.1 over
+verified TLS 1.3.
 
 **This cannot run Chrome, and never will.** Chrome needs the Linux syscall ABI,
 glibc, X11 or Wayland, GPU drivers and a JIT — far more work than this entire

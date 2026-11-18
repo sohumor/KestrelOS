@@ -28,26 +28,26 @@ on-disk format), [net.md](net.md) (network stack), [testing.md](testing.md)
 
 ```
    ring 3   +-------------------------------------------------------+
-            |  init (pid 1) -> sh -> ls, cat, edit, snake, ping ... |
-            |  libc/  (crt0, stdio, stdlib, string, kestrel)        |
+            |  init -> desktop / terminal / sh / browser / apps ... |
+            |  libc/ (@krec), libgui/ 2.0, libweb/, libjs/, libtls/ |
             +---------------------------|---------------------------+
-                                        |  int 0x80
+                                        |  int 0x80 (syscalls 0..77)
    ring 0   +---------------------------v---------------------------+
-            |  syscall.c  (dispatch, user-memory copy-in/out)       |
+            |  syscall.c  (dispatch, caps/sandbox, copy-in/out)     |
             |                                                       |
-            |  uproc.c/elf.c   proc.c/switch.asm   vfs.c/kfs.c      |
-            |  (ELF64 loader)  (scheduler)         (files)          |
+            |  uproc.c/elf.c   proc.c/smp.c     vfs.c/kfs.c (v3)    |
+            |  (ELF64/ET_DYN)  (SMP scheduler)  (33-blk journal)    |
             |                                                       |
-            |  pmm.c  vmm.c  kheap.c   net.c/udp.c/dns.c            |
-            |  (memory)                (TCP/IP-less IP stack)       |
+            |  pmm/vmm/vm/kheap  wm.c/pulse/parcel  net/dhcp/tcp.c  |
+            |  (paging + swap)   (compositor/IPC)   (TCP SACK+DNS)  |
             |                                                       |
-            |  gdt.c idt.c isr.asm pic.c timer.c keyboard.c         |
-            |  console.c serial.c  ata.c  pci.c  rtl8139.c  fpu.c   |
+            |  gdt/idt/isr/pic/timer/fpu/fb/mouse/keyboard/serial   |
+            |  ata.c  blockdev.c  pci/bus_pci/device  rtl8139/e1000 |
             +---------------------------|---------------------------+
                                         |
             +---------------------------v---------------------------+
-            |  hardware: CPU, PIT, 8259 PIC, PS/2, VGA text, COM1,  |
-            |  ATA primary bus, PCI, RTL8139                        |
+            |  hardware: x86-64 SMP, PIT, 8259 PIC, LAPIC, VBE FB,  |
+            |  PS/2 kbd/mouse, COM1, ATA primary, PCI, RTL8139/e1000|
             +-------------------------------------------------------+
 ```
 
@@ -84,40 +84,46 @@ on-disk format), [net.md](net.md) (network stack), [testing.md](testing.md)
 everything above it:
 
 ```
-serial_init(); console_init();          output as early as possible
+serial_init(); console_init(); klog_init();   early logs and output
    |
-E820 summary from boot_info (P2V of the 0x6000 block)
+random_init() + E820 entropy_pool_add()       ChaCha20 CSPRNG seed from boot_info
    |
-gdt_init()      64-bit GDT + TSS (kernel/user code/data, ring-3 entry)
-idt_init()      256-entry IDT, exception + IRQ stubs from isr.asm
-pic_init()      8259 remapped: IRQ 0-15 -> vectors 0x20-0x2F
-timer_init(100) PIT at TIMER_HZ = 100 Hz, drives preemption
-keyboard_init() PS/2 scancode set 1 -> the shared input queue
-serial_init_irq()  COM1 RX interrupts: the serial line is a real console
+gdt_init()          64-bit GDT + TSS (kernel/user code/data, ring-3 entry)
+idt_init()          256-entry IDT, exception + IRQ stubs from isr.asm
+pic_init()          8259 remapped: IRQ 0-15 -> vectors 0x20-0x2F
+timer_init(100)     PIT at TIMER_HZ = 100 Hz, drives preemption
+keyboard_init()     PS/2 scancode set 1 -> the shared input queue
+serial_init_irq()   COM1 RX interrupts: the serial line is a real console
 sti()
    |
-fpu_init()      x87 + SSE on, FXSAVE area saved/restored per task
-pmm_init()      physical page bitmap built from the E820 map
-vmm_init()      real 4-level page tables: kernel higher half + direct map
-smp_init()      ACPI MADT discovery, BSP local APIC + per-CPU GS state
-kheap_init()    kernel heap on top of the pmm
+fpu_init()          x87 + SSE on, FXSAVE area saved/restored per task
+pmm_init()          physical page bitmap built from the E820 map
+vmm_init()          real 4-level page tables: kernel higher half + direct map
+smp_init()          ACPI MADT discovery, BSP local APIC + per-CPU GS state
+kheap_init()        kernel heap on top of the pmm
+fb_init()           map VBE linear framebuffer and switch console output
    |
-proc_init()     the boot context becomes task 0; scheduler armed
+proc_init()         the boot context becomes task 0; scheduler armed
+initcall_run_level(INITCALL_EARLY / CORE)   bus and platform registration
    |
-ata_init()      identify the ATA primary master
-swap_init()     validate the raw page-aligned swap extent
-vfs_init()      mount KFS from LBA 2048 (may fail -> diskless)
-devfs_init()    mount random, log, console and registry devices at /dev
+ata_init()          identify the ATA primary master
+swap_init()         size raw swap extent dynamically past the KFS v3 superblock
+vfs_init()          mount KFS v3 from LBA 2048 (replays 33-block redo journal)
+devfs_init()        mount random, log, console and registry devices at /dev
+mouse_init()        PS/2 mouse coordinates bounded to framebuffer geometry
+initcall_run_level(INITCALL_DRIVER)         PCI + block/NIC driver binding
    |
-net_init()      PCI NIC bring-up, DHCP with static fallback
-tcp_init()      client TCP state, reassembly and SACK
-wm_init()       compositor state
-syscall_init()  install the int 0x80 dispatcher and ring-3 fault handler
-smp_start_aps() INIT/SIPI application processors into pinned idle tasks
+net_init()          PCI NIC bring-up (RTL8139/e1000), DHCP with static fallback
+tcp_init()          client TCP state, out-of-order reassembly and SACK
+wm_init()           Avionics compositor (4 workspaces, resize, live theme state)
+syscall_init()      install int 0x80 dispatcher (0..77) and user_fault()
+initcall_run_level(INITCALL_LATE)
+smp_start_aps()     INIT/SIPI application processors into pinned idle tasks
+klog_hook_kprintf()
    |
 "KESTREL READY"
    |
-kthread_create(init_launcher)  -> uproc_spawn("/bin/init")
+kthread_create(housekeeper); kthread_create(init_launcher -> "/bin/init")
    |
 boot task parks in  for (;;) { sti; hlt; yield(); }
 ```
@@ -135,27 +141,28 @@ Built by `tools/mkimage.py` from the stage binaries, `kernel.bin` and
  LBA 64       +-------------------------------+
               | kernel.bin (flat binary)      |  <= 1984 sectors (992 KiB)
  LBA 2048     +-------------------------------+  FS_START_LBA (kernel/include/ata.h)
-              | KFS filesystem                |  4096-byte blocks = 8 sectors
+              | KFS v3 filesystem             |  4096-byte blocks = 8 sectors
               +-------------------------------+
+              | Dynamic swap extent           |  starts past sb->total_blocks
+              +-------------------------------+  (up to SWAP_MAX_PAGES = 4096)
 ```
 
 ## Kernel subsystem map
 
 | Area | Files | Responsibility |
 |------|-------|----------------|
-| Entry / CPU | `kernel/entry.asm`, `ap_trampoline.asm`, `smp.c`, `cpu.asm`, `isr.asm`, `switch.asm`, `usermode.asm` | long-mode/AP entry, ACPI/xAPIC SMP, per-CPU GS, port/CR helpers, ISR stubs, context switch, `iretq` into ring 3 |
-| Descriptors | `gdt.c`, `idt.c` | per-CPU GDT/TSS with the current kernel stack, 256 IDT gates, vector `0x80` at DPL 3 |
-| Interrupts | `pic.c`, `timer.c`, `smp.c` | 8259 remap to 0x20-0x2F, PIT at 100 Hz on the BSP, LAPIC EOI and reschedule IPIs |
-| Console | `console.c`, `serial.c`, `kprintf.c` | VGA text buffer with colour + ANSI handling, COM1 in/out, formatted kernel printing, `panic()` |
-| Input | `keyboard.c`, `input.c` | PS/2 scancode decode (modifiers, extended keys) and COM1 keys funnelled into one blocking input queue with `KEY_*` codes |
-| FPU | `fpu.c` | enable x87/SSE, per-task FXSAVE area |
-| Memory | `pmm.c`, `vmm.c`, `vm.c`, `kheap.c` | physical pages; four-level paging; lazy ELF/heap/stack faults; swap eviction; kernel heap |
-| Processes | `proc.c`, `signal.c`, `switch.asm` | SMP-safe global run queue, per-CPU current/slices, sleep/wake, signal frames, exit/reaping |
-| Userspace | `uproc.c`, `elf.c`, `usermode.asm`, `syscall.c` | static/ET_DYN loading, `DT_NEEDED` dependencies and relocations, argv, ring-3 entry and syscall/user-copy paths |
-| Storage | `ata.c`, `kfs.c`, `vfs.c` | ATA PIO; KFS inode filesystem with checksummed file-data redo journal; mount-based VFS |
-| Network | `pci.c`, `rtl8139.c`, `e1000.c`, `net.c`, `udp.c`, `dns.c`, `tcp.c` | two NICs; Ethernet/ARP/IPv4/ICMP/UDP/DNS; TCP reassembly, retransmission and SACK |
-| Random | `random.c`, `random_core.c` | hardware/timing entropy, SHA-256 pool and ChaCha20 CSPRNG |
-| Support | `string.c`, `sched_test.c` | freestanding string/memory routines; scheduler self-test threads |
+| Entry / CPU | `entry.asm`, `ap_trampoline.asm`, `smp.c`, `cpu.asm`, `isr.asm`, `switch.asm`, `usermode.asm` | long-mode/AP entry, ACPI/xAPIC SMP, per-CPU GS, port/CR helpers, ISR stubs, context switch, `iretq` into ring 3 |
+| Descriptors | `gdt.c`, `idt.c` | per-CPU GDT/TSS with current kernel stack, 256 IDT gates, vector `0x80` at DPL 3 |
+| Interrupts / Clocks | `pic.c`, `timer.c`, `rtc.c`, `smp.c` | 8259 remap to `0x20`–`0x2F`, PIT at 100 Hz on BSP, CMOS RTC, LAPIC EOI and reschedule IPIs |
+| Console / Log / Mon | `console.c`, `fb.c`, `font.c`, `serial.c`, `output.c`, `kprintf.c`, `klog.c`, `kmon.c`, `power.c` | framebuffer & VGA text consoles, 8×16 font, COM1 I/O, `kprintf`/`panic`, kernel log ring, rescue console, ACPI/reboot |
+| Input | `keyboard.c`, `mouse.c`, `input.c` | PS/2 keyboard + mouse and COM1 keys into shared event/input queues (`KEY_*`) |
+| FPU / Memory | `fpu.c`, `pmm.c`, `vmm.c`, `vm.c`, `kheap.c` | x87/SSE FXSAVE; E820 page bitmap; 4-level paging; lazy ELF/heap/stack faults + dynamic swap; kernel heap |
+| Processes / IPC | `proc.c`, `signal.c`, `pipe.c`, `pulse.c`, `parcel.c`, `switch.asm` | SMP-safe circular run queue, per-CPU current/slices, sleep/wake, signals, pipes, 128-slot Kernel Pulses ring, Talon typed parcels |
+| Userspace / Modules | `uproc.c`, `elf.c`, `usermode.asm`, `syscall.c`, `module.c`, `ksyms.c` | static/`ET_DYN` ELF64 loading, capability masks & path prefix unveiling (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`), ring-3 dispatch (`0..77`), `.ko` modules |
+| Compositor | `wm.c` | kernel window objects (`USER_WIN_BASE`..), 4 workspaces, pinning, live `SYS_WIN_RESIZE` remapping, `SYS_WM_THEME` broadcast |
+| Devices / Storage | `initcall.c`, `device.c`, `bus_pci.c`, `bus_platform.c`, `pci.c`, `ata.c`, `blockdev.c`, `kfs.c`, `vfs.c`, `mount.c`, `devfs.c` | unified initcall/bus/device model, ATA PIO + block devices, KFS v3 (33-block data+metadata redo journal, atomic rename), VFS mounts + `/dev` |
+| Network | `rtl8139.c`, `e1000.c`, `net.c`, `net_checksum.c`, `dhcp.c`, `udp.c`, `dns.c`, `tcp.c`, `tcp_reassembly.c` | two PCI NICs, Ethernet/ARP/IPv4/ICMP/UDP/DNS/DHCP, full TCP with out-of-order reassembly, retransmission and SACK |
+| Random / Tests | `random.c`, `random_core.c`, `sched_test.c`, `string.c` | hardware/timing entropy, SHA-256 mixing pool, ChaCha20 CSPRNG, scheduler self-test, freestanding string/memory helpers |
 
 Headers live in `kernel/include/`, one per subsystem, plus `kernel.h`
 (`P2V`/`V2P`, `PAGE_SIZE`, `KERNEL_VERSION`) and `bootinfo.h` (the layout
@@ -169,8 +176,9 @@ kernel half; only the user half is private.
 
 | Virtual range | Contents | Flags |
 |---------------|----------|-------|
-| `0x0000000000400000` and ET_DYN bases | lazy user ELF segments and dependencies | user, permissions from `PT_LOAD` |
+| `0x0000000000400000` and `ET_DYN` bases | lazy user ELF segments and dependencies | user, permissions from `PT_LOAD` |
 | ... `user_brk` | heap range grown by `SYS_BRK`, populated on fault | user, RW |
+| `0x0000200000000000` (`USER_WIN_BASE`) | window compositor shared pixel buffers (`16 MiB` stride `USER_WIN_STRIDE`) | user, RW, mapped per window (`wid`) |
 | `0x00007FFFFFFFE000` | `USER_STACK_TOP`; 16-page range populated on fault | user, RW |
 | *non-canonical hole* | | |
 | `0xFFFF800000000000` | `PHYS_MAP_BASE` — direct map of all physical memory; `P2V(p)`/`V2P(v)` | kernel, RW |
@@ -187,8 +195,8 @@ tables and DMA buffers: any physical frame is reachable at
  0x0000000000400000  +----------------------+  user text/data
                      |  user heap (brk)     |
                      |          .           |
-                     |          v           |
-                     |                      |
+ 0x0000200000000000  +----------------------+  USER_WIN_BASE (16 MiB/win)
+                     |          .           |
                      |          ^           |
                      |  user stack, 16 pg   |
  0x00007FFFFFFFE000  +----------------------+  USER_STACK_TOP
@@ -209,15 +217,24 @@ kernel threads and user processes are the same type, distinguished by the
 ```
 struct task {
     int pid; char name[32]; enum task_state state;
+    uint32_t uid, gid;
     uint64_t rsp;             /* saved kernel stack pointer   */
     uint8_t *kstack;          /* 16 KiB kernel stack          */
+    uint64_t kernel_rsp0;     /* top used by this CPU's TSS   */
     void *fpu_state;          /* 16-byte-aligned FXSAVE area  */
     uint64_t *pml4;           /* address space                */
     bool user; uint64_t sleep_until; int exit_code;
+    int kill_pending;
+    uint64_t sig_pending, sig_mask;
+    struct k_sigaction sig_actions[K_NSIG];
     int parent_pid; int wait_child_pid;
-    uint64_t user_brk;
+    uint64_t user_heap_start, user_brk;
+    struct vm_area vm_areas[VM_MAX_AREAS];
     struct file *files[MAX_OPEN_FILES];   /* 16 fds           */
-    struct task *qnext, *allnext;         /* run queue, all   */
+    struct task *qnext, *allnext, *reapnext;
+    int cpu, affinity; bool idle;
+    uint64_t cap_mask;        /* monotonic KCAP_* capabilities */
+    char unveil_prefix[64];   /* optional filesystem path jail */
 };
 ```
 
@@ -227,10 +244,10 @@ States: `TASK_RUNNABLE`, `TASK_RUNNING`, `TASK_SLEEPING`, `TASK_STOPPED`,
 
 Scheduling is preemptive round robin over one spin-locked circular run ring.
 The BSP PIT tick broadcasts a LAPIC reschedule IPI; every CPU tracks its own
-five-tick slice and selects a runnable task that is not already running
-elsewhere. The context-switch assembly drops `sched_lock` only after switching
-to the incoming kernel stack. Address-space and FPU state follow the task;
-idle tasks are pinned per CPU and ordinary tasks may migrate.
+five-tick slice (`SCHED_QUANTUM = 5`) and selects a runnable task that is not
+already running elsewhere. The context-switch assembly drops `sched_lock` only
+after switching to the incoming kernel stack. Address-space and FPU state
+follow the task; idle tasks are pinned per CPU and ordinary tasks may migrate.
 
 ## Process lifecycle
 
@@ -267,7 +284,7 @@ idle tasks are pinned per CPU and ordinary tasks may migrate.
    |
   syscall_dispatch: uproc_record_exit(pid, code); task_exit(code)
    |   state = TASK_ZOMBIE, exit code kept in the waitpid ring,
-   |   parent blocked in SYS_WAITPID is woken
+   |   parent blocked in SYS_WAITPID / SYS_WAITANY is woken
    v
   the scheduler reaps the zombie: free kernel stack, FPU area,
   and vmm_destroy_user(pml4) releases the user half and its page tables
@@ -279,10 +296,11 @@ faults), records exit code `-1` and calls `task_exit(-1)`, so a crashing
 process dies alone.
 
 PID 1 is `/bin/init` (`apps/init.c`): it parses `/etc/inittab`, orders
-services by `after=`/`requires=`, waits for explicit readiness markers,
-applies per-unit restart policy and crash backoff, exposes the `/run` service
-control protocol, and performs reverse-order shutdown. The login console is
-one supervised unit rather than a special case.
+services by `after=`/`requires=`, polls readiness files without stalling the
+boot loop (`POLL_MS` / `START_POLL_MS`), applies per-unit restart policy and
+crash backoff, exposes the `/run` service control protocol, and performs
+reverse-order shutdown. The login console is one supervised unit rather than a
+special case.
 
 ## System calls
 
@@ -292,8 +310,8 @@ Convention (`abi/kestrel_abi.h`, `libc/syscall.asm`): `int 0x80`,
 interrupt gate at DPL 3, so `IF` is clear on entry; the dispatcher
 re-enables interrupts immediately because syscalls may block.
 
-| # | Name | Arguments | Returns |
-|---|------|-----------|---------|
+| # | Name | Group / Arguments | Returns |
+|---|------|-------------------|---------|
 | 0 | `SYS_EXIT` | `code` | does not return |
 | 1 | `SYS_WRITE` | `fd, buf, len` | bytes written; fd 1/2 = console |
 | 2 | `SYS_READ` | `fd, buf, len` | bytes read; fd 0 = console, blocks |
@@ -321,6 +339,19 @@ re-enables interrupts immediately because syscalls may block.
 | 24 | `SYS_READ_NB` | `fd, buf, len` | bytes read, 0 if none ready |
 | 25 | `SYS_RTC` | `struct k_rtc*` | 0 / -1 |
 | 26 | `SYS_POWER` | `action (0 = reboot, 1 = halt)` | does not return on success |
+| 27–32 | `SYS_SPAWN_IO`, `SYS_PIPE`, `SYS_DUP2`, `SYS_KILL`, `SYS_WAITANY`, `SYS_EXEC` | pipes, fd redirection, signals, `waitany`, `exec` | fd / pid / status |
+| 33–37 | `SYS_GETUID`, `SYS_GETGID`, `SYS_SETUID`, `SYS_CHMOD`, `SYS_CHOWN` | credentials and VFS ownership/mode | uid/gid or 0/-1 |
+| 38–40 | `SYS_TIME`, `SYS_LOG`, `SYS_LOGREAD` | epoch seconds and kernel log ring | time or log entry |
+| 41–47 | `SYS_FBINFO`, `SYS_MOUSE`, `SYS_WIN_CREATE`, `SYS_WIN_DESTROY`, `SYS_WIN_FLUSH`, `SYS_WIN_EVENT`, `SYS_WIN_MOVE` | framebuffer, mouse, and core WM surfaces | 0/-1 or event status |
+| 48–51 | `SYS_TCP_CONNECT`, `SYS_TCP_SEND`, `SYS_TCP_RECV`, `SYS_TCP_CLOSE` | kernel TCP socket handle lifecycle | handle / bytes / -1 |
+| 52–60 | `SYS_SYNC`, `SYS_INSMOD`, `SYS_RMMOD`, `SYS_MODLIST`, `SYS_MOUNT`, `SYS_UMOUNT`, `SYS_BLKLIST`, `SYS_DEVLIST`, `SYS_MOUNTLIST` | disk sync, `.ko` modules, mounts, `/dev`/block registries | 0 / -1 |
+| 61–66 | `SYS_GETRANDOM`, `SYS_SWAPINFO`, `SYS_SIGACTION`, `SYS_SIGPROCMASK`, `SYS_SIGRETURN`, `SYS_CPUINFO` | ChaCha20 CSPRNG, swap usage, POSIX signal handlers, SMP CPU info | bytes / 0 / -1 |
+| 67–68 | `SYS_WIN_LIST`, `SYS_WIN_CTL` | enumerate same-uid windows; focus/min/max/pin/workspace/close | 0 / -1 |
+| 69–70 | `SYS_SPAWN_CAPS`, `SYS_SANDBOX` | spawn with `KCAP_*` mask/fds/cwd; monotonic cap drop + `unveil_prefix` | pid / 0 / -1 |
+| 71 | `SYS_RENAME` | `oldpath, newpath` (atomic cross-dir KFS v3 rename) | 0 / -1 |
+| 72 | `SYS_PULSE_POLL` | `u64 *seq_inout, topic_mask, out, packed` (128-entry telemetry ring) | count / -1 |
+| 73–75 | `SYS_PARCEL_PUT`, `SYS_PARCEL_GET`, `SYS_PARCEL_LIST` | Talon typed clipboard parcels (8 MRU slots/uid, up to 64 KiB) | id / bytes / -1 |
+| 76–77 | `SYS_WM_THEME`, `SYS_WIN_RESIZE` | update/broadcast compositor theme (`KEV_THEME`); live resize (`KEV_RESIZE`) | 0 / -1 |
 
 `open()` flags: `O_RDONLY 0x000`, `O_WRONLY 0x001`, `O_RDWR 0x002`,
 `O_CREAT 0x040`, `O_TRUNC 0x200`, `O_APPEND 0x400`.
@@ -330,33 +361,37 @@ in `kernel/syscall.c` — `user_range_ok()`, `copy_from_user()`,
 `copy_to_user()`, `copy_str_from_user()` — which walk `current->pml4` and
 return `-1` on an unmapped or non-user address instead of faulting.
 
-Special keys arriving on fd 0 use values `>= 0x80` (`KEY_UP` .. `KEY_DELETE`);
-ordinary keys are ASCII, with ctrl-X as 1..26 and ESC as 27.
+Special keys arriving on fd 0 or window events use values `>= 0x80` (`KEY_UP`
+.. `KEY_SUPER`, `KEY_ALT_*`); ordinary keys are ASCII, with ctrl-X as 1..26 and
+ESC as 27.
 
 Full details, struct layouts and error semantics: [ABI.md](ABI.md).
 
 ## Filesystem
 
 ```
-  app:  open/read/write/seek/readdir/unlink/mkdir/stat
+  app:  open/read/write/seek/readdir/unlink/mkdir/rename/stat
           |  int 0x80
-  syscall.c: per-task fd table (MAX_OPEN_FILES = 16) -> struct file*
+  syscall.c: capability/unveil check + per-task fd table (MAX_OPEN_FILES = 16)
           v
-  vfs.c    absolute paths only; struct file { inum, pos, flags, refs }
+  vfs.c    absolute paths only; permissions/mode check; struct file
           v
-  kfs.c    superblock, block bitmap, 64-byte inodes, direct + one
-           indirect block, directory entries; metadata redo journal
+  kfs.c    KFS v3 ("KFS3"): superblock, block bitmap, 64-byte inodes
+           (10 direct + 1 indirect block), directory entries, atomic rename,
+           and a checksummed 33-block data + metadata redo journal
           v
   ata.c    PIO reads/writes of 512-byte sectors on the primary master;
            FS block B  ->  LBA 2048 + 8*B
 ```
 
-KFS is a fixed-layout inode filesystem with 4096-byte blocks: block 0 is
-the superblock, then the block bitmap, fixed checksummed metadata journal,
-inode table, and data. Regular data is ordered write-through; committed
-metadata transactions replay at mount.
-Host-side tools `tools/mkfs.py` (build an image from a directory tree)
-and `tools/kfsck.py` (validate and list) implement the same format.
+KFS v3 is a fixed-layout inode filesystem with 4096-byte blocks: block 0 is
+the superblock (`KFS_MAGIC = 0x3353464B`), then the block bitmap, a checksummed
+33-block redo journal (up to 32 transaction blocks plus commit record covering
+both file data and metadata), inode table, and data blocks. Committed
+transactions replay cleanly on mount, and `SYS_RENAME` atomically updates source
+and target directory entries within one journaled transaction.
+Host-side tools `tools/mkfs.py` (build a KFS v3 image from a directory tree)
+and `tools/kfsck.py` (validate, replay, and list) implement the exact format.
 
 Full on-disk format: [kfs.md](kfs.md).
 
@@ -364,58 +399,57 @@ Full on-disk format: [kfs.md](kfs.md).
 
 ```
      task context                              IRQ context
-  ping/nslookup/udp                          RTL8139 IRQ
+  tcp / udp / dns / ping                     RTL8139 / e1000 IRQ
         |  syscalls                                |
         v                                          v
-  net_icmp_ping / dns_resolve / udp_send      rx_drain -> net_rx
+  tcp_* / net_icmp_ping / dns / udp           rx_drain -> net_rx
         |                                          |
         v                                    +-----+-----+
    net_ip_send  --> arp_resolve              |           |
         |            (wait + retry)        ARP         IPv4
         v                                  reply     demux
-   rtl8139_send (4 TX descriptors)                +----+----+
-                                                  |         |
-                                                ICMP      udp_input
-                                             echo/reply   (16 port
-                                                          bindings)
+   nic_tx (RTL8139 or e1000 TX ring)          +------+------+------+
+                                              |      |      |      |
+                                            ICMP    UDP   DHCP   TCP + SACK
+                                                              (reassembly.c)
 ```
 
-Layers: PCI enumeration (`pci.c`) finds the RTL8139; the driver
-(`rtl8139.c`) sets up an RX ring and four TX descriptors; `net.c`
-demultiplexes Ethernet, implements ARP (cache, request, reply), IPv4
-build/parse and ICMP echo in both directions; `udp.c` provides send plus
-16 port bindings with short queues; `dns.c` resolves A records
-(compression-pointer aware). Addresses are static, matching QEMU
-user-mode networking (10.0.2.15/24, gateway 10.0.2.2, DNS 10.0.2.3).
+Layers: PCI enumeration (`pci.c` / `bus_pci.c`) binds either RTL8139
+(`rtl8139.c`) or Intel e1000 (`e1000.c`) behind a shared NIC interface;
+`net.c` demultiplexes Ethernet, implements ARP (cache, request, reply), IPv4
+build/parse and ICMP echo in both directions; `dhcp.c` acquires IPv4/gateway/DNS
+leases over DHCP with static QEMU user-mode fallback (`10.0.2.15/24`, gateway
+`10.0.2.2`, DNS `10.0.2.3`); `udp.c` provides send plus 16 port bindings with
+short queues; `dns.c` resolves A records (compression-pointer aware); `tcp.c`
+and `tcp_reassembly.c` implement stateful TCP with out-of-order segment
+reassembly, exponential backoff retransmission, and SACK.
 
 Full details, including the IRQ-context constraints: [net.md](net.md).
 
 ## Userspace
 
-`libc/` is a small freestanding C library built only from this tree:
+`libc/` is a freestanding C library built entirely from this tree:
 
-| File | Contents |
-|------|----------|
-| `libc/crt0.asm` | `_start`: zero `rbp`, align `rsp`, `main(argc, argv)`, then `SYS_EXIT` |
-| `libc/syscall.asm` | the raw `int 0x80` trampoline |
-| `libc/kestrel.c` | one wrapper per syscall, `readline()`, `ip_aton`/`ip_ntoa` |
-| `libc/stdio.c` | `printf`/`snprintf`/`puts`/`putchar` on top of `SYS_WRITE` |
-| `libc/stdlib.c` | `malloc`/`free`/`calloc`/`realloc` on top of `SYS_BRK`, `atoi`/`atol`, `abs`, `rand`/`srand`, `exit` |
-| `libc/string.c` | `str*`/`mem*` |
+| Module | Contents |
+|---|---|
+| `libc/` | `crt0.asm`, `syscall.asm`, `kestrel.c` (syscalls 0..77 + helpers), `stdio.c`, `stdlib.c` (`SYS_BRK` allocator), `string.c`, `krec.c` (`@krec` typed structured record parser/formatter) |
+| `libgui/` | Avionics 2.0 immediate-mode widget toolkit: rounded surfaces, gradients, shadows, sparklines, AA bitmap fonts, live `KEV_THEME`/`KEV_RESIZE` handling, Talon clipboard, and `gui_editor` (`editor.c`) |
+| `libweb/` | HTML5 parser, mutable DOM, CSS cascade/variables/`calc()`/`light-dark()`/`@media`/Grid/Flexbox, layout, multi-subpath SVG & paint, HTTP/1.1 Keep-Alive pool, Web Storage, Canvas 2D + rich Web APIs |
+| `libjs/` | ES6+ bytecode-free AST interpreter (`let`/`const` block scope + TDZ, `class`/`extends`/`super`, `async`/`await`, templates, destructuring, `Symbol`, `Map`/`Set`/`WeakMap`/`WeakSet`, `Uint8Array`, Web APIs) |
+| `libtls/` | TLS 1.3 client, X.509 certificate validator (up to 128 SANs), SHA-2, ChaCha20/Poly1305, AES-GCM |
+| `libimg/` & `libz/` | PNG, GIF, BMP, baseline + progressive (`SOF2`) JPEG decoders; deflate/inflate, CRC32, Adler32 |
 
-Headers are `libc/include/{kestrel,stdio,stdlib,string}.h`; the terminal
-helpers (`term_clear`, `term_goto`, `term_color`, ...) are macros that
-emit ANSI escapes, which both the VGA console and the serial console
-understand.
+Headers live under `libc/include/` (plus library headers in `lib*/`).
+Applications in `apps/*.c` compile into static or dynamically linked (`ET_DYN`
+via `/lib/ld.so`) ELF64 binaries installed at `/bin/<name>`, including graphical
+applications (`desktop`, `terminal`, `browser`, `sysmon`, `settings`, `gfiles`,
+`gpaint`, `gcalc`, `gclock`, `notes`, `sight`, `about`) and 70+ CLI utilities
+with `@krec` `-r` record pipelines (`where`, `sortby`, `pick`, `talon`,
+`inspect`, `kjs`).
 
-Every `apps/*.c` links against that libc with `apps/user.ld` into a
-static ELF64 at `0x400000` and is installed as `/bin/<name>` by the
-filesystem build step.
-
-The shell appends one extra argv element, `--cwd=<cwd>`, to every command
-it spawns, so path-taking applications can resolve relative arguments
-themselves; applications that ignore argv are unaffected. Each such app
-carries a small `strip_cwd_arg()` helper.
+The shell (`apps/sh.c`) supports pipe-backed multi-stage pipelines and appends
+`--cwd=<cwd>` to spawned commands so path-taking utilities can resolve relative
+arguments cleanly; each such utility uses a small `strip_cwd_arg()` helper.
 
 ## HOWTO: add a new system call
 
@@ -423,11 +457,11 @@ Worked example: a hypothetical `SYS_HOSTNAME` that copies a string out to
 userspace.
 
 1. **Reserve the number in the ABI** — `abi/kestrel_abi.h`, which both
-   sides include. Append; never renumber, the numbers are baked into
-   compiled binaries.
+   sides include. Append at the end of the table; never renumber, the numbers
+   are baked into compiled binaries.
 
    ```c
-   #define SYS_HOSTNAME  27  /* (buf, len) -> length copied */
+   #define SYS_HOSTNAME  78  /* (buf, len) -> length copied */
    ```
 
    Add any new struct here too, so kernel and libc always agree.
@@ -479,7 +513,8 @@ userspace.
 5. **Document it** — the syscall table above and `docs/ABI.md`.
 
 6. **Test it** — add a step to `tools/e2e.py` that drives an application
-   using it and expects the output, then `make test`.
+   using it and expects the output, then run `python3 tools/build.py e2e` or
+   `make test`.
 
 Constraints worth remembering: the dispatcher runs with interrupts
 enabled and is preemptible, so anything it touches must tolerate a
@@ -488,8 +523,9 @@ timeouts) but must never `panic()` on user-supplied input.
 
 ## HOWTO: add a new application
 
-1. **Create `apps/<name>.c`** with a `main(int argc, char **argv)`. The
-   Makefile globs `apps/*.c`, so no build file needs editing.
+1. **Create `apps/<name>.c`** with a `main(int argc, char **argv)`. Both
+   `tools/build.py` and the `Makefile` discover `apps/*.c`, so no build file
+   needs editing for standard utilities.
 
    ```c
    /* greet.c - say hello. */
@@ -509,10 +545,10 @@ timeouts) but must never `panic()` on user-supplied input.
    }
    ```
 
-2. **Respect the environment**: only `libc/include/*` and
-   `abi/kestrel_abi.h` are available — no host headers, no libm, no
-   floating point in the kernel-facing paths. Return 0 for success; the
-   shell prints `[exit N]` for anything else.
+2. **Respect the environment**: only `libc/include/*` (plus `libgui`/`libweb`/etc.
+   if linked) and `abi/kestrel_abi.h` are available — no host headers, no libm,
+   and no floating point inside the kernel. Return 0 for success; the shell prints
+   `[exit N]` for anything else.
 
 3. **Handle paths** if the app takes filenames: parse the trailing
    `--cwd=<path>` argument and join relative paths against it, the way
@@ -521,8 +557,8 @@ timeouts) but must never `panic()` on user-supplied input.
 4. **Build and run**:
 
    ```sh
-   make            # links build/apps/greet and bakes it into /bin
-   make run
+   python3 tools/build.py build   # or: make
+   python3 tools/build.py e2e     # or: make run / make test
    ```
 
    ```

@@ -1,74 +1,477 @@
-<!doctype html>
-<html>
-<head><title>KestrelOS</title></head>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>KestrelOS Avionics Start</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#eef3f8, #0b1220);
+      --surface: light-dark(#ffffff, #131d31);
+      --surface-alt: light-dark(#f5f8fc, #18253d);
+      --ink: light-dark(#102033, #e6eef9);
+      --muted: light-dark(#4e6077, #97abc4);
+      --line: light-dark(#cfdbe8, #273854);
+      --accent: light-dark(#0f62c8, #58a6ff);
+      --accent-soft: light-dark(#dcebfa, #1a3152);
+      --ok: light-dark(#0f766e, #34d399);
+      --radius: 12px;
+      --gap: 16px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1220;
+        --surface: #131d31;
+        --surface-alt: #18253d;
+        --ink: #e6eef9;
+        --muted: #97abc4;
+        --line: #273854;
+        --accent: #58a6ff;
+        --accent-soft: #1a3152;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px 18px 28px;
+      background-color: var(--bg);
+      color: var(--ink);
+      font-family: sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .shell {
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 18px;
+      padding: 18px 20px;
+      margin-bottom: var(--gap);
+      background-color: #10243e;
+      background-image: linear-gradient(135deg, #0d1d33, #173a63);
+      color: #f4f8fd;
+      border: 1px solid #2b4c76;
+      border-radius: 14px;
+      box-shadow: 0 8px 22px rgba(8, 18, 34, 0.24);
+    }
+
+    .crest {
+      width: 68px;
+      height: 68px;
+      flex-shrink: 0;
+      color: #6cc2ff;
+    }
+
+    .hero-copy {
+      flex: 1 1 260px;
+      min-width: 220px;
+    }
+
+    .hero h1 {
+      margin: 0 0 6px;
+      font-size: 24px;
+      letter-spacing: 0.4px;
+      color: #ffffff;
+    }
+
+    .hero p {
+      margin: 0 0 12px;
+      color: #cfe0f5;
+      font-size: 13px;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    .badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: bold;
+      background-color: rgba(255, 255, 255, 0.12);
+      border: 1px solid rgba(130, 198, 255, 0.35);
+      color: #e4f1ff;
+    }
+
+    .badge-js {
+      display: none;
+    }
+
+    @media (scripting: enabled) {
+      .badge-js {
+        display: inline-block;
+        background-color: rgba(52, 211, 153, 0.18);
+        border-color: rgba(52, 211, 153, 0.45);
+        color: #b6f7dc;
+      }
+    }
+
+    .bento {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--gap);
+    }
+
+    @media (min-width: 720px) {
+      .bento {
+        grid-template-columns: 1fr 1fr;
+      }
+      .span-2 {
+        grid-column: 1 / 3;
+      }
+    }
+
+    .card {
+      background-color: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 15px 17px;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+    }
+
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      color: var(--ink);
+    }
+
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+      margin: 0 0 10px;
+    }
+
+    .nav-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin: 0;
+      padding: 0;
+    }
+
+    .nav-item {
+      padding: 6px 8px;
+      border-radius: 7px;
+      background-color: var(--surface-alt);
+      border: 1px solid var(--line);
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      font-weight: bold;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .link-note {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 2px;
+    }
+
+    .tls-banner {
+      margin-top: 10px;
+      padding: 9px 11px;
+      border-radius: 8px;
+      background-color: var(--surface-alt);
+      border-left: 3px solid var(--ok);
+      font-size: 12px;
+    }
+
+    .tls-banner strong {
+      display: block;
+      margin-bottom: 2px;
+      color: var(--ink);
+    }
+
+    .hud-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 16px;
+      margin-top: 8px;
+    }
+
+    #horizon {
+      display: block;
+      width: 320px;
+      max-width: 100%;
+      height: 152px;
+      border-radius: 10px;
+      border: 1px solid #2b4c76;
+      background-color: #0b1729;
+    }
+
+    .hud-controls {
+      flex: 1 1 240px;
+      min-width: 210px;
+    }
+
+    .readout {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background-color: var(--surface-alt);
+      border: 1px solid var(--line);
+      font-family: monospace;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+
+    button {
+      padding: 6px 12px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background-color: var(--accent-soft);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    .shortcuts {
+      margin: 0;
+      padding-left: 18px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .shortcuts li {
+      margin-bottom: 3px;
+    }
+  </style>
+</head>
 <body>
+  <div class="shell">
+    <header class="hero">
+      <svg class="crest" viewBox="0 0 96 96" width="68" height="68" aria-label="KestrelOS winged crest">
+        <path d="M48 6 L84 22 L76 62 L48 90 L20 62 L12 22 Z" fill="#132d4f" stroke="#6cc2ff" stroke-width="3"></path>
+        <path d="M18 34 L42 42 L34 52 L16 44 Z M78 34 L54 42 L62 52 L80 44 Z" fill="#38bdf8"></path>
+        <path d="M24 26 L46 38 L48 64 L50 38 L72 26 Q56 44 48 76 Q40 44 24 26 Z" fill="#e0f2fe"></path>
+        <circle cx="48" cy="42" r="7" fill="#0f2544" stroke="#f59e0b" stroke-width="2.5"></circle>
+      </svg>
+      <div class="hero-copy">
+        <h1>KestrelOS</h1>
+        <p>Kestrel Browser runs its own HTML parser, CSS Grid/Flexbox engine, ES6+ runtime, and Canvas 2D surface.</p>
+        <div class="badges">
+          <span class="badge">KFS v3 Journal</span>
+          <span class="badge">Avionics Desktop</span>
+          <span class="badge">CSS Grid</span>
+          <span class="badge badge-js">ES6 Runtime Active</span>
+        </div>
+      </div>
+    </header>
 
-<h1>KestrelOS</h1>
+    <main class="bento">
+      <section class="card">
+        <h2>Local pages</h2>
+        <p class="muted">Offline guides, interactive capability labs, and rootfs files:</p>
+        <div class="nav-list">
+          <div class="nav-item">
+            <a href="/doc/playground.html">/doc/playground.html</a>
+            <div class="link-note">Interactive Web Capabilities Playground</div>
+          </div>
+          <div class="nav-item">
+            <a href="/doc/welcome.md">/doc/welcome.md</a>
+            <div class="link-note">Getting started guide and CLI overview</div>
+          </div>
+          <div class="nav-item">
+            <a href="/doc/test.html">/doc/test.html</a>
+            <div class="link-note">Offline HTML and CSS verification page</div>
+          </div>
+          <div class="nav-item">
+            <a href="/etc/motd">/etc/motd</a>
+            <div class="link-note">Boot message of the day</div>
+          </div>
+          <div class="nav-item">
+            <a href="/etc/version">/etc/version</a>
+            <div class="link-note">KestrelOS build version stamp</div>
+          </div>
+        </div>
+      </section>
 
-<p>This page is being rendered by <b>this operating system's own browser</b>:
-its own HTML parser and layout engine, drawn through its own window manager,
-over its own TCP/IP stack. Nothing here was ported from anywhere.</p>
+      <section class="card">
+        <h2>Live web &amp; security</h2>
+        <p class="muted">Verified transport over KestrelOS TCP/SACK + HTTP/1.1 Keep-Alive:</p>
+        <div class="nav-list">
+          <div class="nav-item">
+            <a href="https://example.com/">https://example.com/</a>
+            <div class="link-note">Verified HTTPS reference page</div>
+          </div>
+          <div class="nav-item">
+            <a href="http://neverssl.com/">http://neverssl.com/</a>
+            <div class="link-note">Plain HTTP captive-network check</div>
+          </div>
+        </div>
+        <div class="tls-banner">
+          <strong>TLS 1.3 is enabled with certificate verification required.</strong>
+          <span>Includes 128-SAN X.509 validation and ChaCha20/AES-GCM CSPRNG.</span>
+        </div>
+      </section>
 
-<h2>Local pages</h2>
+      <section class="card span-2">
+        <h2>Avionics Telemetry Horizon</h2>
+        <p class="muted">Rendered on HTML canvas via ES6 classes. Adjust pitch/bank below:</p>
+        <p class="muted"><a href="/doc/playground.html">Open Web Capabilities Playground</a></p>
+        <div class="hud-wrap">
+          <canvas id="horizon" width="320" height="152"></canvas>
+          <div class="hud-controls">
+            <div class="readout" id="hud-readout">HDG 042 | PITCH +2 deg | BANK 0 deg | ALT 12400 ft</div>
+            <div class="btn-row">
+              <button type="button" id="btn-pitch-up">Pitch +5</button>
+              <button type="button" id="btn-pitch-dn">Pitch -5</button>
+              <button type="button" id="btn-bank">Bank +12</button>
+              <button type="button" id="btn-level">Level Flight</button>
+            </div>
+            <ul class="shortcuts">
+              <li>Ctrl+L address bar | Alt+Left/Right history | Alt+1..4 workspaces</li>
+              <li>browser -t /doc/home.html terminal dump | Super opens Perch</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
 
-<ul>
-  <li><a href="/doc/welcome.md">welcome.md</a> &mdash; a guided tour of the shell</li>
-  <li><a href="/doc/test.html">test.html</a> &mdash; what the HTML engine supports</li>
-  <li><a href="/etc/motd">/etc/motd</a> &mdash; the login banner</li>
-  <li><a href="/etc/version">/etc/version</a> &mdash; the release string</li>
-</ul>
+  <script>
+    class HorizonInstrument {
+      constructor(canvasId, readoutId) {
+        this.canvas = document.getElementById(canvasId);
+        this.readout = document.getElementById(readoutId);
+        this.pitch = 2;
+        this.bank = 0;
+        this.heading = 42;
+        this.altitude = 12400;
+      }
 
-<h2>The live web</h2>
+      draw() {
+        if (!this.canvas || !this.canvas.getContext) return;
+        const ctx = this.canvas.getContext("2d");
+        const w = 320;
+        const h = 152;
+        const cx = w / 2;
+        const cy = h / 2;
 
-<p>These need working networking. In QEMU that means a NIC on the command
-line; in VirtualBox, an Intel PRO/1000 adapter.</p>
+        ctx.clearRect(0, 0, w, h);
+        ctx.fillStyle = "#0b1729";
+        ctx.fillRect(0, 0, w, h);
 
-<ul>
-  <li><a href="https://example.com/">example.com over verified HTTPS</a></li>
-  <li><a href="http://neverssl.com/">neverssl.com over plain HTTP</a></li>
-</ul>
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.rotate((this.bank * Math.PI) / 180);
+        const shift = this.pitch * 2.2;
+        ctx.fillStyle = "#164e87";
+        ctx.fillRect(-260, -180 + shift, 520, 180);
+        ctx.fillStyle = "#4b341e";
+        ctx.fillRect(-260, shift, 520, 180);
 
-<p><b>TLS 1.3 is enabled with certificate verification required.</b>
-HTTPS, redirects, cookies, caching, chunked bodies and gzip decoding all run
-through KestrelOS's own libraries.</p>
+        ctx.strokeStyle = "#e2f1ff";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-200, shift);
+        ctx.lineTo(200, shift);
+        ctx.stroke();
 
-<p>Linked and imported stylesheets, PNG/JPEG/GIF/BMP images, classic
-JavaScript, bounded static modules, Promise jobs and asynchronous fetch,
-live DOM mutation, cookies, form controls and GET/POST submission are enabled.
-Script changes are re-styled and re-laid out. Small i32 WebAssembly modules,
-single-line flex rows and basic inline SVG shapes are also supported.</p>
+        ctx.strokeStyle = "#93c5fd";
+        ctx.lineWidth = 1;
+        for (let step = -20; step <= 20; step += 10) {
+          if (step === 0) continue;
+          const y = shift - step * 2.2;
+          ctx.beginPath();
+          ctx.moveTo(-28, y);
+          ctx.lineTo(28, y);
+          ctx.stroke();
+        }
+        ctx.restore();
 
-<p>The limits are real: <code>let</code>/<code>const</code> currently have
-<code>var</code> semantics and module bindings are not live.
-<code>import.meta.url</code> works, and literal-string
-<code>import()</code> returns a Promise, but those modules are eagerly loaded
-and computed imports are unsupported. Inline modules report the document URL;
-external modules require a JavaScript MIME type and obey fetch-style
-CORS/cookie rules. Inline SVG has polygons, polylines and a bounded,
-single-subpath command subset, not complete paths, arcs or effects. Its default
-<code>viewBox</code> scaling is centered and aspect-preserving, one missing
-dimension can be derived from that ratio, and coordinate/raster work is
-capped. Downloadable webfonts, media codecs and playback are not implemented;
-video can show a poster and audio/video otherwise use fallback boxes. HTTPS
-uses HTTP/1.1 over TLS 1.3 &mdash; HTTP/2 and HTTP/3 are not implemented. The
-from-scratch cryptography has not had a professional audit. Complex sites will
-still degrade or fail; this browser does not claim compatibility with every
-website.</p>
+        ctx.strokeStyle = "#60a5fa";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, 56, Math.PI * 1.15, Math.PI * 1.85);
+        ctx.stroke();
 
-<h2>Getting around</h2>
+        ctx.strokeStyle = "#f59e0b";
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(cx - 28, cy);
+        ctx.lineTo(cx - 10, cy);
+        ctx.lineTo(cx, cy + 7);
+        ctx.lineTo(cx + 10, cy);
+        ctx.lineTo(cx + 28, cy);
+        ctx.stroke();
 
-<ul>
-  <li>Click a link to follow it</li>
-  <li><b>Back</b>, <b>Fwd</b> and <b>Reload</b>, or ctrl-B / ctrl-F / ctrl-R</li>
-  <li>ctrl-L types in the address bar, enter goes</li>
-  <li>Arrows and PgUp/PgDn scroll, ctrl-Q quits</li>
-</ul>
+        ctx.strokeStyle = "#334155";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(4, 4, w - 8, h - 8);
 
-<hr>
+        ctx.fillStyle = "#e2f1ff";
+        ctx.font = "11px monospace";
+        ctx.fillText(`HDG ${String(this.heading).padStart(3, "0")}`, 12, 20);
+        ctx.fillText(`ALT ${this.altitude}ft`, w - 88, 20);
+        ctx.fillStyle = "#34d399";
+        ctx.fillText("KESTREL AVIONICS", 12, h - 10);
 
-<p>Run <code>browser -t &lt;url&gt;</code> from a shell to render any page as
-plain text instead &mdash; that works over a serial console with no graphics
-at all.</p>
+        if (this.readout) {
+          const pSign = this.pitch >= 0 ? "+" : "";
+          this.readout.textContent =
+            `HDG ${String(this.heading).padStart(3, "0")} | PITCH ${pSign}${this.pitch} deg | BANK ${this.bank} deg | ALT ${this.altitude} ft`;
+        }
+      }
 
+      adjustPitch(delta) {
+        this.pitch = Math.max(-25, Math.min(25, this.pitch + delta));
+        this.altitude += delta * 40;
+        this.draw();
+      }
+
+      stepBank() {
+        this.bank = this.bank >= 24 ? -24 : this.bank + 12;
+        this.heading = (this.heading + 15) % 360;
+        this.draw();
+      }
+
+      level() {
+        this.pitch = 0;
+        this.bank = 0;
+        this.draw();
+      }
+    }
+
+    const hud = new HorizonInstrument("horizon", "hud-readout");
+    hud.draw();
+
+    const bind = (id, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("click", fn);
+    };
+    bind("btn-pitch-up", () => hud.adjustPitch(5));
+    bind("btn-pitch-dn", () => hud.adjustPitch(-5));
+    bind("btn-bank", () => hud.stepBank());
+    bind("btn-level", () => hud.level());
+  </script>
 </body>
 </html>

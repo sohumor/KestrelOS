@@ -1,4 +1,4 @@
-# Browser runtime architecture
+# Kestrel Browser runtime architecture
 
 Kestrel Browser is a clean-room engine. Firefox and Chromium documentation is
 used to understand durable architectural boundaries, not as an implementation
@@ -10,16 +10,20 @@ tests.
 The runtime follows five rules:
 
 1. Procedural code implements parsing and processing pipelines. HTML parsing,
-   CSS matching, layout, paint-list generation, image decoding, and bytecode
-   interpretation are explicit operations over inputs and outputs.
+   CSS matching, CSS custom property/`calc()` resolution, Grid/Flexbox/block
+   layout, paint-list generation (gradients, shadows, rounded rects, SVG,
+   Canvas 2D bitmaps), image decoding, and AST/async JS interpretation are
+   explicit operations over inputs and outputs.
 2. Performance-sensitive work is data-oriented. DOM arenas, layout boxes,
-   paint items, flex items, storage entries, and task queues use bounded flat
-   or contiguous collections so hot loops do not chase object hierarchies.
-3. Modules own resources. A browser runtime owns HTTP/TLS services, the UA
-   stylesheet, and local/session stores. A page owns its DOM, author CSS,
-   computed style engine, layout document, script realm, and decoded images.
-4. Input, page events, timers, Promise jobs, and scripted fetches are delivered
-   through event checkpoints. Interrupt handlers never execute page script.
+   paint items, grid/flex items, storage entries, and task queues use bounded
+   flat or contiguous collections so hot loops do not chase object hierarchies.
+3. Modules own resources. A browser runtime owns HTTP/TLS services, the
+   persistent Keep-Alive connection pool, the UA stylesheet, and local/session
+   stores. A tab/page owns its DOM, author CSS, computed style engine, layout
+   document, `<canvas>` bitmaps, script realm, and decoded images.
+4. Input, page events, timers, Promise jobs, async continuations, observers, and
+   scripted fetches are delivered through event checkpoints. Interrupt handlers
+   never execute page script.
 5. State machines make lifecycle changes visible. Composition connects these
    components; no browser subsystem inherits behavior from another.
 
@@ -27,24 +31,30 @@ The runtime follows five rules:
 
 ```text
 browser_runtime
-  +-- HTTP client + TLS options
+  +-- HTTP client (Keep-Alive pool up to HTTP_POOL_MAX) + TLS 1.3 options
   +-- UA stylesheet
   +-- persistent localStorage service
   `-- process-lifetime sessionStorage service
 
-browser_page
-  +-- URL/base URL and response metadata
-  +-- DOM document
-  +-- author stylesheet + computed style engine
-  +-- layout document + flat paint order
-  +-- JavaScript/DOM realm
-  `-- decoded image resources
+browser_tab
+  +-- history stack, address buffer, scroll/focus/hover/active/reader state
+  +-- console log ring (CONSOLE_LOG_MAX) + network log ring (NET_LOG_MAX)
+  `-- active browser_page
+        +-- URL/base URL and response metadata
+        +-- DOM document (including <canvas> pixel buffers)
+        +-- author stylesheet + computed style engine
+        +-- layout document + flat paint order
+        +-- JavaScript/DOM realm (ES6+ libjs + jsdom)
+        `-- decoded image resources
 ```
 
-The page receives references to runtime services through configuration
-structures and callbacks. The DOM bridge does not subclass the network,
+The page receives references to runtime and host services through
+`struct jsdom_config` and explicit callbacks (`print`, `cookie_get`/`cookie_set`,
+`fetch`, `get_box_rect`, `scroll_cb`, `clipboard_write`/`clipboard_read`,
+`stylesheet`). The DOM bridge does not subclass the network, layout, clipboard,
 storage, or renderer. This makes ownership and teardown explicit and lets host
-tests substitute deterministic fetch, cookie, storage, and print services.
+tests substitute deterministic fetch, cookie, geometry, clipboard, storage, and
+print services.
 
 ## Page lifecycle
 
@@ -55,7 +65,8 @@ created -> navigating -> fetching -> response -> parsing
         -> styling -> layout -> scripting -> complete
 ```
 
-A DOM mutation or viewport resize performs:
+A DOM mutation, canvas draw, or viewport resize (`jsdom_notify_resize()`)
+triggers style recomputation and re-layout:
 
 ```text
 complete -> styling -> layout -> complete
@@ -73,7 +84,7 @@ machine makes that boundary explicit so a later nonblocking transport can
 split `fetching` into DNS, connect, TLS, request, headers, and body events
 without changing page ownership.
 
-## Event tasks
+## Event tasks and async execution
 
 Timer and fetch records live in fixed-capacity arrays and move through:
 
@@ -81,14 +92,20 @@ Timer and fetch records live in fixed-capacity arrays and move through:
 free -> queued -> running -> settling -> free
 ```
 
-Promise reactions and `queueMicrotask()` use the JavaScript realm's bounded
-FIFO job queue. One browser checkpoint advances due tasks and drains jobs.
+Promise reactions, `queueMicrotask()`, and `async`/`await` continuations share
+the JavaScript realm's bounded FIFO job queue (`js_run_jobs()`). At each
+checkpoint (`jsdom_pump()`), the runtime drains Promise jobs, delivers
+`MutationObserver`, `ResizeObserver`, and `IntersectionObserver` batches, then
+advances due timer, animation-frame, idle-callback, Fetch, and `FileReader`
+tasks. `async`/`await` suspends function frames in explicit `js_async_task`
+continuations rather than C stack switching, keeping the 64 KiB user stack
+safe across multi-step awaits.
+
 Repeating timers schedule their next event turn only after the current callback
 returns, and cancellation remains valid from inside the callback. GUI idle
 events also run checkpoints, so work progresses without keyboard or mouse
-input.
-Each timer record owns up to 16 forwarded callback values. Animation and idle
-requests compose over the same lifecycle with an explicit callback kind:
+input. Each timer record owns up to 16 forwarded callback values. Animation and
+idle requests compose over the same lifecycle with an explicit callback kind:
 animation receives the event-turn timestamp, while idle receives a freshly
 owned deadline record. Cancellation therefore uses one ID namespace and one
 state transition path instead of parallel schedulers.
@@ -97,14 +114,11 @@ An `AbortController` and its `AbortSignal` compose over one reference-counted
 state record. Fetch tasks keep a non-owning pointer to that state while queued:
 an abort moves matching tasks directly from `queued` to `settling`, rejects
 their Promises with the signal's exact reason, and frees the task before the
-network host is called. The single-threaded synchronous host boundary means a
-task already in `running` completes normally; a future nonblocking transport
-can add cancellation checks at each connection-state transition.
-Timed signals reuse the timer queue and enter the same transition with a
-`TimeoutError`. Composed signals form a bounded acyclic dependency graph:
-`AbortSignal.any()` validates the complete source array transactionally,
-deduplicates sources, and caps both fan-out and graph depth before registering
-edges.
+network host is called. Timed signals reuse the timer queue and enter the same
+transition with a `TimeoutError`. Composed signals form a bounded acyclic
+dependency graph: `AbortSignal.any()` validates the complete source array
+transactionally, deduplicates sources, and caps both fan-out and graph depth
+before registering edges.
 
 Constructed events carry explicit dispatch, stopped, and immediately-stopped
 state rather than encoding propagation in the cancellation flag. Dispatch
@@ -112,23 +126,18 @@ snapshots the existing DOM parent links into a bounded path, walks it in
 capture/target/bubble order, updates target/current-target and phase at each
 step, and consults the same listener arrays used by trusted input events.
 Each listener is a compact record holding callback, capture, once, passive,
-and optional AbortSignal state. Listener removal leaves bounded holes that
-dispatch skips; `once` creates that hole before invocation so re-entrant
-dispatch cannot call it twice, while abort-linked records are skipped as soon
-as their signal transitions.
-The active path is also exposed as a copied `composedPath()` Array during
-callbacks and cleared when dispatch completes, preventing page code from
-mutating the internal traversal snapshot or retaining stale dispatch state.
-Specialized UI, mouse, keyboard, focus, input, and pointer events compose
-prototype layers over the same Event record. Their constructors only add
-normalized initializer fields; cancellation, path traversal, listener
-delivery, and lifecycle state remain owned by the one dispatch pipeline.
+and optional AbortSignal state. `once` clears its listener slot before invocation
+so re-entrant dispatch cannot call it twice, while abort-linked records are
+skipped once triggered. `composedPath()` exposes a copy of the active traversal
+path while dispatch is active. Specialized UI, mouse, keyboard, focus, input,
+and pointer events compose prototype layers over the same `Event` record.
 
-## Data-oriented storage and layout
+## Data-oriented storage, layout, and rendering
 
 Web Storage is an origin-partitioned contiguous table with procedural lookup
-and explicit quotas. The storage module owns copied origin/key/value strings.
-Its versioned percent-escaped persistence format is imported transactionally.
+and explicit quotas (`1 MiB` per origin). The storage module owns copied
+origin/key/value strings, and its versioned percent-escaped persistence format
+is imported transactionally.
 
 The separate `libjs/webapi.c` module operates directly on owned byte spans.
 Text codecs consume `ArrayBuffer`/`Uint8Array` views without intermediate
@@ -142,107 +151,62 @@ second query representation.
 Fetch header sets use a compact fixed-capacity table of unique normalized
 names and owned values. Script-created sets and response wrappers share the
 same reference-counted state; cloning performs bounded procedural copies.
-Append combines in place, while set/delete update the dense table without a
-second object hierarchy.
-Script-created and fetched responses own the same response record shape.
-Cloning procedurally copies the bounded body bytes and header table so each
-clone advances its own `bodyUsed` state without aliasing mutable header data.
-Request records use the same owned header and byte-body components. Fetch
-moves a validated snapshot into its queued task, separating transport-owned
-`Accept`/`Content-Type` fields from a bounded raw extra-header block. The
-browser application rejects cross-origin non-simple requests until a preflight
-state machine is present, preventing the compatibility layer from silently
-bypassing CORS. Mode, credential, and redirect strings live in the request
-record and are copied into the queued transport task, where the connection
-state machine enforces same-origin, cookie, credentialed-CORS, and redirect
-decisions.
-Blob construction appends heterogeneous parts into one capped owned byte
-span. Slices copy only their selected range, and Request/Response copy from
-that same span while inheriting its validated MIME type when no explicit
-`Content-Type` exists.
-FormData reuses Blob values and string values already owned by the realm, then
-procedurally emits one capped multipart byte span per body snapshot. Field
-names and filenames are percent-escaped in disposition headers, preventing
-page-controlled CR/LF or quotes from creating injected HTTP headers.
-The inverse body pipeline parses URL-encoded pairs or bounded multipart
-delimiters back into FormData and reconstructs file parts through the same
-File constructor. Callable collection iterators are small host records holding
-only source identity, cursor, and iteration kind.
+Request records use the same owned header and byte-body components, enforcing
+same-origin, cookie, credentialed-CORS, and redirect decisions at transport time.
+`Blob` construction appends heterogeneous parts into one capped owned byte span;
+`FormData` emits and parses bounded `multipart/form-data` and URL-encoded
+bodies; `FileReader` and Blob object URLs tie directly into the per-realm task
+and registry lifecycle.
 
-FileReader keeps result/error/readiness in an owning host record and queues a
-generation-tagged event-loop task. Generation checks prevent an aborted or
-superseded read from publishing stale results. Blob object URLs use a bounded
-per-realm registry of copied bytes and are resolved inside the Fetch pump, so
-revocation and realm teardown have explicit ownership.
+Web `crypto` fills mutable typed-array views through OS `getrandom()` (backed by
+the SHA-256 entropy pool and ChaCha20 CSPRNG) and shares the TLS SHA-256/384/512
+primitives for `crypto.subtle.digest()`. `navigator.hardwareConcurrency` reads
+from `SYS_CPUINFO`. `navigator.clipboard` delegates `writeText()` / `readText()`
+through the `clipboard_write` / `clipboard_read` seams in `struct jsdom_config`
+(falling back to an internal realm clipboard buffer in headless host tests).
 
-Web `crypto` fills mutable typed-array views through the OS `getrandom()`
-boundary. On Kestrel this reaches the SHA-256 mixing pool and ChaCha20 CSPRNG;
-UUID formatting only occurs after the secure bytes have been obtained.
-Promise-based Web Crypto digests share the TLS library's SHA-256/SHA-384/
-SHA-512 core; the compatibility-only SHA-1 path is isolated from certificate
-and transport decisions. Navigator processor capacity is injected from the
-kernel `cpuinfo()` boundary. Beacon delivery composes a bounded keepalive POST
-onto the existing Fetch task state machine, so it does not add a second
-networking lifecycle.
+`matchMedia()` and stylesheet `@media` evaluation share the CSS parser's bounded
+media-query evaluator (`width`/`height` ranges, `prefers-color-scheme`,
+`scripting`). Custom property (`--*`) inheritance, recursive-descent
+`calc()`/`min()`/`max()`/`clamp()`, `light-dark()`, `box-shadow`, and
+`linear-gradient()` resolve procedurally during style computation without
+floating-point dependencies.
 
-`matchMedia()` composes directly over the stylesheet parser's standalone
-media-query evaluator and receives the same viewport dimensions as layout.
-Location component writes are normalized through the shared URL parser and
-become queued navigation intents, preserving the no-recursive-navigation rule
-inside script execution.
+Flex and Grid layout operate over flat item arrays rather than polymorphic layout
+objects: Flex computes row/column wrapping, `flex-grow`, `flex-shrink`,
+`flex-basis`, `align-items: baseline`, and gaps; Grid computes explicit/fraction
+(`fr`) / `repeat()` / `minmax()` tracks and item placements. `position: sticky`
+offsets are evaluated against scrolled viewport coordinates using the shared
+box tree, and `lay_paint_order()` feeds both `libweb/paint.c` (anti-aliased
+rounded corners, gradients, inset/outer shadows, multi-subpath SVG, `<canvas>`
+bitmaps) and `lay_hit_test_view()`.
 
-Same-document history is a bounded per-realm array of URL/state records.
-Traversal changes the realm URL without entering the network lifecycle,
-dispatches `popstate`, and is synchronized back into the embedding page and
-address bar at browser checkpoints. Modern DOM mutation methods compose over
-the same capped arena tree operations as parsing; string arguments become text
-nodes before the mutation pass. General style-property mutation procedurally
-rewrites one bounded declaration string, replacing duplicates and preserving
-priority metadata.
+Software `<canvas>` 2D backing stores (`struct dom_canvas` attached directly to
+`HTAG_CANVAS` DOM nodes) stay decoupled from layout: `canvas_2d_state` tracks
+affine transform stacks, polygon/arc path arrays, styles, and font state,
+rasterizes into bounded RGBA buffers (`JSDOM_CANVAS_MAX_DIM = 2048`), marks
+the DOM dirty on draw, and serializes uncompressed RGBA PNGs for
+`toDataURL('image/png')`. Layout and `paint.c` blit the resulting bitmap
+whenever present.
 
-ECMAScript collections use dense key and value arrays with bounded linear
-SameValueZero lookup. Map and Set iteration is a cursor over those arrays,
-avoiding an allocation-heavy node hierarchy. WeakMap and WeakSet use the same
-object-keyed representation but deliberately omit size, clearing, enumeration,
-and iterator APIs. Because a JavaScript document realm is region-allocated and
-freed as a unit today, weak entries naturally have realm lifetime; this is
-weaker than tracing-GC ephemeron semantics and is documented as a compatibility
-surface rather than claimed garbage-collection observability.
+`DOMParser` parses HTML, SVG, or XML strings directly via `html_parse_document()`
+into standalone documents; `<template>` elements retain inert parsed contents in
+a `DocumentFragment` exposed as `.content`. Geometry queries
+(`getBoundingClientRect()`) consult `jsdom_config.get_box_rect`, `scrollTo()` /
+`scrollBy()` synchronize with `jsdom_config.scroll_cb`, and `ResizeObserver` /
+`IntersectionObserver` queue bounded observation batches drained in `jsdom_pump()`.
 
-DOM node wrappers now compose separate EventTarget, Node, Element,
-HTMLElement/SVGElement, and Document prototype layers while retaining one
-arena-owned DOM node record. Element records carry a compact known-namespace
-identifier plus an exact arena-owned URI, allowing fast HTML/SVG dispatch
-without losing custom namespace identity. Parser placement propagates SVG and
-MathML namespaces, while scripted construction and namespace-filtered lookup
-reuse the same record and iterative traversal.
-The dataset view keeps a stable object per element and binds each discovered
-camel-cased key to its owning `data-*` attribute; subsequent `setAttribute()`
-keys are added during the next dataset refresh without a parallel attribute
-store.
-DocumentFragment is an arena-owned node type accepted by the same procedural
-tree editor as elements. Inserting one moves its children in order and leaves
-the fragment empty, so off-document composition does not introduce a second
-tree representation or a special rendering path.
+Two-way `dataset` synchronization keeps a per-element binding object over `data-*`
+attributes, syncing reads, new-key creation, writes, and `delete` operations
+directly with the underlying DOM attribute array.
 
-Range is a compact pair of `(node, offset)` boundary points over the same arena
-tree. Boundary comparison walks existing parent/sibling links, content
-operations reuse the normal clone and mutation pipelines, and contextual HTML
-is parsed into an off-document fragment. Selection owns at most one Range
-reference and projects anchor/focus state from it; it does not introduce a
-second text or tree model.
-
-Mutation observation composes a fixed observer table with the same tree and
-attribute operations. Each mutation snapshots a small `MutationRecord` into a
-64-entry per-observer queue; event-loop checkpoints drain that queue before
-timers run. The callback therefore cannot run recursively inside a DOM edit,
-and `takeRecords()` can transactionally transfer the pending snapshot first.
-
-Flex layout gathers participating children into a compact temporary
-`flex_item` array, measures them, distributes available main-axis space, and
-writes results back in a bounded pass. Row and column directions share the
-same record shape while using axis-specific procedural algorithms. Ordinary
-block flow remains the allocation-failure fallback.
+`libjs` implements real block-scoped `let`/`const` lexical environments with
+temporal dead zone (TDZ) checks and per-iteration loop closures, ES6 `class` /
+`extends` / `super`, destructuring, default/rest parameters, spread syntax,
+template and tagged literals, `Symbol` (`[Symbol.iterator]` + `for..of`),
+optional chaining (`?.`), nullish coalescing (`??`), logical assignments, and
+exponentiation (`**`). `Map`, `Set`, `WeakMap`, and `WeakSet` store dense
+bounded key/value arrays with SameValueZero lookup over the realm lifetime.
 
 ## Clean-room architectural references
 

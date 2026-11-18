@@ -354,9 +354,17 @@ class _QuietHTTPServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs):
         self._get_count = 0
+        self._accept_count = 0
         self._path_counts = {}
         self._get_count_lock = threading.Lock()
         super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self._get_count_lock:
+            self._accept_count += 1
+        conn.settimeout(3.0)
+        return conn, addr
 
     def record_get(self, path="/"):
         with self._get_count_lock:
@@ -367,6 +375,11 @@ class _QuietHTTPServer(http.server.ThreadingHTTPServer):
     def get_count(self):
         with self._get_count_lock:
             return self._get_count
+
+    @property
+    def accept_count(self):
+        with self._get_count_lock:
+            return self._accept_count
 
     def path_count(self, path):
         with self._get_count_lock:
@@ -1273,6 +1286,159 @@ def _marker_handler(marker):
                     7, 7, 1, 3, 97, 100, 100, 0, 0,
                     10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11,
                 ])
+            elif path == "/modern":
+                response = (
+                    "<!doctype html><html><head>"
+                    "<title>Kestrel modern web fixture</title>"
+                    "<link rel=stylesheet href=/modern.css>"
+                    "</head><body><h1>MODERN-WEB-START</h1>"
+                    "<img src=/modern/pixel.png width=1 height=1>"
+                    "<div id=\"grid\" class=\"grid\">"
+                    "<div id=\"cell\" class=\"cell\"></div></div>"
+                    "<canvas id=\"cv\" width=\"16\" height=\"16\"></canvas>"
+                    "<script src=/modern.js></script>"
+                    "<script type=module src=/modern-mod.mjs></script>"
+                    "</body></html>"
+                ).encode("ascii")
+            elif path == "/modern.css":
+                content_type = "text/css"
+                response = (
+                    ":root { --gap-px: 12px; --accent: #123456; }\n"
+                    ".grid {\n"
+                    "  display: grid;\n"
+                    "  grid-template-columns: 1fr 2fr;\n"
+                    "  gap: var(--gap-px);\n"
+                    "  color: var(--accent);\n"
+                    "}\n"
+                    ".cell {\n"
+                    "  display: flex;\n"
+                    "  box-sizing: border-box;\n"
+                    "  border-radius: 6px;\n"
+                    "  width: calc(20px + 12px);\n"
+                    "}\n"
+                ).encode("ascii")
+            elif path == "/modern/pixel.png":
+                accept = self.headers.get("Accept", "").lower()
+                if "avif" in accept or "webp" in accept:
+                    err_body = b"unsupported Accept image format"
+                    self.send_response(406)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+                content_type = "image/png"
+                response = base64.b64decode(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                    "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            elif path == "/modern/api":
+                content_type = "application/json"
+                response = b'{"ok":true,"engine":"kestrel"}'
+            elif path == "/modern.js":
+                content_type = "text/javascript"
+                response = (
+                    "const gridEl=document.getElementById('grid');\n"
+                    "const cellEl=document.getElementById('cell');\n"
+                    "const gs=getComputedStyle(gridEl);\n"
+                    "const cs=getComputedStyle(cellEl);\n"
+                    "const cssOk=gs.display==='grid' && "
+                    "gs.gridTemplateColumns==='1fr 2fr' && "
+                    "gs.gap==='12px' && "
+                    "gs.color==='rgb(18, 52, 86)' && "
+                    "gs.getPropertyValue('--gap-px')==='12px' && "
+                    "gs.getPropertyValue('--accent')==='#123456' && "
+                    "cs.display==='flex' && "
+                    "cs.boxSizing==='border-box' && "
+                    "cs.borderRadius==='6px' && "
+                    "(cs.width==='32px' || cs.width==='calc(20px + 12px)');\n"
+                    "const cssNode=document.createElement('p');\n"
+                    "cssNode.textContent=cssOk"
+                    "?'MODERN-CSS-OK':'MODERN-CSS-BAD';\n"
+                    "document.body.appendChild(cssNode);\n"
+                    "const cells=document.querySelectorAll('#grid > .cell');\n"
+                    "const cv=document.getElementById('cv');\n"
+                    "const ctx=cv.getContext('2d');\n"
+                    "ctx.fillStyle='#ff0000';\n"
+                    "ctx.fillRect(0,0,8,8);\n"
+                    "const px=ctx.getImageData(2,2,1,1).data;\n"
+                    "const dataUrl=cv.toDataURL('image/png');\n"
+                    "const canvasOk=cells.length===1 && "
+                    "cells[0]===cellEl && "
+                    "px[0]===255 && px[1]===0 && px[2]===0 && px[3]===255 && "
+                    "dataUrl.indexOf('data:image/png;base64,')===0;\n"
+                    "const canvasNode=document.createElement('p');\n"
+                    "canvasNode.textContent=canvasOk"
+                    "?'MODERN-CANVAS-OK':'MODERN-CANVAS-BAD';\n"
+                    "document.body.appendChild(canvasNode);\n"
+                    "class BaseEngine{\n"
+                    "  constructor(prefix){this.prefix=prefix;}\n"
+                    "  describe(name){return `${this.prefix}:${name}`;}\n"
+                    "}\n"
+                    "class KestrelEngine extends BaseEngine{\n"
+                    "  constructor(prefix,ver){super(prefix);this.ver=ver;}\n"
+                    "  async inspect(url){\n"
+                    "    const res=await fetch(url);\n"
+                    "    const {ok,engine}=await res.json();\n"
+                    "    const opt=({meta:{tag:this.ver}})?.meta?.tag"
+                    "??'none';\n"
+                    "    const missing=null?.x??'fallback';\n"
+                    "    return `${super.describe(engine)}"
+                    "#${opt}/${ok}/${missing}`;\n"
+                    "  }\n"
+                    "}\n"
+                    "async function runModern(){\n"
+                    "  const es6Node=document.createElement('p');\n"
+                    "  try{\n"
+                    "    const eng=new KestrelEngine('eng',1);\n"
+                    "    const summary=await eng.inspect('/modern/api');\n"
+                    "    es6Node.textContent="
+                    "summary==='eng:kestrel#1/true/fallback'"
+                    "?'MODERN-ES6-ASYNC-OK':'MODERN-ES6-ASYNC-BAD';\n"
+                    "  }catch(e){\n"
+                    "    es6Node.textContent='MODERN-ES6-ASYNC-BAD';\n"
+                    "  }\n"
+                    "  document.body.appendChild(es6Node);\n"
+                    "}\n"
+                    "runModern();\n"
+                ).encode("ascii")
+            elif path == "/modern-dep.mjs":
+                content_type = "text/javascript"
+                response = (
+                    "export const TAG = 'MOD-DEP';\n"
+                    "export class DepWidget {\n"
+                    "  constructor(name) {\n"
+                    "    this.name = name;\n"
+                    "  }\n"
+                    "  badge() {\n"
+                    "    return `${this.name}:${TAG}`;\n"
+                    "  }\n"
+                    "}\n"
+                ).encode("ascii")
+            elif path == "/modern-mod.mjs":
+                content_type = "text/javascript"
+                response = (
+                    "import {\n"
+                    "  DepWidget,\n"
+                    "  TAG\n"
+                    "} from '/modern-dep.mjs';\n"
+                    "const widget = new DepWidget('K');\n"
+                    "const modNode = document.createElement('p');\n"
+                    "modNode.textContent = (widget instanceof DepWidget && "
+                    "TAG === 'MOD-DEP' && widget.badge() === 'K:MOD-DEP')\n"
+                    "  ? 'MODERN-MODULE-OK'\n"
+                    "  : 'MODERN-MODULE-BAD';\n"
+                    "document.body.appendChild(modNode);\n"
+                ).encode("ascii")
+            modern_routes = (
+                "/modern",
+                "/modern.css",
+                "/modern/pixel.png",
+                "/modern/api",
+                "/modern.js",
+                "/modern-mod.mjs",
+                "/modern-dep.mjs",
+            )
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(response)))
@@ -1282,7 +1448,9 @@ def _marker_handler(marker):
                     "servercookie=server; Path=/; HttpOnly")
             if path == "/cors.mjs":
                 self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Connection", "close")
+            self.send_header(
+                "Connection",
+                "keep-alive" if path in modern_routes else "close")
             self.end_headers()
             self.wfile.write(response)
 
@@ -1346,6 +1514,7 @@ class BrowserFixtureServers:
         self.threads = []
         self.http_url = None
         self.compat_url = None
+        self.modern_url = None
         self.module_policy_url = None
         self.cors_url = None
         self.https_url = None
@@ -1406,6 +1575,8 @@ class BrowserFixtureServers:
         self.http_url = "http://%s:%d/plain" % (
             QEMU_HOST, self.http.server_address[1])
         self.compat_url = "http://%s:%d/compat" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.modern_url = "http://%s:%d/modern" % (
             QEMU_HOST, self.http.server_address[1])
         self.module_policy_url = "http://%s:%d/module-policy" % (
             QEMU_HOST, self.http.server_address[1])
@@ -2198,6 +2369,52 @@ def t_browser_web_compat(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def t_browser_modern_web(h):
+    """CSS grid/vars/calc, ES6+/async, Canvas 2D, modules, and Keep-Alive."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    modern_paths = [
+        "/modern",
+        "/modern.css",
+        "/modern/pixel.png",
+        "/modern.js",
+        "/modern-mod.mjs",
+        "/modern-dep.mjs",
+        "/modern/api",
+    ]
+    before = {p: browser_fixtures.http.path_count(p) for p in modern_paths}
+    accept_before = browser_fixtures.http.accept_count
+    end = "BROWSER-MODERN-END"
+    h.send("/bin/browser -t -v %s; echo BROWSER-MODERN-STATUS-$?; echo %s"
+           % (browser_fixtures.modern_url, end))
+    block = h.capture_until(r"\n%s\n" % end, timeout=NET_TIMEOUT, regex=True)
+    counts = {p: browser_fixtures.http.path_count(p) - before[p]
+              for p in modern_paths}
+    accept_delta = browser_fixtures.http.accept_count - accept_before
+    for marker in ("MODERN-CSS-OK", "MODERN-ES6-ASYNC-OK",
+                   "MODERN-MODULE-OK", "MODERN-CANVAS-OK"):
+        if marker not in block:
+            raise TimeoutError("modern web marker %s was absent "
+                               "(resource requests %r)" % (marker, counts))
+    statuses = re.findall(r"(?m)^BROWSER-MODERN-STATUS-(-?\d+)$", block)
+    if statuses != ["0"]:
+        raise TimeoutError("browser modern status was %r" % statuses)
+    if not re.search(r"(?m)^subresources: \d+  resource-bytes: \d+  "
+                     r"resource-errors: 0$", block):
+        raise TimeoutError("modern resource summary was missing or unhealthy")
+    if not re.search(r"(?m)^stylesheets: \d+  scripts: \d+  script-errors: 0$",
+                     block):
+        raise TimeoutError("modern CSS/script summary was missing or unhealthy")
+    missed = [p for p in modern_paths if counts[p] <= 0]
+    if missed:
+        raise TimeoutError("browser did not request resources %r" % missed)
+    if not (1 <= accept_delta < len(modern_paths)):
+        raise TimeoutError("expected HTTP Keep-Alive connection reuse "
+                           "(accept_delta=%d, requests=%d)"
+                           % (accept_delta, len(modern_paths)))
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+
 def t_browser_module_policy(h):
     """ES modules reject invalid MIME types and cross-origin denial."""
     if not browser_fixtures:
@@ -2465,6 +2682,7 @@ TESTS = [
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
     ("browser-web-compat", t_browser_web_compat),
+    ("browser-modern-web", t_browser_modern_web),
     ("browser-module-policy", t_browser_module_policy),
     ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),

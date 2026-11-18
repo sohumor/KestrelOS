@@ -8,6 +8,7 @@ replicating all rules in the top-level Makefile with `.d` dependency tracking.
 import argparse
 import concurrent.futures
 import glob
+import json
 import os
 import re
 import shutil
@@ -540,10 +541,125 @@ def run_host_tests(tc):
     run_cmd([sys.executable, r("tools/test_kfs_journal.py")])
 
 
+def generate_compile_commands(tc):
+    os.makedirs(BUILD, exist_ok=True)
+    run_cmd([
+        sys.executable, r("tools/mkconfig.py"),
+        "--config", r("config"),
+        "--header", r("kernel/include/config.h"),
+        "--mk", b("config.mk"),
+        "--quiet",
+    ])
+    cfg = parse_config_mk(b("config.mk"))
+
+    target_flags = ["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []
+    kreg_flags = ["-mgeneral-regs-only"] if tc["is_clang"] else ["-mno-mmx", "-mno-sse", "-mno-sse2"]
+    cflags = target_flags + [
+        "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
+        "-fno-pic", "-fno-pie", "-fno-builtin", "-mno-red-zone",
+    ] + kreg_flags + [
+        "-mcmodel=kernel", "-fno-omit-frame-pointer", "-Wall", "-Wextra",
+        "-O2", "-g", "-Ikernel/include", "-Iabi",
+    ]
+    modcflags = target_flags + [
+        "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
+        "-fno-pic", "-fno-pie", "-fno-builtin", "-mno-red-zone",
+    ] + kreg_flags + [
+        "-mcmodel=kernel", "-fno-common", "-fno-asynchronous-unwind-tables",
+        "-Wall", "-Wextra", "-O2", "-Ikernel/include", "-Iabi",
+    ]
+    ucflags = target_flags + [
+        "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
+        "-fno-pic", "-fno-pie", "-fno-builtin", "-mno-red-zone",
+        "-Wall", "-Wextra", "-O2", "-g",
+        "-Ilibc/include", "-Iabi", "-Ilibgui",
+        "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs",
+    ]
+    dyn_cflags = target_flags + [
+        "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
+        "-fno-builtin", "-mno-red-zone", "-Wall", "-Wextra", "-O2", "-g",
+    ]
+    host_common = ["-std=c11", "-Wall", "-Wextra", "-O2", "-g"]
+    if sys.platform == "win32":
+        host_common += ["-D_CRT_SECURE_NO_WARNINGS", "-Wno-deprecated-declarations"]
+
+    entries = []
+    seen = set()
+
+    def add_entry(src_rel, obj_rel, flags):
+        norm_rel = src_rel.replace("\\", "/")
+        if norm_rel in seen:
+            return
+        seen.add(norm_rel)
+        abs_file = os.path.abspath(r(norm_rel))
+        entries.append({
+            "directory": ROOT,
+            "arguments": [tc["cc"]] + flags + ["-c", norm_rel, "-o", b(obj_rel)],
+            "file": abs_file,
+        })
+
+    k_excl = set(cfg["CONFIG_KERNEL_EXCLUDE"])
+    for s in rel_glob("kernel/*.c"):
+        rel = os.path.relpath(s, ROOT).replace("\\", "/")
+        if rel not in k_excl:
+            add_entry(rel, "kernel/%s.o" % os.path.splitext(os.path.basename(rel))[0], cflags)
+    for s in rel_glob("modules/*.c"):
+        rel = os.path.relpath(s, ROOT).replace("\\", "/")
+        add_entry(rel, "modules/%s.kmod" % os.path.splitext(os.path.basename(rel))[0], modcflags)
+    for s in rel_glob("libc/*.c"):
+        rel = os.path.relpath(s, ROOT).replace("\\", "/")
+        add_entry(rel, "libc/%s.o" % os.path.splitext(os.path.basename(rel))[0], ucflags)
+    for s in rel_glob("libgui/*.c"):
+        rel = os.path.relpath(s, ROOT).replace("\\", "/")
+        add_entry(rel, "libgui/%s.o" % os.path.splitext(os.path.basename(rel))[0], ucflags)
+    for libname in BROWSER_LIBS:
+        for s in rel_glob("%s/*.c" % libname):
+            rel = os.path.relpath(s, ROOT).replace("\\", "/")
+            extra = ["-DCSS_WITH_DOM"] if rel == "libweb/style.c" else []
+            add_entry(rel, "%s/%s.o" % (libname, os.path.splitext(os.path.basename(rel))[0]), ucflags + extra)
+    app_excl = set(cfg["CONFIG_APPS_EXCLUDE"])
+    for s in rel_glob("apps/*.c"):
+        rel = os.path.relpath(s, ROOT).replace("\\", "/")
+        name = os.path.splitext(os.path.basename(rel))[0]
+        if name not in app_excl:
+            add_entry(rel, "apps/%s.o" % name, ucflags)
+    add_entry("dynamic/libgreet.c", "dynamic/libgreet.o", dyn_cflags + ["-fPIC"])
+    add_entry("dynamic/dynhello.c", "dynamic/dynhello.o", dyn_cflags + ["-fPIE"])
+    for pkg in sorted(os.path.basename(p) for p in glob.glob(r("packages/*")) if os.path.isdir(p)):
+        for s in rel_glob("packages/%s/src/*.c" % pkg):
+            rel = os.path.relpath(s, ROOT).replace("\\", "/")
+            prog = os.path.splitext(os.path.basename(rel))[0]
+            add_entry(rel, "pkgobj/%s/%s.o" % (pkg, prog), ucflags)
+
+    host_suites = [
+        ("tools/test_random_core.c", ["-Ikernel/include"]),
+        ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
+        ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),
+        ("tools/test_gui_primitives.c", ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
+        ("tools/test_cryptosym.c", ["-Ilibtls"]),
+        ("tools/test_jpeg_prog.c", ["-Ilibimg", "-Ilibz"]),
+        ("tools/test_js.c", ["-DJS_HOST", "-Ilibjs"]),
+        ("tools/test_dom.c", ["-Ilibweb"]),
+        ("tools/test_css.c", ["-DCSS_WITH_DOM", "-Ilibweb", "-Ilibgui"]),
+        ("tools/test_font.c", ["-Ilibgui", "-Iabi"]),
+        ("tools/test_layout.c", ["-DPAINT_WITH_STDIO", "-Ilibweb", "-Ilibimg", "-Ilibz", "-Ilibgui", "-Iabi"]),
+        ("tools/test_jsdom.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
+        ("tools/test_browser_stack.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Itools/browser-host", "-Ilibgui", "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs"]),
+    ]
+    for rel, extra in host_suites:
+        if os.path.isfile(r(rel)):
+            add_entry(rel, "host-tests/%s.o" % os.path.splitext(os.path.basename(rel))[0], host_common + extra)
+
+    out_path = r("compile_commands.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+    print("compile_commands.json: %d translation units -> %s" % (len(entries), out_path))
+
+
 def main():
     ap = argparse.ArgumentParser(description="KestrelOS cross-platform build runner")
     ap.add_argument("action", nargs="?", default="build",
-                    choices=["build", "clean", "test-host", "fsck", "e2e", "smoke", "all"])
+                    choices=["build", "clean", "test-host", "fsck", "e2e", "smoke", "compdb", "all"])
     ap.add_argument("--nic", default="rtl8139")
     ap.add_argument("--cpus", type=int, default=2)
     args = ap.parse_args()
@@ -555,6 +671,8 @@ def main():
         return 0
 
     tc = detect_toolchain()
+    if args.action in ("build", "compdb", "all"):
+        generate_compile_commands(tc)
     if args.action in ("build", "all"):
         build_all(tc)
     if args.action in ("test-host", "all"):
