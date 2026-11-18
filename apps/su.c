@@ -33,22 +33,24 @@ struct account {
     int gid;
 };
 
-static int sc_getuid(void)
+static void secure_zero(void *p, unsigned long n)
 {
-    return (int)syscall(SYS_GETUID, 0, 0, 0, 0);
+    volatile unsigned char *vp = (volatile unsigned char *)p;
+
+    while (n--)
+        *vp++ = 0;
 }
 
-static int sc_setuid(int uid)
-{
-    return (int)syscall(SYS_SETUID, uid, 0, 0, 0);
-}
-
-/* Pull the shell-injected trailing "--cwd=<path>" argument, if any. */
+/* Pull shell-injected "--cwd=<path>" arguments anywhere in argv. */
 static int strip_cwd_arg(int argc, char **argv)
 {
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
+    int i, out = 1;
+
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--cwd=", 6) != 0)
+            argv[out++] = argv[i];
+    }
+    return out;
 }
 
 static long slurp(const char *path, char *buf, unsigned long max)
@@ -199,9 +201,12 @@ static int shadow_check(const char *user, const char *pw)
     char *line;
     char *f[4];
     long iters;
+    int res = 0;
 
-    if (slurp(SHADOW_PATH, buf, sizeof(buf)) < 0)
+    if (slurp(SHADOW_PATH, buf, sizeof(buf)) < 0) {
+        secure_zero(buf, sizeof(buf));
         return -1;
+    }
     p = buf;
     while ((line = db_next(&p)) != 0) {
         if (split_fields(line, f, 4) != 4)
@@ -209,12 +214,17 @@ static int shadow_check(const char *user, const char *pw)
         if (strcmp(f[0], user) != 0)
             continue;
         iters = atol(f[2]);
-        if (f[1][0] == '\0' || iters < 1 || iters > 1000000)
-            return 0;
+        if (f[1][0] == '\0' || iters < 1 || iters > 1000000) {
+            res = 0;
+            break;
+        }
         sha256_password(f[1], pw, (unsigned long)iters, want);
-        return hash_equal(want, f[3]);
+        res = hash_equal(want, f[3]);
+        break;
     }
-    return 0;
+    secure_zero(want, sizeof(want));
+    secure_zero(buf, sizeof(buf));
+    return res;
 }
 
 /* Read a line from fd 0 with no echo. -1 on ctrl-C/ctrl-D/read error. */
@@ -228,6 +238,7 @@ static int read_password(const char *prompt, char *buf, int n)
         long r = read(0, &c, 1);
 
         if (r <= 0) {
+            secure_zero(buf, (unsigned long)n);
             putchar('\n');
             return -1;
         }
@@ -237,15 +248,17 @@ static int read_password(const char *prompt, char *buf, int n)
             return len;
         }
         if (c == 3 || c == 4) {
+            secure_zero(buf, (unsigned long)n);
             putchar('\n');
             return -1;
         }
         if (c == 8 || c == 127) {
             if (len > 0)
-                len--;
+                buf[--len] = '\0';
             continue;
         }
         if (c == 21) {
+            secure_zero(buf, (unsigned long)n);
             len = 0;
             continue;
         }
@@ -256,6 +269,18 @@ static int read_password(const char *prompt, char *buf, int n)
     }
 }
 
+/* Return 1 if fd 0 is backed by a pipe/file rather than the console TTY. */
+static int stdin_is_nonconsole(void)
+{
+    int dupfd = dup2_(0, 3);
+
+    if (dupfd >= 0) {
+        close(dupfd);
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char pass[FIELD_MAX];
@@ -264,7 +289,9 @@ int main(int argc, char **argv)
     const char *target = "root";
     struct account acct;
     struct k_stat st;
-    char *sargv[3];
+    struct k_spawn_caps caps;
+    char *sargv[4];
+    int sargc = 0;
     int caller;
     int ok;
     int pid;
@@ -278,7 +305,7 @@ int main(int argc, char **argv)
     if (argc == 2)
         target = argv[1];
 
-    caller = sc_getuid();
+    caller = (int)getuid_();
     name_for_uid(caller, caller_name, sizeof(caller_name));
 
     if (!find_account(target, &acct)) {
@@ -287,10 +314,12 @@ int main(int argc, char **argv)
     }
 
     if (caller != acct.uid) {
-        if (read_password("password: ", pass, (int)sizeof(pass)) < 0)
+        if (read_password("password: ", pass, (int)sizeof(pass)) < 0) {
+            secure_zero(pass, sizeof(pass));
             return 1;
+        }
         ok = shadow_check(target, pass);
-        memset(pass, 0, sizeof(pass));
+        secure_zero(pass, sizeof(pass));
         if (ok < 0) {
             printf("su: cannot read %s\n", SHADOW_PATH);
             if (caller != 0)
@@ -303,7 +332,7 @@ int main(int argc, char **argv)
             sleep_ms(2000);
             return 1;
         }
-        if (sc_setuid(acct.uid) != 0) {
+        if (setuid_((uint32_t)acct.uid) != 0) {
             printf("su: cannot become uid %d\n", acct.uid);
             if (caller != 0)
                 printf("su: only root can switch users - KestrelOS has no "
@@ -324,10 +353,24 @@ int main(int argc, char **argv)
     printf("su: %s -> %s (exit the nested shell to come back)\n",
            caller_name, acct.name);
 
-    sargv[0] = acct.shell;
-    sargv[1] = cwdarg;
-    sargv[2] = 0;
-    pid = spawn(acct.shell, sargv);
+    sargv[sargc++] = acct.shell;
+    if (strcmp(acct.shell, "/bin/sh") == 0 && stdin_is_nonconsole())
+        sargv[sargc++] = "-i";
+    sargv[sargc++] = cwdarg;
+    sargv[sargc] = 0;
+
+    memset(&caps, 0, sizeof(caps));
+    caps.fds[0].child_fd = 0;
+    caps.fds[0].parent_fd = 0;
+    caps.fds[1].child_fd = 1;
+    caps.fds[1].parent_fd = 1;
+    caps.fds[2].child_fd = 2;
+    caps.fds[2].parent_fd = 2;
+    caps.n_fds = 3;
+    caps.flags = K_SPAWN_CLOSE_OTHER;
+    caps.cap_mask = (acct.uid != 0) ? KCAP_USER_DEF : 0;
+
+    pid = spawn_caps(acct.shell, sargv, &caps);
     if (pid < 0) {
         printf("su: cannot spawn %s\n", acct.shell);
         return 1;

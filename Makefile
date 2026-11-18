@@ -297,7 +297,7 @@ $(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_S
 	cp $(MOD_BINS) $(BUILD)/rootfs/lib/modules/
 	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
 	$(PY) tools/mkfs.py --mode /etc/shadow:0600 --mode /var/pkg/db:0700 \
-	  --mode /tmp:0777 --mode /run:0777 \
+	  --mode /tmp:0777 --mode /run:0755 \
 	  $(BUILD)/rootfs $@ 64
 
 # ---------------- disk image ----------------

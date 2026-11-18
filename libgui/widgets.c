@@ -92,7 +92,7 @@ void gui_ui_event(gui_ui *ui, const struct k_event *ev)
     case KEV_MOUSE_WHEEL:
         ui->mx = ev->x;
         ui->my = ev->y;
-        ui->wheel += (int)ev->key;
+        ui->wheel += (int)(int32_t)ev->key;
         break;
 #endif
     default:
@@ -122,6 +122,124 @@ static int held_in(const gui_ui *ui, gui_rc r)
 {
     return (ui->buttons & (unsigned)K_MOUSE_LEFT) &&
            gui_hit(r, ui->down_x, ui->down_y) && gui_hit(r, ui->mx, ui->my);
+}
+
+/* --------------------------------------------------- AA text & clipboard */
+
+static const struct font *pick_aa_font(int size, int weight, int style)
+{
+    if (size >= FONT_SIZE_COUNT)
+        return font_for_height(size, weight, style);
+    return font_get(size, weight, style);
+}
+
+int gui_draw_text_aa_n(gui_window *win, int x, int y, const char *s, int n,
+                       int size, int weight, int style,
+                       uint32_t fg, long bg)
+{
+    font_surface fs;
+    font_rc cl;
+    const struct font *f;
+
+    if (!win || !win->px || !s)
+        return x;
+    f = pick_aa_font(size, weight, style);
+    fs = font_surface_of(win->px, win->w, win->h, win->w);
+    cl = font_mkrc(win->clip.x, win->clip.y, win->clip.w, win->clip.h);
+    return x + font_draw_text_n(&fs, cl, x, y, s, n, f, fg, bg);
+}
+
+int gui_draw_text_aa(gui_window *win, int x, int y, const char *s,
+                     int size, int weight, int style,
+                     uint32_t fg, long bg)
+{
+    return gui_draw_text_aa_n(win, x, y, s, -1, size, weight, style, fg, bg);
+}
+
+int gui_draw_text_aa_run(gui_window *win, int x, int y, const char *s, int n,
+                         int size, int weight, int style,
+                         uint32_t fg, long bg, int max_w, int ellipsis)
+{
+    font_surface fs;
+    font_rc cl;
+    const struct font *f;
+
+    if (!win || !win->px || !s)
+        return x;
+    f = pick_aa_font(size, weight, style);
+    fs = font_surface_of(win->px, win->w, win->h, win->w);
+    cl = font_mkrc(win->clip.x, win->clip.y, win->clip.w, win->clip.h);
+    return x + font_draw_run(&fs, cl, x, y, s, n, f, fg, bg, max_w,
+                             ellipsis, 0);
+}
+
+int gui_measure_text_aa(const char *s, int size, int weight, int style,
+                        int *out_h)
+{
+    const struct font *f = pick_aa_font(size, weight, style);
+
+    if (out_h)
+        *out_h = font_line_height(f);
+    return font_text_width(f, s);
+}
+
+int gui_draw_text_mono(gui_window *win, int x, int y, const char *s,
+                       uint32_t fg, long bg)
+{
+    return gui_text(win, x, y, s, fg, bg);
+}
+
+void gui_label_aa(gui_window *win, int x, int y, const char *s,
+                  int size, int weight, uint32_t fg)
+{
+    (void)gui_draw_text_aa(win, x, y, s, size, weight, FONT_ROMAN, fg,
+                           GUI_TRANSPARENT);
+}
+
+int gui_clipboard_copy(const char *text, int len, const char *label)
+{
+    if (!text)
+        return -1;
+    if (len < 0)
+        len = (int)strlen(text);
+    if (len <= 0)
+        return -1;
+    if (len > K_PARCEL_MAX_BYTES)
+        len = K_PARCEL_MAX_BYTES;
+    return parcel_put(K_PARCEL_TEXT, "text/plain",
+                      label ? label : "Text", text, (uint32_t)len);
+}
+
+int gui_clipboard_paste(char *out, int cap)
+{
+    struct k_parcel_info info;
+    int slot;
+    long n;
+
+    if (!out || cap <= 1)
+        return 0;
+    for (slot = 0; slot < K_PARCEL_MAX_SLOTS; slot++) {
+        if (parcel_list(slot, &info) != 0)
+            break;
+        if (info.type == K_PARCEL_TEXT || info.type == K_PARCEL_PATH ||
+            info.type == K_PARCEL_URL || info.type == K_PARCEL_NUMBER ||
+            info.type == K_PARCEL_COLOR || info.type == K_PARCEL_KREC) {
+            uint32_t want = (uint32_t)(cap - 1);
+
+            if (info.size < want)
+                want = info.size;
+            if (want == 0)
+                return 0;
+            n = parcel_get(info.id, 0, out, want);
+            if (n <= 0)
+                return 0;
+            if (n >= cap)
+                n = cap - 1;
+            out[n] = '\0';
+            return (int)n;
+        }
+    }
+    return 0;
 }
 
 /* -------------------------------------------------------------- buttons */
@@ -160,9 +278,9 @@ int gui_button_ex(gui_window *win, gui_rc r, const char *label, gui_ui *ui,
         ty = r.y + (r.h - GUI_FONT_H) / 2;
         if (held)
             ty++;
-        gui_clip(win, gui_mkrc(r.x + 2, r.y, r.w - 4, r.h));
+        gui_push_clip(win, gui_mkrc(r.x + 2, r.y, r.w - 4, r.h));
         gui_text(win, tx, ty, label, text, GUI_TRANSPARENT);
-        gui_unclip(win);
+        gui_pop_clip(win);
     }
     return enabled && clicked_in(ui, r);
 }
@@ -190,10 +308,10 @@ int gui_icon_button(gui_window *win, gui_rc r, enum gui_icon icon,
     gui_icon(win, ix, iy, isz, icon, fg);
     if (label) {
         tx = ix + isz + 7;
-        gui_clip(win, gui_mkrc(tx, r.y, r.x + r.w - tx - 4, r.h));
+        gui_push_clip(win, gui_mkrc(tx, r.y, r.x + r.w - tx - 4, r.h));
         gui_text(win, tx, r.y + (r.h - GUI_FONT_H) / 2, label, fg,
                  GUI_TRANSPARENT);
-        gui_unclip(win);
+        gui_pop_clip(win);
     }
     return clicked;
 }
@@ -300,6 +418,33 @@ int gui_textbox(gui_window *win, gui_rc r, gui_textbox_state *tb, gui_ui *ui)
         case 5:                         /* ctrl-E */
             tb->caret = tb->len;
             break;
+        case 3:                         /* ctrl-C: copy to Talon */
+            if (tb->len > 0)
+                (void)gui_clipboard_copy(tb->buf, tb->len, "TextBox");
+            break;
+        case 24:                        /* ctrl-X: cut to Talon */
+            if (tb->len > 0) {
+                (void)gui_clipboard_copy(tb->buf, tb->len, "TextBox");
+                tb->len = 0;
+                tb->caret = 0;
+                tb->scroll = 0;
+                tb->buf[0] = '\0';
+            }
+            break;
+        case 22: {                      /* ctrl-V: paste from Talon */
+            char pbuf[512];
+            int plen = gui_clipboard_paste(pbuf, (int)sizeof(pbuf));
+            int pi;
+
+            for (pi = 0; pi < plen; pi++) {
+                unsigned char ch = (unsigned char)pbuf[pi];
+                if (ch == '\n' || ch == '\r')
+                    break;
+                if (ch >= 32 && ch < 127)
+                    tb_insert(tb, (char)ch);
+            }
+            break;
+        }
         case 21:                        /* ctrl-U: clear the line */
             tb->len = 0;
             tb->caret = 0;
@@ -323,7 +468,7 @@ int gui_textbox(gui_window *win, gui_rc r, gui_textbox_state *tb, gui_ui *ui)
     gui_round_rect(win, r, 6, GUI_SUNKEN);
     gui_round_frame(win, r, 6, tb->focus ? GUI_ACCENT : GUI_EDGE);
 
-    gui_clip(win, gui_mkrc(r.x + 3, r.y + 1, r.w - 6, r.h - 2));
+    gui_push_clip(win, gui_mkrc(r.x + 3, r.y + 1, r.w - 6, r.h - 2));
     tx = r.x + 4;
     for (i = tb->scroll; i < tb->len && i < tb->scroll + visible; i++)
         tx = gui_char(win, tx, r.y + (r.h - GUI_FONT_H) / 2, tb->buf[i],
@@ -336,7 +481,7 @@ int gui_textbox(gui_window *win, gui_rc r, gui_textbox_state *tb, gui_ui *ui)
         gui_rect(win, cx, r.y + (r.h - GUI_FONT_H) / 2, 1, GUI_FONT_H,
                  GUI_ACCENT);
     }
-    gui_unclip(win);
+    gui_pop_clip(win);
     return entered;
 }
 
@@ -366,6 +511,16 @@ int gui_scrollbar(gui_window *win, gui_rc r, int total, int visible,
         gui_round_rect(win, gui_mkrc(r.x + 3, r.y + 3, r.w - 6, r.h - 6),
                        (r.w - 6) / 2, GUI_PANEL);
         return *top != old;
+    }
+
+    if (ui->wheel && gui_hit(r, ui->mx, ui->my)) {
+        *top -= ui->wheel * 3;
+        if (*top < 0)
+            *top = 0;
+        if (*top > max_top)
+            *top = max_top;
+        ui->wheel = 0;
+        changed = 1;
     }
 
     thumb_h = (r.h * visible) / (total > 0 ? total : 1);
@@ -506,7 +661,7 @@ int gui_listbox(gui_window *win, gui_rc r, gui_list *ls, gui_ui *ui)
             ls->top = 0;
     }
 
-    gui_clip(win, rows);
+    gui_push_clip(win, rows);
     for (i = 0; i < visible; i++) {
         int idx = ls->top + i;
         int y = rows.y + i * row_h;
@@ -531,7 +686,7 @@ int gui_listbox(gui_window *win, gui_rc r, gui_list *ls, gui_ui *ui)
         gui_text(win, rows.x + 4, y + (row_h - GUI_FONT_H) / 2, text, fg,
                  GUI_TRANSPARENT);
     }
-    gui_unclip(win);
+    gui_pop_clip(win);
     return activated;
 }
 
@@ -625,13 +780,12 @@ void gui_badge(gui_window *win, gui_rc r, const char *text, uint32_t color)
 
     if (!win || !text || r.w <= 0 || r.h <= 0)
         return;
-    gui_round_rect(win, r, r.h / 2, gui_mix(color, GUI_SURFACE, 76));
-    gui_round_frame(win, r, r.h / 2, color);
+    gui_draw_pill(win, r, gui_mix(color, GUI_SURFACE, 76), (long)color);
     tx = r.x + (r.w - gui_text_w(text)) / 2;
-    gui_clip(win, r);
+    gui_push_clip(win, r);
     gui_text(win, tx, r.y + (r.h - GUI_FONT_H) / 2, text, GUI_TEXT,
              GUI_TRANSPARENT);
-    gui_unclip(win);
+    gui_pop_clip(win);
 }
 
 /* ------------------------------------------------------------------ menu */

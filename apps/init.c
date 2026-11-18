@@ -3,10 +3,11 @@
  * init reads /etc/inittab, runs the sysinit directives to completion, then
  * starts services described by /etc/services/<name>.svc respecting their
  * `after=` ordering, then the once/respawn directives. From there it runs
- * a poll loop that reaps dead children, restarts respawning units with a
- * backoff, serves control requests from /run/init.cmd (written by
- * `service`) and performs an orderly shutdown when /run/shutdown appears
- * (written by `reboot` / `halt`).
+ * a poll loop that checks starting readiness markers without blocking,
+ * reaps dead children, restarts respawning units with a backoff, serves
+ * control requests from /run/init.cmd (written by `service`) and performs
+ * an orderly shutdown when /run/shutdown appears (written by `reboot` /
+ * `halt`).
  *
  * The file formats and the /run protocol are documented in docs/init.md.
  *
@@ -27,11 +28,12 @@
 
 /* --- tunables --------------------------------------------------------- */
 
-#define POLL_MS         200        /* supervisor tick */
-#define FAIL_WINDOW_MS  30000UL    /* crash-loop detection window */
-#define FAIL_MAX        5          /* deaths in the window before failing */
-#define SETTLED_MS      1000UL     /* uptime after which exit 0 is normal */
-#define STOP_GRACE_MS   3000UL     /* wait for children during shutdown */
+#define POLL_MS          200        /* supervisor tick */
+#define START_POLL_MS    50         /* faster poll while a unit is S_STARTING */
+#define FAIL_WINDOW_MS   30000UL    /* crash-loop detection window */
+#define FAIL_MAX         5          /* deaths in the window before failing */
+#define SETTLED_MS       1000UL     /* uptime after which exit 0 is normal */
+#define STOP_GRACE_MS    3000UL     /* wait for children during shutdown */
 #define START_TIMEOUT_MS 5000UL     /* ready= deadline */
 
 #define MAX_UNITS       24
@@ -103,6 +105,7 @@ struct unit {
     int  restart_pending;     /* start again as soon as it is reaped */
     int  dependency_failed;   /* stopped because a required unit went away */
     int  start_guard;         /* recursive dependency-start cycle guard */
+    int  boot_pending;        /* waiting for an S_STARTING boot predecessor */
     int  seq;                 /* start order, for reverse shutdown */
     int  order;               /* resolved dependency order (services) */
     unsigned long win_start;  /* uptime ms the failure window opened */
@@ -116,6 +119,10 @@ static int nunits;
 static int seq_counter;
 static int state_dirty;
 static int have_run;          /* /run exists and is writable */
+
+static int cmd_pending;
+static char cmd_verb[24];
+static char cmd_name[NAMESZ];
 
 /* --- small helpers ---------------------------------------------------- */
 
@@ -724,14 +731,17 @@ static void state_write(void)
         return;
     n = write(fd, buf, sizeof(buf));
     close(fd);
-    if (n == (long)sizeof(buf))
+    if (n == (long)sizeof(buf)) {
+        chmod_(STATE_PATH, 0644);
         state_dirty = 0;
+    }
 }
 
 /* --- starting and reaping --------------------------------------------- */
 
 static int pid_alive(int pid);
 static void unit_start(struct unit *u);
+static void unit_died(struct unit *u, int code);
 
 static int requirement_satisfied(const struct unit *u)
 {
@@ -741,12 +751,16 @@ static int requirement_satisfied(const struct unit *u)
            u->respawn == R_NEVER;
 }
 
+/* Returns 0 when all requirements are ready, 1 when at least one is still
+ * S_STARTING (caller should stay S_STOPPED and retry on later ticks), or
+ * -1 when a requirement is unavailable or failed. */
 static int ensure_requirements(struct unit *u)
 {
     char scratch[DEPSZ];
     char *dep[MAX_DEPS];
     struct unit *d;
     int n, i;
+    int waiting = 0;
 
     if (u->kind != K_SERVICE || !u->requires[0])
         return 0;
@@ -763,13 +777,35 @@ static int ensure_requirements(struct unit *u)
          * explicitly pull this requirement in. */
         if (d->state == S_DISABLED)
             d->enabled = 1;
-        if (!requirement_satisfied(d))
+        if (!requirement_satisfied(d) && d->state != S_STARTING)
             unit_start(d);
+        if (d->state == S_STARTING) {
+            waiting = 1;
+            continue;
+        }
         if (!requirement_satisfied(d)) {
             logf(K_LOG_ERR, "%s: required service %s did not become ready",
                  u->name, dep[i]);
             return -1;
         }
+    }
+    return waiting ? 1 : 0;
+}
+
+static int any_req_starting(const struct unit *u)
+{
+    char scratch[DEPSZ];
+    char *dep[MAX_DEPS];
+    struct unit *d;
+    int n, i;
+
+    if (u->kind != K_SERVICE || !u->requires[0])
+        return 0;
+    n = split_deps(u->requires, scratch, dep);
+    for (i = 0; i < n; i++) {
+        d = find_unit(dep[i]);
+        if (d && (d->state == S_STARTING || any_req_starting(d)))
+            return 1;
     }
     return 0;
 }
@@ -787,6 +823,14 @@ static void unit_spawn(struct unit *u)
     u->stopping = 0;
     u->restart_pending = 0;
     u->dependency_failed = 0;
+
+    if (u->pid > 0) {
+        if (!pid_alive(u->pid))
+            u->exit_code = waitpid(u->pid);
+        else
+            kill(u->pid, SIGKILL);
+        u->pid = 0;
+    }
 
     if (!u->enabled) {
         u->state = S_DISABLED;
@@ -824,43 +868,12 @@ static void unit_spawn(struct unit *u)
     if (!u->seq)
         u->seq = ++seq_counter;
     logf(K_LOG_INFO, "started %s (pid %d)", u->name, pid);
-
-    if (u->ready[0]) {
-        unsigned long deadline = uptime_ms() + u->start_timeout_ms;
-
-        state_write();
-        while (uptime_ms() < deadline) {
-            if (stat_(u->ready, &st) == 0) {
-                u->state = S_RUNNING;
-                state_dirty = 1;
-                logf(K_LOG_INFO, "%s ready (%s)", u->name, u->ready);
-                return;
-            }
-            if (!pid_alive(pid)) {
-                u->exit_code = waitpid(pid);
-                u->pid = 0;
-                u->state = S_FAILED;
-                state_dirty = 1;
-                logf(K_LOG_ERR, "%s exited before readiness (code %d)",
-                     u->name, u->exit_code);
-                return;
-            }
-            sleep_ms(50);
-        }
-        logf(K_LOG_ERR, "%s readiness timed out after %lu ms",
-             u->name, u->start_timeout_ms);
-        syscall(SYS_KILL, pid, SIGTERM, 0, 0);
-        for (i = 0; i < 20 && pid_alive(pid); i++)
-            sleep_ms(10);
-        u->exit_code = waitpid(pid);
-        u->pid = 0;
-        u->state = S_FAILED;
-        state_dirty = 1;
-    }
 }
 
 static void unit_start(struct unit *u)
 {
+    int req;
+
     if (u->state == S_RUNNING || u->state == S_STARTING)
         return;
     if (u->start_guard) {
@@ -870,13 +883,65 @@ static void unit_start(struct unit *u)
         return;
     }
     u->start_guard = 1;
-    if (ensure_requirements(u) < 0) {
+    req = ensure_requirements(u);
+    if (req < 0) {
         u->state = S_FAILED;
         state_dirty = 1;
-    } else {
+    } else if (req == 0) {
         unit_spawn(u);
     }
+    /* req > 0 means a dependency is S_STARTING; leave u S_STOPPED for retry */
     u->start_guard = 0;
+}
+
+/* Non-blocking check for units in S_STARTING on every supervisor tick. */
+static void check_starting(void)
+{
+    struct k_stat st;
+    unsigned long now = uptime_ms();
+    int i;
+
+    for (i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (u->state != S_STARTING)
+            continue;
+        if (u->stopping)
+            continue;
+        if (u->ready[0] && stat_(u->ready, &st) == 0) {
+            u->state = S_RUNNING;
+            state_dirty = 1;
+            logf(K_LOG_INFO, "%s ready (%s)", u->name, u->ready);
+            continue;
+        }
+        if (u->pid <= 0 || !pid_alive(u->pid)) {
+            u->exit_code = u->pid > 0 ? waitpid(u->pid) : -1;
+            u->pid = 0;
+            u->state = S_FAILED;
+            state_dirty = 1;
+            logf(K_LOG_ERR, "%s exited before readiness (code %d)",
+                 u->name, u->exit_code);
+            continue;
+        }
+        if (now - u->start_ms >= u->start_timeout_ms) {
+            logf(K_LOG_ERR, "%s readiness timed out after %lu ms",
+                 u->name, u->start_timeout_ms);
+            u->stopping = 1;
+            u->dependency_failed = 1;
+            kill(u->pid, SIGTERM);
+            u->state = S_FAILED;
+            state_dirty = 1;
+        }
+    }
+}
+
+static int any_starting(void)
+{
+    int i;
+
+    for (i = 0; i < nunits; i++)
+        if (units[i].state == S_STARTING || units[i].boot_pending)
+            return 1;
+    return cmd_pending;
 }
 
 /* Run a sysinit unit to completion. */
@@ -885,6 +950,11 @@ static void unit_run_sync(struct unit *u)
     int code;
 
     unit_start(u);
+    while (u->state == S_STARTING) {
+        check_starting();
+        if (u->state == S_STARTING)
+            sleep_ms(START_POLL_MS);
+    }
     if (u->state != S_RUNNING)
         return;
     code = waitpid(u->pid);
@@ -1013,7 +1083,7 @@ static void unit_stop(struct unit *u)
 {
     u->stopping = 1;
     if (u->pid > 0)
-        syscall(SYS_KILL, u->pid, SIGTERM, 0, 0);
+        kill(u->pid, SIGTERM);
 }
 
 static int reload_service(struct unit *u)
@@ -1094,6 +1164,10 @@ static void enforce_dependencies(void)
             struct unit *d = &units[j];
             if (!unit_requires(u, d->name) || requirement_satisfied(d))
                 continue;
+            /* If a starting unit depends on another unit that is still
+             * starting, wait until it settles. */
+            if (u->state == S_STARTING && d->state == S_STARTING)
+                continue;
             logf(K_LOG_ERR, "%s stopped: required service %s is not ready",
                  u->name, d->name);
             u->dependency_failed = 1;
@@ -1119,21 +1193,65 @@ static void enforce_dependencies(void)
     }
 }
 
-static void run_command(char *verb, char *name, char *ack, unsigned long size)
+static int deps_starting(const struct unit *u, const char *spec)
+{
+    char scratch[DEPSZ];
+    char *dep[MAX_DEPS];
+    struct unit *d;
+    int n, i;
+
+    if (!spec[0])
+        return 0;
+    n = split_deps(spec, scratch, dep);
+    for (i = 0; i < n; i++) {
+        d = find_unit(dep[i]);
+        if (d && d != u && (d->state == S_STARTING || d->boot_pending))
+            return 1;
+    }
+    return 0;
+}
+
+static void run_boot_pending(void)
+{
+    int o, i;
+
+    for (o = 0; o < nunits; o++) {
+        for (i = 0; i < nunits; i++) {
+            struct unit *u = &units[i];
+            if (u->kind != K_SERVICE || u->order != o || !u->boot_pending)
+                continue;
+            if (deps_starting(u, u->after) || deps_starting(u, u->requires))
+                continue;
+            u->boot_pending = 0;
+            if (u->state != S_FAILED && u->enabled)
+                unit_start(u);
+        }
+    }
+}
+
+/* Returns 1 if the command is deferred waiting for S_STARTING, 0 if ack is
+ * ready to publish. */
+static int run_command(char *verb, char *name, char *ack, unsigned long size)
 {
     struct unit *u = find_unit(name);
 
     if (!u) {
         snprintf(ack, size, "err no such service: %s\n", name);
-        return;
+        return 0;
     }
     logf(K_LOG_INFO, "control: %s %s", verb, name);
 
     if (!strcmp(verb, "start")) {
-        if (u->state == S_RUNNING || u->state == S_STARTING) {
+        if (u->state == S_RUNNING) {
             snprintf(ack, size, "ok %s already running (pid %d)\n", name,
                      u->pid);
-            return;
+            return 0;
+        }
+        if (u->state == S_STARTING) {
+            cmd_pending = 1;
+            setstr(cmd_verb, sizeof(cmd_verb), verb);
+            setstr(cmd_name, sizeof(cmd_name), name);
+            return 1;
         }
         u->enabled = 1;
         u->restart_pending = 0;
@@ -1143,6 +1261,13 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
         u->win_start = 0;
         u->win_open = 0;
         unit_start(u);
+        if (u->state == S_STARTING ||
+            (u->state == S_STOPPED && any_req_starting(u))) {
+            cmd_pending = 1;
+            setstr(cmd_verb, sizeof(cmd_verb), verb);
+            setstr(cmd_name, sizeof(cmd_name), name);
+            return 1;
+        }
         snprintf(ack, size, "%s start %s (%s)\n",
                  u->state == S_RUNNING ? "ok" : "err", name,
                  state_name[u->state]);
@@ -1154,7 +1279,7 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
             u->next_start = 0;
             state_dirty = 1;
             snprintf(ack, size, "ok stop %s (was not running)\n", name);
-            return;
+            return 0;
         }
         unit_stop(u);
         snprintf(ack, size, "ok stop %s (pid %d)\n", name, u->pid);
@@ -1164,13 +1289,20 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
             u->restart_pending = 1;      /* checked before stopping in reap */
             unit_stop(u);
             snprintf(ack, size, "ok restart %s (pid %d)\n", name, u->pid);
-            return;
+            return 0;
         }
         u->fails = 0;
         u->backoff = 0;
         u->win_start = 0;
         u->win_open = 0;
         unit_start(u);
+        if (u->state == S_STARTING ||
+            (u->state == S_STOPPED && any_req_starting(u))) {
+            cmd_pending = 1;
+            setstr(cmd_verb, sizeof(cmd_verb), verb);
+            setstr(cmd_name, sizeof(cmd_name), name);
+            return 1;
+        }
         snprintf(ack, size, "%s restart %s (%s)\n",
                  u->state == S_RUNNING ? "ok" : "err", name,
                  state_name[u->state]);
@@ -1178,7 +1310,7 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
         if (reload_service(u) < 0) {
             snprintf(ack, size, "err reload %s (invalid configuration)\n",
                      name);
-            return;
+            return 0;
         }
         if (!u->enabled) {
             if ((u->state == S_RUNNING || u->state == S_STARTING) &&
@@ -1187,21 +1319,23 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
             else
                 u->state = S_DISABLED;
             snprintf(ack, size, "ok reload %s (disabled)\n", name);
-            return;
+            return 0;
         }
         if ((u->state == S_RUNNING || u->state == S_STARTING) && u->pid > 0) {
             u->restart_pending = 1;
             unit_stop(u);
             snprintf(ack, size, "ok reload %s (restarting pid %d)\n",
                      name, u->pid);
-        } else
+        } else {
             snprintf(ack, size, "ok reload %s (%s)\n", name,
                      state_name[u->state]);
+        }
     } else if (!strcmp(verb, "reset-failed")) {
         u->fails = 0;
         u->backoff = 0;
         u->win_open = 0;
         u->next_start = 0;
+        u->dependency_failed = 0;
         if (u->state == S_FAILED)
             u->state = u->enabled ? S_STOPPED : S_DISABLED;
         state_dirty = 1;
@@ -1210,6 +1344,23 @@ static void run_command(char *verb, char *name, char *ack, unsigned long size)
     } else {
         snprintf(ack, size, "err unknown command: %.20s\n", verb);
     }
+    return 0;
+}
+
+static void commit_command_ack(const char *ack)
+{
+    /* Apply lifecycle effects of a stop/reload before committing the
+     * command acknowledgement and its state snapshot. */
+    enforce_dependencies();
+    state_dirty = 1;
+    /*
+     * An acknowledgement commits the control operation to the client.
+     * Publish its resulting state first so an immediate `service status`
+     * cannot race behind a successful start/stop/reload reply.
+     */
+    state_write();
+    unlink_(CMD_PATH);
+    write_file(ACK_PATH, ack);
 }
 
 /* /run/init.cmd holds one newline-terminated "<verb> <name>" line. The
@@ -1224,6 +1375,32 @@ static void poll_command(void)
 
     if (!have_run)
         return;
+
+    if (cmd_pending) {
+        struct unit *u = find_unit(cmd_name);
+        if (!u) {
+            cmd_pending = 0;
+            snprintf(ack, sizeof(ack), "err no such service: %s\n", cmd_name);
+            commit_command_ack(ack);
+            return;
+        }
+        if (u->state == S_STOPPED && !u->stopping) {
+            if (any_req_starting(u))
+                return;
+            unit_start(u);
+        }
+        if (u->state == S_STARTING ||
+            (u->state == S_STOPPED && any_req_starting(u)))
+            return;
+
+        cmd_pending = 0;
+        snprintf(ack, sizeof(ack), "%s %s %s (%s)\n",
+                 u->state == S_RUNNING ? "ok" : "err",
+                 cmd_verb, cmd_name, state_name[u->state]);
+        commit_command_ack(ack);
+        return;
+    }
+
     n = read_file(CMD_PATH, buf, sizeof(buf));
     if (n < 0)
         return;
@@ -1234,24 +1411,16 @@ static void poll_command(void)
     strip_comment(buf);
     n = split_ws(trim(buf), tok, 3);
     ack[0] = '\0';
-    if (n < 2)
+    if (n < 2) {
         setstr(ack, sizeof(ack),
                "err usage: <start|stop|restart|reload|reset-failed> <name>\n");
+        commit_command_ack(ack);
+        return;
+    }
+    if (run_command(tok[0], tok[1], ack, sizeof(ack)) == 0)
+        commit_command_ack(ack);
     else
-        run_command(tok[0], tok[1], ack, sizeof(ack));
-
-    /* Apply lifecycle effects of a stop/reload before committing the
-     * command acknowledgement and its state snapshot. */
-    enforce_dependencies();
-    state_dirty = 1;
-    /*
-     * An acknowledgement commits the control operation to the client.
-     * Publish its resulting state first so an immediate `service status`
-     * cannot race behind a successful start/stop/reload reply.
-     */
-    state_write();
-    unlink_(CMD_PATH);
-    write_file(ACK_PATH, ack);
+        state_write();
 }
 
 /* --- shutdown --------------------------------------------------------- */
@@ -1320,12 +1489,21 @@ static void do_shutdown(int action)
  * poweroff. */
 static void poll_shutdown(void)
 {
+    struct k_stat st;
     char buf[64];
     char *tok[2];
     int n;
 
     if (!have_run)
         return;
+    if (stat_(SHUTDOWN_PATH, &st) < 0)
+        return;
+    if (st.uid != 0) {
+        logf(K_LOG_WARN, "shutdown: ignoring unprivileged %s (uid %u)",
+             SHUTDOWN_PATH, st.uid);
+        unlink_(SHUTDOWN_PATH);
+        return;
+    }
     n = read_file(SHUTDOWN_PATH, buf, sizeof(buf));
     if (n < 0)
         return;
@@ -1362,12 +1540,19 @@ static void run_setup(void)
              RUN_DIR);
         return;
     }
+    chown_(RUN_DIR, 0, 0);
+    chmod_(RUN_DIR, 0755);
+
     /* /run is on the real filesystem, so clear anything a previous boot
      * left behind - a stale shutdown request would power the machine off
      * again the moment it came up. */
     unlink_(SHUTDOWN_PATH);
     unlink_(CMD_PATH);
     unlink_(ACK_PATH);
+    if (stat_(STATE_PATH, &st) == 0) {
+        chown_(STATE_PATH, 0, 0);
+        chmod_(STATE_PATH, 0644);
+    }
 }
 
 static void start_all(void)
@@ -1379,11 +1564,18 @@ static void start_all(void)
             unit_run_sync(&units[i]);
 
     order_services();
-    for (o = 0; o < nunits; o++)
-        for (i = 0; i < nunits; i++)
-            if (units[i].kind == K_SERVICE && units[i].order == o &&
-                units[i].state != S_FAILED)
-                unit_start(&units[i]);
+    for (o = 0; o < nunits; o++) {
+        for (i = 0; i < nunits; i++) {
+            struct unit *u = &units[i];
+            if (u->kind != K_SERVICE || u->order != o ||
+                u->state == S_FAILED || !u->enabled)
+                continue;
+            if (deps_starting(u, u->after) || deps_starting(u, u->requires))
+                u->boot_pending = 1;
+            else
+                unit_start(u);
+        }
+    }
 
     for (i = 0; i < nunits; i++)
         if ((units[i].kind == K_RESPAWN || units[i].kind == K_ONCE) &&
@@ -1416,13 +1608,15 @@ int main(int argc, char **argv)
     state_write();
 
     for (;;) {
+        check_starting();
+        run_boot_pending();
+        poll_command();
         reap_children();
         enforce_dependencies();
         run_backoff();
-        poll_command();
         poll_shutdown();
         if (state_dirty)
             state_write();
-        sleep_ms(POLL_MS);
+        sleep_ms(any_starting() ? START_POLL_MS : POLL_MS);
     }
 }

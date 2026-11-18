@@ -255,3 +255,27 @@ void signal_user_exception(struct task *t, struct regs *r)
     signal_send(t, sig);
     signal_deliver_pending(t, r);
 }
+
+int signal_interrupt_pending(struct task *t)
+{
+    if (!t || !t->user)
+        return 0;
+
+    uint64_t flags = spin_lock_irqsave(&signal_lock);
+    uint64_t ready = t->sig_pending &
+                     (~t->sig_mask | unblockable_mask());
+    int hit = 0;
+    for (int sig = 1; ready && sig < K_NSIG; sig++) {
+        if (!(ready & sig_bit(sig)))
+            continue;
+        uint64_t h = t->sig_actions[sig].handler;
+        if (sig == SIGKILL || sig == SIGSTOP)
+            h = SIG_DFL;
+        if (h == SIG_IGN || (h == SIG_DFL && default_ignored(sig)))
+            continue;
+        hit = 1;
+        break;
+    }
+    spin_unlock_irqrestore(&signal_lock, flags);
+    return hit;
+}

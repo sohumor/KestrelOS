@@ -10,22 +10,17 @@
  *
  *   df        sizes in KiB
  *   df -h     sizes scaled to K / M / G
+ *   df -r     emit @krec records
  */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
 #define MOUNTS_PATH "/dev/mounts"
 #define TABLE_MAX   2048
 #define FIELD_MAX   64
-
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
 
 static int next_field(const char **pp, char *out, unsigned long outsz)
 {
@@ -93,31 +88,61 @@ static void human(unsigned long long kib, char *out, unsigned long outsz)
 
 int main(int argc, char **argv)
 {
+    static const struct krec_col cols[] = {
+        { "mount",    KREC_STR },
+        { "fs",       KREC_STR },
+        { "total_kb", KREC_U64 },
+        { "used_kb",  KREC_U64 },
+        { "free_kb",  KREC_U64 },
+        { "dev",      KREC_STR },
+    };
     char buf[TABLE_MAX];
     char dev[FIELD_MAX], path[FIELD_MAX], type[FIELD_MAX];
     char bs[FIELD_MAX], nb[FIELD_MAX], nf[FIELD_MAX];
     char c1[24], c2[24], c3[24];
     const char *p;
-    int hflag = 0;
+    int hflag = 0, rflag = 0;
 
-    argc = strip_cwd_arg(argc, argv);
+    argc = krec_strip_cwd(argc, argv, 0);
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-h") == 0) {
-            hflag = 1;
+        if (strcmp(argv[i], "--krec") == 0) {
+            rflag = 1;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("usage: df [-h] [-r]\n");
+            return 0;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (int j = 1; argv[i][j]; j++) {
+                if (argv[i][j] == 'h')
+                    hflag = 1;
+                else if (argv[i][j] == 'r')
+                    rflag = 1;
+                else {
+                    printf("usage: df [-h] [-r]\n");
+                    return 1;
+                }
+            }
         } else {
-            printf("usage: df [-h]\n");
+            printf("usage: df [-h] [-r]\n");
             return 1;
         }
     }
 
     if (read_table(buf, sizeof(buf)) < 0) {
-        printf("df: cannot read %s\n", MOUNTS_PATH);
+        if (rflag)
+            krec_err("df: cannot read %s\n", MOUNTS_PATH);
+        else
+            printf("df: cannot read %s\n", MOUNTS_PATH);
         return 1;
     }
 
-    printf("%-10s %-6s %10s %10s %10s %5s %s\n",
-           "Filesystem", "Type", hflag ? "Size" : "1K-blocks",
-           "Used", "Avail", "Use%", "Mounted on");
+    if (rflag) {
+        if (krec_begin(1, cols, 6) < 0)
+            return 1;
+    } else {
+        printf("%-10s %-6s %10s %10s %10s %5s %s\n",
+               "Filesystem", "Type", hflag ? "Size" : "1K-blocks",
+               "Used", "Avail", "Use%", "Mounted on");
+    }
 
     p = buf;
     while (*p) {
@@ -142,19 +167,34 @@ int main(int argc, char **argv)
         freeb = to_u64(nf);
 
         /* A filesystem with no block device is named after its type. */
-        if (strcmp(dev, "-") == 0)
+        if (strcmp(dev, "-") == 0) {
             strncpy(dev, type, sizeof(dev) - 1);
+            dev[sizeof(dev) - 1] = '\0';
+        }
 
         if (bsz == 0 || blocks == 0) {
-            /* Nothing stored here: no honest numbers to print. */
-            printf("%-10s %-6s %10s %10s %10s %5s %s\n",
-                   dev, type, "-", "-", "-", "-", path);
+            if (rflag) {
+                krec_row(1, 6, path, type, "0", "0", "0", dev);
+            } else {
+                /* Nothing stored here: no honest numbers to print. */
+                printf("%-10s %-6s %10s %10s %10s %5s %s\n",
+                       dev, type, "-", "-", "-", "-", path);
+            }
             continue;
         }
 
         total_kb = blocks * bsz / 1024;
         free_kb = freeb * bsz / 1024;
         used_kb = total_kb - free_kb;
+
+        if (rflag) {
+            snprintf(c1, sizeof(c1), "%llu", total_kb);
+            snprintf(c2, sizeof(c2), "%llu", used_kb);
+            snprintf(c3, sizeof(c3), "%llu", free_kb);
+            krec_row(1, 6, path, type, c1, c2, c3, dev);
+            continue;
+        }
+
         pct = (unsigned)(blocks ? (blocks - freeb) * 100 / blocks : 0);
 
         if (hflag) {

@@ -44,24 +44,31 @@ static int request(const char *what)
 {
     struct k_stat st;
     char line[32];
-    long n;
+    long n, len;
     int fd;
 
     if (!init_present())
         return -1;
     if (stat_(RUN_DIR, &st) < 0 || !st.is_dir) {
-        if (mkdir_(RUN_DIR) < 0 || stat_(RUN_DIR, &st) < 0)
+        if (mkdir_(RUN_DIR) < 0 || stat_(RUN_DIR, &st) < 0 || !st.is_dir)
             return -1;
     }
+    chown_(RUN_DIR, 0, 0);
+    chmod_(RUN_DIR, 0755);
     fd = open(SHUTDOWN_PATH, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0)
         return -1;
     /* init only acts on a newline-terminated word, so the whole request
      * lands in one write and can never be read half-formed. */
     snprintf(line, sizeof(line), "%s\n", what);
-    n = write(fd, line, strlen(line));
+    len = (long)strlen(line);
+    n = write(fd, line, (unsigned long)len);
     close(fd);
-    return n < 0 ? -1 : 0;
+    if (n != len) {
+        unlink_(SHUTDOWN_PATH);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -71,6 +78,10 @@ int main(int argc, char **argv)
     argc = strip_cwd_arg(argc, argv);
     if (argc > 1) {
         printf("usage: reboot\n");
+        return 1;
+    }
+    if (getuid_() != 0) {
+        printf("reboot: permission denied (must be root)\n");
         return 1;
     }
 

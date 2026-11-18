@@ -3,6 +3,7 @@
 #include "vfs.h"
 #include "kheap.h"
 #include "proc.h"
+#include "signal.h"
 #include "string.h"
 
 /* Anonymous pipes.
@@ -130,7 +131,7 @@ long pipe_read_ex(struct file *f, void *buf, unsigned long n, int blocking)
             return 0;           /* EOF or non-blocking empty */
         }
         spin_unlock_irqrestore(&p->lock, fl);
-        if (current && current->kill_pending)
+        if (current && (current->kill_pending || signal_interrupt_pending(current)))
             return -1;
         /* Empty but still writable: wait. task_sleep_ticks() is safe here
          * because the pipe holds no lock of its own. */
@@ -171,8 +172,8 @@ long pipe_write(struct file *f, const void *buf, unsigned long n)
             continue;
         }
         spin_unlock_irqrestore(&p->lock, fl);
-        if (current && current->kill_pending)
-            return -1;
+        if (current && (current->kill_pending || signal_interrupt_pending(current)))
+            return done ? (long)done : -1;
         task_sleep_ticks(1);    /* full: wait for the reader to drain it */
     }
     return (long)done;

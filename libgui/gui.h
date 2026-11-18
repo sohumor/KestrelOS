@@ -20,6 +20,7 @@
 
 #include <stdint.h>
 #include <kestrel.h>
+#include "font.h"
 
 /* ---------------------------------------------------------------- font */
 
@@ -40,9 +41,9 @@ const uint8_t *gui_glyph(unsigned char c);
 #define GUI_GREEN(c) (((c) >> 8) & 0xFF)
 #define GUI_BLUE(c)  ((c) & 0xFF)
 
-/* The palette is process-local but live: gui_next_event() polls
- * /etc/desktop.conf, so open applications adopt an appearance change without
- * restarting. Macros preserve the original call-site API. */
+/* The palette is process-local but live: gui_next_event() updates it via
+ * KEV_THEME / K_TOPIC_THEME pulses without polling the filesystem.
+ * Macros preserve the original call-site API. */
 typedef struct gui_theme {
     uint32_t desk_top, desk_bottom;
     uint32_t panel, panel_hi;
@@ -53,17 +54,31 @@ typedef struct gui_theme {
     uint32_t ok, warn, error, white, black;
 } gui_theme;
 
+enum gui_theme_preset {
+    GUI_THEME_AVIONICS_DARK = 0,
+    GUI_THEME_DAYLIGHT      = 1,
+    GUI_THEME_AMBER         = 2,
+    GUI_THEME_BOREALIS      = 3,
+    GUI_THEME_CUSTOM        = 4,
+    GUI_THEME_PRESET_COUNT  = 5
+};
+
 typedef struct gui_settings {
     int light;       /* 0 = dark, 1 = light */
     int accent;      /* 0..5 */
     int wallpaper;   /* 0..3 */
     int compact;     /* compact dock */
+    int preset;      /* enum gui_theme_preset */
 } gui_settings;
 
 const gui_theme *gui_theme_current(void);
 void gui_settings_get(gui_settings *out);
 int gui_settings_save(const gui_settings *settings);
 void gui_settings_reload(void);
+int gui_theme_set_preset(int preset);
+int gui_theme_get_preset(void);
+void gui_theme_set_custom(const gui_theme *custom);
+int gui_theme_sync_wm(void);
 
 #define GUI_DESK_TOP     (gui_theme_current()->desk_top)
 #define GUI_DESK_BOTTOM  (gui_theme_current()->desk_bottom)
@@ -95,12 +110,16 @@ typedef struct gui_rc {
     int x, y, w, h;
 } gui_rc;
 
+#define GUI_CLIP_STACK_MAX 16
+
 typedef struct gui_window {
     uint32_t wid;        /* compositor window id                    */
     int w, h;            /* client size actually granted            */
     uint32_t *px;        /* w*h pixels, tightly packed, row-major   */
     int open;            /* 0 once closed or the compositor is gone */
     gui_rc clip;         /* current clip rectangle, window coords   */
+    gui_rc clip_stack[GUI_CLIP_STACK_MAX];
+    int clip_depth;
 } gui_window;
 
 static inline gui_rc gui_mkrc(int x, int y, int w, int h)
@@ -129,6 +148,8 @@ void gui_close(gui_window *win);
  * (which also clears win->open, so event loops fall out). */
 int gui_flush(gui_window *win);
 int gui_move(gui_window *win, int x, int y);
+int gui_resize(gui_window *win, int w, int h);
+void gui_window_resized(gui_window *win, int w, int h);
 int gui_window_list(int index, struct k_winsummary *out);
 int gui_window_control(uint32_t wid, int action);
 
@@ -154,7 +175,7 @@ int gui_run(gui_window *win, gui_handler fn, void *ctx, int tick_ms);
 
 unsigned long gui_time(void);          /* SYS_TIME, Unix seconds */
 int gui_uid(void);                     /* SYS_GETUID */
-int gui_kill(int pid);                 /* SYS_KILL */
+int gui_kill(int pid);                 /* SYS_KILL (SIGKILL) */
 int gui_mouse(struct k_mouse *out);    /* SYS_MOUSE, screen coords */
 
 struct gui_tm {
@@ -175,29 +196,51 @@ const char *gui_day_name(int wday);    /* 0..6  -> "Sun".. */
 /* ---------------------------------------------------- drawing (draw.c) */
 
 /* Restrict drawing to r (intersected with the window); gui_unclip drops
- * the restriction. Clip state is per window and not stacked - save it by
- * copying win->clip if a caller needs to nest. */
+ * the restriction and resets the clip stack. gui_push_clip() nests by
+ * intersecting r with the current clip rectangle. */
 void gui_clip(gui_window *win, gui_rc r);
 void gui_unclip(gui_window *win);
+void gui_push_clip(gui_window *win, gui_rc r);
+void gui_push_clip_xy(gui_window *win, int x, int y, int w, int h);
+void gui_pop_clip(gui_window *win);
 
 void gui_clear(gui_window *win, uint32_t color);
 void gui_pixel(gui_window *win, int x, int y, uint32_t color);
+void gui_blend_pixel(gui_window *win, int x, int y, uint32_t color,
+                     uint8_t alpha);
 uint32_t gui_peek(gui_window *win, int x, int y);   /* 0 outside */
 void gui_rect(gui_window *win, int x, int y, int w, int h, uint32_t color);
+void gui_fill_rect_alpha(gui_window *win, int x, int y, int w, int h,
+                         uint32_t color, uint8_t alpha);
 void gui_frame(gui_window *win, int x, int y, int w, int h, uint32_t color);
 /* Two-tone bevel: `hi` along the top/left edges, `lo` along bottom/right. */
 void gui_bevel(gui_window *win, gui_rc r, uint32_t hi, uint32_t lo);
 void gui_line(gui_window *win, int x0, int y0, int x1, int y1,
               uint32_t color);
+void gui_line_aa(gui_window *win, int x0, int y0, int x1, int y1,
+                 uint32_t color);
 void gui_line_w(gui_window *win, int x0, int y0, int x1, int y1,
                 uint32_t color, int width);
 void gui_circle(gui_window *win, int cx, int cy, int r, uint32_t color);
 void gui_disc(gui_window *win, int cx, int cy, int r, uint32_t color);
+void gui_draw_circle(gui_window *win, int cx, int cy, int r, uint32_t color);
+void gui_fill_circle(gui_window *win, int cx, int cy, int r, uint32_t color);
 void gui_vgradient(gui_window *win, gui_rc r, uint32_t top, uint32_t bottom);
 void gui_hgradient(gui_window *win, gui_rc r, uint32_t left, uint32_t right);
 void gui_round_rect(gui_window *win, gui_rc r, int radius, uint32_t color);
 void gui_round_frame(gui_window *win, gui_rc r, int radius, uint32_t color);
 void gui_shadow(gui_window *win, gui_rc r, int radius, uint32_t color);
+void gui_fill_round_rect(gui_window *win, gui_rc r, int radius, uint32_t color);
+void gui_fill_round_rect_alpha(gui_window *win, gui_rc r, int radius,
+                               uint32_t color, uint8_t alpha);
+void gui_stroke_round_rect(gui_window *win, gui_rc r, int radius, int width,
+                           uint32_t color);
+void gui_draw_shadow(gui_window *win, gui_rc r, int radius, int spread,
+                     uint32_t color);
+void gui_draw_pill(gui_window *win, gui_rc r, uint32_t fill, long border);
+void gui_draw_sparkline(gui_window *win, gui_rc r, const int *samples,
+                        int count, int max_val, uint32_t line_color,
+                        long fill_color);
 
 enum gui_icon {
     GUI_ICON_APPS,
@@ -276,6 +319,29 @@ void gui_ui_begin(gui_ui *ui);
 void gui_ui_event(gui_ui *ui, const struct k_event *ev);
 int gui_hit(gui_rc r, int x, int y);
 
+/* Anti-aliased sized text & metrics (backed by libgui/font.c).
+ * `size` accepts enum font_size (FONT_SMALL..FONT_HUGE) or a pixel height
+ * (>= 4, matched via font_for_height). */
+int gui_draw_text_aa(gui_window *win, int x, int y, const char *s,
+                     int size, int weight, int style,
+                     uint32_t fg, long bg);
+int gui_draw_text_aa_n(gui_window *win, int x, int y, const char *s, int n,
+                       int size, int weight, int style,
+                       uint32_t fg, long bg);
+int gui_draw_text_aa_run(gui_window *win, int x, int y, const char *s, int n,
+                         int size, int weight, int style,
+                         uint32_t fg, long bg, int max_w, int ellipsis);
+int gui_measure_text_aa(const char *s, int size, int weight, int style,
+                        int *out_h);
+int gui_draw_text_mono(gui_window *win, int x, int y, const char *s,
+                       uint32_t fg, long bg);
+void gui_label_aa(gui_window *win, int x, int y, const char *s,
+                  int size, int weight, uint32_t fg);
+
+/* Talon clipboard helpers (K_PARCEL_TEXT). */
+int gui_clipboard_copy(const char *text, int len, const char *label);
+int gui_clipboard_paste(char *out, int cap);
+
 /* A push button; returns 1 on the frame the click completes inside it. */
 int gui_button(gui_window *win, gui_rc r, const char *label, gui_ui *ui);
 /* enabled = 0 greys it out and never returns 1; active = 1 draws it as a
@@ -339,3 +405,52 @@ typedef struct gui_menu_state {
 int gui_menu(gui_window *win, gui_rc r, const char *title,
              const char *const *items, int n, gui_menu_state *st,
              gui_ui *ui);
+
+/* --------------------------------------------------- editor (editor.c) */
+
+enum gui_syntax {
+    GUI_SYNTAX_NONE = 0,
+    GUI_SYNTAX_C    = 1,
+    GUI_SYNTAX_JS   = 2,
+    GUI_SYNTAX_HTML = 3,
+    GUI_SYNTAX_CSS  = 4,
+    GUI_SYNTAX_SH   = 5,
+    GUI_SYNTAX_KREC = 6
+};
+
+typedef struct gui_editor_line {
+    char *text;
+    int len;
+    int cap;
+} gui_editor_line;
+
+typedef struct gui_editor {
+    gui_editor_line *lines;
+    int nlines;
+    int lines_cap;
+    int cursor_line;
+    int cursor_col;
+    int sel_active;
+    int sel_line;
+    int sel_col;
+    int scroll_y;
+    int scroll_x;
+    int syntax;
+    int show_lineno;
+    int readonly;
+    int modified;
+    int focus;
+    int tab_size;
+    int line_h;
+    int heap_owned;
+} gui_editor;
+
+gui_editor *gui_editor_create(void);
+void gui_editor_init(gui_editor *ed);
+void gui_editor_destroy(gui_editor *ed);
+int gui_editor_set_text(gui_editor *ed, const char *text);
+int gui_editor_get_text(const gui_editor *ed, char *buf, int cap);
+void gui_editor_set_syntax(gui_editor *ed, int syntax);
+int gui_editor_syntax_for_path(const char *path);
+int gui_editor_event(gui_editor *ed, gui_rc r, gui_ui *ui);
+void gui_editor_draw(gui_window *win, gui_rc r, gui_editor *ed, gui_ui *ui);

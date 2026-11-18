@@ -455,7 +455,7 @@ def build_all(tc):
         "--mode", "/etc/shadow:0600",
         "--mode", "/var/pkg/db:0700",
         "--mode", "/tmp:0777",
-        "--mode", "/run:0777",
+        "--mode", "/run:0755",
         rootfs_stage, fs_img, "64",
     ])
 

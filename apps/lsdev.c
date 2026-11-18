@@ -1,9 +1,10 @@
 /* lsdev.c - list the kernel device tree: what each bus found, and which
  * driver (if any) claimed it.
  *
- * usage: lsdev [-v] [BUS]
+ * usage: lsdev [-v] [-r] [BUS]
  *   -v    also print the PCI class and the raw vendor:device ids for
  *         every device, not just the ones that have them
+ *   -r    emit @krec records
  *   BUS   show only devices on that bus ("pci", "platform")
  *
  * A device with "-" in the DRIVER column was enumerated but nothing
@@ -13,6 +14,7 @@
  */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -47,27 +49,59 @@ static const char *class_name(unsigned class_id)
 
 int main(int argc, char **argv)
 {
+    static const struct krec_col cols[] = {
+        { "bus",    KREC_STR  },
+        { "name",   KREC_STR  },
+        { "driver", KREC_STR  },
+        { "bound",  KREC_BOOL },
+        { "class",  KREC_STR  },
+        { "vendor", KREC_HEX  },
+        { "device", KREC_HEX  },
+    };
     struct k_devinfo di;
     const char *want_bus = 0;
-    int verbose = 0;
+    int verbose = 0, rflag = 0;
     int i, total = 0, shown = 0, bound = 0;
 
+    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
-        /* The shell appends "--cwd=<path>" to every command. */
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
-        if (strcmp(argv[i], "-v") == 0)
-            verbose = 1;
-        else if (argv[i][0] == '-') {
-            printf("usage: lsdev [-v] [BUS]\n");
-            return 1;
-        } else if (!want_bus)
+        if (strcmp(argv[i], "--krec") == 0) {
+            rflag = 1;
+        } else if (strcmp(argv[i], "--help") == 0) {
+            printf("usage: lsdev [-v] [-r] [BUS]\n");
+            return 0;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            for (int j = 1; argv[i][j]; j++) {
+                if (argv[i][j] == 'v')
+                    verbose = 1;
+                else if (argv[i][j] == 'r')
+                    rflag = 1;
+                else if (argv[i][j] == 'h') {
+                    printf("usage: lsdev [-v] [-r] [BUS]\n");
+                    return 0;
+                } else {
+                    printf("usage: lsdev [-v] [-r] [BUS]\n");
+                    return 1;
+                }
+            }
+        } else if (!want_bus) {
             want_bus = argv[i];
+        }
     }
 
-    printf("%-9s %-14s %-10s %s\n", "BUS", "DEVICE", "DRIVER", "ID");
+    if (rflag) {
+        if (krec_begin(1, cols, 7) < 0)
+            return 1;
+    } else {
+        printf("%-9s %-14s %-10s %s\n", "BUS", "DEVICE", "DRIVER", "ID");
+    }
 
     for (i = 0; devinfo_at(i, &di) == 0; i++) {
+        const char *drv;
+        di.bus[sizeof(di.bus) - 1] = '\0';
+        di.name[sizeof(di.name) - 1] = '\0';
+        di.driver[sizeof(di.driver) - 1] = '\0';
+
         total++;
         if (di.bound)
             bound++;
@@ -75,8 +109,24 @@ int main(int argc, char **argv)
             continue;
         shown++;
 
+        drv = di.bound ? di.driver : "-";
+        if (rflag) {
+            char cls_s[24], ven_s[16], dev_s[16];
+            const char *cn = class_name(di.class_id);
+            if (cn)
+                snprintf(cls_s, sizeof(cls_s), "%s", cn);
+            else if (di.class_id)
+                snprintf(cls_s, sizeof(cls_s), "0x%04x", di.class_id);
+            else
+                snprintf(cls_s, sizeof(cls_s), "-");
+            snprintf(ven_s, sizeof(ven_s), "0x%04x", di.vendor);
+            snprintf(dev_s, sizeof(dev_s), "0x%04x", di.device);
+            krec_row(1, 7, di.bus, di.name, drv,
+                     di.bound ? "true" : "false", cls_s, ven_s, dev_s);
+            continue;
+        }
+
         int has_id = (di.vendor || di.device);
-        const char *drv = di.bound ? di.driver : "-";
 
         /* Only pad the driver column when a column follows it, so rows
          * with nothing to say about ids do not trail whitespace. */
@@ -97,6 +147,9 @@ int main(int argc, char **argv)
         }
         printf("\n");
     }
+
+    if (rflag)
+        return 0;
 
     if (want_bus)
         printf("%d of %d device%s on bus \"%s\", %d bound\n",

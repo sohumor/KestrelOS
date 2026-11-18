@@ -1,10 +1,11 @@
 /* netstat.c - show the network configuration and what can be probed.
  *
  *   netstat        interface, addresses and routes
- *   netstat -r     routes only
+ *   netstat -R     routes only
  *   netstat -i     interface only
  *   netstat -p     also probe the gateway and the DNS server with ICMP
  *   netstat -a     everything, including the not-yet-exported sections
+ *   netstat -r     emit @krec structured records
  *
  * The kernel keeps an ARP cache (kernel/net.c) and a table of TCP
  * connections (kernel/tcp.c, TCP_CONNS slots), but neither is reachable
@@ -14,6 +15,7 @@
  */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -129,18 +131,74 @@ static void show_missing(void)
 
 static void usage(void)
 {
-    printf("usage: netstat [-i] [-r] [-p] [-a]\n");
+    printf("usage: netstat [-i] [-R] [-p] [-a] [-r]\n");
     printf("  -i  interface and addresses\n");
-    printf("  -r  routing table\n");
+    printf("  -R  routing table\n");
     printf("  -p  probe the gateway and nameserver with ICMP\n");
     printf("  -a  all of the above plus the unexported-state notes\n");
-    printf("with no options: -i and -r\n");
+    printf("  -r  emit @krec structured records\n");
+    printf("with no options: -i and -R\n");
+}
+
+static void emit_netinfo_krec(const struct k_netinfo *ni)
+{
+    static const struct krec_col cols[] = {
+        { "iface",   KREC_STR },
+        { "state",   KREC_STR },
+        { "mac",     KREC_STR },
+        { "ip",      KREC_IP  },
+        { "netmask", KREC_IP  },
+        { "prefix",  KREC_INT },
+        { "gateway", KREC_IP  },
+        { "dns",     KREC_IP  },
+    };
+    char mac[24], ip[16], mask[16], gw[16], dns[16], pfx_s[16];
+
+    krec_begin(1, cols, 8);
+    if (!ni)
+        return;
+
+    snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+             ni->mac[0], ni->mac[1], ni->mac[2],
+             ni->mac[3], ni->mac[4], ni->mac[5]);
+    ip_ntoa(ni->ip, ip);
+    ip_ntoa(ni->netmask, mask);
+    ip_ntoa(ni->gateway, gw);
+    ip_ntoa(ni->dns, dns);
+    snprintf(pfx_s, sizeof(pfx_s), "%d", mask_prefix(ni->netmask));
+    krec_row(1, 8, "eth0", ni->up ? "up" : "down", mac,
+             ip, mask, pfx_s, gw, dns);
+}
+
+static void emit_routes_krec(const struct k_netinfo *ni)
+{
+    static const struct krec_col cols[] = {
+        { "dst",     KREC_STR },
+        { "gateway", KREC_STR },
+        { "iface",   KREC_STR },
+    };
+    char a[16], b[16];
+
+    krec_begin(1, cols, 3);
+    if (!ni)
+        return;
+
+    if (ni->netmask) {
+        char dst[24];
+        int pfx = mask_prefix(ni->netmask);
+        snprintf(dst, sizeof(dst), "%s/%d",
+                 ip_ntoa(ni->ip & ni->netmask, a), pfx >= 0 ? pfx : 0);
+        krec_row(1, 3, dst, "on-link", "eth0");
+    }
+    if (ni->gateway)
+        krec_row(1, 3, "0.0.0.0/0", ip_ntoa(ni->gateway, b), "eth0");
 }
 
 int main(int argc, char **argv)
 {
     struct k_netinfo ni;
     int want_i = 0, want_r = 0, want_p = 0, want_x = 0, any = 0;
+    int want_krec = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
@@ -148,8 +206,12 @@ int main(int argc, char **argv)
             continue;
         if (strcmp(argv[i], "-i") == 0) {
             want_i = any = 1;
-        } else if (strcmp(argv[i], "-r") == 0) {
+        } else if (strcmp(argv[i], "-R") == 0 ||
+                   strcmp(argv[i], "--routes") == 0) {
             want_r = any = 1;
+        } else if (strcmp(argv[i], "-r") == 0 ||
+                   strcmp(argv[i], "--krec") == 0) {
+            want_krec = 1;
         } else if (strcmp(argv[i], "-p") == 0) {
             want_p = any = 1;
         } else if (strcmp(argv[i], "-a") == 0) {
@@ -170,11 +232,27 @@ int main(int argc, char **argv)
     }
 
     if (netinfo(&ni) != 0) {
+        if (want_krec) {
+            if (want_r && !want_i)
+                emit_routes_krec(0);
+            else
+                emit_netinfo_krec(0);
+            krec_err("netstat: no network interface was found\n");
+            return 1;
+        }
         printf("netstat: no network interface was found\n");
         printf("  The kernel did not initialise a NIC. Only the rtl8139\n");
         printf("  and e1000 drivers exist; check the QEMU/VirtualBox\n");
         printf("  adapter type.\n");
         return 1;
+    }
+
+    if (want_krec) {
+        if (want_r && !want_i)
+            emit_routes_krec(&ni);
+        else
+            emit_netinfo_krec(&ni);
+        return 0;
     }
 
     if (want_i)

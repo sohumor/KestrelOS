@@ -1,6 +1,6 @@
 /* service.c - control and inspect the units supervised by init.
  *
- *   service list                 name, state, pid, restarts
+ *   service list [-r]            name, state, pid, restarts
  *   service status <name>        state plus the .svc configuration
  *   service start|stop|restart|reload|reset-failed <name>
  *   service log <name>           lines mentioning <name> in the log
@@ -10,6 +10,7 @@
  */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -23,18 +24,6 @@
 #define STATESZ 2048
 #define SVCSZ   1024
 #define LINESZ  256
-
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
 
 static int read_file(const char *path, char *buf, int max)
 {
@@ -105,27 +94,134 @@ static int split_ws(char *s, char **out, int max)
 
 /* Load the state file. Returns -1 with a message when init has not
  * published one yet. */
-static int state_load(char *buf, int max)
+static int state_load(char *buf, int max, int quiet)
 {
     if (read_file(STATE_PATH, buf, max) < 0) {
-        printf("service: %s is missing (init may not be running)\n",
-               STATE_PATH);
+        if (quiet)
+            krec_err("service: %s is missing (init may not be running)\n",
+                     STATE_PATH);
+        else
+            printf("service: %s is missing (init may not be running)\n",
+                   STATE_PATH);
         return -1;
     }
     return 0;
 }
 
-static int cmd_list(void)
+static int has_dep_token(const char *list, const char *tok)
 {
+    size_t tlen = strlen(tok);
+    const char *p = list;
+
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len == tlen && strncmp(p, tok, tlen) == 0)
+            return 1;
+        if (!comma)
+            break;
+        p = comma + 1;
+    }
+    return 0;
+}
+
+static void append_deps_tokens(char *dst, int dstsz, const char *val)
+{
+    char tmp[128];
+    char *p;
+
+    snprintf(tmp, sizeof(tmp), "%s", val);
+    p = tmp;
+    while (*p) {
+        char *tok;
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        if (!*p)
+            break;
+        tok = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != ',')
+            p++;
+        if (*p)
+            *p++ = '\0';
+        if (!tok[0] || has_dep_token(dst, tok))
+            continue;
+        {
+            size_t used = strlen(dst);
+            snprintf(dst + used, (unsigned long)(dstsz - (int)used),
+                     "%s%s", used > 0 ? "," : "", tok);
+        }
+    }
+}
+
+static void load_unit_depends(const char *name, char *out, int outsz)
+{
+    char path[128];
+    char svc[SVCSZ];
+    char reqs[128], after[128];
+    char *cur, *line;
+
+    reqs[0] = '\0';
+    after[0] = '\0';
+    out[0] = '\0';
+    snprintf(path, sizeof(path), "%s/%s.svc", SVC_DIR, name);
+    if (read_file(path, svc, sizeof(svc)) >= 0) {
+        cur = svc;
+        while ((line = next_line(&cur)) != 0) {
+            char *eq, *k, *v, *hash;
+            for (hash = line; *hash; hash++) {
+                if (*hash == '#' && (hash == line || hash[-1] == ' ' ||
+                                     hash[-1] == '\t')) {
+                    *hash = '\0';
+                    break;
+                }
+            }
+            line = trim(line);
+            if (!*line)
+                continue;
+            eq = strchr(line, '=');
+            if (!eq)
+                continue;
+            *eq = '\0';
+            k = trim(line);
+            v = trim(eq + 1);
+            if (strcmp(k, "requires") == 0)
+                append_deps_tokens(reqs, sizeof(reqs), v);
+            else if (strcmp(k, "after") == 0)
+                append_deps_tokens(after, sizeof(after), v);
+        }
+    }
+    if (reqs[0])
+        append_deps_tokens(out, outsz, reqs);
+    if (after[0])
+        append_deps_tokens(out, outsz, after);
+    if (!out[0])
+        snprintf(out, (unsigned long)outsz, "-");
+}
+
+static int cmd_list(int rflag)
+{
+    static const struct krec_col cols[] = {
+        { "name",     KREC_STR },
+        { "state",    KREC_STR },
+        { "pid",      KREC_INT },
+        { "restarts", KREC_INT },
+        { "depends",  KREC_STR },
+    };
     char buf[STATESZ];
     char *cur, *line, *f[5];
     int n, rows = 0;
 
-    if (state_load(buf, sizeof(buf)) < 0)
+    if (state_load(buf, sizeof(buf), rflag) < 0)
         return 1;
 
-    printf("%-12s %-9s %6s %8s %5s\n", "NAME", "STATE", "PID", "RESTARTS",
-           "EXIT");
+    if (rflag) {
+        if (krec_begin(1, cols, 5) < 0)
+            return 1;
+    } else {
+        printf("%-12s %-9s %6s %8s %5s\n", "NAME", "STATE", "PID",
+               "RESTARTS", "EXIT");
+    }
+
     cur = buf;
     while ((line = next_line(&cur)) != 0) {
         line = trim(line);
@@ -134,10 +230,16 @@ static int cmd_list(void)
         n = split_ws(line, f, 5);
         if (n < 5)
             continue;
-        printf("%-12s %-9s %6s %8s %5s\n", f[0], f[1], f[2], f[3], f[4]);
+        if (rflag) {
+            char deps[128];
+            load_unit_depends(f[0], deps, sizeof(deps));
+            krec_row(1, 5, f[0], f[1], f[2], f[3], deps);
+        } else {
+            printf("%-12s %-9s %6s %8s %5s\n", f[0], f[1], f[2], f[3], f[4]);
+        }
         rows++;
     }
-    if (rows == 0)
+    if (!rflag && rows == 0)
         printf("(no units)\n");
     return 0;
 }
@@ -167,7 +269,7 @@ static int cmd_status(const char *name)
     char *f[5], *cur, *line;
     int have_svc;
 
-    if (state_load(buf, sizeof(buf)) < 0)
+    if (state_load(buf, sizeof(buf), 0) < 0)
         return 1;
     if (state_find(buf, name, f) < 0) {
         printf("service: %s is not a configured unit\n", name);
@@ -298,7 +400,7 @@ static int send_cmd(const char *verb, const char *name)
 
 static void usage(void)
 {
-    printf("usage: service list\n");
+    printf("usage: service list [-r]\n");
     printf("       service status <name>\n");
     printf("       service start|stop|restart|reload|reset-failed <name>\n");
     printf("       service log <name>\n");
@@ -307,17 +409,36 @@ static void usage(void)
 int main(int argc, char **argv)
 {
     const char *verb;
+    int rflag = 0, out = 1, i;
 
-    argc = strip_cwd_arg(argc, argv);
+    argc = krec_strip_cwd(argc, argv, 0);
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--krec") == 0)
+            rflag = 1;
+        else
+            argv[out++] = argv[i];
+    }
+    argc = out;
+    argv[argc] = 0;
+
     if (argc < 2) {
         usage();
         return 1;
     }
     verb = argv[1];
 
-    if (!strcmp(verb, "list"))
-        return cmd_list();
-    if (argc < 3) {
+    if (!strcmp(verb, "-h") || !strcmp(verb, "--help")) {
+        usage();
+        return 0;
+    }
+    if (!strcmp(verb, "list")) {
+        if (argc != 2) {
+            usage();
+            return 1;
+        }
+        return cmd_list(rflag);
+    }
+    if (rflag || argc < 3) {
         usage();
         return 1;
     }

@@ -1,44 +1,28 @@
 /* sh.c - the KestrelOS shell.
  *
- * Started by init on the console; the minimal shell it grew out of
- * lives on as /bin/minsh, the fallback. Core behavior: the prompt
- * "kestrel:<cwd>$ ", whitespace tokenizing with double-quote grouping
- * (max 16 tokens), the builtins cd, pwd, exit and help, the
- * "--cwd=<cwd>" argument appended to every child, the "sh: command not
- * found: <name>" diagnostic and the "[exit N]" report for a non-zero
- * child status.
+ * Started by init/login on the console or by terminal over pipes; the
+ * minimal shell it grew out of lives on as /bin/minsh, the fallback.
+ * Core behavior: the prompt "kestrel:<cwd>$ ", whitespace tokenizing
+ * with double-quote grouping (max 16 tokens), the builtins cd, pwd,
+ * exit, help, history, clear, which and set, the "--cwd=<cwd>" argument
+ * both honored at startup and forwarded to every child, the
+ * "sh: command not found: <name>" diagnostic and the "[exit N]" report
+ * for a non-zero child status.
  *
- * On top of that it provides:
- *   - its own line editor (no libc change): insert, backspace, delete,
- *     ctrl-U/ctrl-K kill, LEFT/RIGHT/HOME/END (also ctrl-A/ctrl-E),
- *     UP/DOWN recall over a 32-entry history ring, ctrl-C to cancel the
- *     line, ctrl-D on an empty line to leave the shell;
- *   - tab completion: command names out of /bin for argv[0], otherwise
- *     file and directory names out of the containing directory;
- *   - ';' to separate commands and '#' to start a comment;
- *   - $? and $PWD expansion (there is no environment to speak of);
- *   - I/O redirection: 'cmd > file' truncates, 'cmd >> file' appends,
- *     'cmd < file' feeds the file to the command's stdin. External
- *     commands go through spawn_io()/SYS_SPAWN_IO, which opens the
- *     named files onto the child's fd 0/1 in the kernel before the
- *     program runs, so every app's ordinary read(0)/write(1) is
- *     redirected without knowing it; fd 2 stays on the console.
- *     Builtin output through '>' / '>>' is written by the shell
- *     itself. A quoted ">" or "<" is a literal argument, not an
- *     operator;
- *   - the builtins history, clear, which and set.
- *
- * Screen updates are done by rewriting the line. A line longer than
- * TERM_COLS occupies several physical rows, so the repaint first walks
- * back up to the row the prompt started on (CSI A), rewrites prompt and
- * buffer, erases every row the line used to reach (CSI K per row), then
- * places the cursor with CSI A/B plus '\r' and CSI C. That works on the
- * VGA console (kernel/console.c implements \r, CSI K and CSI A/B/C/D,
- * and wraps to the next row as soon as column 80 is passed) and on a
- * plain serial terminal. CSI J is deliberately not used: the console
- * only implements the "whole screen" form of it. '\b' is never used to
- * move the cursor, only to erase, because the VGA console's backspace
- * is destructive.
+ * Features:
+ *   - line editor: insert, backspace, delete, ctrl-U/ctrl-K kill,
+ *     LEFT/RIGHT/HOME/END (also ctrl-A/ctrl-E), UP/DOWN recall over a
+ *     32-entry history ring, ctrl-C to cancel the line, ctrl-D on an
+ *     empty line to leave the shell, and tab completion;
+ *   - command lists: ';', '&&', '||', trailing '&' background jobs, and
+ *     '#' comments;
+ *   - variable expansion: $? and $PWD;
+ *   - I/O redirection ('<', '>', '>>') and multi-stage pipelines
+ *     ('cmd1 | cmd2 | ...') built on pipe_() and spawn_caps(), with
+ *     support for both external commands and shell builtins inside
+ *     pipelines;
+ *   - interactive mode (-i or console TTY) vs non-interactive pipe/file
+ *     input without spurious prompts or control sequences.
  */
 
 #include <kestrel.h>
@@ -46,39 +30,115 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_LINE    512
-#define MAX_TOKENS  16
-#define MAX_PATH    256
-#define MAX_SEGS    16
-#define HIST_MAX    32
-#define MAX_CAND    64
-#define NAME_MAX    64
-#define TERM_COLS   80          /* the VGA console is a fixed 80x25 */
+#define MAX_LINE        512
+#define MAX_TOKENS      16
+#define MAX_PATH        256
+#define MAX_SEGS        16
+#define MAX_PIPE_STAGES 8
+#define MAX_BG          16
+#define HIST_MAX        32
+#define MAX_CAND        64
+#define NAME_MAX        64
+#define TERM_COLS       80      /* the VGA console is a fixed 80x25 */
 
-/* Kernel spawn limits, from kernel/include/uproc.h. Exceeding either of
- * them is silent truncation - of the argument list past the 16th entry,
- * or of an individual argument past 127 bytes - so the shell checks both
- * before calling spawn() and refuses rather than letting an app run on
- * half an argument. */
-#define SPAWN_MAX_ARGS 16
-#define SPAWN_ARG_MAX  128
+/* Kernel spawn limits, from kernel/include/uproc.h. */
+#define SPAWN_MAX_ARGS  16
+#define SPAWN_ARG_MAX   128
+
+enum list_op {
+    LOP_SEQ = 0,
+    LOP_AND,
+    LOP_OR
+};
+
+struct list_item {
+    char *text;
+    int op;                     /* operator following this item */
+    int bg;                     /* trailing '&' */
+};
+
+struct pipe_stage {
+    char expanded[MAX_LINE];
+    char ofile[MAX_PATH];
+    char ifile[MAX_PATH];
+    char ipath[MAX_PATH];
+    char opath[MAX_PATH];
+    char *tok[MAX_TOKENS];
+    int quoted[MAX_TOKENS];
+    int ntok;
+    int omode;
+};
 
 static char cwd[MAX_PATH] = "/";
 static int last_status;                 /* $? */
-static int out_fd = 1;                  /* builtin output, redirected by > */
+static int out_fd = 1;                  /* builtin output fd */
+static int interactive = 1;
 static int want_exit;
 static int exit_code;
+
+static int cap_active;
+static char *cap_buf;
+static unsigned long cap_len;
+static unsigned long cap_cap;
+
+static int bg_pids[MAX_BG];
+static int nbg;
 
 static char hist[HIST_MAX][MAX_LINE];
 static int hist_count;                  /* entries currently stored */
 static int hist_head;                   /* next slot to write */
 static int hist_total;                  /* lifetime count, for numbering */
 
+static struct pipe_stage stages[MAX_PIPE_STAGES];
+
 /* --- small helpers ---------------------------------------------------- */
 
-/* Builtin output. Goes to fd 1 normally, to the redirection target when
- * one is active. Diagnostics that are about the shell itself keep using
- * printf so they stay on the console. */
+static void write_all(int fd, const char *buf, unsigned long len)
+{
+    unsigned long off = 0;
+
+    while (off < len) {
+        long w = write(fd, buf + off, len - off);
+        if (w <= 0)
+            break;
+        off += (unsigned long)w;
+    }
+}
+
+static void cap_reset(void)
+{
+    free(cap_buf);
+    cap_buf = 0;
+    cap_len = 0;
+    cap_cap = 0;
+    cap_active = 0;
+}
+
+static void cap_append(const char *s, unsigned long n)
+{
+    if (n == 0)
+        return;
+    if (cap_len + n > cap_cap) {
+        unsigned long ncap = cap_cap ? cap_cap * 2 : 512;
+        char *nb;
+
+        while (ncap < cap_len + n)
+            ncap *= 2;
+        nb = malloc(ncap);
+        if (!nb)
+            return;
+        if (cap_buf && cap_len > 0)
+            memcpy(nb, cap_buf, cap_len);
+        free(cap_buf);
+        cap_buf = nb;
+        cap_cap = ncap;
+    }
+    memcpy(cap_buf + cap_len, s, n);
+    cap_len += n;
+}
+
+/* Builtin output. Goes to cap_buf when capturing a pipeline stage, or
+ * to out_fd normally. */
 static void sh_out(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void sh_out(const char *fmt, ...)
 {
@@ -92,13 +152,26 @@ static void sh_out(const char *fmt, ...)
     if (n < 0)
         return;
     if (n > (int)sizeof(buf) - 1)
-        n = (int)sizeof(buf) - 1;       /* vsnprintf returns the full length */
-    write(out_fd, buf, (unsigned long)n);
+        n = (int)sizeof(buf) - 1;
+    if (cap_active)
+        cap_append(buf, (unsigned long)n);
+    else
+        write_all(out_fd, buf, (unsigned long)n);
 }
 
 static int is_space(int c)
 {
     return c == ' ' || c == '\t';
+}
+
+static int is_blank(const char *s)
+{
+    while (*s) {
+        if (!is_space((unsigned char)*s))
+            return 0;
+        s++;
+    }
+    return 1;
 }
 
 static int is_name_char(int c)
@@ -137,7 +210,7 @@ static int tokenize(char *line, char **tokens, int *quoted)
                 p++;
                 continue;
             }
-            if (w == tokens[n - 1])         /* first byte kept, if any */
+            if (w == tokens[n - 1])
                 quoted[n - 1] = inq;
             *w++ = *p++;
         }
@@ -204,8 +277,8 @@ static void path_join_norm(const char *base, const char *rel,
     }
 }
 
-/* Resolve a command name the way the old shell did: absolute as given,
- * otherwise <cwd>/name then /bin/name. Returns 0 and fills out. */
+/* Resolve a command name: absolute as given, otherwise <cwd>/name then
+ * /bin/name. Returns 0 and fills out. */
 static int resolve_cmd(const char *name, char *out, unsigned long outsz)
 {
     struct k_stat st;
@@ -244,10 +317,10 @@ static void hist_add(const char *line)
     while (is_space(*p))
         p++;
     if (!*p)
-        return;                         /* blank lines are not remembered */
+        return;
     last = hist_get(1);
     if (last && strcmp(last, line) == 0)
-        return;                         /* nor immediate duplicates */
+        return;
 
     snprintf(hist[hist_head], MAX_LINE, "%s", line);
     hist_head = (hist_head + 1) % HIST_MAX;
@@ -258,11 +331,6 @@ static void hist_add(const char *line)
 
 /* --- line editing ----------------------------------------------------- */
 
-/* Where the line editor currently is on screen, in physical rows counted
- * from the row the prompt starts on. line_row is the cursor, line_rows
- * the last row the painted line reaches. Nothing but the line editor
- * writes to the screen while a line is being edited, so tracking these
- * two is enough to repaint a line that wraps over several rows. */
 static int line_row;
 static int line_rows;
 
@@ -294,13 +362,11 @@ static void line_seek(const char *prompt, int cur)
 static void line_redraw(const char *prompt, const char *buf, int len, int cur)
 {
     int plen = (int)strlen(prompt);
-    int end = (plen + len) / TERM_COLS;   /* row the line now ends on */
+    int end = (plen + len) / TERM_COLS;
     int i;
 
     line_up(line_row);
     printf("\r%s%s\033[K", prompt, buf);
-    /* CSI K only clears the row the cursor is on and the console has no
-     * erase-below, so wipe the rows a longer line left behind by hand. */
     for (i = end; i < line_rows; i++)
         printf("\n\033[K");
     line_up(line_rows - end);
@@ -367,7 +433,6 @@ static int gather(const char *dir, const char *pfx)
     return n;
 }
 
-/* Length of the longest prefix shared by all n candidates. */
 static int common_prefix_len(int n)
 {
     int i, k = 0;
@@ -402,11 +467,14 @@ static void do_complete(const char *prompt, char *buf, int *len, int *cur,
     memcpy(tokbuf, buf + start, (unsigned long)tlen);
     tokbuf[tlen] = '\0';
 
-    for (i = 0; i < start; i++) {
-        if (!is_space(buf[i])) {
+    for (i = start - 1; i >= 0; i--) {
+        if (is_space(buf[i]))
+            continue;
+        if (buf[i] == ';' || buf[i] == '|' || buf[i] == '&')
+            is_cmd = 1;
+        else
             is_cmd = 0;
-            break;
-        }
+        break;
     }
 
     slash = strrchr(tokbuf, '/');
@@ -453,23 +521,21 @@ static void do_complete(const char *prompt, char *buf, int *len, int *cur,
         line_insert(buf, len, cur, max, add);
     }
 
-    /* Step below the whole painted line before listing the candidates,
-     * or the listing lands on top of a wrapped line's tail. */
     if (line_rows > line_row)
         printf("\033[%dB", line_rows - line_row);
     putchar('\n');
     for (i = 0; i < n; i++)
         printf("%s%s  ", cand[i], cand_dir[i] ? "/" : "");
     putchar('\n');
-    line_row = 0;               /* the listing scrolled the line away */
+    line_row = 0;
     line_rows = 0;
     line_redraw(prompt, buf, *len, *cur);
 }
 
 /* --- readline --------------------------------------------------------- */
 
-/* Read one edited line. Returns 1 with buf filled (possibly empty, when
- * the line was cancelled with ctrl-C), or 0 for end of input. */
+/* Read one edited line in interactive mode. Returns 1 with buf filled
+ * (possibly empty, when cancelled with ctrl-C), or 0 for end of input. */
 static int sh_readline(const char *prompt, char *buf, int max)
 {
     char saved[MAX_LINE];
@@ -479,7 +545,6 @@ static int sh_readline(const char *prompt, char *buf, int max)
     saved[0] = '\0';
     buf[0] = '\0';
     printf("%s", prompt);
-    /* A long cwd can wrap the prompt itself, so start from where it ends. */
     line_row = plen / TERM_COLS;
     line_rows = line_row;
 
@@ -496,7 +561,7 @@ static int sh_readline(const char *prompt, char *buf, int max)
         }
         if (c == '\n' || c == '\r') {
             buf[len] = '\0';
-            line_seek(prompt, len);     /* past the tail of a wrapped line */
+            line_seek(prompt, len);
             putchar('\n');
             return 1;
         }
@@ -595,16 +660,13 @@ static int sh_readline(const char *prompt, char *buf, int max)
             }
             continue;
         }
-        if (c >= 0x80)                  /* other KEY_* codes: ignore */
+        if (c >= 0x80)
             continue;
-        if (c < 32)                     /* other control characters */
+        if (c < 32)
             continue;
         if (len >= max - 1)
             continue;
         if (cur == len) {
-            /* Appending: echo the one character, no repaint needed. The
-             * console wraps as soon as column 80 is passed, so the row
-             * the cursor lands on follows from the new length. */
             buf[len++] = (char)c;
             buf[len] = '\0';
             cur = len;
@@ -622,10 +684,36 @@ static int sh_readline(const char *prompt, char *buf, int max)
     }
 }
 
+/* Read one plain line from a non-interactive pipe/file (no prompt, no
+ * echo, no ANSI escapes). */
+static int read_plain_line(char *buf, int max)
+{
+    int len = 0;
+
+    for (;;) {
+        unsigned char c;
+        long r = read(0, &c, 1);
+
+        if (r <= 0) {
+            if (len == 0)
+                return 0;
+            buf[len] = '\0';
+            return 1;
+        }
+        if (c == '\n') {
+            if (len > 0 && buf[len - 1] == '\r')
+                len--;
+            buf[len] = '\0';
+            return 1;
+        }
+        if (len < max - 1)
+            buf[len++] = (char)c;
+    }
+}
+
 /* --- line preprocessing ----------------------------------------------- */
 
-/* Truncate the line at an unquoted '#' that starts a word. A ';' ends a
- * word just as whitespace does, so "echo a;# comment" comments too. */
+/* Truncate the line at an unquoted '#' that starts a word. */
 static void strip_comment(char *s)
 {
     int inq = 0, i;
@@ -643,26 +731,128 @@ static void strip_comment(char *s)
     }
 }
 
-/* Cut the line into ';'-separated segments in place. Returns the count,
- * or -1 if there are more segments than maxseg. */
-static int split_semi(char *s, char **segs, int maxseg)
+/* Cut line into items separated by ';', '&&', '||', and '&' in place.
+ * Returns item count, -1 on syntax error, -2 on too many items. */
+static int split_list(char *s, struct list_item *items, int maxitems)
 {
-    int n = 1, inq = 0;
-    char *p;
+    int n = 0, inq = 0;
+    char *start = s, *p = s;
 
-    segs[0] = s;
-    for (p = s; *p; p++) {
+    while (*p) {
         if (*p == '"') {
             inq = !inq;
+            p++;
             continue;
         }
-        if (*p == ';' && !inq) {
-            *p = '\0';
-            if (n >= maxseg)
-                return -1;
-            segs[n++] = p + 1;
+        if (inq) {
+            p++;
+            continue;
         }
+        if (*p == ';') {
+            *p++ = '\0';
+            if (n >= maxitems)
+                return -2;
+            items[n].text = start;
+            items[n].op = LOP_SEQ;
+            items[n].bg = 0;
+            n++;
+            start = p;
+            continue;
+        }
+        if (p[0] == '&' && p[1] == '&') {
+            if (p[2] == '&')
+                return -1;
+            *p = '\0';
+            p += 2;
+            if (is_blank(start))
+                return -1;
+            if (n >= maxitems)
+                return -2;
+            items[n].text = start;
+            items[n].op = LOP_AND;
+            items[n].bg = 0;
+            n++;
+            start = p;
+            if (is_blank(start))
+                return -1;
+            continue;
+        }
+        if (*p == '&') {
+            *p++ = '\0';
+            if (is_blank(start))
+                return -1;
+            if (n >= maxitems)
+                return -2;
+            items[n].text = start;
+            items[n].op = LOP_SEQ;
+            items[n].bg = 1;
+            n++;
+            start = p;
+            continue;
+        }
+        if (p[0] == '|' && p[1] == '|') {
+            if (p[2] == '|')
+                return -1;
+            *p = '\0';
+            p += 2;
+            if (is_blank(start))
+                return -1;
+            if (n >= maxitems)
+                return -2;
+            items[n].text = start;
+            items[n].op = LOP_OR;
+            items[n].bg = 0;
+            n++;
+            start = p;
+            if (is_blank(start))
+                return -1;
+            continue;
+        }
+        p++;
     }
+    if (!is_blank(start)) {
+        if (n >= maxitems)
+            return -2;
+        items[n].text = start;
+        items[n].op = LOP_SEQ;
+        items[n].bg = 0;
+        n++;
+    }
+    return n;
+}
+
+/* Split an item on single unquoted '|'. Returns stage count, -1 on
+ * syntax error, -2 on too many stages. */
+static int split_pipe(char *s, char **out, int maxstages)
+{
+    int n = 0, inq = 0;
+    char *start = s, *p = s;
+
+    while (*p) {
+        if (*p == '"') {
+            inq = !inq;
+            p++;
+            continue;
+        }
+        if (!inq && *p == '|') {
+            *p++ = '\0';
+            if (is_blank(start))
+                return -1;
+            if (n >= maxstages)
+                return -2;
+            out[n++] = start;
+            start = p;
+            if (is_blank(start))
+                return -1;
+            continue;
+        }
+        p++;
+    }
+    if (is_blank(start))
+        return n > 0 ? -1 : 0;
+    if (n >= maxstages)
+        return -2;
+    out[n++] = start;
     return n;
 }
 
@@ -704,9 +894,7 @@ static int expand_vars(const char *in, char *out, unsigned long outsz)
 }
 
 /* Pull '<', '>' and '>>' plus their targets out of the token array.
- * Returns the remaining token count, or -1 on a syntax error. A token
- * that carried double quotes is never an operator, so `echo ">"` passes
- * a literal '>' along the way sh always did. */
+ * Returns the remaining token count, or -1 on a syntax error. */
 static int parse_redirect(int ntok, char **tok, int *quoted, char *ofile,
                           unsigned long ofsz, int *omode, char *ifile,
                           unsigned long ifsz)
@@ -787,9 +975,8 @@ static void builtin_help(void)
     sh_out("editing: left/right/home/end, ctrl-A ctrl-E ctrl-U ctrl-K,\n");
     sh_out("         up/down recalls history, ctrl-C cancels, ctrl-D exits\n");
     sh_out("tab completes /bin names for the command and paths elsewhere\n");
-    sh_out("';' separates commands, '#' starts a comment, $? and $PWD expand\n");
-    sh_out("'cmd > file' truncates, 'cmd >> file' appends the command's\n");
-    sh_out("output; 'cmd < file' feeds the file to its input\n");
+    sh_out("operators: ';', '&&', '||', '&' background, '#' comments,\n");
+    sh_out("           $? and $PWD, '|', '<', '>', '>>'\n");
     last_status = 0;
 }
 
@@ -845,16 +1032,27 @@ static int is_builtin(const char *name)
            strcmp(name, "which") == 0 || strcmp(name, "set") == 0;
 }
 
-static void run_builtin(int ntok, char **tok)
+static void run_builtin(int ntok, char **tok, int in_pipeline)
 {
     if (strcmp(tok[0], "cd") == 0) {
-        builtin_cd(ntok, tok);
+        if (in_pipeline) {
+            char saved_cwd[MAX_PATH];
+            snprintf(saved_cwd, sizeof(saved_cwd), "%s", cwd);
+            builtin_cd(ntok, tok);
+            snprintf(cwd, sizeof(cwd), "%s", saved_cwd);
+        } else {
+            builtin_cd(ntok, tok);
+        }
     } else if (strcmp(tok[0], "pwd") == 0) {
         sh_out("%s\n", cwd);
         last_status = 0;
     } else if (strcmp(tok[0], "exit") == 0) {
-        want_exit = 1;
-        exit_code = ntok > 1 ? atoi(tok[1]) : 0;
+        int code = ntok > 1 ? atoi(tok[1]) : 0;
+        if (!in_pipeline) {
+            want_exit = 1;
+            exit_code = code;
+        }
+        last_status = code;
     } else if (strcmp(tok[0], "help") == 0) {
         builtin_help();
     } else if (strcmp(tok[0], "history") == 0) {
@@ -869,183 +1067,457 @@ static void run_builtin(int ntok, char **tok)
     }
 }
 
-/* --- external commands ------------------------------------------------ */
+/* --- background reaping ----------------------------------------------- */
 
-/* Run an external command. ifile/ofile are the '<' / '>' targets
- * relative to the cwd ("" = none); omode is 2 for '>>', else '>'
- * truncates. Redirections are wired up by the kernel via spawn_io(). */
-static void run_external(int ntok, char **tok, const char *ifile,
-                         const char *ofile, int omode)
+static void bg_track(int pid)
+{
+    if (nbg < MAX_BG)
+        bg_pids[nbg++] = pid;
+}
+
+static void reap_bg(void)
+{
+    int i = 0;
+
+    while (i < nbg) {
+        struct k_psinfo pi;
+        int alive = 0;
+        int j;
+
+        for (j = 0; psinfo(j, &pi) == 0; j++) {
+            if (pi.pid == bg_pids[i]) {
+                alive = (pi.state != K_STATE_ZOMBIE);
+                break;
+            }
+        }
+        if (!alive) {
+            int code = waitpid(bg_pids[i]);
+            if (interactive)
+                printf("[bg done %d: exit %d]\n", bg_pids[i], code);
+            bg_pids[i] = bg_pids[--nbg];
+            continue;
+        }
+        i++;
+    }
+}
+
+/* --- pipeline and external execution ---------------------------------- */
+
+static int parse_stage(const char *raw, struct pipe_stage *st)
+{
+    struct k_stat kst;
+
+    if (expand_vars(raw, st->expanded, sizeof(st->expanded)) != 0) {
+        printf("sh: line too long after expansion\n");
+        return -1;
+    }
+    st->ntok = tokenize(st->expanded, st->tok, st->quoted);
+    if (st->ntok < 0) {
+        printf("sh: too many tokens (max %d)\n", MAX_TOKENS);
+        return -1;
+    }
+    if (st->ntok == 0)
+        return 0;
+
+    st->ntok = parse_redirect(st->ntok, st->tok, st->quoted, st->ofile,
+                              sizeof(st->ofile), &st->omode, st->ifile,
+                              sizeof(st->ifile));
+    if (st->ntok < 0) {
+        printf("sh: syntax error in redirection\n");
+        return -1;
+    }
+    if (st->ntok == 0) {
+        printf("sh: missing command before redirection\n");
+        return -1;
+    }
+    if (st->ifile[0]) {
+        path_join_norm(cwd, st->ifile, st->ipath, sizeof(st->ipath));
+        if (stat_(st->ipath, &kst) != 0 || kst.is_dir) {
+            printf("sh: cannot open %s\n", st->ipath);
+            return -1;
+        }
+    }
+    if (st->omode)
+        path_join_norm(cwd, st->ofile, st->opath, sizeof(st->opath));
+    return 1;
+}
+
+static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
+                                int out_fd_stage, int *status_out)
 {
     char path[MAX_PATH];
-    char ipath[MAX_PATH];
-    char opath[MAX_PATH];
     char cwdarg[MAX_PATH + 8];
     char *sargv[SPAWN_MAX_ARGS + 1];
-    const char *in = 0, *out = 0;
-    struct k_stat st;
-    int i, pid, code, argn = 0;
+    struct k_spawn_caps caps;
+    int i, pid, argn = 0;
 
-    if (resolve_cmd(tok[0], path, sizeof(path)) != 0) {
-        printf("sh: command not found: %s\n", tok[0]);
-        last_status = 127;
-        return;
+    if (resolve_cmd(st->tok[0], path, sizeof(path)) != 0) {
+        printf("sh: command not found: %s\n", st->tok[0]);
+        *status_out = 127;
+        return -1;
     }
-    if (ifile[0]) {
-        path_join_norm(cwd, ifile, ipath, sizeof(ipath));
-        /* A missing input file is the shell's error to report; checking
-         * here keeps the kernel's spawn diagnostic off the console. */
-        if (stat_(ipath, &st) != 0 || st.is_dir) {
-            printf("sh: cannot open %s\n", ipath);
-            last_status = 1;
-            return;
-        }
-        in = ipath;
-    }
-    if (omode) {
-        path_join_norm(cwd, ofile, opath, sizeof(opath));
-        out = opath;
-    }
-    /* The kernel copies at most SPAWN_MAX_ARGS argv entries and silently
-     * drops the rest, which would eat the --cwd= argument. Refuse instead. */
-    if (ntok > SPAWN_MAX_ARGS - 1) {
+    if (st->ntok > SPAWN_MAX_ARGS - 1) {
         printf("sh: too many arguments (max %d)\n", SPAWN_MAX_ARGS - 1);
-        last_status = 1;
-        return;
+        *status_out = 1;
+        return -1;
     }
-    /* An argument longer than SPAWN_ARG_MAX is truncated by the kernel
-     * without a word, which hands the app half a path. Refuse instead. */
-    for (i = 0; i < ntok; i++) {
-        if (strlen(tok[i]) >= SPAWN_ARG_MAX) {
+    for (i = 0; i < st->ntok; i++) {
+        if (strlen(st->tok[i]) >= SPAWN_ARG_MAX) {
             printf("sh: argument %d too long (max %d)\n", i,
                    SPAWN_ARG_MAX - 1);
-            last_status = 1;
-            return;
+            *status_out = 1;
+            return -1;
         }
     }
-    for (i = 0; i < ntok; i++)
-        sargv[argn++] = tok[i];
+    for (i = 0; i < st->ntok; i++)
+        sargv[argn++] = st->tok[i];
 
     snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
-    /* An argument that does not fit SPAWN_ARG_MAX makes the whole spawn
-     * fail, so a very deep cwd costs the hint, not the command. */
     if (strlen(cwdarg) < SPAWN_ARG_MAX) {
         sargv[argn++] = cwdarg;
     } else {
         printf("sh: cwd too long to pass on; %s will resolve against /\n",
-               tok[0]);
+               st->tok[0]);
     }
     sargv[argn] = 0;
 
-    if (in || out)
-        pid = spawn_io(path, sargv, in, out, omode == 2);
-    else
-        pid = spawn(path, sargv);
+    memset(&caps, 0, sizeof(caps));
+    caps.fds[0].child_fd = 0;
+    caps.fds[0].parent_fd = in_fd;
+    caps.fds[1].child_fd = 1;
+    caps.fds[1].parent_fd = out_fd_stage;
+    caps.fds[2].child_fd = 2;
+    caps.fds[2].parent_fd = 2;
+    caps.n_fds = 3;
+    caps.flags = K_SPAWN_CLOSE_OTHER;
+
+    pid = spawn_caps(path, sargv, &caps);
     if (pid < 0) {
         printf("sh: spawn failed: %s\n", path);
-        last_status = 1;
-        return;
+        *status_out = 1;
+        return -1;
     }
-    code = waitpid(pid);
-    if (code != 0)
-        printf("[exit %d]\n", code);
-    last_status = code;
+    return pid;
 }
 
-/* --- one command ------------------------------------------------------ */
-
-static void run_segment(char *seg)
+static void run_pipeline(char *seg, int bg)
 {
-    char expanded[MAX_LINE];
-    char ofile[MAX_PATH];
-    char ifile[MAX_PATH];
-    char rpath[MAX_PATH];
-    char *tok[MAX_TOKENS];
-    int quoted[MAX_TOKENS];
-    int ntok, rmode, fd;
+    char *raw_stages[MAX_PIPE_STAGES];
+    int pids[MAX_PIPE_STAGES];
+    int nstages, i, s;
+    int prev_read = -1;
+    int pending_wr = -1;
+    int npids = 0, last_pid = -1;
+    int last_stage_status = 0;
 
-    if (expand_vars(seg, expanded, sizeof(expanded)) != 0) {
-        printf("sh: line too long after expansion\n");
+    nstages = split_pipe(seg, raw_stages, MAX_PIPE_STAGES);
+    if (nstages == -1) {
+        printf("sh: syntax error near '|'\n");
         last_status = 1;
         return;
     }
-    ntok = tokenize(expanded, tok, quoted);
-    if (ntok < 0) {
-        printf("sh: too many tokens (max %d)\n", MAX_TOKENS);
+    if (nstages == -2) {
+        printf("sh: too many pipeline stages (max %d)\n", MAX_PIPE_STAGES);
         last_status = 1;
         return;
     }
-    if (ntok == 0)
+    if (nstages == 0)
         return;
 
-    ntok = parse_redirect(ntok, tok, quoted, ofile, sizeof(ofile), &rmode,
-                          ifile, sizeof(ifile));
-    if (ntok < 0) {
-        printf("sh: syntax error in redirection\n");
-        last_status = 1;
-        return;
-    }
-    if (ntok == 0) {
-        printf("sh: missing command before redirection\n");
-        last_status = 1;
-        return;
-    }
-
-    if (!is_builtin(tok[0])) {
-        run_external(ntok, tok, ifile, ofile, rmode);
-        return;
-    }
-
-    /* Builtins read no input, so '<' is accepted and ignored; '>' and
-     * '>>' capture their output, written by the shell itself. */
-    fd = 1;
-    if (rmode) {
-        path_join_norm(cwd, ofile, rpath, sizeof(rpath));
-        fd = open(rpath, O_WRONLY | O_CREAT |
-                         (rmode == 2 ? O_APPEND : O_TRUNC));
-        if (fd < 0) {
-            printf("sh: cannot open %s\n", rpath);
+    for (s = 0; s < nstages; s++) {
+        int pr = parse_stage(raw_stages[s], &stages[s]);
+        if (pr < 0) {
             last_status = 1;
             return;
         }
+        if (pr == 0) {
+            if (nstages > 1) {
+                printf("sh: syntax error near '|'\n");
+                last_status = 1;
+            }
+            return;
+        }
     }
-    out_fd = fd;
-    run_builtin(ntok, tok);
-    out_fd = 1;
-    if (fd != 1)
-        close(fd);
+
+    /* Single-stage builtin without background runs directly in the shell. */
+    if (nstages == 1 && is_builtin(stages[0].tok[0]) && !bg) {
+        int fd = 1;
+        if (stages[0].omode) {
+            fd = open(stages[0].opath, O_WRONLY | O_CREAT |
+                      (stages[0].omode == 2 ? O_APPEND : O_TRUNC));
+            if (fd < 0) {
+                printf("sh: cannot open %s\n", stages[0].opath);
+                last_status = 1;
+                return;
+            }
+        }
+        out_fd = fd;
+        run_builtin(stages[0].ntok, stages[0].tok, 0);
+        out_fd = 1;
+        if (fd != 1)
+            close(fd);
+        return;
+    }
+
+    for (s = 0; s < nstages; s++) {
+        int pnext[2] = { -1, -1 };
+        int opened_in = -1, opened_out = -1;
+        int in_fd, out_fd_stage;
+        int stage_is_builtin = is_builtin(stages[s].tok[0]);
+
+        if (s < nstages - 1) {
+            if (pipe_(pnext) != 0) {
+                printf("sh: pipe failed\n");
+                last_stage_status = 1;
+                break;
+            }
+        }
+
+        if (stages[s].ifile[0]) {
+            opened_in = open(stages[s].ipath, O_RDONLY);
+            if (opened_in < 0) {
+                printf("sh: cannot open %s\n", stages[s].ipath);
+                if (pnext[0] >= 0) close(pnext[0]);
+                if (pnext[1] >= 0) close(pnext[1]);
+                last_stage_status = 1;
+                break;
+            }
+        } else if (bg && s == 0 && prev_read < 0) {
+            opened_in = open("/dev/null", O_RDONLY);
+        }
+
+        if (stages[s].omode) {
+            opened_out = open(stages[s].opath, O_WRONLY | O_CREAT |
+                              (stages[s].omode == 2 ? O_APPEND : O_TRUNC));
+            if (opened_out < 0) {
+                printf("sh: cannot open %s\n", stages[s].opath);
+                if (opened_in >= 0) close(opened_in);
+                if (pnext[0] >= 0) close(pnext[0]);
+                if (pnext[1] >= 0) close(pnext[1]);
+                last_stage_status = 1;
+                break;
+            }
+        }
+
+        in_fd = (opened_in >= 0) ? opened_in : (prev_read >= 0 ? prev_read : 0);
+        out_fd_stage = (opened_out >= 0) ? opened_out
+                     : (s < nstages - 1 ? pnext[1] : 1);
+
+        if (stage_is_builtin) {
+            /* A builtin reads no stdin, so drop any upstream builtin/pipe. */
+            if (pending_wr >= 0) {
+                close(pending_wr);
+                pending_wr = -1;
+            }
+            cap_reset();
+            if (prev_read >= 0) {
+                close(prev_read);
+                prev_read = -1;
+            }
+            if (opened_in >= 0) {
+                close(opened_in);
+                opened_in = -1;
+            }
+
+            if (s < nstages - 1 && opened_out < 0) {
+                /* Capture output in memory until stage s+1's reader spawns,
+                 * avoiding pipe-buffer deadlock on >4 KiB output. */
+                cap_active = 1;
+                run_builtin(stages[s].ntok, stages[s].tok, nstages > 1);
+                cap_active = 0;
+                pending_wr = pnext[1];
+                prev_read = pnext[0];
+            } else {
+                out_fd = out_fd_stage;
+                run_builtin(stages[s].ntok, stages[s].tok, nstages > 1);
+                out_fd = 1;
+                if (opened_out >= 0)
+                    close(opened_out);
+                if (pnext[1] >= 0)
+                    close(pnext[1]);
+                prev_read = pnext[0];
+            }
+            last_pid = -1;
+            last_stage_status = last_status;
+            continue;
+        }
+
+        int st_err = 0;
+        int pid = spawn_stage_external(&stages[s], in_fd, out_fd_stage, &st_err);
+
+        /* Close parent-side FDs handed off to the child immediately. */
+        if (prev_read >= 0) {
+            close(prev_read);
+            prev_read = -1;
+        }
+        if (opened_in >= 0)
+            close(opened_in);
+        if (opened_out >= 0)
+            close(opened_out);
+        if (pnext[1] >= 0)
+            close(pnext[1]);
+
+        if (pid < 0) {
+            if (pending_wr >= 0) {
+                close(pending_wr);
+                pending_wr = -1;
+            }
+            cap_reset();
+            last_pid = -1;
+            last_stage_status = st_err;
+            prev_read = pnext[0];
+            continue;
+        }
+
+        pids[npids++] = pid;
+        last_pid = pid;
+
+        if (pending_wr >= 0) {
+            if (cap_buf && cap_len > 0)
+                write_all(pending_wr, cap_buf, cap_len);
+            close(pending_wr);
+            pending_wr = -1;
+            cap_reset();
+        }
+        prev_read = pnext[0];
+    }
+
+    if (prev_read >= 0)
+        close(prev_read);
+    if (pending_wr >= 0)
+        close(pending_wr);
+    cap_reset();
+
+    if (bg) {
+        for (i = 0; i < npids; i++)
+            bg_track(pids[i]);
+        if (npids > 0 && interactive)
+            printf("[bg] %d\n", pids[npids - 1]);
+        last_status = 0;
+        return;
+    }
+
+    {
+        int code = last_stage_status;
+        for (i = 0; i < npids; i++) {
+            int w = waitpid(pids[i]);
+            if (pids[i] == last_pid)
+                code = w;
+        }
+        if (code != 0 && last_pid >= 0)
+            printf("[exit %d]\n", code);
+        last_status = code;
+    }
+}
+
+static void run_line(char *line)
+{
+    struct list_item items[MAX_SEGS];
+    int nitems, i, prev_op;
+
+    strip_comment(line);
+    nitems = split_list(line, items, MAX_SEGS);
+    if (nitems == -1) {
+        printf("sh: syntax error near unexpected token\n");
+        last_status = 1;
+        return;
+    }
+    if (nitems == -2) {
+        printf("sh: too many commands (max %d)\n", MAX_SEGS);
+        last_status = 1;
+        return;
+    }
+
+    prev_op = LOP_SEQ;
+    for (i = 0; i < nitems; i++) {
+        int should_run = 1;
+
+        if (prev_op == LOP_AND && last_status != 0)
+            should_run = 0;
+        else if (prev_op == LOP_OR && last_status == 0)
+            should_run = 0;
+
+        if (should_run && !is_blank(items[i].text)) {
+            run_pipeline(items[i].text, items[i].bg);
+            if (want_exit)
+                return;
+        }
+        prev_op = items[i].op;
+    }
+}
+
+static int stdin_is_tty(void)
+{
+    int d = dup2_(0, 3);
+
+    if (d >= 0) {
+        close(d);
+        return 0;
+    }
+    return 1;
+}
+
+static void apply_cwd_arg(const char *arg)
+{
+    char norm[MAX_PATH];
+    struct k_stat st;
+
+    if (!arg || arg[0] != '/') {
+        snprintf(cwd, sizeof(cwd), "/");
+        return;
+    }
+    path_join_norm("/", arg, norm, sizeof(norm));
+    if (stat_(norm, &st) == 0 && st.is_dir)
+        snprintf(cwd, sizeof(cwd), "%s", norm);
+    else
+        snprintf(cwd, sizeof(cwd), "/");
 }
 
 int main(int argc, char **argv)
 {
     char line[MAX_LINE];
     char prompt[MAX_PATH + 16];
-    char *segs[MAX_SEGS];
-    int nseg, i;
+    const char *cmd_str = 0;
+    int force_interactive = 0;
+    int i;
 
-    (void)argc;
-    (void)argv;
+    for (i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--cwd=", 6) == 0) {
+            apply_cwd_arg(argv[i] + 6);
+        } else if (strcmp(argv[i], "-i") == 0) {
+            force_interactive = 1;
+        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            cmd_str = argv[++i];
+        }
+    }
+
+    if (cmd_str) {
+        interactive = 0;
+        snprintf(line, sizeof(line), "%s", cmd_str);
+        run_line(line);
+        reap_bg();
+        return want_exit ? exit_code : last_status;
+    }
+
+    interactive = force_interactive || stdin_is_tty();
+    if (interactive)
+        signal(SIGINT, (sighandler_t)SIG_IGN);
 
     for (;;) {
-        snprintf(prompt, sizeof(prompt), "kestrel:%s$ ", cwd);
-        if (!sh_readline(prompt, line, (int)sizeof(line))) {
-            /* ctrl-D on an empty line: leave the shell. */
-            putchar('\n');
-            return 0;
+        reap_bg();
+        if (interactive) {
+            snprintf(prompt, sizeof(prompt), "kestrel:%s$ ", cwd);
+            if (!sh_readline(prompt, line, (int)sizeof(line))) {
+                putchar('\n');
+                return last_status;
+            }
+            hist_add(line);
+        } else {
+            if (!read_plain_line(line, (int)sizeof(line)))
+                return last_status;
         }
-        hist_add(line);
-        strip_comment(line);
-
-        nseg = split_semi(line, segs, MAX_SEGS);
-        if (nseg < 0) {
-            printf("sh: too many commands (max %d)\n", MAX_SEGS);
-            last_status = 1;
-            continue;
-        }
-        for (i = 0; i < nseg; i++) {
-            run_segment(segs[i]);
-            if (want_exit)
-                return exit_code;
-        }
+        run_line(line);
+        if (want_exit)
+            return exit_code;
     }
 }

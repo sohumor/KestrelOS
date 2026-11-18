@@ -1,13 +1,14 @@
 /* ls.c - list directory contents.
  *
- * usage: ls [-a] [path...]
+ * usage: ls [-a] [-r] [path...]
  * Always long-style: "TYPE  SIZE  NAME", directories first (marked
  * 'd'), aligned columns, trailing entry count. "." and ".." are hidden
- * (and not counted) unless -a is given. With no path arguments the
- * shell-provided cwd is listed.
+ * (and not counted) unless -a is given. With -r, emits @krec records.
+ * With no path arguments the shell-provided cwd is listed.
  */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -15,16 +16,6 @@
 #define MAX_PATH    256
 
 static const char *g_cwd = "/";
-
-/* Pull the shell-injected trailing "--cwd=<path>" argument, if any. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0) {
-        g_cwd = argv[argc - 1] + 6;
-        return argc - 1;
-    }
-    return argc;
-}
 
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
@@ -42,7 +33,19 @@ static int is_dot(const char *name)
     return strcmp(name, ".") == 0 || strcmp(name, "..") == 0;
 }
 
-static int list_path(const char *path, int show_all)
+static void emit_krec_entry(const char *name, int is_dir, uint32_t size,
+                            uint32_t uid, uint32_t gid, uint32_t mode)
+{
+    char size_s[24], uid_s[16], gid_s[16], mode_s[16];
+
+    snprintf(size_s, sizeof(size_s), "%u", size);
+    snprintf(uid_s, sizeof(uid_s), "%u", uid);
+    snprintf(gid_s, sizeof(gid_s), "%u", gid);
+    snprintf(mode_s, sizeof(mode_s), "0%03o", mode & 0777U);
+    krec_row(1, 6, name, is_dir ? "dir" : "file", size_s, uid_s, gid_s, mode_s);
+}
+
+static int list_path(const char *path, int show_all, int rflag)
 {
     static struct k_dirent ents[MAX_ENTRIES];
     struct k_stat st;
@@ -53,12 +56,19 @@ static int list_path(const char *path, int show_all)
 
     if (n == 0) {
         if (stat_(path, &st) != 0) {
-            printf("ls: cannot access %s\n", path);
+            if (rflag)
+                krec_err("ls: cannot access %s\n", path);
+            else
+                printf("ls: cannot access %s\n", path);
             return 1;
         }
         if (!st.is_dir) {
-            printf("- %8u  %s\n", st.size, path);
-            printf("1 entry\n");
+            if (rflag) {
+                emit_krec_entry(path, 0, st.size, st.uid, st.gid, st.mode);
+            } else {
+                printf("- %8u  %s\n", st.size, path);
+                printf("1 entry\n");
+            }
             return 0;
         }
     }
@@ -69,43 +79,71 @@ static int list_path(const char *path, int show_all)
                 continue;
             if (!show_all && is_dot(ents[i].name))
                 continue;
-            printf("%c %8u  %s\n", ents[i].is_dir ? 'd' : '-',
-                   ents[i].size, ents[i].name);
+            ents[i].name[sizeof(ents[i].name) - 1] = '\0';
+            if (rflag) {
+                emit_krec_entry(ents[i].name, ents[i].is_dir != 0,
+                                ents[i].size, ents[i].uid, ents[i].gid,
+                                ents[i].mode);
+            } else {
+                printf("%c %8u  %s\n", ents[i].is_dir ? 'd' : '-',
+                       ents[i].size, ents[i].name);
+            }
             count++;
         }
     }
-    printf("%d entr%s\n", count, count == 1 ? "y" : "ies");
+    if (!rflag)
+        printf("%d entr%s\n", count, count == 1 ? "y" : "ies");
     return 0;
 }
 
 int main(int argc, char **argv)
 {
+    static const struct krec_col cols[] = {
+        { "name", KREC_STR },
+        { "type", KREC_STR },
+        { "size", KREC_U64 },
+        { "uid",  KREC_INT },
+        { "gid",  KREC_INT },
+        { "mode", KREC_STR },
+    };
     char path[MAX_PATH];
-    int i, rc = 0, show_all = 0, paths = 0;
+    int i, rc = 0, show_all = 0, rflag = 0, paths = 0;
 
-    argc = strip_cwd_arg(argc, argv);
+    argc = krec_strip_cwd(argc, argv, &g_cwd);
 
     for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-a") == 0) {
-            show_all = 1;
+        if (strcmp(argv[i], "--krec") == 0) {
+            rflag = 1;
         } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
-            printf("usage: ls [-a] [path...]\n");
-            return 1;
+            int j;
+            for (j = 1; argv[i][j]; j++) {
+                if (argv[i][j] == 'a')
+                    show_all = 1;
+                else if (argv[i][j] == 'r')
+                    rflag = 1;
+                else {
+                    printf("usage: ls [-a] [-r] [path...]\n");
+                    return 1;
+                }
+            }
         } else {
             paths++;
         }
     }
 
+    if (rflag && krec_begin(1, cols, 6) < 0)
+        return 1;
+
     if (paths == 0)
-        return list_path(g_cwd, show_all);
+        return list_path(g_cwd, show_all, rflag);
 
     for (i = 1; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] != '\0')
             continue;
         resolve(argv[i], path, sizeof(path));
-        if (paths > 1)
+        if (!rflag && paths > 1)
             printf("%s:\n", path);
-        if (list_path(path, show_all) != 0)
+        if (list_path(path, show_all, rflag) != 0)
             rc = 1;
     }
     return rc;

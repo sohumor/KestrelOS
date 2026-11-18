@@ -21,3 +21,7 @@ int signal_sigreturn(struct task *task, struct regs *regs);
 
 /* Convert a CPU exception into its conventional process signal. */
 void signal_user_exception(struct task *task, struct regs *regs);
+
+/* Non-zero when an unmasked signal with a terminating, stopping, or
+ * handler action is pending on `task` (used to interrupt blocking waits). */
+int signal_interrupt_pending(struct task *task);

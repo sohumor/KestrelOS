@@ -2368,6 +2368,30 @@ def t_smp(h):
     wait_prompt(h)
 
 
+def t_krec_pipeline(h):
+    h.send('ls -r /bin | where "name == talon" | pick -r name,type')
+    h.expect("@krec name:str type:str")
+    h.expect(r"\ntalon\tfile\n", regex=True)
+    wait_prompt(h)
+
+    h.send('ps -r | where "pid > 0" | sortby -r pid | pick pid,name')
+    h.expect(r"\npid +name\n", regex=True)
+    h.expect(r"\n *\d+ +init\n", regex=True)
+    wait_prompt(h)
+
+
+def t_talon_cli(h):
+    h.send("talon put -t url -l docs https://kestrel.os/test")
+    h.expect(r"parcel \d+ \(url, 23 bytes\)", regex=True)
+    wait_prompt(h)
+    h.send("talon get")
+    h.expect("https://kestrel.os/test")
+    wait_prompt(h)
+    h.send('talon ls -r | where "type == url" | pick label')
+    h.expect(r"\ndocs\n", regex=True)
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("login", t_login),
@@ -2407,6 +2431,8 @@ TESTS = [
     ("id", t_id),
     ("redirect", t_redirect),
     ("pipe", t_pipe),
+    ("krec-pipeline", t_krec_pipeline),
+    ("talon-cli", t_talon_cli),
     ("dev", t_dev),
     ("dmesg", t_dmesg),
     ("service-list", t_service_list),

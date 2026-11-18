@@ -1,6 +1,7 @@
 /* lsmod.c - list the loaded kernel modules. */
 
 #include <kestrel.h>
+#include <krec.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,14 +32,53 @@ static const char *state_name(uint32_t state)
     }
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    static const struct krec_col cols[] = {
+        { "name",  KREC_STR },
+        { "size",  KREC_U64 },
+        { "refs",  KREC_INT },
+        { "state", KREC_STR },
+        { "desc",  KREC_STR },
+    };
     struct k_modinfo mi;
-    int i = 0;
+    int rflag = 0;
+    int i;
+
+    argc = krec_strip_cwd(argc, argv, 0);
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--krec") == 0) {
+            rflag = 1;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            printf("usage: lsmod [-r]\n");
+            return 0;
+        } else {
+            printf("usage: lsmod [-r]\n");
+            return 1;
+        }
+    }
+
+    if (rflag) {
+        if (krec_begin(1, cols, 5) < 0)
+            return 1;
+        i = 0;
+        while (syscall(SYS_MODLIST, i, (long)&mi, 0, 0) == 0) {
+            char size_s[24], refs_s[16];
+            mi.name[sizeof(mi.name) - 1] = '\0';
+            mi.desc[sizeof(mi.desc) - 1] = '\0';
+            snprintf(size_s, sizeof(size_s), "%u", mi.size);
+            snprintf(refs_s, sizeof(refs_s), "%u", mi.refs);
+            krec_row(1, 5, mi.name, size_s, refs_s,
+                     state_name(mi.state), mi.desc);
+            i++;
+        }
+        return 0;
+    }
 
     printf("%-16s %8s %5s  %-10s %s\n",
            "NAME", "SIZE", "REFS", "STATE", "DESCRIPTION");
 
+    i = 0;
     while (syscall(SYS_MODLIST, i, (long)&mi, 0, 0) == 0) {
         mi.name[sizeof(mi.name) - 1] = '\0';
         mi.desc[sizeof(mi.desc) - 1] = '\0';
