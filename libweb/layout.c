@@ -194,6 +194,48 @@ static int32_t content_dim(int32_t v, const struct computed_style *cs,
     return v > 0 ? v : 0;
 }
 
+static int32_t vedge_bp(const struct computed_style *cs)
+{
+    return used_len(cs->padding[CSS_TOP], -1, 0) +
+           used_len(cs->padding[CSS_BOTTOM], -1, 0) +
+           cs->border_width[CSS_TOP] + cs->border_width[CSS_BOTTOM];
+}
+
+static int32_t ratio_mul(int32_t v, int64_t num, int64_t den)
+{
+    if (v <= 0 || num <= 0 || den <= 0)
+        return 0;
+    return clamp32(((int64_t)v * num + den / 2) / den);
+}
+
+static int32_t ratio_height_from_width(const struct computed_style *cs,
+                                       int32_t inner_w, int32_t h_bp,
+                                       int32_t v_bp)
+{
+    if (!cs || cs->aspect_ratio <= 0)
+        return 0;
+    if (cs->box_sizing == CSS_BOXSIZING_BORDER) {
+        int32_t bw = imax(0, inner_w + h_bp);
+        int32_t bh = ratio_mul(bw, 1000LL, cs->aspect_ratio);
+        return imax(0, bh - v_bp);
+    }
+    return ratio_mul(imax(0, inner_w), 1000LL, cs->aspect_ratio);
+}
+
+static int32_t ratio_width_from_height(const struct computed_style *cs,
+                                       int32_t inner_h, int32_t h_bp,
+                                       int32_t v_bp)
+{
+    if (!cs || cs->aspect_ratio <= 0)
+        return 0;
+    if (cs->box_sizing == CSS_BOXSIZING_BORDER) {
+        int32_t bh = imax(0, inner_h + v_bp);
+        int32_t bw = ratio_mul(bh, cs->aspect_ratio, 1000LL);
+        return imax(0, bw - h_bp);
+    }
+    return ratio_mul(imax(0, inner_h), cs->aspect_ratio, 1000LL);
+}
+
 /* min/max clamping. max-width: none is CSS_LEN_NONE. */
 static int32_t clamp_width(int32_t w, const struct computed_style *cs,
                            int32_t base, int32_t h_bp)
@@ -353,6 +395,29 @@ static int32_t text_width(const struct font *f, const char *s, unsigned long n)
      * font_text_width_n stays as the definition of record. */
     (void)s;
     return (int32_t)((long)f->w * (long)n);
+}
+
+static int32_t text_char_step(const struct font *f,
+                              const struct computed_style *cs)
+{
+    int32_t ls = cs ? cs->letter_spacing : 0;
+    int32_t step = f->w + ls;
+    return step > 0 ? step : 0;
+}
+
+static int32_t text_width_adv(const struct font *f,
+                              const struct computed_style *cs, unsigned long n)
+{
+    return (int32_t)((long)text_char_step(f, cs) * (long)n);
+}
+
+static int32_t text_width_vis(const struct font *f,
+                              const struct computed_style *cs, unsigned long n)
+{
+    int32_t step = text_char_step(f, cs);
+    if (n == 0)
+        return 0;
+    return (int32_t)((long)(n - 1) * (long)step + (long)f->w);
 }
 
 /* ================================================================== *
@@ -1055,6 +1120,8 @@ static void mark_flags(struct lay_box *b, const struct computed_style *cs,
         b->flags |= LAYF_HIDDEN;
     if (!ws_collapses(cs->white_space))
         b->flags |= LAYF_PRE;
+    if (cs->has_transform)
+        b->flags |= LAYF_STACK;
     if (in_link)
         b->flags |= LAYF_LINK;
 }
@@ -1542,8 +1609,12 @@ static void text_intrinsic(const struct lay_box *b, int32_t *minw,
 {
     unsigned long i = 0, start;
     int32_t widest = 0, total = 0, line = 0;
+    int32_t step = text_char_step(b->font, b->style);
     int pre = (b->flags & LAYF_PRE) != 0;
     int wrap = ws_wraps(b->style->white_space);
+    int char_min = (b->style->word_break == CSS_WORDBREAK_BREAK_ALL ||
+                    b->style->overflow_wrap == CSS_OVERFLOWWRAP_ANYWHERE);
+    int have_ch = 0;
 
     if (!pre) {
         while (i < b->text_len) {
@@ -1553,15 +1624,20 @@ static void text_intrinsic(const struct lay_box *b, int32_t *minw,
             while (i < b->text_len && !ws_is_space((unsigned char)b->text[i]))
                 i++;
             if (i > start) {
-                int32_t w = text_width(b->font, b->text + start, i - start);
+                unsigned long wn = i - start;
+                int32_t w = text_width_vis(b->font, b->style, wn);
+                int32_t mw = char_min ? b->font->w : w;
 
-                if (w > widest)
-                    widest = w;
-                if (total)
-                    total += b->font->w;   /* the collapsed space */
-                total += w;
+                if (mw > widest)
+                    widest = mw;
+                if (have_ch)
+                    total += step;         /* the collapsed space */
+                total += (int32_t)((long)wn * (long)step);
+                have_ch = 1;
             }
         }
+        if (have_ch)
+            total = total - step + b->font->w;
         if (!wrap)
             widest = total;   /* nowrap: nothing may break */
         *minw = widest;
@@ -1570,25 +1646,38 @@ static void text_intrinsic(const struct lay_box *b, int32_t *minw,
     }
     for (i = 0; i <= b->text_len; i++) {
         if (i == b->text_len || b->text[i] == '\n') {
-            if (line > widest) widest = line;
-            if (line > total) total = line;
+            int32_t vis = have_ch ? (line - step + b->font->w) : 0;
+            if (vis > widest) widest = vis;
+            if (vis > total) total = vis;
             line = 0;
+            have_ch = 0;
         } else {
-            line += b->font->w;
+            line += step;
+            have_ch = 1;
         }
     }
     if (wrap) {
         int32_t run = 0;
+        int run_ch = 0;
 
         widest = 0;
         for (i = 0; i < b->text_len; i++) {
             if (ws_is_space((unsigned char)b->text[i])) {
+                int32_t vis = run_ch ? (run - step + b->font->w) : 0;
+                if (vis > widest) widest = vis;
                 run = 0;
+                run_ch = 0;
+            } else if (char_min) {
+                if (b->font->w > widest)
+                    widest = b->font->w;
             } else {
-                run += b->font->w;
-                if (run > widest)
-                    widest = run;
+                run += step;
+                run_ch = 1;
             }
+        }
+        if (run_ch) {
+            int32_t vis = run - step + b->font->w;
+            if (vis > widest) widest = vis;
         }
     }
     *minw = widest;
@@ -1669,6 +1758,66 @@ static int len_is_fixed_px(struct css_len l, int32_t *out)
     return 0;
 }
 
+static void grid_intrinsic_item(struct lay_ctx *c, struct lay_box *ch,
+                                const struct computed_style *cs, int ncols,
+                                int32_t col_gap, int *io_col,
+                                int32_t *cmin, int32_t *cmax, int depth)
+{
+    const struct computed_style *is = ch->style;
+    int32_t m = 0, s = 0;
+    int c0, span;
+
+    if (is->grid_col_start > 0 && is->grid_col_end > is->grid_col_start)
+        span = is->grid_col_end - is->grid_col_start;
+    else
+        span = is->grid_col_span >= 1 ? is->grid_col_span : 1;
+    if (span > ncols) span = ncols;
+    if (is->grid_col_start > 0) {
+        c0 = is->grid_col_start - 1;
+        if (c0 >= ncols) { c0 = ncols - 1; span = 1; }
+        if (c0 + span > ncols) span = ncols - c0;
+    } else if (is->grid_col_end > 0) {
+        c0 = imax(0, is->grid_col_end - 1 - span);
+    } else {
+        if (*io_col + span > ncols)
+            *io_col = 0;
+        c0 = *io_col;
+        *io_col += span;
+        if (*io_col >= ncols)
+            *io_col = 0;
+    }
+    intrinsic_widths(c, ch, &m, &s, depth + 1);
+    if (span == 1) {
+        if (cs->grid_ncols == 0 || cs->grid_cols[c0].kind != CSS_GRID_PX) {
+            if (m > cmin[c0]) cmin[c0] = m;
+            if (s > cmax[c0]) cmax[c0] = s;
+        }
+    } else {
+        int32_t sm = 0, sx = 0;
+        int k;
+        for (k = 0; k < span; k++) {
+            sm += cmin[c0 + k];
+            sx += cmax[c0 + k];
+        }
+        sm += col_gap * (span - 1);
+        sx += col_gap * (span - 1);
+        if (m > sm) {
+            int32_t per = (m - sm + span - 1) / span;
+            for (k = 0; k < span; k++)
+                if (cs->grid_ncols == 0 ||
+                    cs->grid_cols[c0 + k].kind != CSS_GRID_PX)
+                    cmin[c0 + k] += per;
+        }
+        if (s > sx) {
+            int32_t per = (s - sx + span - 1) / span;
+            for (k = 0; k < span; k++)
+                if (cs->grid_ncols == 0 ||
+                    cs->grid_cols[c0 + k].kind != CSS_GRID_PX)
+                    cmax[c0 + k] += per;
+        }
+    }
+}
+
 static void grid_intrinsic(struct lay_ctx *c, struct lay_box *b,
                            int32_t *minw, int32_t *maxw, int depth)
 {
@@ -1680,7 +1829,8 @@ static void grid_intrinsic(struct lay_ctx *c, struct lay_box *b,
     int32_t col_gap = cs->column_gap > 0 ? cs->column_gap
                                          : (cs->gap > 0 ? cs->gap : 0);
     struct lay_box *ch;
-    int col = 0, i;
+    struct lay_box **ord = 0;
+    int col = 0, i, has_order = 0, cnt = 0;
 
     for (i = 0; i < ncols; i++) {
         if (cs->grid_ncols > 0 && cs->grid_cols[i].kind == CSS_GRID_PX) {
@@ -1691,62 +1841,43 @@ static void grid_intrinsic(struct lay_ctx *c, struct lay_box *b,
         }
     }
     for (ch = b->first_child; ch; ch = ch->next) {
-        const struct computed_style *is = ch->style;
-        int32_t m = 0, s = 0;
-        int c0, span;
-
         if (ch->kind == LAY_BOX_MARKER || (ch->flags & LAYF_ABSOLUTE))
             continue;
-        if (is->grid_col_start > 0 && is->grid_col_end > is->grid_col_start)
-            span = is->grid_col_end - is->grid_col_start;
-        else
-            span = is->grid_col_span >= 1 ? is->grid_col_span : 1;
-        if (span > ncols) span = ncols;
-        if (is->grid_col_start > 0) {
-            c0 = is->grid_col_start - 1;
-            if (c0 >= ncols) { c0 = ncols - 1; span = 1; }
-            if (c0 + span > ncols) span = ncols - c0;
-        } else if (is->grid_col_end > 0) {
-            c0 = imax(0, is->grid_col_end - 1 - span);
-        } else {
-            if (col + span > ncols)
-                col = 0;
-            c0 = col;
-            col += span;
-            if (col >= ncols)
-                col = 0;
-        }
-        intrinsic_widths(c, ch, &m, &s, depth + 1);
-        if (span == 1) {
-            if (cs->grid_ncols == 0 || cs->grid_cols[c0].kind != CSS_GRID_PX) {
-                if (m > cmin[c0]) cmin[c0] = m;
-                if (s > cmax[c0]) cmax[c0] = s;
+        cnt++;
+        if (ch->style && ch->style->order != 0)
+            has_order = 1;
+    }
+    if (has_order && cnt > 1) {
+        ord = (struct lay_box **)calloc((unsigned long)cnt, sizeof(*ord));
+        if (ord) {
+            int idx = 0, k2;
+            for (ch = b->first_child; ch; ch = ch->next)
+                if (ch->kind != LAY_BOX_MARKER && !(ch->flags & LAYF_ABSOLUTE))
+                    ord[idx++] = ch;
+            for (idx = 1; idx < cnt; idx++) {
+                struct lay_box *key = ord[idx];
+                int32_t ko = key->style->order;
+                k2 = idx - 1;
+                while (k2 >= 0 && ord[k2]->style->order > ko) {
+                    ord[k2 + 1] = ord[k2];
+                    k2--;
+                }
+                ord[k2 + 1] = key;
             }
-        } else {
-            int32_t sm = 0, sx = 0;
-            int k;
-            for (k = 0; k < span; k++) {
-                sm += cmin[c0 + k];
-                sx += cmax[c0 + k];
-            }
-            sm += col_gap * (span - 1);
-            sx += col_gap * (span - 1);
-            if (m > sm) {
-                int32_t per = (m - sm + span - 1) / span;
-                for (k = 0; k < span; k++)
-                    if (cs->grid_ncols == 0 ||
-                        cs->grid_cols[c0 + k].kind != CSS_GRID_PX)
-                        cmin[c0 + k] += per;
-            }
-            if (s > sx) {
-                int32_t per = (s - sx + span - 1) / span;
-                for (k = 0; k < span; k++)
-                    if (cs->grid_ncols == 0 ||
-                        cs->grid_cols[c0 + k].kind != CSS_GRID_PX)
-                        cmax[c0 + k] += per;
-            }
+            for (idx = 0; idx < cnt; idx++)
+                grid_intrinsic_item(c, ord[idx], cs, ncols, col_gap, &col,
+                                    cmin, cmax, depth);
+            free(ord);
+            goto done_grid_cols;
         }
     }
+    for (ch = b->first_child; ch; ch = ch->next) {
+        if (ch->kind == LAY_BOX_MARKER || (ch->flags & LAYF_ABSOLUTE))
+            continue;
+        grid_intrinsic_item(c, ch, cs, ncols, col_gap, &col,
+                            cmin, cmax, depth);
+    }
+done_grid_cols:
     *minw = *maxw = col_gap * (ncols - 1);
     for (i = 0; i < ncols; i++) {
         if (cmax[i] < cmin[i]) cmax[i] = cmin[i];
@@ -1785,7 +1916,11 @@ static void intrinsic_widths(struct lay_ctx *c, struct lay_box *b,
 
         if (len_is_fixed_px(cs->width, &px))
             w = content_dim(px, cs, bp);
-        else
+        else if (cs->aspect_ratio > 0 && len_is_fixed_px(cs->height, &px)) {
+            int32_t vbp = vedge_bp(cs);
+            int32_t dh = clamp_height(content_dim(px, cs, vbp), cs, -1, vbp);
+            w = ratio_width_from_height(cs, dh, bp, vbp);
+        } else
             w = b->intrinsic_w;
         if (len_is_fixed_px(cs->max_width, &px)) {
             int32_t mx = content_dim(px, cs, bp);
@@ -1852,6 +1987,14 @@ static void intrinsic_widths(struct lay_ctx *c, struct lay_box *b,
             if (m > inner_min) inner_min = m;
             if (s > inner_max) inner_max = s;
         }
+    }
+    if (!len_is_fixed_px(cs->width, &px) &&
+        cs->aspect_ratio > 0 && len_is_fixed_px(cs->height, &px)) {
+        int32_t vbp = vedge_bp(cs);
+        int32_t dh = clamp_height(content_dim(px, cs, vbp), cs, -1, vbp);
+        int32_t rw = ratio_width_from_height(cs, dh, bp, vbp);
+        if (rw > inner_min) inner_min = rw;
+        if (rw > inner_max) inner_max = rw;
     }
     if (len_is_fixed_px(cs->min_width, &px)) {
         int32_t mn = content_dim(px, cs, bp);
@@ -2239,7 +2382,7 @@ static void ifc_emit_space(struct lay_ifc *f)
     fr->style = f->sp_style;
     fr->rec = f->sp_rec;
     fr->x = f->pen;
-    fr->w = f->sp_font->w;
+    fr->w = text_char_step(f->sp_font, f->sp_style);
     fr->is_space = 1;
     frag_metrics(f, fr, f->sp_style, f->sp_font, 0);
     f->pen += fr->w;
@@ -2251,19 +2394,24 @@ static void ifc_add_word(struct lay_ifc *f, struct lay_box *tb,
                          const char *s, unsigned long n, int wrap)
 {
     const struct font *font = tb->font;
-    int32_t w = text_width(font, s, n);
-    int32_t sp = f->pending_space ? f->sp_font->w : 0;
+    int32_t step = text_char_step(font, tb->style);
+    int32_t w_adv = text_width_adv(font, tb->style, n);
+    int32_t w_vis = text_width_vis(font, tb->style, n);
+    int32_t sp = f->pending_space
+        ? text_char_step(f->sp_font, f->sp_style) : 0;
+    int break_all = tb->style->word_break == CSS_WORDBREAK_BREAK_ALL;
     int guard = 0;
 
     for (;;) {
         int32_t avail = ifc_avail(f);
 
-        if (!wrap || f->pen + sp + w <= avail) {
+        if (!wrap || f->pen + sp + w_vis <= avail) {
             ifc_emit_space(f);
-            ifc_emit(f, tb, s, n, w, 0);
+            ifc_emit(f, tb, s, n, w_adv, 0);
             return;
         }
-        if (ifc_has_content(f) && f->pen > 0) {
+        if (ifc_has_content(f) && f->pen > 0 &&
+            (!break_all || f->pen + sp + font->w > avail)) {
             f->pending_space = 0;
             ifc_break(f, 0);
             sp = 0;
@@ -2271,23 +2419,26 @@ static void ifc_add_word(struct lay_ifc *f, struct lay_box *tb,
                 wrap = 0;      /* a zero-width line: stop retrying */
             continue;
         }
-        /* The word is alone on the line and still too wide: break it at
-         * the last character that fits, never fewer than one. */
+        /* Break within the word at the last character that fits on this
+         * line, never fewer than one. */
         {
-            unsigned long fit = font->w > 0
-                ? (unsigned long)((avail - f->pen) / font->w) : 1;
+            int32_t space_left = avail - (f->pen + sp);
+            unsigned long fit = 1;
 
+            if (space_left >= font->w && step > 0)
+                fit = 1 + (unsigned long)((space_left - font->w) / step);
             if (fit < 1) fit = 1;
             if (fit >= n) {
                 ifc_emit_space(f);
-                ifc_emit(f, tb, s, n, w, 0);
+                ifc_emit(f, tb, s, n, w_adv, 0);
                 return;
             }
             ifc_emit_space(f);
-            ifc_emit(f, tb, s, fit, text_width(font, s, fit), 0);
+            ifc_emit(f, tb, s, fit, text_width_adv(font, tb->style, fit), 0);
             s += fit;
             n -= fit;
-            w = text_width(font, s, n);
+            w_adv = text_width_adv(font, tb->style, n);
+            w_vis = text_width_vis(font, tb->style, n);
             ifc_break(f, 0);
             sp = 0;
             if (guard++ > 100000) {
@@ -2347,7 +2498,7 @@ static void ifc_add_text(struct lay_ifc *f, struct lay_box *tb)
                 j++;
             {
                 unsigned long len = j - i;
-                int32_t w = text_width(tb->font, t + i, len);
+                int32_t w = text_width_adv(tb->font, tb->style, len);
 
                 /* Preserved spaces are NOT trimmed at the end of a
                  * line - that is the whole point of `pre` - so they are
@@ -2648,10 +2799,124 @@ static void ifc_commit(struct lay_ifc *f, int forced)
         return;
     }
 
+    avail = ifc_avail(f);
+    if ((f->block->flags & LAYF_CLIP) &&
+        f->block->style->text_overflow == CSS_TEXTOVERFLOW_ELLIPSIS &&
+        !ws_wraps(f->block->style->white_space) && nf > 0 && avail > 0) {
+        struct lay_frag *lf = &fg[nf - 1];
+        int32_t vis_end = lf->x + lf->w;
+
+        if (lf->kind == LAY_FRAG_TEXT && lf->font && lf->len > 0 &&
+            lf->style && lf->style->letter_spacing != 0)
+            vis_end = lf->x + text_width_vis(lf->font, lf->style, lf->len);
+        if (vis_end > avail) {
+            const struct font *ef = lay_font_for(f->block->style);
+            const struct computed_style *es = f->block->style;
+            struct dom_node *ell_node = f->block->node;
+            int16_t ell_rec = -1;
+            int32_t ell_w = text_width_vis(ef, es, 3);
+            int new_nf = 0;
+
+            for (i = 0; i < nf; i++) {
+                const struct font *cf = fg[i].font ? fg[i].font : ef;
+                const struct computed_style *cs_i =
+                    fg[i].style ? fg[i].style : es;
+                int32_t step = text_char_step(cf, cs_i);
+                int32_t ew = text_width_vis(cf, cs_i, 3);
+
+                if (fg[i].kind != LAY_FRAG_TEXT) {
+                    if (fg[i].x + fg[i].w + ew <= avail) {
+                        new_nf = i + 1;
+                        continue;
+                    }
+                    ef = cf; es = cs_i; ell_w = ew;
+                    ell_node = fg[i].node; ell_rec = fg[i].rec;
+                    new_nf = i;
+                    break;
+                }
+                if (fg[i].x + (int32_t)fg[i].len * step + ew <= avail) {
+                    new_nf = i + 1;
+                    continue;
+                }
+                {
+                    int32_t rem = avail - ew - fg[i].x;
+                    unsigned long keep = (rem > 0 && step > 0)
+                        ? (unsigned long)(rem / step) : 0;
+
+                    if (keep > fg[i].len)
+                        keep = fg[i].len;
+                    ef = cf; es = cs_i; ell_w = ew;
+                    ell_node = fg[i].node; ell_rec = fg[i].rec;
+                    if (keep > 0) {
+                        fg[i].len = (uint32_t)keep;
+                        fg[i].w = (int32_t)((long)keep * (long)step);
+                        new_nf = i + 1;
+                    } else {
+                        new_nf = i;
+                        if (new_nf == 0)
+                            ell_rec = -1;
+                    }
+                }
+                break;
+            }
+            if (new_nf == nf) {
+                if (ifc_frag(f)) {
+                    fg = c->frags + f->frag_base;
+                    nf = new_nf + 1;
+                }
+            } else {
+                nf = new_nf + 1;
+            }
+            c->nfrag = f->frag_base + nf;
+            {
+                struct lay_frag *efr = &fg[nf - 1];
+                int32_t ex = (nf > 1) ? fg[nf - 2].x + fg[nf - 2].w : 0;
+
+                memset(efr, 0, sizeof(*efr));
+                efr->kind = LAY_FRAG_TEXT;
+                efr->text = "...";
+                efr->len = 3;
+                efr->font = ef;
+                efr->style = es;
+                efr->node = ell_node;
+                efr->rec = ell_rec;
+                efr->x = ex;
+                efr->w = ell_w;
+                frag_metrics(f, efr, es, ef, 0);
+                f->pen = ex + ell_w;
+                for (k = 0; k < nr; k++) {
+                    struct lay_rec *r = &c->recs[f->rec_base + k];
+                    if (!r->open) {
+                        if (r->x1 > f->pen) r->x1 = f->pen;
+                        if (r->x0 > f->pen) r->x0 = f->pen;
+                    }
+                }
+            }
+        }
+    }
+    if (nf > 0) {
+        struct lay_frag *lf = &fg[nf - 1];
+        if (lf->kind == LAY_FRAG_TEXT && lf->font && lf->len > 0 &&
+            lf->style && lf->style->letter_spacing != 0) {
+            int32_t old_w = lf->w;
+            int32_t new_w = text_width_vis(lf->font, lf->style, lf->len);
+
+            if (new_w != old_w) {
+                lf->w = new_w;
+                for (k = 0; k < nr; k++) {
+                    struct lay_rec *r = &c->recs[f->rec_base + k];
+                    if (!r->open && r->x1 == lf->x + old_w)
+                        r->x1 = lf->x + new_w;
+                }
+                if (f->pen == lf->x + old_w)
+                    f->pen = lf->x + new_w;
+            }
+        }
+    }
+
     line_w = nf ? fg[nf - 1].x + fg[nf - 1].w : f->pen;
     if (!nf && !nr)
         line_w = 0;
-    avail = ifc_avail(f);
 
     max_asc = f->strut_asc;
     max_desc = f->strut_desc;
@@ -3085,12 +3350,31 @@ static void resolve_replaced(struct lay_ctx *c, struct lay_box *b,
     h = auto_h ? -1 : content_dim(used_len(cs->height, cb_h, 0), cs, v_bp);
 
     if (w < 0 && h < 0) {
-        w = iw;
-        h = ih;
+        if (cs->aspect_ratio > 0) {
+            if (iw > 0) {
+                w = iw;
+                h = ratio_height_from_width(cs, w, h_bp, v_bp);
+            } else if (ih > 0) {
+                h = ih;
+                w = ratio_width_from_height(cs, h, h_bp, v_bp);
+            } else {
+                w = 0;
+                h = 0;
+            }
+        } else {
+            w = iw;
+            h = ih;
+        }
     } else if (w < 0) {
-        w = (ih > 0) ? clamp32((long long)h * iw / ih) : iw;
+        if (cs->aspect_ratio > 0)
+            w = ratio_width_from_height(cs, h, h_bp, v_bp);
+        else
+            w = (ih > 0) ? clamp32((long long)h * iw / ih) : iw;
     } else if (h < 0) {
-        h = (iw > 0) ? clamp32((long long)w * ih / iw) : ih;
+        if (cs->aspect_ratio > 0)
+            h = ratio_height_from_width(cs, w, h_bp, v_bp);
+        else
+            h = (iw > 0) ? clamp32((long long)w * ih / iw) : ih;
     }
     if (w < 0) w = 0;
     if (h < 0) h = 0;
@@ -3099,12 +3383,22 @@ static void resolve_replaced(struct lay_ctx *c, struct lay_box *b,
         int32_t cw = clamp_width(w, cs, cb_w, h_bp);
         int32_t chh;
 
-        if (cw != w && auto_h && iw > 0)
-            h = clamp32((long long)cw * ih / iw);
+        if (cw != w && auto_h) {
+            if (cs->aspect_ratio > 0)
+                h = ratio_height_from_width(cs, cw, h_bp, v_bp);
+            else if (iw > 0)
+                h = clamp32((long long)cw * ih / iw);
+        }
         w = cw;
         chh = clamp_height(h, cs, cb_h, v_bp);
-        if (chh != h && auto_w && ih > 0)
-            w = clamp_width(clamp32((long long)chh * iw / ih), cs, cb_w, h_bp);
+        if (chh != h && auto_w) {
+            if (cs->aspect_ratio > 0)
+                w = clamp_width(ratio_width_from_height(cs, chh, h_bp, v_bp),
+                                cs, cb_w, h_bp);
+            else if (ih > 0)
+                w = clamp_width(clamp32((long long)chh * iw / ih),
+                                cs, cb_w, h_bp);
+        }
         h = chh;
     }
     b->w = w;
@@ -3172,7 +3466,7 @@ static void solve_width(struct lay_box *b, int32_t cb_w, int32_t spec_w)
 }
 
 static void resolve_horizontal(struct lay_ctx *c, struct lay_box *b,
-                               int32_t cb_w, int mode, int depth)
+                               int32_t cb_w, int32_t cb_h, int mode, int depth)
 {
     const struct computed_style *cs = b->style;
     int32_t spec, clamped, h_bp;
@@ -3196,15 +3490,23 @@ static void resolve_horizontal(struct lay_ctx *c, struct lay_box *b,
         b->marg[CSS_RIGHT] = len_is_auto(cs->margin[CSS_RIGHT])
             ? 0 : used_len(cs->margin[CSS_RIGHT], cb_w, 0);
         if (len_is_auto_or_indef(cs->width, cb_w)) {
-            int32_t mn = 0, mx = 0, avail;
+            if (cs->aspect_ratio > 0 && !len_is_auto_or_indef(cs->height, cb_h)) {
+                int32_t vbp = box_v_bp(b);
+                int32_t dh = clamp_height(
+                    content_dim(used_len(cs->height, cb_h, 0), cs, vbp),
+                    cs, cb_h, vbp);
+                b->w = ratio_width_from_height(cs, dh, h_bp, vbp);
+            } else {
+                int32_t mn = 0, mx = 0, avail;
 
-            intrinsic_widths(c, b, &mn, &mx, depth);
-            mn -= edges + b->marg[CSS_LEFT] + b->marg[CSS_RIGHT];
-            mx -= edges + b->marg[CSS_LEFT] + b->marg[CSS_RIGHT];
-            if (mn < 0) mn = 0;
-            if (mx < mn) mx = mn;
-            avail = cb_w - edges - b->marg[CSS_LEFT] - b->marg[CSS_RIGHT];
-            b->w = imin(imax(mn, avail), mx);
+                intrinsic_widths(c, b, &mn, &mx, depth);
+                mn -= edges + b->marg[CSS_LEFT] + b->marg[CSS_RIGHT];
+                mx -= edges + b->marg[CSS_LEFT] + b->marg[CSS_RIGHT];
+                if (mn < 0) mn = 0;
+                if (mx < mn) mx = mn;
+                avail = cb_w - edges - b->marg[CSS_LEFT] - b->marg[CSS_RIGHT];
+                b->w = imin(imax(mn, avail), mx);
+            }
         } else {
             b->w = content_dim(used_len(cs->width, cb_w, 0), cs, h_bp);
         }
@@ -3212,8 +3514,19 @@ static void resolve_horizontal(struct lay_ctx *c, struct lay_box *b,
         return;
     }
 
-    spec = len_is_auto_or_indef(cs->width, cb_w)
-        ? -1 : content_dim(used_len(cs->width, cb_w, 0), cs, h_bp);
+    if (len_is_auto_or_indef(cs->width, cb_w)) {
+        if (cs->aspect_ratio > 0 && !len_is_auto_or_indef(cs->height, cb_h)) {
+            int32_t vbp = box_v_bp(b);
+            int32_t dh = clamp_height(
+                content_dim(used_len(cs->height, cb_h, 0), cs, vbp),
+                cs, cb_h, vbp);
+            spec = ratio_width_from_height(cs, dh, h_bp, vbp);
+        } else {
+            spec = -1;
+        }
+    } else {
+        spec = content_dim(used_len(cs->width, cb_w, 0), cs, h_bp);
+    }
     solve_width(b, cb_w, spec);
     clamped = clamp_width(b->w, cs, cb_w, h_bp);
     if (clamped != b->w)
@@ -3497,12 +3810,18 @@ static void layout_item_fixedw(struct lay_ctx *c, struct lay_box *ch,
         if (force_w) {
             inner_w = clamp_width(inner_w, ics, cb_w, box_h_bp(ch));
             if (inner_w != ch->w) {
-                if (len_is_auto_or_indef(ics->height, cb_h) &&
-                    ch->intrinsic_w > 0 && ch->intrinsic_h > 0) {
-                    ch->h = clamp_height(
-                        clamp32((long long)inner_w * ch->intrinsic_h /
-                                ch->intrinsic_w),
-                        ics, cb_h, box_v_bp(ch));
+                if (len_is_auto_or_indef(ics->height, cb_h)) {
+                    if (ics->aspect_ratio > 0) {
+                        ch->h = clamp_height(
+                            ratio_height_from_width(ics, inner_w,
+                                                    box_h_bp(ch), box_v_bp(ch)),
+                            ics, cb_h, box_v_bp(ch));
+                    } else if (ch->intrinsic_w > 0 && ch->intrinsic_h > 0) {
+                        ch->h = clamp_height(
+                            clamp32((long long)inner_w * ch->intrinsic_h /
+                                    ch->intrinsic_w),
+                            ics, cb_h, box_v_bp(ch));
+                    }
                 }
                 ch->w = inner_w;
                 ch->baseline = ch->h + ch->pad[CSS_BOTTOM] +
@@ -3534,6 +3853,32 @@ static void layout_item_fixedw(struct lay_ctx *c, struct lay_box *ch,
 #else
 #define LAY_NOINLINE
 #endif
+
+static int effective_align(const struct computed_style *parent,
+                           const struct computed_style *item)
+{
+    if (item && item->align_self != CSS_ALIGNSELF_AUTO &&
+        item->align_self < CSS_ALIGNSELF_COUNT)
+        return (int)item->align_self - 1;
+    return parent->align_items;
+}
+
+static void sort_flex_items(struct flex_item *items, int n)
+{
+    int i, j;
+
+    for (i = 1; i < n; i++) {
+        struct flex_item key = items[i];
+        int32_t ko = key.box->style->order;
+
+        j = i - 1;
+        while (j >= 0 && items[j].box->style->order > ko) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = key;
+    }
+}
 
 static LAY_NOINLINE int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
                                             int32_t y, int32_t definite_h,
@@ -3600,6 +3945,15 @@ static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
             inner_b = content_dim(used_len(ics->width, b->w, 0), ics, h_bp);
             inner_b = clamp_width(inner_b, ics, b->w, h_bp);
             basis = inner_b + h_extra;
+        } else if (ics->aspect_ratio > 0 &&
+                   !len_is_auto_or_indef(ics->height, definite_h)) {
+            int32_t vbp = box_v_bp(ch);
+            int32_t dh = clamp_height(
+                content_dim(used_len(ics->height, definite_h, 0), ics, vbp),
+                ics, definite_h, vbp);
+            inner_b = clamp_width(ratio_width_from_height(ics, dh, h_bp, vbp),
+                                  ics, b->w, h_bp);
+            basis = inner_b + h_extra;
         } else {
             intrinsic_widths(c, ch, &mn, &mx, depth + 1);
             basis = mx;
@@ -3617,6 +3971,8 @@ static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
             items[i].min_main = items[i].basis;
         i++;
     }
+
+    sort_flex_items(items, count);
 
     wrap = b->style->flex_wrap == CSS_FLEXWRAP_WRAP ||
            b->style->flex_wrap == CSS_FLEXWRAP_WRAP_REVERSE;
@@ -3646,6 +4002,7 @@ static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
         int s = line_starts[k], e = line_starts[k + 1], n_line = e - s, j;
         int32_t free_space = 0, start = 0, gap_extra = 0, cursor;
         int32_t line_h = 0, line_cross, max_asc = 0, max_desc = 0;
+        int have_base = 0;
 
         flex_resolve_line(items, s, e, b->w, main_gap, &free_space);
         flex_justify(b->style->justify_content, reverse, n_line, free_space,
@@ -3662,26 +4019,28 @@ static int32_t layout_flex_row(struct lay_ctx *c, struct lay_box *b,
             r = lay_margin_rect(ch);
             if (r.h > line_h)
                 line_h = r.h;
-            if (b->style->align_items == CSS_ALIGN_BASELINE) {
+            if (effective_align(b->style, ch->style) == CSS_ALIGN_BASELINE) {
                 int32_t asc = item_first_baseline_offset(ch);
                 int32_t desc = r.h - asc;
 
+                have_base = 1;
                 if (asc > max_asc) max_asc = asc;
                 if (desc > max_desc) max_desc = desc;
             }
             cursor += items[at].allocated + main_gap + gap_extra;
         }
-        if (b->style->align_items == CSS_ALIGN_BASELINE &&
-            max_asc + max_desc > line_h)
+        if (have_base && max_asc + max_desc > line_h)
             line_h = max_asc + max_desc;
         line_cross = (nlines == 1 && definite_h >= 0 && definite_h > line_h)
             ? definite_h : line_h;
         for (j = s; j < e; j++) {
             lay_rect r = lay_margin_rect(items[j].box);
             int32_t dy = 0;
+            int al;
 
             ch = items[j].box;
-            switch (b->style->align_items) {
+            al = effective_align(b->style, ch->style);
+            switch (al) {
             case CSS_ALIGN_END:
                 dy = line_cross - r.h;
                 break;
@@ -3779,7 +4138,8 @@ static int32_t layout_flex_column(struct lay_ctx *c, struct lay_box *b,
             continue;
         }
         ch->flags |= LAYF_BFC;
-        shrink_w = wrap || b->style->align_items != CSS_ALIGN_STRETCH ||
+        shrink_w = wrap ||
+                   effective_align(b->style, ics) != CSS_ALIGN_STRETCH ||
                    !len_is_auto_or_indef(ics->width, b->w);
         layout_standalone(c, ch, b->x, 0, b->w, shrink_w, depth + 1);
         r = lay_margin_rect(ch);
@@ -3816,6 +4176,8 @@ static int32_t layout_flex_column(struct lay_ctx *c, struct lay_box *b,
             items[i].min_main = items[i].basis;
         i++;
     }
+
+    sort_flex_items(items, count);
 
     if (!wrap) {
         nlines = 1;
@@ -3861,8 +4223,16 @@ static int32_t layout_flex_column(struct lay_ctx *c, struct lay_box *b,
             if (items[j].allocated != items[j].basis) {
                 int32_t nh = imax(0, items[j].allocated - box_v_bp(ch) -
                                   ch->marg[CSS_TOP] - ch->marg[CSS_BOTTOM]);
-                if (ch->kind != LAY_BOX_REPLACED)
+                if (ch->kind != LAY_BOX_REPLACED) {
                     ch->h = nh;
+                    if (ch->style->aspect_ratio > 0 &&
+                        len_is_auto_or_indef(ch->style->width, b->w)) {
+                        ch->w = clamp_width(
+                            ratio_width_from_height(ch->style, nh,
+                                                    box_h_bp(ch), box_v_bp(ch)),
+                            ch->style, b->w, box_h_bp(ch));
+                    }
+                }
             }
         }
         flex_justify(b->style->justify_content, reverse, n_line, free_space,
@@ -3875,11 +4245,13 @@ static int32_t layout_flex_column(struct lay_ctx *c, struct lay_box *b,
             lay_rect r = lay_margin_rect(items[at].box);
             lay_rect border = lay_border_rect(items[at].box);
             int32_t ix = b->x;
+            int al;
 
             ch = items[at].box;
-            if (b->style->align_items == CSS_ALIGN_END)
+            al = effective_align(b->style, ch->style);
+            if (al == CSS_ALIGN_END)
                 ix += col_cross - border.w;
-            else if (b->style->align_items == CSS_ALIGN_CENTER)
+            else if (al == CSS_ALIGN_CENTER)
                 ix += (col_cross - border.w) / 2;
             if (ix < b->x)
                 ix = b->x;
@@ -3915,6 +4287,93 @@ struct grid_item {
     int row, col, rspan, cspan;
     int r0, c0; /* explicit 0-based start, or -1 if auto */
 };
+
+static void sort_grid_items(struct grid_item *items, int n)
+{
+    int i, j;
+
+    for (i = 1; i < n; i++) {
+        struct grid_item key = items[i];
+        int32_t ko = key.box->style->order;
+
+        j = i - 1;
+        while (j >= 0 && items[j].box->style->order > ko) {
+            items[j + 1] = items[j];
+            j--;
+        }
+        items[j + 1] = key;
+    }
+}
+
+static void grid_size_rows(const struct computed_style *cs, int nrows,
+                           int32_t definite_h, int32_t row_gap,
+                           int32_t *row_h)
+{
+    int r;
+    int32_t fixed_h = 0, total_gaps = row_gap * (nrows - 1);
+    int64_t fr_total = 0, max_fr_unit = 0;
+
+    if (cs->grid_nrows == 0 || nrows <= 0)
+        return;
+    for (r = 0; r < nrows; r++) {
+        struct css_grid_track tr;
+
+        if (r < cs->grid_nrows) {
+            tr = cs->grid_rows[r];
+        } else {
+            tr.kind = CSS_GRID_AUTO;
+            tr.val = 0;
+        }
+        if (tr.kind == CSS_GRID_NONE)
+            tr.kind = CSS_GRID_AUTO;
+        if (tr.kind == CSS_GRID_PX) {
+            row_h[r] = imax(0, tr.val);
+            fixed_h += row_h[r];
+        } else if (tr.kind == CSS_GRID_PCT) {
+            if (definite_h >= 0)
+                row_h[r] = imax(0, clamp32((int64_t)definite_h * tr.val / 100000));
+            fixed_h += row_h[r];
+        } else if (tr.kind == CSS_GRID_FR) {
+            if (tr.val > 0) {
+                int64_t unit = ((int64_t)row_h[r] * 1000LL + tr.val - 1) / tr.val;
+                if (unit > max_fr_unit)
+                    max_fr_unit = unit;
+                fr_total += tr.val;
+            } else {
+                row_h[r] = 0;
+            }
+        } else {
+            fixed_h += row_h[r];
+        }
+    }
+    if (fr_total > 0) {
+        if (definite_h >= 0) {
+            int32_t rem = definite_h - total_gaps - fixed_h;
+            int32_t left = rem > 0 ? rem : 0;
+            int64_t fr_left = fr_total;
+
+            for (r = 0; r < nrows; r++) {
+                if (r >= cs->grid_nrows || cs->grid_rows[r].kind != CSS_GRID_FR ||
+                    cs->grid_rows[r].val <= 0)
+                    continue;
+                row_h[r] = cs->grid_rows[r].val == fr_left ? left :
+                    (int32_t)((int64_t)left * cs->grid_rows[r].val / fr_left);
+                left -= row_h[r];
+                fr_left -= cs->grid_rows[r].val;
+            }
+        } else {
+            for (r = 0; r < nrows; r++) {
+                int32_t h;
+                if (r >= cs->grid_nrows || cs->grid_rows[r].kind != CSS_GRID_FR ||
+                    cs->grid_rows[r].val <= 0)
+                    continue;
+                h = (int32_t)((max_fr_unit * cs->grid_rows[r].val + 500) / 1000);
+                if (h > row_h[r])
+                    row_h[r] = h;
+            }
+        }
+    }
+}
 
 static int grid_occ_fits(const uint8_t *occ, int occ_rows, int ncols,
                          int r, int c, int rspan, int cspan)
@@ -4056,6 +4515,8 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
         i++;
     }
 
+    sort_grid_items(items, count);
+
     /* Placement pass 1a: explicit row AND explicit col. */
     for (i = 0; i < count; i++) {
         if (items[i].r0 < 0 || items[i].c0 < 0)
@@ -4134,6 +4595,8 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
     for (i = 0; i < count; i++)
         if (items[i].row + items[i].rspan > nrows)
             nrows = items[i].row + items[i].rspan;
+    if (cs->grid_nrows > nrows)
+        nrows = cs->grid_nrows;
     if (nrows <= 0) {
         free(items);
         return definite_h >= 0 ? definite_h : 0;
@@ -4253,24 +4716,29 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
     }
 
     /* Measure row heights: single-row spans first, then multi-row spans */
-    for (i = 0; i < count; i++) {
-        lay_rect r = lay_margin_rect(items[i].box);
+    {
+        int have_base = 0;
 
-        if (items[i].rspan != 1)
-            continue;
-        if (r.h > row_h[items[i].row])
-            row_h[items[i].row] = r.h;
-        if (cs->align_items == CSS_ALIGN_BASELINE) {
-            int32_t asc = item_first_baseline_offset(items[i].box);
-            int32_t desc = r.h - asc;
-            if (asc > row_asc[items[i].row]) row_asc[items[i].row] = asc;
-            if (desc > row_desc[items[i].row]) row_desc[items[i].row] = desc;
+        for (i = 0; i < count; i++) {
+            lay_rect r = lay_margin_rect(items[i].box);
+
+            if (items[i].rspan != 1)
+                continue;
+            if (r.h > row_h[items[i].row])
+                row_h[items[i].row] = r.h;
+            if (effective_align(cs, items[i].box->style) == CSS_ALIGN_BASELINE) {
+                int32_t asc = item_first_baseline_offset(items[i].box);
+                int32_t desc = r.h - asc;
+                have_base = 1;
+                if (asc > row_asc[items[i].row]) row_asc[items[i].row] = asc;
+                if (desc > row_desc[items[i].row]) row_desc[items[i].row] = desc;
+            }
         }
-    }
-    if (cs->align_items == CSS_ALIGN_BASELINE) {
-        for (i = 0; i < nrows; i++)
-            if (row_asc[i] + row_desc[i] > row_h[i])
-                row_h[i] = row_asc[i] + row_desc[i];
+        if (have_base) {
+            for (i = 0; i < nrows; i++)
+                if (row_asc[i] + row_desc[i] > row_h[i])
+                    row_h[i] = row_asc[i] + row_desc[i];
+        }
     }
     for (i = 0; i < count; i++) {
         int32_t have = row_gap * (items[i].rspan - 1), want;
@@ -4285,6 +4753,8 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
             row_h[items[i].row + items[i].rspan - 1] += want - have;
     }
 
+    grid_size_rows(cs, nrows, definite_h, row_gap, row_h);
+
     row_y[0] = y;
     for (i = 1; i < nrows; i++)
         row_y[i] = row_y[i - 1] + row_h[i - 1] + row_gap;
@@ -4297,12 +4767,23 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
         lay_rect r = lay_margin_rect(item);
         int32_t span_h = row_gap * (items[i].rspan - 1);
         int32_t dy = row_y[items[i].row] - r.y;
-        int k;
+        int k, al;
 
         for (k = 0; k < items[i].rspan; k++)
             span_h += row_h[items[i].row + k];
 
-        switch (cs->align_items) {
+        if (ics->height.type == CSS_LEN_PCT && definite_h < 0 &&
+            items[i].row < cs->grid_nrows && item->kind != LAY_BOX_REPLACED) {
+            int32_t vbp = box_v_bp(item);
+            int32_t nh = clamp_height(
+                content_dim(used_len(ics->height, span_h, 0), ics, vbp),
+                ics, span_h, vbp);
+            item->h = nh;
+            r = lay_margin_rect(item);
+        }
+
+        al = effective_align(cs, ics);
+        switch (al) {
         case CSS_ALIGN_END:
             dy += span_h - r.h;
             break;
@@ -4314,11 +4795,14 @@ static int32_t layout_grid(struct lay_ctx *c, struct lay_box *b,
                 dy += row_asc[items[i].row] - item_first_baseline_offset(item);
             break;
         case CSS_ALIGN_STRETCH:
-            if (len_is_auto_or_indef(ics->height, definite_h) &&
+            if ((len_is_auto(ics->height) ||
+                 (len_is_auto_or_indef(ics->height, definite_h) &&
+                  items[i].row >= cs->grid_nrows)) &&
                 item->kind != LAY_BOX_REPLACED && r.h < span_h) {
                 int32_t want = imax(0, span_h - item->marg[CSS_TOP] -
                                     item->marg[CSS_BOTTOM] - box_v_bp(item));
-                want = clamp_height(want, ics, definite_h, box_v_bp(item));
+                int32_t hbase = definite_h >= 0 ? definite_h : span_h;
+                want = clamp_height(want, ics, hbase, box_v_bp(item));
                 if (want > item->h)
                     item->h = want;
             }
@@ -4401,7 +4885,7 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
         return btop + lay_border_rect(b).h;
     }
 
-    resolve_horizontal(c, b, cb_w, mode, depth);
+    resolve_horizontal(c, b, cb_w, cb_h, mode, depth);
     auto_h = len_is_auto_or_indef(cs->height, cb_h);
     if (!auto_h) {
         definite_h = content_dim(used_len(cs->height, cb_h, 0), cs,
@@ -4435,142 +4919,153 @@ static int32_t layout_block_box(struct lay_ctx *c, struct lay_box *b,
         }
     }
 
-    b->y = btop + b->bord[CSS_TOP] + b->pad[CSS_TOP];
-    content_y = b->y;
-    flow = content_y;
+    {
+        int32_t ar_h = -1;
+        int32_t pass_h;
 
-    mine.base = (b->flags & LAYF_BFC) ? c->nfl : bfc->base;
-    mine.cx = b->x;
-    mine.cw = b->w;
-    mine.low_left = mine.low_right = 0;
+        if (auto_h && cs->aspect_ratio > 0) {
+            ar_h = ratio_height_from_width(cs, b->w, box_h_bp(b), box_v_bp(b));
+            ar_h = clamp_height(ar_h, cs, cb_h, box_v_bp(b));
+        }
+        pass_h = auto_h ? ar_h : definite_h;
 
-    if (b->first_child && b->first_child->kind == LAY_BOX_MARKER &&
-        b->first_child->style->list_style_position == CSS_LISTPOS_OUTSIDE) {
-        marker = b->first_child;
-        box_unlink(marker);
-    }
+        b->y = btop + b->bord[CSS_TOP] + b->pad[CSS_TOP];
+        content_y = b->y;
+        flow = content_y;
 
-    if (cs->display == CSS_DISPLAY_FLEX ||
-        cs->display == CSS_DISPLAY_INLINE_FLEX) {
-        if (cs->flex_direction == CSS_FLEXDIR_ROW ||
-            cs->flex_direction == CSS_FLEXDIR_ROW_REVERSE)
-            h_children = layout_flex_row(c, b, content_y,
-                                         auto_h ? -1 : definite_h,
-                                         &mine, depth);
-        else
-            h_children = layout_flex_column(c, b, content_y,
-                                            auto_h ? -1 : definite_h,
-                                            &mine, depth);
-        if (h_children >= 0) {
+        mine.base = (b->flags & LAYF_BFC) ? c->nfl : bfc->base;
+        mine.cx = b->x;
+        mine.cw = b->w;
+        mine.low_left = mine.low_right = 0;
+
+        if (b->first_child && b->first_child->kind == LAY_BOX_MARKER &&
+            b->first_child->style->list_style_position == CSS_LISTPOS_OUTSIDE) {
+            marker = b->first_child;
+            box_unlink(marker);
+        }
+
+        if (cs->display == CSS_DISPLAY_FLEX ||
+            cs->display == CSS_DISPLAY_INLINE_FLEX) {
+            if (cs->flex_direction == CSS_FLEXDIR_ROW ||
+                cs->flex_direction == CSS_FLEXDIR_ROW_REVERSE)
+                h_children = layout_flex_row(c, b, content_y, pass_h,
+                                             &mine, depth);
+            else
+                h_children = layout_flex_column(c, b, content_y, pass_h,
+                                                &mine, depth);
+            if (h_children >= 0) {
+                flow = content_y + h_children;
+                open = marg_of(0);
+            } else {
+                /* Allocation failure retains the readable block fallback. */
+                open = marg_of(0);
+                can_skip = 0;
+                for (ch = b->first_child; ch; ch = nx) {
+                    nx = ch->next;
+                    if (ch->kind == LAY_BOX_MARKER)
+                        continue;
+                    if (ch->flags & LAYF_ABSOLUTE) {
+                        record_out_of_flow(c, ch, b->x,
+                                           flow + marg_value(open));
+                        continue;
+                    }
+                    flow = layout_block_box(c, ch, b->x, b->w, pass_h,
+                                            flow, &mine, &open, 0,
+                                            LAY_MODE_FLOW, depth + 1);
+                }
+                h_children = flow - content_y;
+            }
+        } else if (cs->display == CSS_DISPLAY_GRID ||
+                   cs->display == CSS_DISPLAY_INLINE_GRID) {
+            h_children = layout_grid(c, b, content_y, pass_h, &mine, depth);
+            if (h_children >= 0) {
+                flow = content_y + h_children;
+                open = marg_of(0);
+            } else {
+                open = marg_of(0);
+                can_skip = 0;
+                for (ch = b->first_child; ch; ch = nx) {
+                    nx = ch->next;
+                    if (ch->kind == LAY_BOX_MARKER)
+                        continue;
+                    if (ch->flags & LAYF_ABSOLUTE) {
+                        record_out_of_flow(c, ch, b->x,
+                                           flow + marg_value(open));
+                        continue;
+                    }
+                    flow = layout_block_box(c, ch, b->x, b->w, pass_h,
+                                            flow, &mine, &open, 0,
+                                            LAY_MODE_FLOW, depth + 1);
+                }
+                h_children = flow - content_y;
+            }
+        } else if (b->flags & LAYF_IFC) {
+            int32_t mw = 0;
+
+            h_children = layout_inline(c, b, &mine, content_y, &mw, depth);
+            has_lines = h_children > 0;
             flow = content_y + h_children;
             open = marg_of(0);
         } else {
-            /* Allocation failure retains the readable block fallback. */
             open = marg_of(0);
-            can_skip = 0;
+            can_skip = block_collapses_with_children(b) && !skip_top ? 1 :
+                       block_collapses_with_children(b);
             for (ch = b->first_child; ch; ch = nx) {
                 nx = ch->next;
                 if (ch->kind == LAY_BOX_MARKER)
                     continue;
                 if (ch->flags & LAYF_ABSOLUTE) {
-                    record_out_of_flow(c, ch, b->x,
-                                       flow + marg_value(open));
+                    record_out_of_flow(c, ch, b->x, flow + marg_value(open));
                     continue;
                 }
-                flow = layout_block_box(c, ch, b->x, b->w,
-                                        auto_h ? -1 : definite_h,
-                                        flow, &mine, &open, 0,
-                                        LAY_MODE_FLOW, depth + 1);
+                if (ch->flags & LAYF_FLOAT) {
+                    int32_t hint = flow + marg_value(open);
+
+                    layout_standalone(c, ch, b->x, hint, b->w, 1, depth + 1);
+                    float_place(c, &mine, ch, hint);
+                    continue;
+                }
+                flow = layout_block_box(c, ch, b->x, b->w, pass_h,
+                                        flow, &mine, &open,
+                                        first && can_skip, LAY_MODE_FLOW,
+                                        depth + 1);
+                first = 0;
             }
             h_children = flow - content_y;
         }
-    } else if (cs->display == CSS_DISPLAY_GRID ||
-               cs->display == CSS_DISPLAY_INLINE_GRID) {
-        h_children = layout_grid(c, b, content_y,
-                                 auto_h ? -1 : definite_h, &mine, depth);
-        if (h_children >= 0) {
-            flow = content_y + h_children;
-            open = marg_of(0);
+
+        mbot = marg_of(len_is_auto(cs->margin[CSS_BOTTOM])
+                       ? 0 : used_len(cs->margin[CSS_BOTTOM], cb_w, 0));
+        b->marg[CSS_TOP] = len_is_auto(cs->margin[CSS_TOP])
+            ? 0 : used_len(cs->margin[CSS_TOP], cb_w, 0);
+        b->marg[CSS_BOTTOM] = mbot.pos + mbot.neg;
+
+        if (!auto_h) {
+            used_h = definite_h;
+            outgoing = mbot;
+        } else if (b->flags & LAYF_BFC) {
+            int32_t fl = float_lowest(c, &mine);
+
+            used_h = h_children + marg_value(open);
+            if (fl - content_y > used_h)
+                used_h = fl - content_y;
+            outgoing = mbot;
+        } else if (b->bord[CSS_BOTTOM] || b->pad[CSS_BOTTOM]) {
+            used_h = h_children + marg_value(open);
+            outgoing = mbot;
         } else {
-            open = marg_of(0);
-            can_skip = 0;
-            for (ch = b->first_child; ch; ch = nx) {
-                nx = ch->next;
-                if (ch->kind == LAY_BOX_MARKER)
-                    continue;
-                if (ch->flags & LAYF_ABSOLUTE) {
-                    record_out_of_flow(c, ch, b->x,
-                                       flow + marg_value(open));
-                    continue;
-                }
-                flow = layout_block_box(c, ch, b->x, b->w,
-                                        auto_h ? -1 : definite_h,
-                                        flow, &mine, &open, 0,
-                                        LAY_MODE_FLOW, depth + 1);
-            }
-            h_children = flow - content_y;
+            used_h = h_children;
+            outgoing = marg_collapse(open, mbot);
         }
-    } else if (b->flags & LAYF_IFC) {
-        int32_t mw = 0;
-
-        h_children = layout_inline(c, b, &mine, content_y, &mw, depth);
-        has_lines = h_children > 0;
-        flow = content_y + h_children;
-        open = marg_of(0);
-    } else {
-        open = marg_of(0);
-        can_skip = block_collapses_with_children(b) && !skip_top ? 1 :
-                   block_collapses_with_children(b);
-        for (ch = b->first_child; ch; ch = nx) {
-            nx = ch->next;
-            if (ch->kind == LAY_BOX_MARKER)
-                continue;
-            if (ch->flags & LAYF_ABSOLUTE) {
-                record_out_of_flow(c, ch, b->x, flow + marg_value(open));
-                continue;
-            }
-            if (ch->flags & LAYF_FLOAT) {
-                int32_t hint = flow + marg_value(open);
-
-                layout_standalone(c, ch, b->x, hint, b->w, 1, depth + 1);
-                float_place(c, &mine, ch, hint);
-                continue;
-            }
-            flow = layout_block_box(c, ch, b->x, b->w,
-                                    auto_h ? -1 : definite_h,
-                                    flow, &mine, &open,
-                                    first && can_skip, LAY_MODE_FLOW,
-                                    depth + 1);
-            first = 0;
+        if (auto_h && ar_h >= 0) {
+            if (b->flags & LAYF_CLIP)
+                used_h = ar_h;
+            else if (ar_h > used_h)
+                used_h = ar_h;
         }
-        h_children = flow - content_y;
+        used_h = clamp_height(used_h, cs, cb_h, box_v_bp(b));
+        b->h = used_h;
     }
-
-    mbot = marg_of(len_is_auto(cs->margin[CSS_BOTTOM])
-                   ? 0 : used_len(cs->margin[CSS_BOTTOM], cb_w, 0));
-    b->marg[CSS_TOP] = len_is_auto(cs->margin[CSS_TOP])
-        ? 0 : used_len(cs->margin[CSS_TOP], cb_w, 0);
-    b->marg[CSS_BOTTOM] = mbot.pos + mbot.neg;
-
-    if (!auto_h) {
-        used_h = definite_h;
-        outgoing = mbot;
-    } else if (b->flags & LAYF_BFC) {
-        int32_t fl = float_lowest(c, &mine);
-
-        used_h = h_children + marg_value(open);
-        if (fl - content_y > used_h)
-            used_h = fl - content_y;
-        outgoing = mbot;
-    } else if (b->bord[CSS_BOTTOM] || b->pad[CSS_BOTTOM]) {
-        used_h = h_children + marg_value(open);
-        outgoing = mbot;
-    } else {
-        used_h = h_children;
-        outgoing = marg_collapse(open, mbot);
-    }
-    used_h = clamp_height(used_h, cs, cb_h, box_v_bp(b));
-    b->h = used_h;
 
     if (auto_h && used_h == 0 && !has_lines &&
         !b->bord[CSS_TOP] && !b->pad[CSS_TOP] &&
@@ -5256,11 +5751,13 @@ static struct lay_box *abs_containing_block(struct lay_ctx *c,
     struct lay_box *p;
     int guard = 0;
 
-    if (b->flags & LAYF_FIXED)
-        return c->L->icb;
-    for (p = b->parent; p && guard++ < LAY_MAX_DEPTH * 2; p = p->parent)
-        if (p->flags & LAYF_POSITIONED)
+    for (p = b->parent; p && guard++ < LAY_MAX_DEPTH * 2; p = p->parent) {
+        if (p->style && p->style->has_transform && !(p->flags & LAYF_ANON) &&
+            p->kind != LAY_BOX_INLINE)
             return p;
+        if (!(b->flags & LAYF_FIXED) && (p->flags & LAYF_POSITIONED))
+            return p;
+    }
     return c->L->icb;
 }
 
@@ -5282,6 +5779,7 @@ static void layout_absolute(struct lay_ctx *c, struct lay_box *b, int depth)
             pb.h = c->L->opt.viewport_h;
         }
     } else {
+        b->flags &= ~LAYF_FIXED;
         pb = lay_padding_rect(cb);
     }
     cbx = pb.x;
@@ -5313,7 +5811,12 @@ static void layout_absolute(struct lay_ctx *c, struct lay_box *b, int depth)
             w = content_dim(used_len(cs->width, cbw, 0), cs, h_bp);
         else if (!auto_l && !auto_r)
             w = imax(0, cbw - l - r - hmbp);
-        else {
+        else if (!auto_h && cs->aspect_ratio > 0) {
+            int32_t dh = clamp_height(
+                content_dim(used_len(cs->height, cbh, 0), cs, v_bp),
+                cs, cbh, v_bp);
+            w = ratio_width_from_height(cs, dh, h_bp, v_bp);
+        } else {
             int32_t mn = 0, mx = 0, avail;
 
             intrinsic_widths(c, b, &mn, &mx, depth);
@@ -5419,6 +5922,131 @@ static void apply_relative(struct lay_document *L)
         if (n == L->icb)
             break;
         n = n->next;
+    }
+}
+
+static int32_t xform_scale_coord(int32_t v, int32_t orig, int32_t sc, int32_t t)
+{
+    int64_t m = (int64_t)(v - orig) * sc;
+    int64_t q = m >= 0 ? (m + 500) / 1000 : -((-m + 500) / 1000);
+    return clamp32((int64_t)orig + q + t);
+}
+
+static int32_t xform_scale_dim(int32_t v, int32_t sc)
+{
+    int64_t a = sc < 0 ? -(int64_t)sc : (int64_t)sc;
+    if (v <= 0)
+        return 0;
+    return clamp32(((int64_t)v * a + 500) / 1000);
+}
+
+static void transform_scale_subtree(struct lay_box *b, int32_t ox, int32_t oy,
+                                    int32_t sx, int32_t sy,
+                                    int32_t tx, int32_t ty)
+{
+    struct lay_box *n = b;
+
+    for (;;) {
+        int fixed_boundary = n != b && (n->flags & LAYF_FIXED);
+
+        if (!fixed_boundary) {
+            int32_t x0 = xform_scale_coord(n->x, ox, sx, tx);
+            int32_t x1 = xform_scale_coord(n->x + n->w, ox, sx, tx);
+            int32_t y0 = xform_scale_coord(n->y, oy, sy, ty);
+            int32_t y1 = xform_scale_coord(n->y + n->h, oy, sy, ty);
+
+            if (x0 <= x1) { n->x = x0; n->w = x1 - x0; }
+            else          { n->x = x1; n->w = x0 - x1; }
+            if (y0 <= y1) { n->y = y0; n->h = y1 - y0; }
+            else          { n->y = y1; n->h = y0 - y1; }
+
+            n->pad[CSS_LEFT]    = xform_scale_dim(n->pad[CSS_LEFT], sx);
+            n->pad[CSS_RIGHT]   = xform_scale_dim(n->pad[CSS_RIGHT], sx);
+            n->pad[CSS_TOP]     = xform_scale_dim(n->pad[CSS_TOP], sy);
+            n->pad[CSS_BOTTOM]  = xform_scale_dim(n->pad[CSS_BOTTOM], sy);
+            n->bord[CSS_LEFT]   = xform_scale_dim(n->bord[CSS_LEFT], sx);
+            n->bord[CSS_RIGHT]  = xform_scale_dim(n->bord[CSS_RIGHT], sx);
+            n->bord[CSS_TOP]    = xform_scale_dim(n->bord[CSS_TOP], sy);
+            n->bord[CSS_BOTTOM] = xform_scale_dim(n->bord[CSS_BOTTOM], sy);
+            if (sx < 0) {
+                int32_t t = n->pad[CSS_LEFT];
+                n->pad[CSS_LEFT] = n->pad[CSS_RIGHT];
+                n->pad[CSS_RIGHT] = t;
+                t = n->bord[CSS_LEFT];
+                n->bord[CSS_LEFT] = n->bord[CSS_RIGHT];
+                n->bord[CSS_RIGHT] = t;
+            }
+            if (sy < 0) {
+                int32_t t = n->pad[CSS_TOP];
+                n->pad[CSS_TOP] = n->pad[CSS_BOTTOM];
+                n->pad[CSS_BOTTOM] = t;
+                t = n->bord[CSS_TOP];
+                n->bord[CSS_TOP] = n->bord[CSS_BOTTOM];
+                n->bord[CSS_BOTTOM] = t;
+            }
+            n->baseline = xform_scale_dim(n->baseline, sy);
+        }
+        if (!fixed_boundary && n->first_child) {
+            n = n->first_child;
+            continue;
+        }
+        while (n != b && !n->next)
+            n = n->parent;
+        if (n == b)
+            break;
+        n = n->next;
+    }
+}
+
+static void apply_box_transform(struct lay_box *b)
+{
+    const struct computed_style *cs = b->style;
+    lay_rect br;
+    int32_t tx, ty, sx, sy;
+
+    if ((b->flags & LAYF_ANON) || b->kind == LAY_BOX_INLINE ||
+        b->kind == LAY_BOX_LINE || b->kind == LAY_BOX_TEXT ||
+        b->kind == LAY_BOX_MARKER || !cs || !cs->has_transform)
+        return;
+
+    br = lay_border_rect(b);
+    tx = used_len(cs->translate_x, br.w, 0);
+    ty = used_len(cs->translate_y, br.h, 0);
+    sx = cs->scale_x;
+    sy = cs->scale_y;
+    if (sx == 1000 && sy == 1000) {
+        translate_relative_subtree(b, tx, ty);
+        return;
+    }
+    transform_scale_subtree(b, br.x + br.w / 2, br.y + br.h / 2,
+                            sx, sy, tx, ty);
+}
+
+static void apply_transforms(struct lay_document *L)
+{
+    struct lay_box *n = L->icb;
+    int descending = 1;
+
+    for (;;) {
+        if (descending) {
+            if (n->first_child) {
+                n = n->first_child;
+                continue;
+            }
+        }
+        for (;;) {
+            if (n != L->icb)
+                apply_box_transform(n);
+            if (n == L->icb)
+                return;
+            if (n->next) {
+                n = n->next;
+                descending = 1;
+                break;
+            }
+            n = n->parent;
+            descending = 0;
+        }
     }
 }
 
@@ -5914,6 +6542,7 @@ static struct lay_document *lay_run(struct dom_document *doc,
     }
 
     apply_relative(L);
+    apply_transforms(L);
     mark_positioning_contexts(L);
 
     if (rb) {

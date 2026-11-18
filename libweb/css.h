@@ -277,6 +277,40 @@ enum { CSS_FLEXWRAP_LIST(CSS_ENUM_X) CSS_FLEXWRAP_COUNT };
     X(CSS_COLORSCHEME_DARK,   "dark")
 enum { CSS_COLORSCHEME_LIST(CSS_ENUM_X) CSS_COLORSCHEME_COUNT };
 
+#define CSS_OBJECTFIT_LIST(X) \
+    X(CSS_OBJECTFIT_FILL,       "fill") \
+    X(CSS_OBJECTFIT_CONTAIN,    "contain") \
+    X(CSS_OBJECTFIT_COVER,      "cover") \
+    X(CSS_OBJECTFIT_NONE,       "none") \
+    X(CSS_OBJECTFIT_SCALE_DOWN, "scale-down")
+enum { CSS_OBJECTFIT_LIST(CSS_ENUM_X) CSS_OBJECTFIT_COUNT };
+
+#define CSS_ALIGNSELF_LIST(X) \
+    X(CSS_ALIGNSELF_AUTO,     "auto") \
+    X(CSS_ALIGNSELF_STRETCH,  "stretch") \
+    X(CSS_ALIGNSELF_START,    "flex-start") \
+    X(CSS_ALIGNSELF_END,      "flex-end") \
+    X(CSS_ALIGNSELF_CENTER,   "center") \
+    X(CSS_ALIGNSELF_BASELINE, "baseline")
+enum { CSS_ALIGNSELF_LIST(CSS_ENUM_X) CSS_ALIGNSELF_COUNT };
+
+#define CSS_TEXTOVERFLOW_LIST(X) \
+    X(CSS_TEXTOVERFLOW_CLIP,     "clip") \
+    X(CSS_TEXTOVERFLOW_ELLIPSIS, "ellipsis")
+enum { CSS_TEXTOVERFLOW_LIST(CSS_ENUM_X) CSS_TEXTOVERFLOW_COUNT };
+
+#define CSS_WORDBREAK_LIST(X) \
+    X(CSS_WORDBREAK_NORMAL,     "normal") \
+    X(CSS_WORDBREAK_BREAK_ALL,  "break-all") \
+    X(CSS_WORDBREAK_BREAK_WORD, "break-word")
+enum { CSS_WORDBREAK_LIST(CSS_ENUM_X) CSS_WORDBREAK_COUNT };
+
+#define CSS_OVERFLOWWRAP_LIST(X) \
+    X(CSS_OVERFLOWWRAP_NORMAL,     "normal") \
+    X(CSS_OVERFLOWWRAP_BREAK_WORD, "break-word") \
+    X(CSS_OVERFLOWWRAP_ANYWHERE,   "anywhere")
+enum { CSS_OVERFLOWWRAP_LIST(CSS_ENUM_X) CSS_OVERFLOWWRAP_COUNT };
+
 /* font-size keywords survive parsing because "smaller" and "larger" need
  * the parent's font size, which only the cascade knows. */
 #define CSS_FONTSIZEKW_LIST(X) \
@@ -388,10 +422,24 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_ROW_GAP,             "row-gap") \
     X(CSS_PROP_COLUMN_GAP,          "column-gap") \
     X(CSS_PROP_GRID_TEMPLATE_COLS,  "grid-template-columns") \
+    X(CSS_PROP_GRID_TEMPLATE_ROWS,  "grid-template-rows") \
     X(CSS_PROP_GRID_COL_START,      "grid-column-start") \
     X(CSS_PROP_GRID_COL_END,        "grid-column-end") \
     X(CSS_PROP_GRID_ROW_START,      "grid-row-start") \
-    X(CSS_PROP_GRID_ROW_END,        "grid-row-end")
+    X(CSS_PROP_GRID_ROW_END,        "grid-row-end") \
+    X(CSS_PROP_ASPECT_RATIO,        "aspect-ratio") \
+    X(CSS_PROP_OBJECT_FIT,          "object-fit") \
+    X(CSS_PROP_ALIGN_SELF,          "align-self") \
+    X(CSS_PROP_ORDER,               "order") \
+    X(CSS_PROP_OUTLINE_WIDTH,       "outline-width") \
+    X(CSS_PROP_OUTLINE_STYLE,       "outline-style") \
+    X(CSS_PROP_OUTLINE_COLOR,       "outline-color") \
+    X(CSS_PROP_OUTLINE_OFFSET,      "outline-offset") \
+    X(CSS_PROP_TEXT_OVERFLOW,       "text-overflow") \
+    X(CSS_PROP_WORD_BREAK,          "word-break") \
+    X(CSS_PROP_OVERFLOW_WRAP,       "overflow-wrap") \
+    X(CSS_PROP_LETTER_SPACING,      "letter-spacing") \
+    X(CSS_PROP_TRANSFORM,           "transform")
 enum { CSS_PROP_LIST(CSS_ENUM_X) CSS_PROP_COUNT };
 
 /* ------------------------------------------------------------------ *
@@ -653,6 +701,7 @@ struct css_len {
 };
 
 #define CSS_GRID_MAX_COLS   12
+#define CSS_GRID_MAX_ROWS   12
 #define CSS_GRAD_MAX_STOPS  4
 
 enum {
@@ -680,12 +729,15 @@ struct computed_style {
     uint8_t list_style_position, border_collapse, text_transform;
     uint8_t text_decoration;             /* CSS_DECOR_* bitmask         */
     uint8_t flex_direction, flex_wrap, justify_content, align_items;
+    uint8_t align_self, object_fit, outline_style;
+    uint8_t text_overflow, word_break, overflow_wrap;
     uint8_t box_sizing, color_scheme;
     uint8_t border_style[4];
     uint8_t z_auto;
     uint8_t has_gradient, grad_nstops;
     uint8_t has_shadow, shadow_inset;
-    uint8_t grid_ncols;
+    uint8_t has_transform;
+    uint8_t grid_ncols, grid_nrows;
     uint16_t font_weight;                /* 100..900                    */
     uint16_t opacity;                    /* 0..1000 (1000 = opaque)     */
 
@@ -693,7 +745,11 @@ struct computed_style {
     int32_t border_width[4];             /* px, 0 when style is none    */
     int32_t border_radius[4];            /* px, TL/TR/BR/BL             */
     int32_t border_spacing;              /* px                          */
+    int32_t outline_width, outline_offset; /* px                        */
     int32_t z_index;
+    int32_t order;                       /* flex / grid item order      */
+    int32_t aspect_ratio;                /* thousandths, 0 = auto       */
+    int32_t letter_spacing;              /* px, 0 = normal              */
     int32_t vertical_align_px;           /* when vertical_align == LENGTH */
     int32_t flex_grow;                   /* unitless, thousandths        */
     int32_t flex_shrink;                 /* unitless, thousandths (1000) */
@@ -706,10 +762,13 @@ struct computed_style {
     struct css_len offset[4];            /* top/right/bottom/left       */
     struct css_len line_height;
     struct css_len text_indent;
+    struct css_len translate_x, translate_y;
+    int32_t scale_x, scale_y;            /* thousandths, 1000 = 1.0     */
 
     uint32_t color;                      /* 0xAARRGGBB, always opaque   */
     uint32_t background_color;           /* alpha 0 means transparent   */
     uint32_t border_color[4];
+    uint32_t outline_color;
 
     int16_t  grad_angle_deg;             /* 180 = to bottom, 90 = right */
     uint32_t grad_colors[CSS_GRAD_MAX_STOPS];
@@ -719,6 +778,7 @@ struct computed_style {
     uint32_t shadow_color;
 
     struct css_grid_track grid_cols[CSS_GRID_MAX_COLS];
+    struct css_grid_track grid_rows[CSS_GRID_MAX_ROWS];
     int16_t  grid_col_start, grid_col_end; /* 0 = auto, >0 line         */
     uint8_t  grid_col_span, grid_row_span; /* default 1                 */
     int16_t  grid_row_start, grid_row_end; /* 0 = auto, >0 line         */

@@ -248,6 +248,11 @@ static const char *const d_lstype[]    = { CSS_LISTSTYLE_LIST(X_STR) 0 };
 static const char *const d_lspos[]     = { CSS_LISTPOS_LIST(X_STR) 0 };
 static const char *const d_bcoll[]     = { CSS_BORDERCOLLAPSE_LIST(X_STR) 0 };
 static const char *const d_ttrans[]    = { CSS_TEXTTRANSFORM_LIST(X_STR) 0 };
+static const char *const d_objectfit[] = { CSS_OBJECTFIT_LIST(X_STR) 0 };
+static const char *const d_alignself[] = { CSS_ALIGNSELF_LIST(X_STR) 0 };
+static const char *const d_textovf[]   = { CSS_TEXTOVERFLOW_LIST(X_STR) 0 };
+static const char *const d_wordbreak[] = { CSS_WORDBREAK_LIST(X_STR) 0 };
+static const char *const d_ovfwrap[]   = { CSS_OVERFLOWWRAP_LIST(X_STR) 0 };
 
 static const char *kwname(const char *const *t, int v, int max)
 {
@@ -394,12 +399,16 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
         }
         return 1;
     case CSS_PROP_GRID_TEMPLATE_COLS:
-        if (cs->grid_ncols == 0) {
+    case CSS_PROP_GRID_TEMPLATE_ROWS: {
+        const struct css_grid_track *tr_arr =
+            (id == CSS_PROP_GRID_TEMPLATE_COLS) ? cs->grid_cols : cs->grid_rows;
+        int n = (id == CSS_PROP_GRID_TEMPLATE_COLS) ? cs->grid_ncols : cs->grid_nrows;
+        if (n == 0) {
             strcpy(out, "none");
         } else {
             int i, pos = 0;
-            for (i = 0; i < cs->grid_ncols; i++) {
-                const struct css_grid_track *tr = &cs->grid_cols[i];
+            for (i = 0; i < n; i++) {
+                const struct css_grid_track *tr = &tr_arr[i];
                 char tb[32];
                 if (i > 0) out[pos++] = ' ';
                 if (tr->kind == CSS_GRID_AUTO) strcpy(tb, "auto");
@@ -412,6 +421,56 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
                 strcpy(out + pos, tb);
                 pos += (int)strlen(tb);
             }
+        }
+        return 1;
+    }
+    case CSS_PROP_ASPECT_RATIO:
+        if (cs->aspect_ratio == 0) strcpy(out, "auto");
+        else fmt_milli(cs->aspect_ratio, out);
+        return 1;
+    case CSS_PROP_OBJECT_FIT:
+        strcpy(out, kwname(d_objectfit, cs->object_fit, CSS_OBJECTFIT_COUNT));
+        return 1;
+    case CSS_PROP_ALIGN_SELF:
+        strcpy(out, kwname(d_alignself, cs->align_self, CSS_ALIGNSELF_COUNT));
+        return 1;
+    case CSS_PROP_ORDER:
+        sprintf(out, "%d", (int)cs->order);
+        return 1;
+    case CSS_PROP_OUTLINE_WIDTH:
+        sprintf(out, "%dpx", (int)cs->outline_width);
+        return 1;
+    case CSS_PROP_OUTLINE_STYLE:
+        strcpy(out, kwname(d_bstyle, cs->outline_style, CSS_BORDERSTYLE_COUNT));
+        return 1;
+    case CSS_PROP_OUTLINE_COLOR:
+        fmt_color(cs->outline_color, out);
+        return 1;
+    case CSS_PROP_OUTLINE_OFFSET:
+        sprintf(out, "%dpx", (int)cs->outline_offset);
+        return 1;
+    case CSS_PROP_TEXT_OVERFLOW:
+        strcpy(out, kwname(d_textovf, cs->text_overflow, CSS_TEXTOVERFLOW_COUNT));
+        return 1;
+    case CSS_PROP_WORD_BREAK:
+        strcpy(out, kwname(d_wordbreak, cs->word_break, CSS_WORDBREAK_COUNT));
+        return 1;
+    case CSS_PROP_OVERFLOW_WRAP:
+        strcpy(out, kwname(d_ovfwrap, cs->overflow_wrap, CSS_OVERFLOWWRAP_COUNT));
+        return 1;
+    case CSS_PROP_LETTER_SPACING:
+        sprintf(out, "%dpx", (int)cs->letter_spacing);
+        return 1;
+    case CSS_PROP_TRANSFORM:
+        if (!cs->has_transform) {
+            strcpy(out, "none");
+        } else {
+            char bx[48], by[48], sx[24], sy[24];
+            fmt_len(cs->translate_x, bx);
+            fmt_len(cs->translate_y, by);
+            fmt_milli(cs->scale_x, sx);
+            fmt_milli(cs->scale_y, sy);
+            sprintf(out, "t(%s,%s) s(%s,%s)", bx, by, sx, sy);
         }
         return 1;
     case CSS_PROP_GRID_COL_START:
@@ -1170,7 +1229,120 @@ static const struct tcase cases[] = {
  "grid-row-start=2;grid-row-end=auto;grid-row-span=3", 0},
 {"grid-col-span-only",
  "#t { grid-column: span 2 }", "<div id=t/>", "t",
- "grid-column-start=auto;grid-column-end=auto;grid-col-span=2", 0}
+ "grid-column-start=auto;grid-column-end=auto;grid-col-span=2", 0},
+{"grid-template-rows-tracks",
+ "#t { display: grid; grid-template-rows: 40px repeat(2, 1fr) auto 20% }",
+ "<div id=t/>", "t",
+ "grid-template-rows=40px 1fr 1fr auto 20%", 0},
+{"grid-template-rows-none",
+ "#t { grid-template-rows: 50px; grid-template-rows: none }",
+ "<div id=t/>", "t",
+ "grid-template-rows=none", 0},
+{"aspect-ratio-values",
+ "#a { aspect-ratio: 16 / 9 } #b { aspect-ratio: 1.5 } #c { aspect-ratio: 4/3 } "
+ "#d { aspect-ratio: 1/1; aspect-ratio: auto }",
+ "<div><div id=a/><div id=b/><div id=c/><div id=d/></div>", "a",
+ "aspect-ratio=1.778", 0},
+{"aspect-ratio-decimal-and-auto",
+ "#b { aspect-ratio: 1.5 } #c { aspect-ratio: 4/3 } #d { aspect-ratio: 2; aspect-ratio: auto }",
+ "<div><div id=b/><div id=c/><div id=d/></div>", "b",
+ "aspect-ratio=1.5", 0},
+{"aspect-ratio-auto-and-invalid",
+ "#c { aspect-ratio: 4/3; aspect-ratio: -1; aspect-ratio: 16 / 0 } "
+ "#d { aspect-ratio: 2; aspect-ratio: auto }",
+ "<div><div id=c/><div id=d/></div>", "c",
+ "aspect-ratio=1.333", 0},
+{"aspect-ratio-reset-auto",
+ "#d { aspect-ratio: 2; aspect-ratio: auto }",
+ "<div id=d/>", "d",
+ "aspect-ratio=auto", 0},
+{"aspect-ratio-var-expr",
+ ":root { --w: 16; --h: 9; } #t { aspect-ratio: var(--w) / var(--h) }",
+ "<div id=t/>", "t",
+ "aspect-ratio=1.778", 0},
+{"object-fit-keywords",
+ "#a { object-fit: contain } #b { object-fit: cover } "
+ "#c { object-fit: none } #d { object-fit: scale-down }",
+ "<div><img id=a/><img id=b/><img id=c/><img id=d/></div>", "b",
+ "object-fit=cover", 0},
+{"object-fit-scale-down",
+ "#d { object-fit: scale-down }", "<img id=d/>", "d",
+ "object-fit=scale-down", 0},
+{"box-align-start-end-and-align-self",
+ "#a { justify-content: start; align-items: end; align-self: center } "
+ "#b { justify-content: end; align-items: start; align-self: end }",
+ "<div><div id=a/><div id=b/></div>", "a",
+ "justify-content=flex-start;align-items=flex-end;align-self=center", 0},
+{"align-self-start-end-baseline",
+ "#b { justify-content: end; align-items: start; align-self: start } "
+ "#c { align-self: end } #d { align-self: baseline }",
+ "<div><div id=b/><div id=c/><div id=d/></div>", "b",
+ "justify-content=flex-end;align-items=flex-start;align-self=flex-start", 0},
+{"order-int-and-reject-float",
+ "#a { order: -3 } #b { order: 5; order: 1.5 }",
+ "<div><div id=a/><div id=b/></div>", "a",
+ "order=-3", 0},
+{"order-reject-float-preserves",
+ "#b { order: 5; order: 1.5 }", "<div id=b/>", "b",
+ "order=5", 0},
+{"outline-shorthand-full",
+ "#t { outline: 2px dashed #ff0000; outline-offset: -4px }",
+ "<div id=t/>", "t",
+ "outline-width=2px;outline-style=dashed;outline-color=#ff0000;outline-offset=-4px", 0},
+{"outline-shorthand-default-color-and-width",
+ "#t { color: #123456; outline: solid }",
+ "<div id=t/>", "t",
+ "outline-width=3px;outline-style=solid;outline-color=#123456", 0},
+{"outline-none-resets",
+ "#t { outline: 4px solid #ff0000; outline: none }",
+ "<div id=t/>", "t",
+ "outline-width=0px;outline-style=none", 0},
+{"outline-auto-and-invert",
+ "#t { color: #00aa55; outline-style: auto; outline-color: invert }",
+ "<div id=t/>", "t",
+ "outline-width=3px;outline-style=solid;outline-color=#00aa55", 0},
+{"outline-var",
+ ":root { --ow: 3px; --oc: #224466; } #t { outline: var(--ow) dotted var(--oc); outline-offset: 6px }",
+ "<div id=t/>", "t",
+ "outline-width=3px;outline-style=dotted;outline-color=#224466;outline-offset=6px", 0},
+{"text-layout-properties-inherit",
+ "#p { letter-spacing: 2px; word-break: break-all; overflow-wrap: anywhere; text-overflow: ellipsis } "
+ "#c { text-overflow: ellipsis }",
+ "<div id=p><span id=c/></div>", "c",
+ "letter-spacing=2px;word-break=break-all;overflow-wrap=anywhere;text-overflow=ellipsis", 0},
+{"word-wrap-alias-and-letter-spacing-negative",
+ "#t { word-wrap: break-word; letter-spacing: -1px; word-break: break-word }",
+ "<div id=t/>", "t",
+ "overflow-wrap=break-word;letter-spacing=-1px;word-break=break-word", 0},
+{"letter-spacing-normal-reset",
+ "#t { letter-spacing: 4px; letter-spacing: normal }",
+ "<div id=t/>", "t",
+ "letter-spacing=0px", 0},
+{"transform-translate-pct-and-px",
+ "#t { transform: translateX(-50%) translateY(-2px) }",
+ "<div id=t/>", "t",
+ "transform=t(-50%,-2px) s(1,1)", 0},
+{"transform-translate-and-scale-chain",
+ "#t { transform: translate(10px, 20px) scale(2, 0.5) }",
+ "<div id=t/>", "t",
+ "transform=t(10px,20px) s(2,0.5)", 0},
+{"transform-scale-then-translate",
+ "#t { transform: scale(2) translateX(10px) }",
+ "<div id=t/>", "t",
+ "transform=t(20px,0px) s(2,2)", 0},
+{"transform-var-calc-and-none",
+ ":root { --dx: 12px; } #a { transform: translateX(var(--dx)) scale(1.5) } "
+ "#b { transform: translate(10px); transform: none } #c { transform: translateX(10px); transform: bogus(1px) }",
+ "<div><div id=a/><div id=b/><div id=c/></div>", "a",
+ "transform=t(12px,0px) s(1.5,1.5)", 0},
+{"transform-none-and-invalid-ignored",
+ "#b { transform: translate(10px); transform: none } #c { transform: translateX(10px); transform: bogus(1px) }",
+ "<div><div id=b/><div id=c/></div>", "b",
+ "transform=none", 0},
+{"transform-invalid-does-not-clobber",
+ "#c { transform: translateX(10px); transform: bogus(1px) }",
+ "<div id=c/>", "c",
+ "transform=t(10px,0px) s(1,1)", 0}
 };
 
 #define NCASES ((int)(sizeof(cases) / sizeof(cases[0])))

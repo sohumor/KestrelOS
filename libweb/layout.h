@@ -300,6 +300,17 @@ static inline lay_rect lay_paint_rect(const struct lay_box *b)
         if (sw > 0 && sh > 0)
             r = lay_rect_union(r, lay_mkrect(sx, sy, sw, sh));
     }
+    if (b->style && b->style->outline_width > 0 &&
+        b->style->outline_style != CSS_BORDERSTYLE_NONE &&
+        b->style->outline_style != CSS_BORDERSTYLE_HIDDEN) {
+        lay_rect br = lay_border_rect(b);
+        int32_t d = b->style->outline_offset + b->style->outline_width;
+        int32_t ow = br.w + 2 * d;
+        int32_t oh = br.h + 2 * d;
+
+        if (ow > 0 && oh > 0)
+            r = lay_rect_union(r, lay_mkrect(br.x - d, br.y - d, ow, oh));
+    }
     return r;
 }
 

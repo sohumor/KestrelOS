@@ -1678,6 +1678,23 @@ static lay_rect box_clip_rect(const struct pstate *p, const struct lay_box *b,
     return shift_rect(lay_clip_rect(b), bx, by);
 }
 
+static lay_rect box_self_clip_rect(const struct pstate *p,
+                                   const struct lay_box *b,
+                                   int32_t bx, int32_t by)
+{
+    if (b->flags & LAYF_FIXED)
+        return lay_mkrect(-0x20000000, -0x20000000, 0x40000000, 0x40000000);
+    if (b->flags & LAYF_CLIP) {
+        if (b->parent) {
+            int32_t px, py;
+            box_shift(p, b->parent, &px, &py);
+            return box_clip_rect(p, b->parent, px, py);
+        }
+        return lay_mkrect(-0x20000000, -0x20000000, 0x40000000, 0x40000000);
+    }
+    return box_clip_rect(p, b, bx, by);
+}
+
 static unsigned effective_opacity(const struct lay_box *b)
 {
     uint64_t op = 1000;
@@ -2105,6 +2122,59 @@ static void paint_frame_rounded(const struct paint_target *t, lay_rect clip,
     }
 }
 
+static void paint_outline(struct pstate *p, lay_rect clip, lay_rect br,
+                          const int32_t r_out[4], int rounded,
+                          const struct computed_style *cs,
+                          unsigned opacity, const struct rclip_list *rc)
+{
+    int32_t ow = cs->outline_width;
+    int32_t off = cs->outline_offset;
+    uint8_t sty = cs->outline_style;
+    uint32_t ocol = cs->outline_color;
+    lay_rect out_r, in_r;
+    int32_t obw[4], ro[4], ri[4];
+    uint32_t cols[4];
+    uint8_t stys[4];
+    int i;
+
+    if (ow <= 0 || sty == CSS_BORDERSTYLE_NONE ||
+        sty == CSS_BORDERSTYLE_HIDDEN || !CSS_COLOR_A(ocol))
+        return;
+
+    out_r = lay_mkrect(br.x - off - ow, br.y - off - ow,
+                       br.w + 2 * (off + ow), br.h + 2 * (off + ow));
+    in_r = lay_mkrect(br.x - off, br.y - off,
+                      br.w + 2 * off, br.h + 2 * off);
+    if (out_r.w <= 0 || out_r.h <= 0)
+        return;
+
+    for (i = 0; i < 4; i++) {
+        obw[i] = ow;
+        cols[i] = ocol;
+        stys[i] = sty;
+        ro[i] = rounded && r_out[i] > 0 ? pmax(0, r_out[i] + off + ow) : 0;
+        ri[i] = rounded && r_out[i] > 0 ? pmax(0, r_out[i] + off) : 0;
+    }
+    if (rounded && sty == CSS_BORDERSTYLE_SOLID) {
+        paint_frame_rounded(p->t, clip, out_r, in_r, ro, ri, ri,
+                            obw, cols, stys, opacity, rc);
+    } else if (opacity == 1000 && rc->n == 0) {
+        paint_frame(p->t, clip, out_r, ow, ow, ow, ow, cols, stys);
+    } else {
+        uint32_t fcol[4];
+        for (i = 0; i < 4; i++) {
+            unsigned ca = scale_alpha(CSS_COLOR_A(ocol), opacity);
+            fcol[i] = (ca << 24) | (ocol & 0x00FFFFFFu);
+        }
+        if (rc->n == 0)
+            paint_frame(p->t, clip, out_r, ow, ow, ow, ow, fcol, stys);
+        else
+            paint_frame_rounded(p->t, clip, out_r, in_r, ro, ri, ri,
+                                obw, cols, stys, opacity, rc);
+    }
+    if (p->st) p->st->rects++;
+}
+
 static void paint_background(struct pstate *p, const struct lay_box *b)
 {
     const struct computed_style *cs = b->style;
@@ -2128,7 +2198,7 @@ static void paint_background(struct pstate *p, const struct lay_box *b)
         return;
 
     box_shift(p, b, &bx, &by);
-    clip = lay_rect_intersect(box_clip_rect(p, b, bx, by), p->dirty);
+    clip = lay_rect_intersect(box_self_clip_rect(p, b, bx, by), p->dirty);
     if (clip.w <= 0 || clip.h <= 0)
         return;
     br = shift_rect(lay_border_rect(b), bx, by);
@@ -2310,6 +2380,7 @@ static void paint_background(struct pstate *p, const struct lay_box *b)
             if (p->st) p->st->rects++;
         }
     }
+    paint_outline(p, clip, br, r_out, rounded, cs, opacity, &rc);
     if (p->o->debug_boxes) {
         for (i = 0; i < 4; i++) {
             col[i] = 0xFFFF00FFu;
@@ -2492,6 +2563,73 @@ static void composite_snapshot(const struct paint_target *t, lay_rect r,
     free(saved);
 }
 
+static lay_rect object_fit_rect(lay_rect cr, int32_t iw, int32_t ih, int fit)
+{
+    int32_t dw = cr.w, dh = cr.h;
+    int32_t cw, ch;
+    int64_t lhs, rhs;
+
+    if (iw <= 0 || ih <= 0 || cr.w <= 0 || cr.h <= 0 ||
+        fit == CSS_OBJECTFIT_FILL)
+        return cr;
+    if (fit == CSS_OBJECTFIT_NONE) {
+        return lay_mkrect(cr.x + (cr.w - iw) / 2, cr.y + (cr.h - ih) / 2,
+                          iw, ih);
+    }
+    lhs = (int64_t)iw * cr.h;
+    rhs = (int64_t)cr.w * ih;
+    if (fit == CSS_OBJECTFIT_COVER) {
+        if (lhs >= rhs) {
+            dh = cr.h;
+            dw = (int32_t)(((int64_t)cr.h * iw + ih / 2) / ih);
+        } else {
+            dw = cr.w;
+            dh = (int32_t)(((int64_t)cr.w * ih + iw / 2) / iw);
+        }
+        return lay_mkrect(cr.x + (cr.w - dw) / 2, cr.y + (cr.h - dh) / 2,
+                          dw, dh);
+    }
+    if (lhs >= rhs) {
+        cw = cr.w;
+        ch = (int32_t)(((int64_t)cr.w * ih + iw / 2) / iw);
+    } else {
+        ch = cr.h;
+        cw = (int32_t)(((int64_t)cr.h * iw + ih / 2) / ih);
+    }
+    if (fit == CSS_OBJECTFIT_SCALE_DOWN && iw <= cw && ih <= ch) {
+        dw = iw;
+        dh = ih;
+    } else {
+        dw = cw;
+        dh = ch;
+    }
+    return lay_mkrect(cr.x + (cr.w - dw) / 2, cr.y + (cr.h - dh) / 2,
+                      dw, dh);
+}
+
+static void paint_text_span(const font_surface *fs, font_rc frc,
+                            int32_t x, int32_t y, const char *s, int n,
+                            const struct font *f, int32_t ls, uint32_t fg)
+{
+    int i;
+    int32_t step;
+
+    if (n <= 0 || !f)
+        return;
+    if (ls == 0) {
+        font_draw_text_n(fs, frc, x, y, s, n, f, fg, FONT_TRANSPARENT);
+        return;
+    }
+    step = f->w + ls;
+    if (step < 0)
+        step = 0;
+    for (i = 0; i < n && s[i]; i++) {
+        font_draw_char(fs, frc, x, y, (unsigned char)s[i], f, fg,
+                       FONT_TRANSPARENT);
+        x += step;
+    }
+}
+
 static void paint_content(struct pstate *p, const struct lay_box *b)
 {
     const struct computed_style *cs = b->style;
@@ -2561,7 +2699,9 @@ static void paint_content(struct pstate *p, const struct lay_box *b)
             saved = 0;
         }
         if (im) {
-            blit_image_ex(p->t, clip, cr, im, opacity, &rc);
+            lay_rect dst = object_fit_rect(cr, im->w, im->h, cs->object_fit);
+            lay_rect im_clip = lay_rect_intersect(clip, cr);
+            blit_image_ex(p->t, im_clip, dst, im, opacity, &rc);
             if (p->st) p->st->images++;
         } else if (b->node && b->node->tag_id == HTAG_SVG) {
             if (rc.n > 0 && rclip_touches_corners(&rc, cr)) {
@@ -2657,36 +2797,44 @@ static void paint_content(struct pstate *p, const struct lay_box *b)
             if (s1 > b->text_len) s1 = b->text_len;
             if (s0 > s1) s0 = s1;
         }
-        if (sel && s1 > s0) {
-            int32_t x0 = r.x + (int32_t)s0 * b->font->w;
-            int32_t x1 = r.x + (int32_t)s1 * b->font->w;
+        {
+            int32_t ls = cs ? cs->letter_spacing : 0;
+            int32_t step = (b->font->w + ls > 0) ? (b->font->w + ls) : 0;
 
-            paint_fill(p->t, clip, lay_mkrect(x0, r.y, x1 - x0, r.h),
-                       CSS_COLOR_A(sbg) ? sbg : 0xFF5BA3D0u);
-            font_draw_text_n(&fs, frc, r.x, r.y, b->text, (int)s0, b->font,
-                             fg, FONT_TRANSPARENT);
-            font_draw_text_n(&fs, frc, x0, r.y, b->text + s0,
-                             (int)(s1 - s0), b->font,
-                             CSS_COLOR_A(sfg) ? CSS_COLOR_RGB(sfg) : 0xFFFFFF,
-                             FONT_TRANSPARENT);
-            font_draw_text_n(&fs, frc, x1, r.y, b->text + s1,
-                             (int)(b->text_len - s1), b->font, fg,
-                             FONT_TRANSPARENT);
-        } else {
-            font_draw_text_n(&fs, frc, r.x, r.y, b->text, (int)b->text_len,
-                             b->font, fg, FONT_TRANSPARENT);
-        }
-        if (p->st) p->st->glyphs += b->text_len;
-        if (cs->text_decoration)
-            draw_decorations(p->t, clip, b, r.x, r.y, b->w,
-                             0xFF000000u | fg);
-        if (p->o->caret_box == b) {
-            int32_t cx = r.x + (int32_t)(p->o->caret_offset > b->text_len
-                                         ? b->text_len : p->o->caret_offset) *
-                         b->font->w;
+            if (sel && s1 > s0) {
+                int32_t x0 = r.x + (int32_t)s0 * step;
+                int32_t x1 = r.x + (int32_t)s1 * step;
+                int32_t sel_w = (s1 == b->text_len && ls > 0)
+                    ? (r.x + r.w - x0) : (x1 - x0);
 
-            paint_fill(p->t, clip, lay_mkrect(cx, r.y, 1, r.h),
-                       p->o->caret_color ? p->o->caret_color : 0xFF000000u);
+                if (sel_w < b->font->w) sel_w = b->font->w;
+                paint_fill(p->t, clip, lay_mkrect(x0, r.y, sel_w, r.h),
+                           CSS_COLOR_A(sbg) ? sbg : 0xFF5BA3D0u);
+                paint_text_span(&fs, frc, r.x, r.y, b->text, (int)s0,
+                                b->font, ls, fg);
+                paint_text_span(&fs, frc, x0, r.y, b->text + s0,
+                                (int)(s1 - s0), b->font, ls,
+                                CSS_COLOR_A(sfg) ? CSS_COLOR_RGB(sfg)
+                                                 : 0xFFFFFFu);
+                paint_text_span(&fs, frc, x1, r.y, b->text + s1,
+                                (int)(b->text_len - s1), b->font, ls, fg);
+            } else {
+                paint_text_span(&fs, frc, r.x, r.y, b->text,
+                                (int)b->text_len, b->font, ls, fg);
+            }
+            if (p->st) p->st->glyphs += b->text_len;
+            if (cs->text_decoration)
+                draw_decorations(p->t, clip, b, r.x, r.y, b->w,
+                                 0xFF000000u | fg);
+            if (p->o->caret_box == b) {
+                uint32_t off_c = p->o->caret_offset > b->text_len
+                    ? b->text_len : p->o->caret_offset;
+                int32_t cx = r.x + (int32_t)off_c * step;
+
+                paint_fill(p->t, clip, lay_mkrect(cx, r.y, 1, r.h),
+                           p->o->caret_color ? p->o->caret_color
+                                             : 0xFF000000u);
+            }
         }
         if (saved)
             composite_snapshot(p->t, snap_r, saved, opacity, &rc);
@@ -2749,7 +2897,9 @@ int lay_paint(const struct lay_document *L, const struct paint_target *t,
             : shift_rect(lay_paint_rect(b), bx, by);
         if (!lay_rect_intersects(own, dirty))
             continue;
-        cl = box_clip_rect(&p, b, bx, by);
+        cl = (items[i].phase == LAY_PHASE_BACKGROUND)
+            ? box_self_clip_rect(&p, b, bx, by)
+            : box_clip_rect(&p, b, bx, by);
         if (!lay_rect_intersects(cl, dirty))
             continue;
 

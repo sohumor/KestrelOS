@@ -33,6 +33,7 @@
 #include "font.h"
 #include "layout.h"
 #include "paint.h"
+#include "img.h"
 
 /* ------------------------------------------------------------------ *
  * css_style_initial
@@ -92,6 +93,17 @@ void css_style_initial(struct computed_style *cs)
     cs->grad_angle_deg = 180;
     cs->grid_col_span = 1;
     cs->grid_row_span = 1;
+    cs->align_self = CSS_ALIGNSELF_AUTO;
+    cs->object_fit = CSS_OBJECTFIT_FILL;
+    cs->outline_style = CSS_BORDERSTYLE_NONE;
+    cs->outline_color = CSS_RGB(0, 0, 0);
+    cs->text_overflow = CSS_TEXTOVERFLOW_CLIP;
+    cs->word_break = CSS_WORDBREAK_NORMAL;
+    cs->overflow_wrap = CSS_OVERFLOWWRAP_NORMAL;
+    cs->scale_x = 1000;
+    cs->scale_y = 1000;
+    cs->translate_x.type = CSS_LEN_PX;
+    cs->translate_y.type = CSS_LEN_PX;
     for (i = 0; i < 4; i++) {
         cs->margin[i].type = CSS_LEN_PX;
         cs->padding[i].type = CSS_LEN_PX;
@@ -2880,6 +2892,25 @@ static void rnd_style(struct computed_style *cs)
         cs->shadow_spread = (int32_t)rnd(9) - 4;
         cs->shadow_color = (0x80u << 24) | rnd(0xFFFFFF);
     }
+    cs->align_self = (uint8_t)rnd(CSS_ALIGNSELF_COUNT);
+    cs->order = rnd(4) ? 0 : ((int32_t)rnd(7) - 3);
+    cs->aspect_ratio = rnd(5) ? 0 : (int32_t)(500 + rnd(2500));
+    cs->object_fit = (uint8_t)rnd(CSS_OBJECTFIT_COUNT);
+    cs->outline_style = rnd(4) ? CSS_BORDERSTYLE_NONE : (uint8_t)rnd(CSS_BORDERSTYLE_COUNT);
+    cs->outline_width = (int32_t)rnd(6);
+    cs->outline_offset = (int32_t)rnd(11) - 5;
+    cs->outline_color = 0xFF000000u | rnd(0xFFFFFF);
+    cs->text_overflow = (uint8_t)rnd(CSS_TEXTOVERFLOW_COUNT);
+    cs->word_break = (uint8_t)rnd(CSS_WORDBREAK_COUNT);
+    cs->overflow_wrap = (uint8_t)rnd(CSS_OVERFLOWWRAP_COUNT);
+    cs->letter_spacing = rnd(4) ? 0 : ((int32_t)rnd(7) - 2);
+    if (rnd(6) == 0) {
+        cs->has_transform = 1;
+        cs->translate_x = rnd_len(1);
+        cs->translate_y = rnd_len(1);
+        cs->scale_x = (int32_t)(500 + rnd(2000));
+        cs->scale_y = (int32_t)(500 + rnd(2000));
+    }
 }
 
 static const char *const fuzz_words[] = {
@@ -3748,6 +3779,602 @@ static void test_paint_svg_modern(void)
 }
 
 /* ================================================================== *
+ * Wave 7 modern CSS3 layout, alignment, sizing & paint tests
+ * ================================================================== */
+
+static void test_aspect_ratio_layout(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *ar_wh = st_block(t);
+    struct computed_style *ar_hw = st_block(t);
+    struct computed_style *ar_bb = st_block(t);
+    struct computed_style *ar_cl = st_block(t);
+    struct computed_style *ar_im = st(t);
+    struct dom_node *d, *n1, *n2, *n3, *n4, *ni;
+    struct lay_document *L;
+    struct lay_opts o;
+    struct lay_box *b;
+
+    GROUP("aspect-ratio: sizing, box-sizing, min/max, replaced");
+
+    root->width = LPX(500);
+
+    ar_wh->width = LPX(160);
+    ar_wh->aspect_ratio = 1778; /* 16 / 9 */
+
+    ar_hw->width = LAUTO();
+    ar_hw->height = LPX(90);
+    ar_hw->aspect_ratio = 1778;
+
+    ar_bb->box_sizing = CSS_BOXSIZING_BORDER;
+    ar_bb->width = LPX(100);
+    set_padding(ar_bb, 10, 10, 10, 10);
+    ar_bb->aspect_ratio = 2000; /* 2 / 1 -> outer 100x50 -> inner 80x30 */
+
+    ar_cl->width = LPX(100);
+    ar_cl->max_height = LPX(60);
+    ar_cl->aspect_ratio = 1000; /* 1 / 1 clamped down to 60 */
+
+    ar_im->display = CSS_DISPLAY_INLINE;
+    ar_im->width = LPX(80);
+    ar_im->aspect_ratio = 1000; /* 1 / 1 overrides a.png 100x50 ratio */
+
+    d = el(t, 0, "div", root);
+    n1 = el(t, d, "div", ar_wh);
+    n2 = el(t, d, "div", ar_hw);
+    n3 = el(t, d, "div", ar_bb);
+    n4 = el(t, d, "div", ar_cl);
+    ni = el(t, d, "img", ar_im);
+    dom_set_attr(ni, "src", "a.png");
+
+    lay_opts_init(&o, 500, 400);
+    o.image_size = fake_image_size;
+    L = lay_layout_node(d, &o);
+
+    CHECK_EQ(lay_box_for_node(L, n1)->w, 160);
+    CHECK_EQ(lay_box_for_node(L, n1)->h, 90);
+    CHECK_EQ(lay_box_for_node(L, n2)->w, 160);
+    CHECK_EQ(lay_box_for_node(L, n2)->h, 90);
+    b = lay_box_for_node(L, n3);
+    CHECK_EQ(b->w, 80);
+    CHECK_EQ(b->h, 30);
+    CHECK_EQ(lay_border_rect(b).h, 50);
+    CHECK_EQ(lay_box_for_node(L, n4)->h, 60);
+    CHECK_EQ(lay_box_for_node(L, ni)->w, 80);
+    CHECK_EQ(lay_box_for_node(L, ni)->h, 80);
+
+    lay_free(L);
+
+    ar_cl->max_height.type = CSS_LEN_NONE;
+    ar_cl->min_height = LPX(130);
+    L = lay_layout_node(d, &o);
+    CHECK_EQ(lay_box_for_node(L, n4)->h, 130);
+
+    lay_free(L);
+    tfree(t);
+}
+
+struct objfit_ctx {
+    struct image split;
+    struct image small_red;
+    struct image wide_red;
+};
+
+static int objfit_size(void *ctx, const char *url, int32_t *w, int32_t *h)
+{
+    struct objfit_ctx *oc = (struct objfit_ctx *)ctx;
+    if (!strcmp(url, "split.png")) { *w = oc->split.w; *h = oc->split.h; return 1; }
+    if (!strcmp(url, "small.png")) { *w = oc->small_red.w; *h = oc->small_red.h; return 1; }
+    if (!strcmp(url, "wide.png"))  { *w = oc->wide_red.w;  *h = oc->wide_red.h;  return 1; }
+    return 0;
+}
+
+static const struct image *objfit_get(void *ctx, const char *url)
+{
+    struct objfit_ctx *oc = (struct objfit_ctx *)ctx;
+    if (!strcmp(url, "split.png")) return &oc->split;
+    if (!strcmp(url, "small.png")) return &oc->small_red;
+    if (!strcmp(url, "wide.png"))  return &oc->wide_red;
+    return 0;
+}
+
+static void init_solid_img(struct image *im, int w, int h, uint32_t px)
+{
+    int i;
+    im->w = w;
+    im->h = h;
+    im->has_alpha = 0;
+    im->alpha = 0;
+    im->px = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    for (i = 0; i < w * h; i++)
+        im->px[i] = px;
+}
+
+static void test_object_fit_paint(void)
+{
+    struct tctx *t = tnew();
+    struct objfit_ctx oc;
+    struct computed_style *root = st_block(t);
+    struct computed_style *s1 = st(t), *s2 = st(t), *s3 = st(t), *s4 = st(t), *s5 = st(t);
+    struct dom_node *d, *i1, *i2, *i3, *i4, *i5;
+    struct lay_document *L;
+    struct lay_opts lo;
+    struct paint_opts po;
+    struct paint_target tg = mk_target(200, 120);
+    int x, y;
+
+    GROUP("object-fit: contain, cover, none, scale-down");
+
+    init_solid_img(&oc.split, 40, 20, 0xFFFF0000u);
+    for (y = 0; y < 20; y++)
+        for (x = 0; x < 20; x++)
+            oc.split.px[y * 40 + x] = 0xFF0000FFu; /* left blue, right red */
+    init_solid_img(&oc.small_red, 10, 10, 0xFFFF0000u);
+    init_solid_img(&oc.wide_red, 100, 50, 0xFFFF0000u);
+
+    root->width = LPX(200);
+    s1->display = CSS_DISPLAY_INLINE_BLOCK;
+    s1->width = LPX(40); s1->height = LPX(40);
+    s1->background_color = CSS_RGB(0, 255, 0);
+    s1->object_fit = CSS_OBJECTFIT_CONTAIN;
+
+    s2->display = CSS_DISPLAY_INLINE_BLOCK;
+    s2->width = LPX(20); s2->height = LPX(20);
+    s2->margin[CSS_LEFT] = LPX(10); s2->margin[CSS_RIGHT] = LPX(10);
+    s2->background_color = CSS_RGB(0, 255, 0);
+    s2->object_fit = CSS_OBJECTFIT_COVER;
+
+    s3->display = CSS_DISPLAY_INLINE_BLOCK;
+    s3->width = LPX(40); s3->height = LPX(40);
+    s3->background_color = CSS_RGB(0, 255, 0);
+    s3->object_fit = CSS_OBJECTFIT_NONE;
+
+    s4->display = CSS_DISPLAY_INLINE_BLOCK;
+    s4->width = LPX(40); s4->height = LPX(40);
+    s4->background_color = CSS_RGB(0, 255, 0);
+    s4->object_fit = CSS_OBJECTFIT_SCALE_DOWN;
+
+    s5->display = CSS_DISPLAY_INLINE_BLOCK;
+    s5->width = LPX(40); s5->height = LPX(40);
+    s5->background_color = CSS_RGB(0, 255, 0);
+    s5->object_fit = CSS_OBJECTFIT_SCALE_DOWN;
+
+    d = el(t, 0, "div", root);
+    i1 = el(t, d, "img", s1); dom_set_attr(i1, "src", "wide.png");
+    i2 = el(t, d, "img", s2); dom_set_attr(i2, "src", "split.png");
+    i3 = el(t, d, "img", s3); dom_set_attr(i3, "src", "small.png");
+    i4 = el(t, d, "img", s4); dom_set_attr(i4, "src", "small.png");
+    i5 = el(t, d, "img", s5); dom_set_attr(i5, "src", "wide.png");
+
+    lay_opts_init(&lo, 200, 120);
+    lo.image_size = objfit_size;
+    lo.image_ctx = &oc;
+    L = lay_layout_node(d, &lo);
+
+    paint_opts_init(&po);
+    po.canvas = CSS_RGB(255, 255, 255);
+    po.image = objfit_get;
+    po.image_ctx = &oc;
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 120), &po, 0);
+
+    {
+        struct lay_box *b1 = lay_box_for_node(L, i1);
+        struct lay_box *b2 = lay_box_for_node(L, i2);
+        struct lay_box *b3 = lay_box_for_node(L, i3);
+        struct lay_box *b4 = lay_box_for_node(L, i4);
+        struct lay_box *b5 = lay_box_for_node(L, i5);
+
+        /* i1 contain 100x50 in 40x40 -> 40x20 at dy=10..30: top/bottom green, mid red */
+        CHECK_EQ(px_at(&tg, b1->x + 20, b1->y + 5), 0x00FF00);
+        CHECK_EQ(px_at(&tg, b1->x + 20, b1->y + 20), 0xFF0000);
+        CHECK_EQ(px_at(&tg, b1->x + 20, b1->y + 35), 0x00FF00);
+
+        /* i2 cover split 40x20 in 20x20: cropped horizontally -> left blue, right red */
+        CHECK_EQ(px_at(&tg, b2->x + 5, b2->y + 10), 0x0000FF);
+        CHECK_EQ(px_at(&tg, b2->x + 15, b2->y + 10), 0xFF0000);
+        CHECK_EQ(px_at(&tg, b2->x - 2, b2->y + 10), 0xFFFFFF);
+        CHECK_EQ(px_at(&tg, b2->x + 22, b2->y + 10), 0xFFFFFF);
+
+        /* i3 none 10x10 in 40x40 -> centered 15..25 */
+        CHECK_EQ(px_at(&tg, b3->x + 5, b3->y + 5), 0x00FF00);
+        CHECK_EQ(px_at(&tg, b3->x + 20, b3->y + 20), 0xFF0000);
+
+        /* i4 scale-down 10x10 in 40x40 -> picks none (10x10) */
+        CHECK_EQ(px_at(&tg, b4->x + 5, b4->y + 5), 0x00FF00);
+        CHECK_EQ(px_at(&tg, b4->x + 20, b4->y + 20), 0xFF0000);
+
+        /* i5 scale-down 100x50 in 40x40 -> picks contain (40x20) */
+        CHECK_EQ(px_at(&tg, b5->x + 20, b5->y + 5), 0x00FF00);
+        CHECK_EQ(px_at(&tg, b5->x + 20, b5->y + 20), 0xFF0000);
+    }
+
+    free(tg.px);
+    free(oc.split.px);
+    free(oc.small_red.px);
+    free(oc.wide_red.px);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_flex_grid_modern(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *fr = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *fa = st_block(t), *fb = st_block(t);
+    struct computed_style *fc = st_block(t), *fd = st_block(t);
+    struct computed_style *fcol = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *ca = st_block(t), *cb = st_block(t);
+    struct computed_style *gr = st_disp(t, CSS_DISPLAY_GRID);
+    struct computed_style *g0 = st_block(t), *g1 = st_block(t);
+    struct computed_style *g2 = st_block(t), *g3 = st_block(t);
+    struct dom_node *d, *nf, *nfa, *nfb, *nfc, *nfd;
+    struct dom_node *nfc2, *nca, *ncb, *ng, *ng0, *ng1, *ng2, *ng3;
+    struct lay_document *L;
+
+    GROUP("flex & grid: order, align-self, grid-template-rows");
+
+    root->width = LPX(300);
+
+    fr->width = LPX(200);
+    fr->height = LPX(40);
+    fr->align_items = CSS_ALIGN_START;
+    fa->width = LPX(40); fa->height = LPX(20); fa->order = 2;
+    fb->width = LPX(40); fb->height = LPX(20); fb->order = -1;
+    fb->align_self = CSS_ALIGNSELF_CENTER;
+    fc->width = LPX(40); fc->height = LPX(20); fc->order = 0;
+    fc->align_self = CSS_ALIGNSELF_END;
+    fd->width = LPX(40); fd->height = LPX(20); fd->order = 0;
+
+    fcol->flex_direction = CSS_FLEXDIR_COLUMN;
+    fcol->width = LPX(100);
+    fcol->align_items = CSS_ALIGN_START;
+    ca->width = LPX(30); ca->height = LPX(20); ca->order = 1;
+    ca->align_self = CSS_ALIGNSELF_END;
+    cb->width = LPX(40); cb->height = LPX(20); cb->order = -2;
+    cb->align_self = CSS_ALIGNSELF_CENTER;
+
+    gr->width = LPX(200);
+    gr->height = LPX(230);
+    gr->grid_ncols = 2;
+    gr->grid_cols[0].kind = CSS_GRID_FR; gr->grid_cols[0].val = 1000;
+    gr->grid_cols[1].kind = CSS_GRID_FR; gr->grid_cols[1].val = 1000;
+    gr->grid_nrows = 3;
+    gr->grid_rows[0].kind = CSS_GRID_PX; gr->grid_rows[0].val = 30;
+    gr->grid_rows[1].kind = CSS_GRID_FR; gr->grid_rows[1].val = 1000;
+    gr->grid_rows[2].kind = CSS_GRID_FR; gr->grid_rows[2].val = 2000;
+    gr->row_gap = 10;
+    gr->align_items = CSS_ALIGN_START;
+
+    g0->height = LPX(20); g0->order = 1;
+    g1->height = LPX(20); g1->order = 0;
+    g2->height = LPX(20); g2->order = 2; g2->grid_col_span = 2; g2->align_self = CSS_ALIGNSELF_CENTER;
+    g3->height = LAUTO(); g3->order = 3; g3->align_self = CSS_ALIGNSELF_STRETCH;
+
+    d = el(t, 0, "div", root);
+    nf = el(t, d, "div", fr);
+    nfa = el(t, nf, "div", fa);
+    nfb = el(t, nf, "div", fb);
+    nfc = el(t, nf, "div", fc);
+    nfd = el(t, nf, "div", fd);
+
+    nfc2 = el(t, d, "div", fcol);
+    nca = el(t, nfc2, "div", ca);
+    ncb = el(t, nfc2, "div", cb);
+
+    ng = el(t, d, "div", gr);
+    ng0 = el(t, ng, "div", g0);
+    ng1 = el(t, ng, "div", g1);
+    ng2 = el(t, ng, "div", g2);
+    ng3 = el(t, ng, "div", g3);
+
+    L = run(t, d, 300, 500);
+
+    /* flex row order: fb(-1)=0, fc(0)=40, fd(0)=80, fa(2)=120 */
+    CHECK_EQ(lay_box_for_node(L, nfb)->x, 0);
+    CHECK_EQ(lay_box_for_node(L, nfc)->x, 40);
+    CHECK_EQ(lay_box_for_node(L, nfd)->x, 80);
+    CHECK_EQ(lay_box_for_node(L, nfa)->x, 120);
+    /* align-self in row */
+    CHECK_EQ(lay_box_for_node(L, nfb)->y, 10);
+    CHECK_EQ(lay_box_for_node(L, nfc)->y, 20);
+    CHECK_EQ(lay_box_for_node(L, nfd)->y, 0);
+
+    /* flex column order & align-self */
+    CHECK(lay_box_for_node(L, ncb)->y < lay_box_for_node(L, nca)->y);
+    CHECK_EQ(lay_box_for_node(L, nca)->x, 70); /* 100 - 30 */
+    CHECK_EQ(lay_box_for_node(L, ncb)->x, 30); /* (100 - 40) / 2 */
+
+    /* grid order: g1(0) col 0, g0(1) col 1 */
+    CHECK_EQ(lay_box_for_node(L, ng1)->x, 0);
+    CHECK_EQ(lay_box_for_node(L, ng0)->x, 100);
+    /* grid-template-rows: 30px (y=0..30), gap 10, 1fr=60 (y=40..100), gap 10, 2fr=120 (y=110..230) */
+    {
+        struct lay_box *bg = lay_box_for_node(L, ng);
+        struct lay_box *bg2 = lay_box_for_node(L, ng2);
+        struct lay_box *bg3 = lay_box_for_node(L, ng3);
+
+        CHECK_EQ(bg2->y - bg->y, 40 + (60 - 20) / 2); /* centered in 60px row 1 */
+        CHECK_EQ(bg3->y - bg->y, 110);
+        CHECK_EQ(bg3->h, 120); /* stretched into 2fr row 2 */
+    }
+
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_outline_paint(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *box = st_block(t);
+    struct computed_style *neg = st_block(t);
+    struct dom_node *d, *nb, *nn;
+    struct lay_document *L;
+    struct paint_opts po;
+    struct paint_target tg = mk_target(160, 160);
+    lay_rect pr;
+
+    GROUP("outline: layout invariant, offset positive/negative, overflow clip");
+
+    root->width = LPX(160);
+    root->overflow = CSS_OVERFLOW_HIDDEN;
+    box->width = LPX(40);
+    box->height = LPX(40);
+    box->margin[CSS_TOP] = LPX(20);
+    box->margin[CSS_LEFT] = LPX(20);
+    box->overflow = CSS_OVERFLOW_HIDDEN;
+    box->background_color = CSS_RGB(0, 255, 0);
+    box->outline_width = 4;
+    box->outline_style = CSS_BORDERSTYLE_SOLID;
+    box->outline_color = CSS_RGB(255, 0, 0);
+    box->outline_offset = 3;
+
+    neg->width = LPX(40);
+    neg->height = LPX(40);
+    neg->margin[CSS_TOP] = LPX(20);
+    neg->margin[CSS_LEFT] = LPX(20);
+    neg->background_color = CSS_RGB(255, 255, 255);
+    neg->outline_width = 2;
+    neg->outline_style = CSS_BORDERSTYLE_SOLID;
+    neg->outline_color = CSS_RGB(0, 0, 255);
+    neg->outline_offset = -5;
+
+    d = el(t, 0, "div", root);
+    nb = el(t, d, "div", box);
+    nn = el(t, d, "div", neg);
+
+    L = run(t, d, 160, 160);
+    pr = lay_paint_rect(lay_box_for_node(L, nb));
+    CHECK_EQ(lay_box_for_node(L, nb)->x, 20);
+    CHECK_EQ(lay_box_for_node(L, nb)->w, 40);
+    CHECK_EQ(pr.x, 13);
+    CHECK_EQ(pr.w, 54);
+
+    paint_opts_init(&po);
+    po.canvas = CSS_RGB(255, 255, 255);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 160, 160), &po, 0);
+
+    /* outline ring at (13..16), offset gap at (17..19), box at (20..59) */
+    CHECK_EQ(px_at(&tg, 15, 40), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 18, 40), 0xFFFFFF);
+    CHECK_EQ(px_at(&tg, 40, 40), 0x00FF00);
+
+    /* negative outline_offset (-5px, width 2px) occupies [bn->x+3 .. bn->x+4] */
+    {
+        struct lay_box *bn = lay_box_for_node(L, nn);
+        CHECK_EQ(px_at(&tg, bn->x + 4, bn->y + 20), 0x0000FF);
+        CHECK_EQ(px_at(&tg, bn->x + 5, bn->y + 20), 0xFFFFFF);
+    }
+
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_text_modern_layout(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *ib_ls = st(t);
+    struct computed_style *wb_norm = st_block(t);
+    struct computed_style *wb_all = st_block(t);
+    struct computed_style *el_blk = st_block(t);
+    struct computed_style *el_ib = st(t);
+    struct computed_style *el_fit = st_block(t);
+    struct dom_node *d, *nls, *nwn, *nwa, *nel, *neib, *nefit;
+    struct lay_document *L;
+    struct lay_box *b;
+    struct paint_opts po;
+    struct paint_target tg = mk_target(200, 260);
+    int x, y, ink_in_ell = 0;
+
+    GROUP("text polish: letter-spacing, word-break, ellipsis");
+
+    root->width = LPX(200);
+
+    ib_ls->display = CSS_DISPLAY_INLINE_BLOCK;
+    ib_ls->letter_spacing = 4;
+    ib_ls->color = CSS_RGB(0, 0, 0);
+
+    wb_norm->width = LPX(80);
+    wb_norm->overflow_wrap = CSS_OVERFLOWWRAP_BREAK_WORD;
+
+    wb_all->width = LPX(80);
+    wb_all->word_break = CSS_WORDBREAK_BREAK_ALL;
+
+    el_blk->width = LPX(80);
+    el_blk->overflow = CSS_OVERFLOW_HIDDEN;
+    el_blk->white_space = CSS_WHITESPACE_NOWRAP;
+    el_blk->text_overflow = CSS_TEXTOVERFLOW_ELLIPSIS;
+
+    el_ib->display = CSS_DISPLAY_INLINE_BLOCK;
+    el_ib->width = LPX(64);
+    el_ib->overflow = CSS_OVERFLOW_HIDDEN;
+    el_ib->white_space = CSS_WHITESPACE_NOWRAP;
+    el_ib->text_overflow = CSS_TEXTOVERFLOW_ELLIPSIS;
+
+    el_fit->width = LPX(80);
+    el_fit->overflow = CSS_OVERFLOW_HIDDEN;
+    el_fit->white_space = CSS_WHITESPACE_NOWRAP;
+    el_fit->text_overflow = CSS_TEXTOVERFLOW_ELLIPSIS;
+
+    d = el(t, 0, "div", root);
+    nls = el(t, d, "span", ib_ls);
+    txt(t, nls, "abcd");
+    nwn = el(t, d, "div", wb_norm);
+    txt(t, nwn, "hi superlongword");
+    nwa = el(t, d, "div", wb_all);
+    txt(t, nwa, "hi superlongword");
+    nel = el(t, d, "div", el_blk);
+    txt(t, nel, "HelloWorldExtra");
+    neib = el(t, d, "span", el_ib);
+    txt(t, neib, "ABCDEFGHIJKLM");
+    nefit = el(t, d, "div", el_fit);
+    txt(t, nefit, "HelloWorld");
+
+    L = run(t, d, 200, 260);
+
+    /* letter-spacing=4, FONT_BODY w=8 -> step=12, "abcd" = 3*12 + 8 = 44 */
+    CHECK_EQ(lay_box_for_node(L, nls)->w, 44);
+
+    /* overflow-wrap wraps whole word onto line 2; break-all fills line 1 */
+    b = lay_box_for_node(L, nwn);
+    CHECK_EQ(first_text(first_line(b))->text_len, 2);
+    b = lay_box_for_node(L, nwa);
+    CHECK_EQ(first_text(first_line(b))->text_len, 10);
+
+    /* text-overflow: ellipsis produces "..." fragment inside 80px and 64px */
+    {
+        struct lay_box *l = first_line(lay_box_for_node(L, nel));
+        struct lay_box *last = l ? l->last_child : 0;
+        CHECK_EQ(l->w, 80);
+        CHECK(last && last->text_len == 3 && !strncmp(last->text, "...", 3));
+        CHECK_EQ(l->first_child->text_len, 7);
+    }
+    {
+        struct lay_box *l = first_line(lay_box_for_node(L, neib));
+        struct lay_box *last = l ? l->last_child : 0;
+        CHECK_EQ(l->w, 64);
+        CHECK(last && last->text_len == 3 && !strncmp(last->text, "...", 3));
+        CHECK_EQ(l->first_child->text_len, 5);
+    }
+    {
+        struct lay_box *l = first_line(lay_box_for_node(L, nefit));
+        CHECK_EQ(l->w, 80);
+        CHECK_EQ(l->first_child->text_len, 10);
+        CHECK(l->first_child == l->last_child);
+    }
+
+    paint_opts_init(&po);
+    po.canvas = CSS_RGB(255, 255, 255);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 260), &po, 0);
+
+    /* Check pixel spacing between char 0 [0..7] and char 1 [12..19] */
+    {
+        struct lay_box *bl = lay_box_for_node(L, nls);
+        int gap_clean = 1, c1_ink = 0;
+        for (y = bl->y; y < bl->y + bl->h; y++) {
+            if (px_at(&tg, bl->x + 9, y) != 0xFFFFFF) gap_clean = 0;
+            for (x = bl->x + 12; x < bl->x + 20; x++)
+                if (px_at(&tg, x, y) != 0xFFFFFF) c1_ink = 1;
+        }
+        CHECK(gap_clean);
+        CHECK(c1_ink);
+    }
+    {
+        struct lay_box *bl = lay_box_for_node(L, nel);
+        for (y = bl->y; y < bl->y + bl->h; y++)
+            for (x = bl->x + 56; x < bl->x + 80; x++)
+                if (px_at(&tg, x, y) != 0xFFFFFF)
+                    ink_in_ell = 1;
+        CHECK(ink_in_ell);
+    }
+
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_transform_layout(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *pop = st_block(t);
+    struct computed_style *shf = st_block(t);
+    struct computed_style *sib = st_block(t);
+    struct computed_style *scl = st_block(t);
+    struct dom_node *d, *np, *nsh, *nsib, *nsc;
+    struct lay_document *L;
+    struct lay_box *bp, *bsh, *bsib, *bsc;
+
+    GROUP("transform: translateX(-50%), translateY(-2px), scale(2), hit-test");
+
+    root->position = CSS_POSITION_RELATIVE;
+    root->overflow = CSS_OVERFLOW_HIDDEN;
+    root->width = LPX(400);
+    root->height = LPX(400);
+
+    pop->position = CSS_POSITION_ABSOLUTE;
+    pop->offset[CSS_LEFT].type = CSS_LEN_PCT; pop->offset[CSS_LEFT].v = 50000;
+    pop->offset[CSS_TOP] = LPX(10);
+    pop->width = LPX(100);
+    pop->height = LPX(40);
+    pop->has_transform = 1;
+    pop->translate_x.type = CSS_LEN_PCT; pop->translate_x.v = -50000;
+
+    shf->width = LPX(80);
+    shf->height = LPX(30);
+    shf->margin[CSS_TOP] = LPX(20);
+    shf->has_transform = 1;
+    shf->translate_y = LPX(-2);
+
+    sib->width = LPX(80);
+    sib->height = LPX(20);
+
+    scl->width = LPX(100);
+    scl->height = LPX(40);
+    scl->margin[CSS_TOP] = LPX(50);
+    scl->margin[CSS_LEFT] = LPX(100);
+    scl->has_transform = 1;
+    scl->scale_x = 2000;
+    scl->scale_y = 2000;
+
+    d = el(t, 0, "div", root);
+    np = el(t, d, "div", pop);
+    nsh = el(t, d, "div", shf);
+    nsib = el(t, d, "div", sib);
+    nsc = el(t, d, "div", scl);
+
+    L = run(t, d, 400, 400);
+    bp = lay_box_for_node(L, np);
+    bsh = lay_box_for_node(L, nsh);
+    bsib = lay_box_for_node(L, nsib);
+    bsc = lay_box_for_node(L, nsc);
+
+    /* left:50% (200) + translateX(-50% of 100 = -50) => 150 */
+    CHECK_EQ(bp->x, 150);
+    CHECK_EQ(bp->y, 10);
+    CHECK_EQ(lay_hit_test_view(L, 155, 20, 0, 0), bp);
+    CHECK_EQ(lay_hit_test_view(L, 145, 20, 0, 0), lay_box_for_node(L, d));
+
+    /* translateY(-2px) moves shf from 20 -> 18, sibling stays at 50 */
+    CHECK_EQ(bsh->y, 18);
+    CHECK_EQ(bsib->y, 50);
+
+    /* scale(2) around center of (100, 120, 100, 40) -> (50, 100, 200, 80) */
+    CHECK_EQ(bsc->x, 50);
+    CHECK_EQ(bsc->y, 100);
+    CHECK_EQ(bsc->w, 200);
+    CHECK_EQ(bsc->h, 80);
+    CHECK_EQ(lay_hit_test_view(L, 55, 110, 0, 0), bsc);
+
+    lay_free(L);
+    tfree(t);
+}
+
+/* ================================================================== *
  * main
  * ================================================================== */
 
@@ -3852,6 +4479,13 @@ int main(int argc, char **argv)
     test_fixed_and_sticky_paint_hit();
     test_paint_modern_effects();
     test_paint_svg_modern();
+
+    test_aspect_ratio_layout();
+    test_object_fit_paint();
+    test_flex_grid_modern();
+    test_outline_paint();
+    test_text_modern_layout();
+    test_transform_layout();
 
     render_pages();
     test_pathological();

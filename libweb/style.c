@@ -54,6 +54,7 @@ int css_stylesheet_prefers_dark(const struct css_stylesheet *ss);
 #define CSS_RAW_GRID_LINE  9
 #define CSS_RAW_FONT       10
 #define CSS_RAW_LIST_STYLE 11
+#define CSS_RAW_OUTLINE    12
 
 struct cascade_slot {
     uint8_t  used;
@@ -245,6 +246,11 @@ static const char *const kw_fontweight[]  = { CSS_FONTWEIGHTKW_LIST(CSS_STR_X) 0
 static const char *const kw_borderwidth[] = { "thin", "medium", "thick", 0 };
 static const char *const kw_decor[]       = { "none", "underline", "overline",
                                               "line-through", "blink", 0 };
+static const char *const kw_objectfit[]   = { CSS_OBJECTFIT_LIST(CSS_STR_X) 0 };
+static const char *const kw_alignself[]   = { CSS_ALIGNSELF_LIST(CSS_STR_X) 0 };
+static const char *const kw_textoverflow[]= { CSS_TEXTOVERFLOW_LIST(CSS_STR_X) 0 };
+static const char *const kw_wordbreak[]   = { CSS_WORDBREAK_LIST(CSS_STR_X) 0 };
+static const char *const kw_overflowwrap[]= { CSS_OVERFLOWWRAP_LIST(CSS_STR_X) 0 };
 
 /* ================================================================== *
  * initial values
@@ -332,6 +338,23 @@ void css_style_initial(struct computed_style *cs)
     cs->grid_row_span = 1;
     cs->background_image = 0;
     cs->font_family_name = 0;
+    cs->align_self = CSS_ALIGNSELF_AUTO;
+    cs->object_fit = CSS_OBJECTFIT_FILL;
+    cs->outline_style = CSS_BORDERSTYLE_NONE;
+    cs->text_overflow = CSS_TEXTOVERFLOW_CLIP;
+    cs->word_break = CSS_WORDBREAK_NORMAL;
+    cs->overflow_wrap = CSS_OVERFLOWWRAP_NORMAL;
+    cs->outline_width = 0;
+    cs->outline_offset = 0;
+    cs->outline_color = CSS_RGB(0, 0, 0);
+    cs->order = 0;
+    cs->aspect_ratio = 0;
+    cs->letter_spacing = 0;
+    cs->has_transform = 0;
+    cs->translate_x = len_px(0);
+    cs->translate_y = len_px(0);
+    cs->scale_x = 1000;
+    cs->scale_y = 1000;
 }
 
 /* ================================================================== *
@@ -451,6 +474,11 @@ static void copy_prop(struct computed_style *d, const struct computed_style *s,
         for (i = 0; i < CSS_GRID_MAX_COLS; i++)
             d->grid_cols[i] = s->grid_cols[i];
         break;
+    case CSS_PROP_GRID_TEMPLATE_ROWS:
+        d->grid_nrows = s->grid_nrows;
+        for (i = 0; i < CSS_GRID_MAX_ROWS; i++)
+            d->grid_rows[i] = s->grid_rows[i];
+        break;
     case CSS_PROP_GRID_COL_START:  d->grid_col_start = s->grid_col_start; break;
     case CSS_PROP_GRID_COL_END:
         d->grid_col_end = s->grid_col_end;
@@ -460,6 +488,25 @@ static void copy_prop(struct computed_style *d, const struct computed_style *s,
     case CSS_PROP_GRID_ROW_END:
         d->grid_row_end = s->grid_row_end;
         d->grid_row_span = s->grid_row_span;
+        break;
+    case CSS_PROP_ASPECT_RATIO:    d->aspect_ratio = s->aspect_ratio; break;
+    case CSS_PROP_OBJECT_FIT:      d->object_fit = s->object_fit; break;
+    case CSS_PROP_ALIGN_SELF:      d->align_self = s->align_self; break;
+    case CSS_PROP_ORDER:           d->order = s->order; break;
+    case CSS_PROP_OUTLINE_WIDTH:   d->outline_width = s->outline_width; break;
+    case CSS_PROP_OUTLINE_STYLE:   d->outline_style = s->outline_style; break;
+    case CSS_PROP_OUTLINE_COLOR:   d->outline_color = s->outline_color; break;
+    case CSS_PROP_OUTLINE_OFFSET:  d->outline_offset = s->outline_offset; break;
+    case CSS_PROP_TEXT_OVERFLOW:   d->text_overflow = s->text_overflow; break;
+    case CSS_PROP_WORD_BREAK:      d->word_break = s->word_break; break;
+    case CSS_PROP_OVERFLOW_WRAP:   d->overflow_wrap = s->overflow_wrap; break;
+    case CSS_PROP_LETTER_SPACING:  d->letter_spacing = s->letter_spacing; break;
+    case CSS_PROP_TRANSFORM:
+        d->has_transform = s->has_transform;
+        d->translate_x = s->translate_x;
+        d->translate_y = s->translate_y;
+        d->scale_x = s->scale_x;
+        d->scale_y = s->scale_y;
         break;
     default: break;
     }
@@ -1868,27 +1915,284 @@ static int parse_grid_tracks_list(const struct style_engine *se,
     return 1;
 }
 
-static void apply_grid_template_cols_str(const struct style_engine *se,
-                                         struct computed_style *cs,
-                                         const char *s, int len,
-                                         int32_t root_fs)
+static void apply_grid_tracks_str(const struct style_engine *se,
+                                  const char *s, int len, int32_t fs,
+                                  int32_t root_fs, struct css_grid_track *dst,
+                                  uint8_t *dst_n, int max_tracks)
 {
     int a, al, count = 0;
     struct css_grid_track tracks[CSS_GRID_MAX_COLS];
 
+    if (max_tracks > CSS_GRID_MAX_COLS)
+        max_tracks = CSS_GRID_MAX_COLS;
     trim_span(s, len, &a, &al);
     if (al <= 0)
         return;
     if (al == 4 && s_stricmp_n(s + a, "none", 4) == 0) {
-        cs->grid_ncols = 0;
+        *dst_n = 0;
         return;
     }
-    if (!parse_grid_tracks_list(se, s + a, al, cs->font_size, root_fs,
-                                tracks, &count, CSS_GRID_MAX_COLS, 0))
+    if (!parse_grid_tracks_list(se, s + a, al, fs, root_fs,
+                                tracks, &count, max_tracks, 0))
         return;
-    cs->grid_ncols = (uint8_t)count;
+    *dst_n = (uint8_t)count;
     for (a = 0; a < count; a++)
-        cs->grid_cols[a] = tracks[a];
+        dst[a] = tracks[a];
+}
+
+static int apply_aspect_ratio_str(const struct style_engine *se,
+                                  struct computed_style *cs, const char *s,
+                                  int len, int32_t root_fs)
+{
+    int a, al, i, depth = 0, slash = -1;
+    struct calc_val cv, cv2;
+
+    trim_span(s, len, &a, &al);
+    if (al <= 0)
+        return 0;
+    s += a;
+    len = al;
+    if (len == 4 && s_stricmp_n(s, "auto", 4) == 0) {
+        cs->aspect_ratio = 0;
+        return 1;
+    }
+    for (i = 0; i < len; i++) {
+        if (s[i] == '(') depth++;
+        else if (s[i] == ')' && depth > 0) depth--;
+        else if (depth == 0 && s[i] == '/') {
+            if (slash >= 0)
+                return 0;
+            slash = i;
+        }
+    }
+    if (slash < 0) {
+        int64_t r;
+        if (!eval_calc_str(se, s, len, cs->font_size, root_fs, &cv) ||
+            cv.has_unit || cv.pct_milli != 0 || cv.px_milli <= 0)
+            return 0;
+        r = cv.px_milli;
+        if (r > 100000000LL) r = 100000000LL;
+        cs->aspect_ratio = (int32_t)r;
+        return 1;
+    }
+    if (!eval_calc_str(se, s, slash, cs->font_size, root_fs, &cv) ||
+        cv.has_unit || cv.pct_milli != 0 || cv.px_milli <= 0)
+        return 0;
+    if (!eval_calc_str(se, s + slash + 1, len - slash - 1, cs->font_size,
+                       root_fs, &cv2) ||
+        cv2.has_unit || cv2.pct_milli != 0 || cv2.px_milli <= 0)
+        return 0;
+    {
+        int64_t r = div_round64(cv.px_milli * 1000LL, cv2.px_milli);
+        if (r < 1) r = 1;
+        if (r > 100000000LL) r = 100000000LL;
+        cs->aspect_ratio = (int32_t)r;
+    }
+    return 1;
+}
+
+static int eval_scale_arg(const struct style_engine *se, const char *s, int len,
+                          int32_t fs, int32_t root_fs, int64_t *out_milli)
+{
+    struct calc_val cv;
+    if (!eval_calc_str(se, s, len, fs, root_fs, &cv))
+        return 0;
+    if (!cv.has_unit && cv.pct_milli == 0) {
+        *out_milli = cv.px_milli;
+        return 1;
+    }
+    if (cv.pct_milli != 0 && cv.px_milli == 0) {
+        *out_milli = cv.pct_milli / 100;
+        return 1;
+    }
+    return 0;
+}
+
+static void unpack_css_len(struct css_len l, int64_t *px, int64_t *pct)
+{
+    if (l.type == CSS_LEN_PCT) {
+        *px = 0;
+        *pct = l.v;
+    } else if (l.type == CSS_LEN_CALC) {
+        *px = l.v;
+        *pct = l.pct;
+    } else {
+        *px = l.v;
+        *pct = 0;
+    }
+}
+
+static struct css_len pack_css_len(int64_t px, int64_t pct)
+{
+    struct css_len l;
+    if (pct == 0) {
+        l.type = CSS_LEN_PX;
+        l.v = clamp_px(px);
+        l.pct = 0;
+    } else if (px == 0) {
+        l.type = CSS_LEN_PCT;
+        l.v = clamp_pct_milli(pct);
+        l.pct = 0;
+    } else {
+        l.type = CSS_LEN_CALC;
+        l.v = clamp_px(px);
+        l.pct = clamp_pct_milli(pct);
+    }
+    return l;
+}
+
+static int apply_transform_str(const struct style_engine *se,
+                               struct computed_style *cs, const char *s,
+                               int len, int32_t root_fs)
+{
+    int a, al, i = 0;
+    int64_t tx_px = 0, tx_pct = 0, ty_px = 0, ty_pct = 0;
+    int64_t sx = 1000, sy = 1000;
+    int nfn = 0;
+
+    trim_span(s, len, &a, &al);
+    if (al <= 0)
+        return 0;
+    s += a;
+    len = al;
+    if (len == 4 && s_stricmp_n(s, "none", 4) == 0) {
+        cs->has_transform = 0;
+        cs->translate_x = len_px(0);
+        cs->translate_y = len_px(0);
+        cs->scale_x = 1000;
+        cs->scale_y = 1000;
+        return 1;
+    }
+    while (i < len) {
+        int nst, nlen, ast, alen, depth, na;
+        int starts[4], lens[4];
+        struct css_len dx, dy, dz;
+        int64_t dpx, dpct, qpx, qpct, vx, vy;
+        const char *fn, *arg;
+
+        while (i < len && s_is_ws((unsigned char)s[i]))
+            i++;
+        if (i >= len)
+            break;
+        nst = i;
+        while (i < len && s[i] != '(' && !s_is_ws((unsigned char)s[i]))
+            i++;
+        nlen = i - nst;
+        if (nlen <= 0 || i >= len || s[i] != '(')
+            return 0;
+        i++;
+        ast = i;
+        depth = 1;
+        while (i < len && depth > 0) {
+            int ch = (unsigned char)s[i];
+            if (ch == '"' || ch == '\'') {
+                int q = ch;
+                i++;
+                while (i < len) {
+                    if (s[i] == '\\' && i + 1 < len) { i += 2; continue; }
+                    if (s[i] == q) { i++; break; }
+                    i++;
+                }
+                continue;
+            }
+            if (ch == '(') depth++;
+            else if (ch == ')') depth--;
+            i++;
+        }
+        if (depth != 0)
+            return 0;
+        alen = (i - 1) - ast;
+        fn = s + nst;
+        arg = s + ast;
+        na = split_comma_args(arg, alen, starts, lens, 4);
+
+        if (nlen == 9 && s_stricmp_n(fn, "translate", 9) == 0) {
+            if (na < 1 || na > 2) return 0;
+            if (!eval_len_str(se, arg + starts[0], lens[0], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dx))
+                return 0;
+            if (na == 2) {
+                if (!eval_len_str(se, arg + starts[1], lens[1], cs->font_size,
+                                  root_fs, 1, 1, 0, 0, &dy))
+                    return 0;
+            } else {
+                dy = len_px(0);
+            }
+        } else if (nlen == 10 && s_stricmp_n(fn, "translatex", 10) == 0) {
+            if (na != 1) return 0;
+            if (!eval_len_str(se, arg + starts[0], lens[0], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dx))
+                return 0;
+            dy = len_px(0);
+        } else if (nlen == 10 && s_stricmp_n(fn, "translatey", 10) == 0) {
+            if (na != 1) return 0;
+            dx = len_px(0);
+            if (!eval_len_str(se, arg + starts[0], lens[0], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dy))
+                return 0;
+        } else if (nlen == 11 && s_stricmp_n(fn, "translate3d", 11) == 0) {
+            if (na != 3) return 0;
+            if (!eval_len_str(se, arg + starts[0], lens[0], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dx) ||
+                !eval_len_str(se, arg + starts[1], lens[1], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dy) ||
+                !eval_len_str(se, arg + starts[2], lens[2], cs->font_size,
+                              root_fs, 1, 1, 0, 0, &dz))
+                return 0;
+        } else if (nlen == 5 && s_stricmp_n(fn, "scale", 5) == 0) {
+            if (na < 1 || na > 2) return 0;
+            if (!eval_scale_arg(se, arg + starts[0], lens[0], cs->font_size,
+                                root_fs, &vx))
+                return 0;
+            if (na == 2) {
+                if (!eval_scale_arg(se, arg + starts[1], lens[1], cs->font_size,
+                                    root_fs, &vy))
+                    return 0;
+            } else {
+                vy = vx;
+            }
+            sx = div_round64(sx * vx, 1000);
+            sy = div_round64(sy * vy, 1000);
+            nfn++;
+            continue;
+        } else if (nlen == 6 && s_stricmp_n(fn, "scalex", 6) == 0) {
+            if (na != 1 || !eval_scale_arg(se, arg + starts[0], lens[0],
+                                           cs->font_size, root_fs, &vx))
+                return 0;
+            sx = div_round64(sx * vx, 1000);
+            nfn++;
+            continue;
+        } else if (nlen == 6 && s_stricmp_n(fn, "scaley", 6) == 0) {
+            if (na != 1 || !eval_scale_arg(se, arg + starts[0], lens[0],
+                                           cs->font_size, root_fs, &vy))
+                return 0;
+            sy = div_round64(sy * vy, 1000);
+            nfn++;
+            continue;
+        } else {
+            return 0;
+        }
+
+        unpack_css_len(dx, &dpx, &dpct);
+        unpack_css_len(dy, &qpx, &qpct);
+        tx_px += div_round64(sx * dpx, 1000);
+        tx_pct += div_round64(sx * dpct, 1000);
+        ty_px += div_round64(sy * qpx, 1000);
+        ty_pct += div_round64(sy * qpct, 1000);
+        nfn++;
+    }
+    if (nfn <= 0)
+        return 0;
+    if (sx < -10000000LL) sx = -10000000LL;
+    if (sx >  10000000LL) sx =  10000000LL;
+    if (sy < -10000000LL) sy = -10000000LL;
+    if (sy >  10000000LL) sy =  10000000LL;
+    cs->has_transform = 1;
+    cs->translate_x = pack_css_len(tx_px, tx_pct);
+    cs->translate_y = pack_css_len(ty_px, ty_pct);
+    cs->scale_x = (int32_t)sx;
+    cs->scale_y = (int32_t)sy;
+    return 1;
 }
 
 static int parse_grid_line_str(const struct style_engine *se,
@@ -2115,9 +2419,14 @@ static int apply_direct_raw_prop(struct style_engine *se,
     case CSS_PROP_FLEX_DIRECTION:
     case CSS_PROP_FLEX_WRAP:
     case CSS_PROP_JUSTIFY_CONTENT:
-    case CSS_PROP_ALIGN_ITEMS: {
+    case CSS_PROP_ALIGN_ITEMS:
+    case CSS_PROP_ALIGN_SELF:
+    case CSS_PROP_OBJECT_FIT:
+    case CSS_PROP_TEXT_OVERFLOW:
+    case CSS_PROP_WORD_BREAK:
+    case CSS_PROP_OVERFLOW_WRAP: {
         const char *const *tbl = 0;
-        int k;
+        int k = -1;
         if (!buf[0]) return 0;
         switch (prop) {
         case CSS_PROP_DISPLAY:        tbl = kw_display; break;
@@ -2136,11 +2445,29 @@ static int apply_direct_raw_prop(struct style_engine *se,
         case CSS_PROP_TEXT_TRANSFORM: tbl = kw_ttransform; break;
         case CSS_PROP_FLEX_DIRECTION: tbl = kw_flexdir; break;
         case CSS_PROP_FLEX_WRAP:      tbl = kw_flexwrap; break;
-        case CSS_PROP_JUSTIFY_CONTENT: tbl = kw_justify; break;
-        case CSS_PROP_ALIGN_ITEMS:    tbl = kw_align; break;
+        case CSS_PROP_JUSTIFY_CONTENT:
+            if (s_stricmp(buf, "start") == 0) k = CSS_JUSTIFY_START;
+            else if (s_stricmp(buf, "end") == 0) k = CSS_JUSTIFY_END;
+            else tbl = kw_justify;
+            break;
+        case CSS_PROP_ALIGN_ITEMS:
+            if (s_stricmp(buf, "start") == 0) k = CSS_ALIGN_START;
+            else if (s_stricmp(buf, "end") == 0) k = CSS_ALIGN_END;
+            else tbl = kw_align;
+            break;
+        case CSS_PROP_ALIGN_SELF:
+            if (s_stricmp(buf, "start") == 0) k = CSS_ALIGNSELF_START;
+            else if (s_stricmp(buf, "end") == 0) k = CSS_ALIGNSELF_END;
+            else tbl = kw_alignself;
+            break;
+        case CSS_PROP_OBJECT_FIT:     tbl = kw_objectfit; break;
+        case CSS_PROP_TEXT_OVERFLOW:  tbl = kw_textoverflow; break;
+        case CSS_PROP_WORD_BREAK:     tbl = kw_wordbreak; break;
+        case CSS_PROP_OVERFLOW_WRAP:  tbl = kw_overflowwrap; break;
         default: break;
         }
-        k = kw_lookup(tbl, buf);
+        if (k < 0 && tbl)
+            k = kw_lookup(tbl, buf);
         if (k < 0) return 0;
         switch (prop) {
         case CSS_PROP_DISPLAY:        cs->display = (uint8_t)k; break;
@@ -2161,6 +2488,11 @@ static int apply_direct_raw_prop(struct style_engine *se,
         case CSS_PROP_FLEX_WRAP:      cs->flex_wrap = (uint8_t)k; break;
         case CSS_PROP_JUSTIFY_CONTENT: cs->justify_content = (uint8_t)k; break;
         case CSS_PROP_ALIGN_ITEMS:    cs->align_items = (uint8_t)k; break;
+        case CSS_PROP_ALIGN_SELF:     cs->align_self = (uint8_t)k; break;
+        case CSS_PROP_OBJECT_FIT:     cs->object_fit = (uint8_t)k; break;
+        case CSS_PROP_TEXT_OVERFLOW:  cs->text_overflow = (uint8_t)k; break;
+        case CSS_PROP_WORD_BREAK:     cs->word_break = (uint8_t)k; break;
+        case CSS_PROP_OVERFLOW_WRAP:  cs->overflow_wrap = (uint8_t)k; break;
         default: break;
         }
         return 1;
@@ -2499,7 +2831,13 @@ static int apply_direct_raw_prop(struct style_engine *se,
         return 1;
 
     case CSS_PROP_GRID_TEMPLATE_COLS:
-        apply_grid_template_cols_str(se, cs, s, len, root_fs);
+        apply_grid_tracks_str(se, s, len, cs->font_size, root_fs,
+                              cs->grid_cols, &cs->grid_ncols, CSS_GRID_MAX_COLS);
+        return 1;
+
+    case CSS_PROP_GRID_TEMPLATE_ROWS:
+        apply_grid_tracks_str(se, s, len, cs->font_size, root_fs,
+                              cs->grid_rows, &cs->grid_nrows, CSS_GRID_MAX_ROWS);
         return 1;
 
     case CSS_PROP_GRID_COL_START:
@@ -2508,6 +2846,68 @@ static int apply_direct_raw_prop(struct style_engine *se,
     case CSS_PROP_GRID_ROW_END:
         apply_grid_line_val(se, cs, prop, s, len);
         return 1;
+
+    case CSS_PROP_ASPECT_RATIO:
+        return apply_aspect_ratio_str(se, cs, s, len, root_fs);
+
+    case CSS_PROP_ORDER:
+        if (!eval_calc_str(se, s, len, cs->font_size, root_fs, &cv) ||
+            cv.has_unit || cv.pct_milli != 0 || (cv.px_milli % 1000) != 0)
+            return 0;
+        cs->order = (int32_t)(cv.px_milli / 1000);
+        return 1;
+
+    case CSS_PROP_OUTLINE_WIDTH:
+        if (buf[0]) {
+            int k = kw_lookup(kw_borderwidth, buf);
+            if (k >= 0) {
+                static const int32_t bw[3] = { 1, 3, 5 };
+                cs->outline_width = bw[k];
+                return 1;
+            }
+        }
+        if (!eval_len_str(se, s, len, cs->font_size, root_fs, 0, 0, 0, 0, &l))
+            return 0;
+        cs->outline_width = l.v;
+        return 1;
+
+    case CSS_PROP_OUTLINE_STYLE: {
+        int k = -1;
+        if (!buf[0]) return 0;
+        if (s_stricmp(buf, "auto") == 0) k = CSS_BORDERSTYLE_SOLID;
+        else k = kw_lookup(kw_borderstyle, buf);
+        if (k < 0) return 0;
+        cs->outline_style = (uint8_t)k;
+        return 1;
+    }
+
+    case CSS_PROP_OUTLINE_COLOR:
+        if (buf[0] && s_stricmp(buf, "invert") == 0) {
+            cs->outline_color = cs->color;
+            return 1;
+        }
+        if (!eval_color_str(se, cs, parent, s, len, &c, 1)) return 0;
+        cs->outline_color = c;
+        return 1;
+
+    case CSS_PROP_OUTLINE_OFFSET:
+        if (!eval_len_str(se, s, len, cs->font_size, root_fs, 1, 0, 0, 0, &l))
+            return 0;
+        cs->outline_offset = l.v;
+        return 1;
+
+    case CSS_PROP_LETTER_SPACING:
+        if (buf[0] && s_stricmp(buf, "normal") == 0) {
+            cs->letter_spacing = 0;
+            return 1;
+        }
+        if (!eval_len_str(se, s, len, cs->font_size, root_fs, 1, 0, 0, 0, &l))
+            return 0;
+        cs->letter_spacing = l.v;
+        return 1;
+
+    case CSS_PROP_TRANSFORM:
+        return apply_transform_str(se, cs, s, len, root_fs);
 
     default:
         return 0;
@@ -2538,11 +2938,15 @@ static void apply_raw_expr(struct style_engine *se, struct computed_style *cs,
     }
     if ((al == 7 && s_stricmp_n(exp_buf + a, "initial", 7) == 0)) {
         copy_prop(cs, initial, prop);
+        if (prop == CSS_PROP_OUTLINE_COLOR) cs->outline_color = cs->color;
+        else if (prop == CSS_PROP_OUTLINE_WIDTH) cs->outline_width = 3;
         return;
     }
     if ((al == 5 && s_stricmp_n(exp_buf + a, "unset", 5) == 0)) {
         copy_prop(cs, css_property_inherited(prop)
                           ? (parent ? parent : initial) : initial, prop);
+        if (prop == CSS_PROP_OUTLINE_COLOR) cs->outline_color = cs->color;
+        else if (prop == CSS_PROP_OUTLINE_WIDTH) cs->outline_width = 3;
         return;
     }
 
@@ -2574,16 +2978,20 @@ static void apply_raw_expr(struct style_engine *se, struct computed_style *cs,
         return;
     }
 
-    if (raw_kw == CSS_RAW_BORDER) {
+    if (raw_kw == CSS_RAW_BORDER || raw_kw == CSS_RAW_OUTLINE) {
         int ts[8], tl[8], nt, i;
-        int is_w = (prop >= CSS_PROP_BORDER_TOP_WIDTH &&
-                    prop <= CSS_PROP_BORDER_LEFT_WIDTH);
-        int is_s = (prop >= CSS_PROP_BORDER_TOP_STYLE &&
-                    prop <= CSS_PROP_BORDER_LEFT_STYLE);
+        int is_out = (raw_kw == CSS_RAW_OUTLINE);
+        int is_w = is_out ? (prop == CSS_PROP_OUTLINE_WIDTH)
+                          : (prop >= CSS_PROP_BORDER_TOP_WIDTH &&
+                             prop <= CSS_PROP_BORDER_LEFT_WIDTH);
+        int is_s = is_out ? (prop == CSS_PROP_OUTLINE_STYLE)
+                          : (prop >= CSS_PROP_BORDER_TOP_STYLE &&
+                             prop <= CSS_PROP_BORDER_LEFT_STYLE);
         int w_idx = -1, s_idx = -1, c_idx = -1;
         if (al == 4 && s_stricmp_n(exp_buf + a, "none", 4) == 0) {
             if (is_w) (void)apply_direct_raw_prop(se, cs, parent, prop, "0px", 3, root_fs);
             else if (is_s) (void)apply_direct_raw_prop(se, cs, parent, prop, "none", 4, root_fs);
+            else if (is_out) cs->outline_color = cs->color;
             return;
         }
         nt = split_top_tokens(exp_buf + a, al, ts, tl, 8);
@@ -2596,7 +3004,8 @@ static void apply_raw_expr(struct style_engine *se, struct computed_style *cs,
             if (len_i < (int)sizeof(tb)) {
                 memcpy(tb, tok, (unsigned long)len_i);
                 tb[len_i] = 0;
-                if (s_idx < 0 && kw_lookup(kw_borderstyle, tb) >= 0) {
+                if (s_idx < 0 && (kw_lookup(kw_borderstyle, tb) >= 0 ||
+                                  (is_out && s_stricmp(tb, "auto") == 0))) {
                     s_idx = i; continue;
                 }
                 if (w_idx < 0 && kw_lookup(kw_borderwidth, tb) >= 0) {
@@ -2607,7 +3016,9 @@ static void apply_raw_expr(struct style_engine *se, struct computed_style *cs,
                                           0, 0, 0, 0, &l)) {
                 w_idx = i; continue;
             }
-            if (c_idx < 0 && eval_color_str(se, cs, parent, tok, len_i, &c, 1)) {
+            if (c_idx < 0 && (eval_color_str(se, cs, parent, tok, len_i, &c, 1) ||
+                              (is_out && len_i == 6 &&
+                               s_stricmp_n(tok, "invert", 6) == 0))) {
                 c_idx = i; continue;
             }
             return;
@@ -2628,6 +3039,8 @@ static void apply_raw_expr(struct style_engine *se, struct computed_style *cs,
             if (c_idx >= 0)
                 (void)apply_direct_raw_prop(se, cs, parent, prop,
                                             exp_buf + a + ts[c_idx], tl[c_idx], root_fs);
+            else if (is_out)
+                cs->outline_color = cs->color;
         }
         return;
     }
@@ -2868,13 +3281,18 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
     }
     if (v->type == CSS_VAL_INITIAL) {
         copy_prop(cs, initial, prop);
+        if (prop == CSS_PROP_OUTLINE_COLOR) cs->outline_color = cs->color;
+        else if (prop == CSS_PROP_OUTLINE_WIDTH) cs->outline_width = 3;
         return;
     }
     if (v->type == CSS_VAL_UNSET) {
         if (css_property_inherited(prop))
             copy_prop(cs, parent ? parent : initial, prop);
-        else
+        else {
             copy_prop(cs, initial, prop);
+            if (prop == CSS_PROP_OUTLINE_COLOR) cs->outline_color = cs->color;
+            else if (prop == CSS_PROP_OUTLINE_WIDTH) cs->outline_width = 3;
+        }
         return;
     }
     if (v->type == CSS_VAL_RAW_EXPR) {
@@ -3187,6 +3605,60 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
         } else if (v->type == CSS_VAL_NUMBER) {
             cs->grid_row_end = (int16_t)clamp_px(v->num / 1000);
         }
+        break;
+    case CSS_PROP_ASPECT_RATIO:
+        if (v->type == CSS_VAL_AUTO)
+            cs->aspect_ratio = 0;
+        else if (v->type == CSS_VAL_NUMBER)
+            cs->aspect_ratio = v->num;
+        break;
+    case CSS_PROP_OBJECT_FIT:
+        if (v->type == CSS_VAL_KEYWORD) cs->object_fit = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_ALIGN_SELF:
+        if (v->type == CSS_VAL_KEYWORD) cs->align_self = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_ORDER:
+        if (v->type == CSS_VAL_NUMBER) cs->order = (int32_t)(v->num / 1000);
+        break;
+    case CSS_PROP_OUTLINE_WIDTH:
+        if (v->type == CSS_VAL_KEYWORD) {
+            static const int32_t bw[3] = { 1, 3, 5 };
+            int k = v->kw;
+            if (k < 0) k = 0;
+            if (k > 2) k = 2;
+            cs->outline_width = bw[k];
+        } else if (v->type == CSS_VAL_LENGTH) {
+            cs->outline_width = resolve_px(se, v, fs, root_fs);
+        }
+        break;
+    case CSS_PROP_OUTLINE_STYLE:
+        if (v->type == CSS_VAL_KEYWORD) cs->outline_style = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_OUTLINE_COLOR:
+        if (v->type == CSS_VAL_COLOR)
+            cs->outline_color = v->color;
+        else if (v->type == CSS_VAL_IDENT)
+            cs->outline_color = cs->color;
+        break;
+    case CSS_PROP_OUTLINE_OFFSET:
+        if (v->type == CSS_VAL_LENGTH)
+            cs->outline_offset = resolve_px(se, v, fs, root_fs);
+        break;
+    case CSS_PROP_TEXT_OVERFLOW:
+        if (v->type == CSS_VAL_KEYWORD) cs->text_overflow = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_WORD_BREAK:
+        if (v->type == CSS_VAL_KEYWORD) cs->word_break = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_OVERFLOW_WRAP:
+        if (v->type == CSS_VAL_KEYWORD) cs->overflow_wrap = (uint8_t)v->kw;
+        break;
+    case CSS_PROP_LETTER_SPACING:
+        if (v->type == CSS_VAL_KEYWORD)
+            cs->letter_spacing = 0;
+        else if (v->type == CSS_VAL_LENGTH)
+            cs->letter_spacing = resolve_px(se, v, fs, root_fs);
         break;
     case CSS_PROP_Z_INDEX:
         if (v->type == CSS_VAL_AUTO) {
@@ -3624,6 +4096,13 @@ static struct computed_style *style_compute_internal(
         if (cs->border_style[i] == CSS_BORDERSTYLE_NONE ||
             cs->border_style[i] == CSS_BORDERSTYLE_HIDDEN)
             cs->border_width[i] = 0;
+    if (!se->slots[CSS_PROP_OUTLINE_COLOR].used)
+        cs->outline_color = cs->color;
+    if (cs->outline_style == CSS_BORDERSTYLE_NONE ||
+        cs->outline_style == CSS_BORDERSTYLE_HIDDEN)
+        cs->outline_width = 0;
+    else if (!se->slots[CSS_PROP_OUTLINE_WIDTH].used)
+        cs->outline_width = 3;
 
     if (cs->grid_col_start > 0 && cs->grid_col_end > cs->grid_col_start) {
         int32_t sp = cs->grid_col_end - cs->grid_col_start;

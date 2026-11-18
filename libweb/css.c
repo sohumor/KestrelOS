@@ -899,6 +899,12 @@ static const char *const kw_decor[]       = { "none", "underline", "overline",
 static const char *const kw_boxsizing[]   = { CSS_BOXSIZING_LIST(CSS_STR_X) 0 };
 static const char *const kw_flexwrap[]    = { CSS_FLEXWRAP_LIST(CSS_STR_X) 0 };
 static const char *const kw_colorscheme[] = { CSS_COLORSCHEME_LIST(CSS_STR_X) 0 };
+static const char *const kw_objectfit[]   = { CSS_OBJECTFIT_LIST(CSS_STR_X) 0 };
+static const char *const kw_alignself[]   = { CSS_ALIGNSELF_LIST(CSS_STR_X) 0 };
+static const char *const kw_textoverflow[]= { CSS_TEXTOVERFLOW_LIST(CSS_STR_X) 0 };
+static const char *const kw_wordbreak[]   = { CSS_WORDBREAK_LIST(CSS_STR_X) 0 };
+static const char *const kw_overflowwrap[]= { CSS_OVERFLOWWRAP_LIST(CSS_STR_X) 0 };
+static const char *const kw_normal_only[] = { "normal", 0 };
 
 static const char *const prop_names[] = { CSS_PROP_LIST(CSS_STR_X) 0 };
 
@@ -991,10 +997,24 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_ROW_GAP]             = { 0, PA_LEN, 0 },
     [CSS_PROP_COLUMN_GAP]          = { 0, PA_LEN, 0 },
     [CSS_PROP_GRID_TEMPLATE_COLS]  = { 0, 0, kw_none_only },
+    [CSS_PROP_GRID_TEMPLATE_ROWS]  = { 0, 0, kw_none_only },
     [CSS_PROP_GRID_COL_START]      = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
     [CSS_PROP_GRID_COL_END]        = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
     [CSS_PROP_GRID_ROW_START]      = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
-    [CSS_PROP_GRID_ROW_END]        = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 }
+    [CSS_PROP_GRID_ROW_END]        = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
+    [CSS_PROP_ASPECT_RATIO]        = { 0, PA_NUM|PA_AUTO, 0 },
+    [CSS_PROP_OBJECT_FIT]          = { 0, 0, kw_objectfit },
+    [CSS_PROP_ALIGN_SELF]          = { 0, 0, kw_alignself },
+    [CSS_PROP_ORDER]               = { 0, PA_NUM|PA_NEG, 0 },
+    [CSS_PROP_OUTLINE_WIDTH]       = { 0, PA_LEN, kw_borderwidth },
+    [CSS_PROP_OUTLINE_STYLE]       = { 0, 0, kw_borderstyle },
+    [CSS_PROP_OUTLINE_COLOR]       = { 0, PA_COLOR, 0 },
+    [CSS_PROP_OUTLINE_OFFSET]      = { 0, PA_LEN|PA_NEG, 0 },
+    [CSS_PROP_TEXT_OVERFLOW]       = { 0, 0, kw_textoverflow },
+    [CSS_PROP_WORD_BREAK]          = { 1, 0, kw_wordbreak },
+    [CSS_PROP_OVERFLOW_WRAP]       = { 1, 0, kw_overflowwrap },
+    [CSS_PROP_LETTER_SPACING]      = { 1, PA_LEN|PA_NEG, kw_normal_only },
+    [CSS_PROP_TRANSFORM]           = { 0, 0, kw_none_only }
 };
 
 static int css_stricmp_n(const char *a, const char *b, unsigned long n)
@@ -1139,6 +1159,7 @@ struct css_stylesheet {
 #define CSS_RAW_GRID_LINE  9
 #define CSS_RAW_FONT       10
 #define CSS_RAW_LIST_STYLE 11
+#define CSS_RAW_OUTLINE    12
 
 struct css_parser {
     struct css_lex lex;
@@ -2044,6 +2065,106 @@ static int validate_grid_cols(const char *s)
     return ntrack > 0;
 }
 
+static int validate_transform_args(struct css_lex *L, int min_args,
+                                   int max_args, int allow_len)
+{
+    int narg = 1, tok_in_arg = 0;
+    struct css_tok t;
+
+    for (;;) {
+        lex_next(L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            return 0;
+        if (t.type == T_RPAREN)
+            break;
+        if (t.type == T_COMMA) {
+            if (tok_in_arg == 0)
+                return 0;
+            narg++;
+            tok_in_arg = 0;
+            continue;
+        }
+        if (tok_in_arg > 0)
+            return 0;
+        if (t.type == T_PERCENT) {
+            tok_in_arg = 1;
+            continue;
+        }
+        if (t.type == T_NUMBER) {
+            if (allow_len && t.num != 0)
+                return 0;
+            tok_in_arg = 1;
+            continue;
+        }
+        if (t.type == T_DIMENSION) {
+            if (!allow_len || unit_id(t.unit) == CSS_UNIT_NONE)
+                return 0;
+            tok_in_arg = 1;
+            continue;
+        }
+        if (t.type == T_FUNCTION &&
+            (css_stricmp(t.text, "calc") == 0 ||
+             css_stricmp(t.text, "min") == 0 ||
+             css_stricmp(t.text, "max") == 0 ||
+             css_stricmp(t.text, "clamp") == 0)) {
+            if (!validate_math_fn(L, t.text, 0))
+                return 0;
+            tok_in_arg = 1;
+            continue;
+        }
+        return 0;
+    }
+    if (tok_in_arg == 0 || narg < min_args || narg > max_args)
+        return 0;
+    return 1;
+}
+
+static int validate_transform(const char *s)
+{
+    struct css_lex L;
+    struct css_tok t;
+    int nfn = 0;
+
+    if (!s || !*s)
+        return 0;
+    if (contains_var_ci(s))
+        return 1;
+    if (css_stricmp(s, "none") == 0 || css_stricmp(s, "inherit") == 0 ||
+        css_stricmp(s, "initial") == 0 || css_stricmp(s, "unset") == 0)
+        return 1;
+    L.s = s;
+    L.n = strlen(s);
+    L.i = 0;
+    for (;;) {
+        lex_next(&L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            break;
+        if (t.type != T_FUNCTION)
+            return 0;
+        if (css_stricmp(t.text, "translate") == 0) {
+            if (!validate_transform_args(&L, 1, 2, 1)) return 0;
+        } else if (css_stricmp(t.text, "translatex") == 0 ||
+                   css_stricmp(t.text, "translatey") == 0) {
+            if (!validate_transform_args(&L, 1, 1, 1)) return 0;
+        } else if (css_stricmp(t.text, "translate3d") == 0) {
+            if (!validate_transform_args(&L, 3, 3, 1)) return 0;
+        } else if (css_stricmp(t.text, "scale") == 0) {
+            if (!validate_transform_args(&L, 1, 2, 0)) return 0;
+        } else if (css_stricmp(t.text, "scalex") == 0 ||
+                   css_stricmp(t.text, "scaley") == 0) {
+            if (!validate_transform_args(&L, 1, 1, 0)) return 0;
+        } else {
+            return 0;
+        }
+        nfn++;
+    }
+    return nfn > 0;
+}
+
 /* ================================================================== *
  * turning components into longhand declarations
  * ================================================================== */
@@ -2109,6 +2230,48 @@ static int coerce(int prop, const struct css_value *in, struct css_value *out)
             out->type = CSS_VAL_AUTO;
             return 1;
         }
+        if (prop == CSS_PROP_OUTLINE_STYLE &&
+            css_stricmp(in->str, "auto") == 0) {
+            out->type = CSS_VAL_KEYWORD;
+            out->kw = CSS_BORDERSTYLE_SOLID;
+            return 1;
+        }
+        if (prop == CSS_PROP_JUSTIFY_CONTENT) {
+            if (css_stricmp(in->str, "start") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_JUSTIFY_START;
+                return 1;
+            }
+            if (css_stricmp(in->str, "end") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_JUSTIFY_END;
+                return 1;
+            }
+        }
+        if (prop == CSS_PROP_ALIGN_ITEMS) {
+            if (css_stricmp(in->str, "start") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_ALIGN_START;
+                return 1;
+            }
+            if (css_stricmp(in->str, "end") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_ALIGN_END;
+                return 1;
+            }
+        }
+        if (prop == CSS_PROP_ALIGN_SELF) {
+            if (css_stricmp(in->str, "start") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_ALIGNSELF_START;
+                return 1;
+            }
+            if (css_stricmp(in->str, "end") == 0) {
+                out->type = CSS_VAL_KEYWORD;
+                out->kw = CSS_ALIGNSELF_END;
+                return 1;
+            }
+        }
         k = kw_index(pi->kw, in->str);
         if (k >= 0) {
             out->type = CSS_VAL_KEYWORD;
@@ -2122,7 +2285,9 @@ static int coerce(int prop, const struct css_value *in, struct css_value *out)
                 out->color = CSS_TRANSPARENT;
                 return 1;
             }
-            if (css_stricmp(in->str, "currentcolor") == 0) {
+            if (css_stricmp(in->str, "currentcolor") == 0 ||
+                (prop == CSS_PROP_OUTLINE_COLOR &&
+                 css_stricmp(in->str, "invert") == 0)) {
                 out->type = CSS_VAL_IDENT;
                 out->str = in->str;
                 return 1;
@@ -2263,6 +2428,60 @@ static int expand_border(struct css_parser *p, int t, int r, int b, int l,
         emit(p, side_bs[i], &st, important);
         if (have_c)
             emit(p, side_bc[i], &co, important);
+    }
+    return 1;
+}
+
+/* outline: width || style || color, in any order. */
+static int expand_outline(struct css_parser *p, int important)
+{
+    struct css_value w, st, co, tmp;
+    int have_w = 0, have_s = 0, have_c = 0, i;
+
+    memset(&w, 0, sizeof(w));
+    memset(&st, 0, sizeof(st));
+    memset(&co, 0, sizeof(co));
+
+    if (p->ncomp == 1 && p->comp[0].type == CSS_VAL_IDENT &&
+        css_stricmp(p->comp[0].str, "none") == 0) {
+        emit_kw(p, CSS_PROP_OUTLINE_STYLE, CSS_BORDERSTYLE_NONE, important);
+        emit_len(p, CSS_PROP_OUTLINE_WIDTH, 0, CSS_UNIT_PX, important);
+        co.type = CSS_VAL_IDENT;
+        co.str = "currentcolor";
+        emit(p, CSS_PROP_OUTLINE_COLOR, &co, important);
+        return 1;
+    }
+    for (i = 0; i < p->ncomp; i++) {
+        if (!have_s && coerce(CSS_PROP_OUTLINE_STYLE, &p->comp[i], &tmp) &&
+            tmp.type == CSS_VAL_KEYWORD) {
+            st = tmp; have_s = 1; continue;
+        }
+        if (!have_w && coerce(CSS_PROP_OUTLINE_WIDTH, &p->comp[i], &tmp)) {
+            w = tmp; have_w = 1; continue;
+        }
+        if (!have_c && coerce(CSS_PROP_OUTLINE_COLOR, &p->comp[i], &tmp)) {
+            co = tmp; have_c = 1; continue;
+        }
+        return 0;
+    }
+    if (!have_w && !have_s && !have_c)
+        return 0;
+    if (!have_w) {
+        w.type = CSS_VAL_KEYWORD;   /* medium */
+        w.kw = 1;
+    }
+    if (!have_s) {
+        st.type = CSS_VAL_KEYWORD;
+        st.kw = CSS_BORDERSTYLE_NONE;
+    }
+    emit(p, CSS_PROP_OUTLINE_WIDTH, &w, important);
+    emit(p, CSS_PROP_OUTLINE_STYLE, &st, important);
+    if (have_c)
+        emit(p, CSS_PROP_OUTLINE_COLOR, &co, important);
+    else {
+        co.type = CSS_VAL_IDENT;
+        co.str = "currentcolor";
+        emit(p, CSS_PROP_OUTLINE_COLOR, &co, important);
     }
     return 1;
 }
@@ -2813,11 +3032,55 @@ static int store_color_scheme(struct css_parser *p, int important)
     return 0;
 }
 
+static int store_aspect_ratio(struct css_parser *p, int important)
+{
+    struct css_value v;
+    memset(&v, 0, sizeof(v));
+
+    if (p->ncomp == 1) {
+        const struct css_value *c = &p->comp[0];
+        if (c->type == CSS_VAL_INHERIT || c->type == CSS_VAL_INITIAL ||
+            c->type == CSS_VAL_UNSET) {
+            emit(p, CSS_PROP_ASPECT_RATIO, c, important);
+            return 1;
+        }
+        if (c->type == CSS_VAL_IDENT && css_stricmp(c->str, "auto") == 0) {
+            v.type = CSS_VAL_AUTO;
+            emit(p, CSS_PROP_ASPECT_RATIO, &v, important);
+            return 1;
+        }
+        if (c->type == CSS_VAL_NUMBER && c->num > 0) {
+            v.type = CSS_VAL_NUMBER;
+            v.num = c->num;
+            emit(p, CSS_PROP_ASPECT_RATIO, &v, important);
+            return 1;
+        }
+        return 0;
+    }
+    if (p->ncomp == 3 && p->comp[0].type == CSS_VAL_NUMBER &&
+        p->comp[1].type == VAL_SLASH && p->comp[2].type == CSS_VAL_NUMBER) {
+        int64_t a = p->comp[0].num;
+        int64_t b = p->comp[2].num;
+        int64_t r;
+        if (a <= 0 || b <= 0)
+            return 0;
+        r = (a * 1000LL + b / 2) / b;
+        if (r < 1)
+            r = 1;
+        v.type = CSS_VAL_NUMBER;
+        v.num = clamp32(r, 1, 100000000);
+        emit(p, CSS_PROP_ASPECT_RATIO, &v, important);
+        return 1;
+    }
+    return 0;
+}
+
 enum {
     SH_NONE = 0, SH_MARGIN, SH_PADDING, SH_BORDER, SH_BORDER_TOP,
     SH_BORDER_RIGHT, SH_BORDER_BOTTOM, SH_BORDER_LEFT, SH_BORDER_WIDTH,
     SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_RADIUS, SH_BACKGROUND,
-    SH_FONT, SH_LIST_STYLE, SH_FLEX, SH_GAP, SH_GRID_COL, SH_GRID_ROW
+    SH_FONT, SH_LIST_STYLE, SH_FLEX, SH_GAP, SH_GRID_COL, SH_GRID_ROW,
+    SH_OUTLINE, SH_WORD_WRAP
 };
 
 static int shorthand_id(const char *n)
@@ -2840,6 +3103,8 @@ static int shorthand_id(const char *n)
     if (css_stricmp(n, "gap") == 0)           return SH_GAP;
     if (css_stricmp(n, "grid-column") == 0)   return SH_GRID_COL;
     if (css_stricmp(n, "grid-row") == 0)      return SH_GRID_ROW;
+    if (css_stricmp(n, "outline") == 0)       return SH_OUTLINE;
+    if (css_stricmp(n, "word-wrap") == 0)     return SH_WORD_WRAP;
     return SH_NONE;
 }
 
@@ -2933,6 +3198,14 @@ static int emit_raw_for_decl(struct css_parser *p, const char *name,
             emit_raw(p, CSS_PROP_LIST_STYLE_TYPE, CSS_RAW_LIST_STYLE, s, important);
             emit_raw(p, CSS_PROP_LIST_STYLE_POSITION, CSS_RAW_LIST_STYLE, s, important);
             return 1;
+        case SH_OUTLINE:
+            emit_raw(p, CSS_PROP_OUTLINE_WIDTH, CSS_RAW_OUTLINE, s, important);
+            emit_raw(p, CSS_PROP_OUTLINE_STYLE, CSS_RAW_OUTLINE, s, important);
+            emit_raw(p, CSS_PROP_OUTLINE_COLOR, CSS_RAW_OUTLINE, s, important);
+            return 1;
+        case SH_WORD_WRAP:
+            emit_raw(p, CSS_PROP_OVERFLOW_WRAP, CSS_RAW_NONE, s, important);
+            return 1;
         default:
             return 0;
         }
@@ -2998,6 +3271,16 @@ static int apply_declaration(struct css_parser *p, const char *name,
                 emit(p, CSS_PROP_GRID_ROW_END, &p->comp[0], important);
                 return 1;
             }
+            if (sh == SH_OUTLINE) {
+                emit(p, CSS_PROP_OUTLINE_WIDTH, &p->comp[0], important);
+                emit(p, CSS_PROP_OUTLINE_STYLE, &p->comp[0], important);
+                emit(p, CSS_PROP_OUTLINE_COLOR, &p->comp[0], important);
+                return 1;
+            }
+            if (sh == SH_WORD_WRAP) {
+                emit(p, CSS_PROP_OVERFLOW_WRAP, &p->comp[0], important);
+                return 1;
+            }
         }
         switch (sh) {
         case SH_MARGIN:       ok = expand_box(p, side_margin, important); break;
@@ -3027,6 +3310,15 @@ static int apply_declaration(struct css_parser *p, const char *name,
         case SH_GRID_ROW:
             ok = expand_grid_line(p, CSS_PROP_GRID_ROW_START,
                                   CSS_PROP_GRID_ROW_END, important); break;
+        case SH_OUTLINE:
+            ok = expand_outline(p, important); break;
+        case SH_WORD_WRAP:
+            if (p->ncomp == 1 &&
+                coerce(CSS_PROP_OVERFLOW_WRAP, &p->comp[0], &v)) {
+                emit(p, CSS_PROP_OVERFLOW_WRAP, &v, important);
+                ok = 1;
+            }
+            break;
         default: break;
         }
         if (!ok)
@@ -3061,6 +3353,20 @@ static int apply_declaration(struct css_parser *p, const char *name,
         return store_font_weight(p, important);
     case CSS_PROP_COLOR_SCHEME:
         return store_color_scheme(p, important);
+    case CSS_PROP_ASPECT_RATIO:
+        return store_aspect_ratio(p, important);
+    case CSS_PROP_ORDER:
+        if (p->ncomp == 1 && (p->comp[0].type == CSS_VAL_INHERIT ||
+                              p->comp[0].type == CSS_VAL_UNSET ||
+                              p->comp[0].type == CSS_VAL_INITIAL)) {
+            emit(p, prop, &p->comp[0], important);
+            return 1;
+        }
+        if (p->ncomp != 1 || p->comp[0].type != CSS_VAL_NUMBER ||
+            !p->comp[0].kw)
+            return 0;
+        emit(p, prop, &p->comp[0], important);
+        return 1;
     case CSS_PROP_GRID_COL_START:
     case CSS_PROP_GRID_COL_END:
     case CSS_PROP_GRID_ROW_START:
@@ -3093,12 +3399,14 @@ static int parse_decl_value_and_apply(struct css_parser *p, const char *name,
                                       int stop_rparen, int *important)
 {
     int is_shadow = (css_stricmp(name, "box-shadow") == 0);
-    int is_grid_cols = (css_stricmp(name, "grid-template-columns") == 0);
+    int is_grid_tracks = (css_stricmp(name, "grid-template-columns") == 0 ||
+                          css_stricmp(name, "grid-template-rows") == 0);
+    int is_transform = (css_stricmp(name, "transform") == 0);
     char raw_buf[CSS_RAW_CAP];
     int raw_len = 0, raw_ok = 0, ok = 0;
 
     *important = 0;
-    if (is_shadow || is_grid_cols) {
+    if (is_shadow || is_grid_tracks || is_transform) {
         p->lex = colon_lex;
         raw_ok = read_raw_span(&p->lex, raw_buf, sizeof(raw_buf), &raw_len,
                                important, stop_rparen, 0);
@@ -3106,7 +3414,8 @@ static int parse_decl_value_and_apply(struct css_parser *p, const char *name,
         if (!raw_ok || raw_len == 0)
             return 0;
         if (is_shadow ? !validate_box_shadow(raw_buf)
-                      : !validate_grid_cols(raw_buf))
+                      : (is_grid_tracks ? !validate_grid_cols(raw_buf)
+                                        : !validate_transform(raw_buf)))
             return 0;
         return emit_raw_for_decl(p, name, raw_buf, *important);
     }
@@ -3119,6 +3428,7 @@ static int parse_decl_value_and_apply(struct css_parser *p, const char *name,
             return 0;
         if (sh == SH_NONE && prop != CSS_PROP_FONT_FAMILY &&
             prop != CSS_PROP_TEXT_DECORATION && prop != CSS_PROP_COLOR_SCHEME &&
+            prop != CSS_PROP_ASPECT_RATIO &&
             prop != CSS_PROP_GRID_COL_START && prop != CSS_PROP_GRID_COL_END &&
             prop != CSS_PROP_GRID_ROW_START && prop != CSS_PROP_GRID_ROW_END &&
             prop != CSS_PROP_BACKGROUND_IMAGE && p->ncomp != 1)
