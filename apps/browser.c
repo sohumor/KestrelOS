@@ -1675,7 +1675,7 @@ page_image_load(struct browser_page *p, const char *ref)
     p->images = im;
     if (resource_fetch(p, p->base_url, ref, RESOURCE_MAX,
                        "image/png,image/jpeg,image/gif,image/bmp,"
-                       "image/svg+xml,*/*;q=0.5",
+                       "image/svg+xml,image/x-icon,*/*;q=0.5",
                        &body, err, sizeof(err)) != 0) {
         p->resource_errors++;
         im->state = -1;

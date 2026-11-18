@@ -96,7 +96,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
-        test-random test-browser-host test-gui-host \
+        test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -337,12 +337,20 @@ test-random:
 	sh tools/run-random-tests.sh
 
 test-jpeg-prog:
+	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
 	  -o $(BUILD)/test_jpeg_prog tools/test_jpeg_prog.c \
 	  libimg/*.c libz/inflate.c libz/adler32.c libz/crc32.c
 	$(BUILD)/test_jpeg_prog
 
-test-browser-host: test-jpeg-prog
+test-img-formats:
+	@mkdir -p $(BUILD)
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
+	  -o $(BUILD)/test_img_formats tools/test_img_formats.c \
+	  libimg/*.c libz/inflate.c libz/adler32.c libz/crc32.c
+	$(BUILD)/test_img_formats
+
+test-browser-host: test-jpeg-prog test-img-formats
 	sh tools/run-jsdom-tests.sh
 	sh tools/run-browser-stack.sh
 

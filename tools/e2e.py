@@ -35,6 +35,7 @@ import re
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1293,6 +1294,9 @@ def _marker_handler(marker):
                     "<link rel=stylesheet href=/modern.css>"
                     "</head><body><h1>MODERN-WEB-START</h1>"
                     "<img src=/modern/pixel.png width=1 height=1>"
+                    "<img id=\"svgimg\" src=/modern/badge.svg>"
+                    "<img id=\"icoimg\" src=/modern/favicon.ico>"
+                    "<div id=\"ratio\" class=\"ratio\"></div>"
                     "<div id=\"grid\" class=\"grid\">"
                     "<div id=\"cell\" class=\"cell\"></div></div>"
                     "<canvas id=\"cv\" width=\"16\" height=\"16\"></canvas>"
@@ -1304,6 +1308,10 @@ def _marker_handler(marker):
                 content_type = "text/css"
                 response = (
                     ":root { --gap-px: 12px; --accent: #123456; }\n"
+                    ".ratio {\n"
+                    "  width: 80px;\n"
+                    "  aspect-ratio: 2 / 1;\n"
+                    "}\n"
                     ".grid {\n"
                     "  display: grid;\n"
                     "  grid-template-columns: 1fr 2fr;\n"
@@ -1332,6 +1340,44 @@ def _marker_handler(marker):
                 response = base64.b64decode(
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
                     "AAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            elif path == "/modern/badge.svg":
+                accept = self.headers.get("Accept", "").lower()
+                if "image/svg+xml" not in accept:
+                    err_body = b"missing image/svg+xml Accept"
+                    self.send_response(406)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+                content_type = "image/svg+xml"
+                response = (
+                    b'<svg xmlns="http://www.w3.org/2000/svg" '
+                    b'width="16" height="8" viewBox="0 0 16 8">'
+                    b'<rect width="16" height="8" fill="#00ff00"/></svg>'
+                )
+            elif path == "/modern/favicon.ico":
+                accept = self.headers.get("Accept", "").lower()
+                if "image/x-icon" not in accept:
+                    err_body = b"missing image/x-icon Accept"
+                    self.send_response(406)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.send_header("Connection", "keep-alive")
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+                content_type = "image/x-icon"
+                response = (
+                    struct.pack("<HHH", 0, 1, 1)
+                    + struct.pack("<BBBBHHII", 4, 4, 0, 0, 1, 32,
+                                  40 + 64 + 16, 22)
+                    + struct.pack("<IiiHHIIiiII", 40, 4, 8, 1, 32, 0,
+                                  64 + 16, 0, 0, 0, 0)
+                    + b"\x00\xff\x00\xff" * 16
+                    + b"\x00" * 16
+                )
             elif path == "/modern/api":
                 content_type = "application/json"
                 response = b'{"ok":true,"engine":"kestrel"}'
@@ -1401,6 +1447,35 @@ def _marker_handler(marker):
                     "  document.body.appendChild(es6Node);\n"
                     "}\n"
                     "runModern();\n"
+                    "const ratioEl=document.getElementById('ratio');\n"
+                    "const svgEl=document.getElementById('svgimg');\n"
+                    "const icoEl=document.getElementById('icoimg');\n"
+                    "const rs=getComputedStyle(ratioEl);\n"
+                    "const rr=ratioEl.getBoundingClientRect();\n"
+                    "const sr=svgEl.getBoundingClientRect();\n"
+                    "const ir=icoEl.getBoundingClientRect();\n"
+                    "const ratioOk=rs.getPropertyValue('aspect-ratio')==='2' && "
+                    "rr.width===80 && rr.height===40;\n"
+                    "const mediaOk=sr.width===16 && sr.height===8 && "
+                    "ir.width===4 && ir.height===4;\n"
+                    "const u=new URL('/modern/api?x=1&y=2#h', location.href);\n"
+                    "const urlOk=URL.canParse('https://kestrel.os/a') && "
+                    "!URL.canParse('://bad') && "
+                    "u.pathname==='/modern/api' && "
+                    "u.searchParams.get('x')==='1' && u.hash==='#h';\n"
+                    "const u16=new Uint16Array([0x1234, 0xabcd]);\n"
+                    "const dv=new DataView(u16.buffer);\n"
+                    "dv.setUint16(2, 0x4242, false);\n"
+                    "const cloned=structuredClone({arr:[1,2,3].toReversed()});\n"
+                    "const jsOk=u16.BYTES_PER_ELEMENT===2 && u16.length===2 && "
+                    "u16[0]===0x1234 && dv.getUint16(2, false)===0x4242 && "
+                    "cloned.arr[0]===3;\n"
+                    "const w7Node=document.createElement('p');\n"
+                    "w7Node.textContent=(ratioOk && mediaOk && urlOk && jsOk)"
+                    "?'MODERN-WAVE7-OK':('MODERN-WAVE7-BAD:'+ratioOk+':'+"
+                    "mediaOk+':'+urlOk+':'+jsOk+':'+rr.width+'x'+rr.height+"
+                    "':'+sr.width+'x'+sr.height+':'+ir.width+'x'+ir.height);\n"
+                    "document.body.appendChild(w7Node);\n"
                 ).encode("ascii")
             elif path == "/modern-dep.mjs":
                 content_type = "text/javascript"
@@ -1434,6 +1509,8 @@ def _marker_handler(marker):
                 "/modern",
                 "/modern.css",
                 "/modern/pixel.png",
+                "/modern/badge.svg",
+                "/modern/favicon.ico",
                 "/modern/api",
                 "/modern.js",
                 "/modern-mod.mjs",
@@ -2000,6 +2077,39 @@ def t_dev(h):
         wait_prompt(h)
 
 
+def t_flight(h):
+    """Exercise /dev/flight @krec stream and /bin/flight CLI."""
+    h.send("ls /dev")
+    h.expect(r"\n- +\d+ +flight\n", regex=True)
+    wait_prompt(h)
+
+    # Guarantee a fresh fs transaction in the 256-entry ring even under --only.
+    h.send("echo flt > /tmp/flt.tmp")
+    wait_prompt(h)
+    h.send("rm /tmp/flt.tmp")
+    wait_prompt(h)
+
+    h.send('cat /dev/flight | where "cat == fs" | pick -r cat,event')
+    h.expect("@krec cat:str event:str")
+    h.expect(r"\nfs\ttx_commit\n", regex=True)
+    wait_prompt(h)
+
+    h.send('flight --krec | where "cat == proc" | pick -r cat,event')
+    h.expect("@krec cat:str event:str")
+    h.expect(r"\nproc\t(spawn|exit)\n", regex=True)
+    wait_prompt(h)
+
+    h.send("flight --cat fs -n 5")
+    h.expect(r"\n\d+ +\d+ +-?\d+ +fs +tx_commit +", regex=True)
+    wait_prompt(h)
+
+    h.send("flight --stats")
+    h.expect("Flight Recorder Statistics")
+    h.expect(r"\nCATEGORY +COUNT\n", regex=True)
+    h.expect(r"\ncpu0 +\d+\n", regex=True)
+    wait_prompt(h)
+
+
 # ---- kernel log and services ------------------------------------------
 
 
@@ -2377,6 +2487,8 @@ def t_browser_modern_web(h):
         "/modern",
         "/modern.css",
         "/modern/pixel.png",
+        "/modern/badge.svg",
+        "/modern/favicon.ico",
         "/modern.js",
         "/modern-mod.mjs",
         "/modern-dep.mjs",
@@ -2392,7 +2504,8 @@ def t_browser_modern_web(h):
               for p in modern_paths}
     accept_delta = browser_fixtures.http.accept_count - accept_before
     for marker in ("MODERN-CSS-OK", "MODERN-ES6-ASYNC-OK",
-                   "MODERN-MODULE-OK", "MODERN-CANVAS-OK"):
+                   "MODERN-MODULE-OK", "MODERN-CANVAS-OK",
+                   "MODERN-WAVE7-OK"):
         if marker not in block:
             raise TimeoutError("modern web marker %s was absent "
                                "(resource requests %r)" % (marker, counts))
@@ -2674,6 +2787,7 @@ TESTS = [
     ("inspect-cli", t_inspect_cli),
     ("kjs-cli", t_kjs_cli),
     ("dev", t_dev),
+    ("flight", t_flight),
     ("dmesg", t_dmesg),
     ("service-list", t_service_list),
     ("service-lifecycle", t_service_lifecycle),
