@@ -311,7 +311,10 @@ class Harness:
     def send_raw(self, data):
         raw = data.encode("utf-8")
         if self._sock is not None:
-            self._sock.sendall(raw)
+            for off in range(0, len(raw), 8):
+                self._sock.sendall(raw[off:off + 8])
+                if off + 8 < len(raw):
+                    time.sleep(0.002)
         else:
             self.proc.stdin.write(raw)
             self.proc.stdin.flush()

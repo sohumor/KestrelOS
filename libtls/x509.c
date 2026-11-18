@@ -887,6 +887,10 @@ static int parse_san(struct x509_cert *c, const uint8_t *v, size_t len)
         return -1;
     if (!der_eof(&d))
         return -1;
+    if (!c->san_raw) {
+        c->san_raw = v;
+        c->san_raw_len = len;
+    }
     der_enter(&t, &seq);
     while (!der_eof(&seq)) {
         struct der_tlv gn;
@@ -907,6 +911,8 @@ static int parse_san(struct x509_cert *c, const uint8_t *v, size_t len)
                 c->san[c->n_san].len = (int)gn.len;
                 c->san[c->n_san].is_ip = 0;
                 c->n_san++;
+            } else {
+                c->san_overflow = 1;
             }
         } else if (gn.tag == 7 && !gn.constructed) { /* iPAddress      */
             if (gn.len != 4 && gn.len != 16)
@@ -916,6 +922,8 @@ static int parse_san(struct x509_cert *c, const uint8_t *v, size_t len)
                 c->san[c->n_san].len = (int)gn.len;
                 c->san[c->n_san].is_ip = 1;
                 c->n_san++;
+            } else {
+                c->san_overflow = 1;
             }
         }
     }
@@ -1500,6 +1508,61 @@ static int wildcard_match(const char *pat, size_t plen, const char *host,
     return ci_eq(prest, prest_len, hrest, hrest_len);
 }
 
+static int match_san_entry(const struct x509_san *s, const char *host,
+                           size_t hlen, int is_ip, const uint8_t ip[4])
+{
+    if (is_ip)
+        return s->is_ip && s->len == 4 && memcmp(s->p, ip, 4) == 0;
+    if (s->is_ip)
+        return 0;
+    if (s->len > 2 && s->p[0] == '*')
+        return wildcard_match(s->p, (size_t)s->len, host, hlen);
+    return ci_eq(s->p, (size_t)s->len, host, hlen);
+}
+
+static int check_san_overflow(const struct x509_cert *cert, const char *host,
+                              size_t hlen, int is_ip, const uint8_t ip[4])
+{
+    struct der d, seq;
+    struct der_tlv t;
+    int seen = 0;
+
+    if (!cert->san_raw || cert->san_raw_len == 0)
+        return 0;
+    der_init(&d, cert->san_raw, cert->san_raw_len);
+    if (der_read_expect(&d, &t, DER_SEQUENCE) < 0 || !der_eof(&d))
+        return 0;
+    der_enter(&t, &seq);
+    while (!der_eof(&seq)) {
+        struct der_tlv gn;
+        struct x509_san s;
+        if (der_read(&seq, &gn) < 0)
+            return 0;
+        if (gn.cls != DER_CLASS_CONTEXT)
+            continue;
+        if (gn.tag == 2 && !gn.constructed) {
+            if (gn.len == 0 || gn.len > 255)
+                continue;
+            s.p = (const char *)gn.val;
+            s.len = (int)gn.len;
+            s.is_ip = 0;
+        } else if (gn.tag == 7 && !gn.constructed) {
+            if (gn.len != 4 && gn.len != 16)
+                continue;
+            s.p = (const char *)gn.val;
+            s.len = (int)gn.len;
+            s.is_ip = 1;
+        } else {
+            continue;
+        }
+        if (seen++ < X509_MAX_SAN)
+            continue;
+        if (match_san_entry(&s, host, hlen, is_ip, ip))
+            return 1;
+    }
+    return 0;
+}
+
 int x509_check_hostname(const struct x509_cert *cert, const char *host)
 {
     size_t hlen;
@@ -1525,22 +1588,12 @@ int x509_check_hostname(const struct x509_cert *cert, const char *host)
     is_ip = parse_ipv4(host, hlen, ip);
 
     for (i = 0; i < cert->n_san; i++) {
-        const struct x509_san *s = &cert->san[i];
-        if (is_ip) {
-            if (s->is_ip && s->len == 4 && memcmp(s->p, ip, 4) == 0)
-                return 1;
-            continue;
-        }
-        if (s->is_ip)
-            continue;
-        if (s->len > 2 && s->p[0] == '*') {
-            if (wildcard_match(s->p, (size_t)s->len, host, hlen))
-                return 1;
-            continue;
-        }
-        if (ci_eq(s->p, (size_t)s->len, host, hlen))
+        if (match_san_entry(&cert->san[i], host, hlen, is_ip, ip))
             return 1;
     }
+    if (cert->san_overflow &&
+        check_san_overflow(cert, host, hlen, is_ip, ip))
+        return 1;
     /* Only fall back to the subject CN when there is no SAN at all;
      * RFC 6125 deprecated the CN and a certificate that has a SAN has
      * already said everything it means to say. */
@@ -1621,7 +1674,9 @@ int x509_verify_chain(const struct x509_cert *chain, int n,
         if (chain[0].n_san > 0)
             CFAIL("the certificate is for '%.*s'%s, not '%s'",
                   chain[0].san[0].len, chain[0].san[0].p,
-                  chain[0].n_san > 1 ? " (among others)" : "", hostname);
+                  (chain[0].n_san > 1 || chain[0].san_overflow)
+                      ? " (among others)" : "",
+                  hostname);
         CFAIL("the certificate is for '%s', not '%s'",
               cn_or(&chain[0]), hostname);
     }

@@ -163,6 +163,12 @@ static void serial_drain_rx(void)
     spin_unlock_irqrestore(&serial_rx_lock, flags);
 }
 
+void serial_poll_rx(void)
+{
+    if (serial_input_online)
+        serial_drain_rx();
+}
+
 void serial_init_irq(void)
 {
     irq_install_handler(4, serial_irq);

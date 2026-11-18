@@ -500,6 +500,11 @@ def run_host_tests(tc):
          ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
         ("test_cryptosym", [r("tools/test_cryptosym.c"), r("libtls/hash.c"), r("libtls/aead.c")],
          ["-Ilibtls"]),
+        ("test_jpeg_prog", [
+            r("tools/test_jpeg_prog.c"),
+            r("libimg/img.c"), r("libimg/bmp.c"), r("libimg/gif.c"), r("libimg/jpeg.c"), r("libimg/png.c"),
+            r("libz/inflate.c"), r("libz/adler32.c"), r("libz/crc32.c"),
+        ], ["-Ilibimg", "-Ilibz"]),
         ("test_js", [r("tools/test_js.c")] + rel_glob("libjs/*.c"),
          ["-DJS_HOST", "-Ilibjs"]),
         ("test_dom", [r("tools/test_dom.c"), r("libweb/dom.c"), r("libweb/entities.c"), r("libweb/html.c")],

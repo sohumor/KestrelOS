@@ -260,6 +260,23 @@ enum { CSS_BORDERCOLLAPSE_LIST(CSS_ENUM_X) CSS_BORDERCOLLAPSE_COUNT };
     X(CSS_TEXTTRANSFORM_LOWERCASE,  "lowercase")
 enum { CSS_TEXTTRANSFORM_LIST(CSS_ENUM_X) CSS_TEXTTRANSFORM_COUNT };
 
+#define CSS_BOXSIZING_LIST(X) \
+    X(CSS_BOXSIZING_CONTENT, "content-box") \
+    X(CSS_BOXSIZING_BORDER,  "border-box")
+enum { CSS_BOXSIZING_LIST(CSS_ENUM_X) CSS_BOXSIZING_COUNT };
+
+#define CSS_FLEXWRAP_LIST(X) \
+    X(CSS_FLEXWRAP_NOWRAP,       "nowrap") \
+    X(CSS_FLEXWRAP_WRAP,         "wrap") \
+    X(CSS_FLEXWRAP_WRAP_REVERSE, "wrap-reverse")
+enum { CSS_FLEXWRAP_LIST(CSS_ENUM_X) CSS_FLEXWRAP_COUNT };
+
+#define CSS_COLORSCHEME_LIST(X) \
+    X(CSS_COLORSCHEME_NORMAL, "normal") \
+    X(CSS_COLORSCHEME_LIGHT,  "light") \
+    X(CSS_COLORSCHEME_DARK,   "dark")
+enum { CSS_COLORSCHEME_LIST(CSS_ENUM_X) CSS_COLORSCHEME_COUNT };
+
 /* font-size keywords survive parsing because "smaller" and "larger" need
  * the parent's font size, which only the cascade knows. */
 #define CSS_FONTSIZEKW_LIST(X) \
@@ -301,6 +318,7 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_POSITION,            "position") \
     X(CSS_PROP_FLOAT,               "float") \
     X(CSS_PROP_CLEAR,               "clear") \
+    X(CSS_PROP_BOX_SIZING,          "box-sizing") \
     X(CSS_PROP_WIDTH,               "width") \
     X(CSS_PROP_HEIGHT,              "height") \
     X(CSS_PROP_MIN_WIDTH,           "min-width") \
@@ -331,13 +349,20 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_BORDER_RIGHT_COLOR,  "border-right-color") \
     X(CSS_PROP_BORDER_BOTTOM_COLOR, "border-bottom-color") \
     X(CSS_PROP_BORDER_LEFT_COLOR,   "border-left-color") \
+    X(CSS_PROP_BORDER_TL_RADIUS,    "border-top-left-radius") \
+    X(CSS_PROP_BORDER_TR_RADIUS,    "border-top-right-radius") \
+    X(CSS_PROP_BORDER_BR_RADIUS,    "border-bottom-right-radius") \
+    X(CSS_PROP_BORDER_BL_RADIUS,    "border-bottom-left-radius") \
     X(CSS_PROP_FONT_FAMILY,         "font-family") \
     X(CSS_PROP_FONT_SIZE,           "font-size") \
     X(CSS_PROP_FONT_WEIGHT,         "font-weight") \
     X(CSS_PROP_FONT_STYLE,          "font-style") \
     X(CSS_PROP_COLOR,               "color") \
+    X(CSS_PROP_COLOR_SCHEME,        "color-scheme") \
+    X(CSS_PROP_OPACITY,             "opacity") \
     X(CSS_PROP_BACKGROUND_COLOR,    "background-color") \
     X(CSS_PROP_BACKGROUND_IMAGE,    "background-image") \
+    X(CSS_PROP_BOX_SHADOW,          "box-shadow") \
     X(CSS_PROP_TEXT_ALIGN,          "text-align") \
     X(CSS_PROP_TEXT_DECORATION,     "text-decoration") \
     X(CSS_PROP_TEXT_INDENT,         "text-indent") \
@@ -353,10 +378,20 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_BORDER_SPACING,      "border-spacing") \
     X(CSS_PROP_Z_INDEX,             "z-index") \
     X(CSS_PROP_FLEX_DIRECTION,      "flex-direction") \
+    X(CSS_PROP_FLEX_WRAP,           "flex-wrap") \
     X(CSS_PROP_JUSTIFY_CONTENT,     "justify-content") \
     X(CSS_PROP_ALIGN_ITEMS,         "align-items") \
     X(CSS_PROP_FLEX_GROW,           "flex-grow") \
-    X(CSS_PROP_GAP,                 "gap")
+    X(CSS_PROP_FLEX_SHRINK,         "flex-shrink") \
+    X(CSS_PROP_FLEX_BASIS,          "flex-basis") \
+    X(CSS_PROP_GAP,                 "gap") \
+    X(CSS_PROP_ROW_GAP,             "row-gap") \
+    X(CSS_PROP_COLUMN_GAP,          "column-gap") \
+    X(CSS_PROP_GRID_TEMPLATE_COLS,  "grid-template-columns") \
+    X(CSS_PROP_GRID_COL_START,      "grid-column-start") \
+    X(CSS_PROP_GRID_COL_END,        "grid-column-end") \
+    X(CSS_PROP_GRID_ROW_START,      "grid-row-start") \
+    X(CSS_PROP_GRID_ROW_END,        "grid-row-end")
 enum { CSS_PROP_LIST(CSS_ENUM_X) CSS_PROP_COUNT };
 
 /* ------------------------------------------------------------------ *
@@ -376,7 +411,8 @@ enum {
     CSS_VAL_INHERIT,
     CSS_VAL_INITIAL,
     CSS_VAL_BITS,       /* .kw is a bitmask (text-decoration)           */
-    CSS_VAL_UNSET       /* inherit if the property inherits, else initial */
+    CSS_VAL_UNSET,      /* inherit if the property inherits, else initial */
+    CSS_VAL_RAW_EXPR    /* .str: deferred var()/calc()/min/max/clamp/gradient/shadow/grid */
 };
 
 enum {
@@ -493,10 +529,18 @@ struct css_selector {
  * ------------------------------------------------------------------ */
 enum { CSS_ORIGIN_UA = 0, CSS_ORIGIN_USER, CSS_ORIGIN_AUTHOR, CSS_ORIGIN_INLINE };
 
+struct css_custom_decl {
+    const char *name;
+    const char *value;
+    uint8_t important;
+};
+
 struct css_rule {
     struct css_selector sel;
     const struct css_decl *decls;
     int ndecl;
+    const struct css_custom_decl *customs;
+    int ncustom;
     uint32_t order;      /* global source order, assigned by the caller */
     int16_t media;       /* index into the sheet's media blocks, or -1  */
     uint8_t origin;
@@ -509,6 +553,8 @@ struct css_media {
     int32_t dpi;         /* resolution, 96 unless the caller knows       */
     uint8_t screen;      /* 1 = "screen" (so "print" blocks are skipped) */
     uint8_t monochrome;
+    uint8_t prefers_dark;/* 1 when dark UI/color-scheme is active        */
+    uint8_t scripting;   /* 1 when scripting (JS) is enabled             */
 };
 
 struct css_stylesheet;
@@ -596,16 +642,36 @@ enum {
     CSS_LEN_PCT,       /* .v is thousandths of a percent                */
     CSS_LEN_NONE,      /* max-width: none                               */
     CSS_LEN_NORMAL,    /* line-height: normal                           */
-    CSS_LEN_NUMBER     /* line-height: 1.5, .v thousandths              */
+    CSS_LEN_NUMBER,    /* line-height: 1.5, .v thousandths              */
+    CSS_LEN_CALC       /* mixed % + px: .pct thousandths% + .v px       */
 };
 
 struct css_len {
     int32_t v;
+    int32_t pct;
     uint8_t type;
+};
+
+#define CSS_GRID_MAX_COLS   12
+#define CSS_GRAD_MAX_STOPS  4
+
+enum {
+    CSS_GRID_NONE = 0,
+    CSS_GRID_AUTO,
+    CSS_GRID_PX,
+    CSS_GRID_PCT,
+    CSS_GRID_FR
+};
+
+struct css_grid_track {
+    uint8_t kind;      /* CSS_GRID_*                                    */
+    int32_t val;       /* px, thousandths of %, or thousandths of fr    */
 };
 
 /* Side indices, in CSS shorthand order. */
 enum { CSS_TOP = 0, CSS_RIGHT = 1, CSS_BOTTOM = 2, CSS_LEFT = 3 };
+/* Corner indices for border-radius. */
+enum { CSS_TL = 0, CSS_TR = 1, CSS_BR = 2, CSS_BL = 3 };
 
 struct computed_style {
     uint8_t display, position, css_float, clear;
@@ -613,21 +679,29 @@ struct computed_style {
     uint8_t visibility, font_style, font_family, list_style_type;
     uint8_t list_style_position, border_collapse, text_transform;
     uint8_t text_decoration;             /* CSS_DECOR_* bitmask         */
-    uint8_t flex_direction, justify_content, align_items;
+    uint8_t flex_direction, flex_wrap, justify_content, align_items;
+    uint8_t box_sizing, color_scheme;
     uint8_t border_style[4];
     uint8_t z_auto;
+    uint8_t has_gradient, grad_nstops;
+    uint8_t has_shadow, shadow_inset;
+    uint8_t grid_ncols;
     uint16_t font_weight;                /* 100..900                    */
+    uint16_t opacity;                    /* 0..1000 (1000 = opaque)     */
 
     int32_t font_size;                   /* px, always resolved         */
     int32_t border_width[4];             /* px, 0 when style is none    */
+    int32_t border_radius[4];            /* px, TL/TR/BR/BL             */
     int32_t border_spacing;              /* px                          */
     int32_t z_index;
     int32_t vertical_align_px;           /* when vertical_align == LENGTH */
     int32_t flex_grow;                   /* unitless, thousandths        */
-    int32_t gap;                         /* px                           */
+    int32_t flex_shrink;                 /* unitless, thousandths (1000) */
+    int32_t gap, row_gap, column_gap;    /* px                           */
 
     struct css_len width, height;
     struct css_len min_width, max_width, min_height, max_height;
+    struct css_len flex_basis;
     struct css_len margin[4], padding[4];
     struct css_len offset[4];            /* top/right/bottom/left       */
     struct css_len line_height;
@@ -636,6 +710,18 @@ struct computed_style {
     uint32_t color;                      /* 0xAARRGGBB, always opaque   */
     uint32_t background_color;           /* alpha 0 means transparent   */
     uint32_t border_color[4];
+
+    int16_t  grad_angle_deg;             /* 180 = to bottom, 90 = right */
+    uint32_t grad_colors[CSS_GRAD_MAX_STOPS];
+    int16_t  grad_pos[CSS_GRAD_MAX_STOPS]; /* 0..1000                   */
+
+    int32_t  shadow_x, shadow_y, shadow_blur, shadow_spread;
+    uint32_t shadow_color;
+
+    struct css_grid_track grid_cols[CSS_GRID_MAX_COLS];
+    int16_t  grid_col_start, grid_col_end; /* 0 = auto, >0 line         */
+    uint8_t  grid_col_span, grid_row_span; /* default 1                 */
+    int16_t  grid_row_start, grid_row_end; /* 0 = auto, >0 line         */
 
     const char *background_image;        /* url, or 0                   */
     const char *font_family_name;        /* first named family, or 0    */

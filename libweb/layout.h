@@ -138,6 +138,9 @@ const char *lay_kind_name(int kind);
 #define LAYF_LAST_LINE   0x00040000u /* last line box of its block       */
 #define LAYF_BR          0x00080000u /* the fragment came from <br>      */
 #define LAYF_REPLACED    0x00100000u /* an image or other replaced box   */
+#define LAYF_STICKY      0x00200000u /* position: sticky                 */
+#define LAYF_FIXED_CTX   0x00400000u /* descendant of position: fixed    */
+#define LAYF_STICKY_CTX  0x00800000u /* descendant of position: sticky   */
 
 /* ------------------------------------------------------------------ *
  * Rectangles
@@ -281,6 +284,25 @@ static inline lay_rect lay_clip_rect(const struct lay_box *b)
     return lay_mkrect(b->clip_x, b->clip_y, b->clip_w, b->clip_h);
 }
 
+static inline lay_rect lay_paint_rect(const struct lay_box *b)
+{
+    lay_rect r = lay_border_rect(b);
+
+    if (b->style && b->style->has_shadow && !b->style->shadow_inset &&
+        CSS_COLOR_A(b->style->shadow_color)) {
+        int32_t blur = b->style->shadow_blur > 0 ? b->style->shadow_blur : 0;
+        int32_t sp = b->style->shadow_spread;
+        int32_t sx = r.x + b->style->shadow_x - sp - blur;
+        int32_t sy = r.y + b->style->shadow_y - sp - blur;
+        int32_t sw = r.w + 2 * (sp + blur);
+        int32_t sh = r.h + 2 * (sp + blur);
+
+        if (sw > 0 && sh > 0)
+            r = lay_rect_union(r, lay_mkrect(sx, sy, sw, sh));
+    }
+    return r;
+}
+
 /* ------------------------------------------------------------------ *
  * Options
  *
@@ -377,6 +399,18 @@ int lay_paint_order(const struct lay_document *L,
  * and every clip rectangle, or 0. */
 struct lay_box *lay_hit_test(const struct lay_document *L,
                              int32_t x, int32_t y);
+
+/* Topmost box at viewport-space point (vx, vy) when scrolled by
+ * (scroll_x, scroll_y). Handles position: fixed and position: sticky. */
+struct lay_box *lay_hit_test_view(const struct lay_document *L,
+                                  int32_t vx, int32_t vy,
+                                  int32_t scroll_x, int32_t scroll_y);
+
+/* Visual document-space offset (dx, dy) for a box at scroll (scroll_x,
+ * scroll_y) due to position: sticky ancestors (0, 0 otherwise). */
+void lay_sticky_offset(const struct lay_document *L, const struct lay_box *b,
+                       int32_t scroll_x, int32_t scroll_y,
+                       int32_t *dx, int32_t *dy);
 
 /* The DOM node behind that point - the nearest non-anonymous ancestor of
  * the hit box - or 0. */

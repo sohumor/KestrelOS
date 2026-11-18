@@ -852,8 +852,10 @@ static void unit_spawn(struct unit *u)
     if (u->ready[0])
         unlink_(u->ready);
 
-    if (u->out[0])
-        pid = spawn_io(u->exec, argv, 0, u->out, 1);
+    const char *in_path = (u->kind == K_SERVICE) ? "/dev/null" : 0;
+
+    if (in_path || u->out[0])
+        pid = spawn_io(u->exec, argv, in_path, u->out[0] ? u->out : 0, 1);
     else
         pid = spawn(u->exec, argv);
 

@@ -68,11 +68,16 @@ void css_style_initial(struct computed_style *cs)
     cs->text_transform = CSS_TEXTTRANSFORM_NONE;
     cs->text_decoration = CSS_DECOR_NONE;
     cs->flex_direction = CSS_FLEXDIR_ROW;
+    cs->flex_wrap = CSS_FLEXWRAP_NOWRAP;
     cs->justify_content = CSS_JUSTIFY_START;
     cs->align_items = CSS_ALIGN_STRETCH;
+    cs->box_sizing = CSS_BOXSIZING_CONTENT;
+    cs->color_scheme = CSS_COLORSCHEME_NORMAL;
     cs->font_weight = 400;
+    cs->opacity = 1000;
     cs->font_size = 16;
     cs->z_auto = 1;
+    cs->flex_shrink = 1000;
     cs->color = CSS_RGB(0, 0, 0);
     cs->background_color = CSS_TRANSPARENT;
     cs->width.type = CSS_LEN_AUTO;
@@ -81,8 +86,12 @@ void css_style_initial(struct computed_style *cs)
     cs->min_height.type = CSS_LEN_PX;
     cs->max_width.type = CSS_LEN_NONE;
     cs->max_height.type = CSS_LEN_NONE;
+    cs->flex_basis.type = CSS_LEN_AUTO;
     cs->line_height.type = CSS_LEN_NORMAL;
     cs->text_indent.type = CSS_LEN_PX;
+    cs->grad_angle_deg = 180;
+    cs->grid_col_span = 1;
+    cs->grid_row_span = 1;
     for (i = 0; i < 4; i++) {
         cs->margin[i].type = CSS_LEN_PX;
         cs->padding[i].type = CSS_LEN_PX;
@@ -90,6 +99,7 @@ void css_style_initial(struct computed_style *cs)
         cs->border_style[i] = CSS_BORDERSTYLE_NONE;
         cs->border_color[i] = CSS_RGB(0, 0, 0);
         cs->border_width[i] = 0;
+        cs->border_radius[i] = 0;
     }
 }
 #endif
@@ -2766,12 +2776,19 @@ static unsigned rnd(unsigned n)
 
 static struct css_len rnd_len(int allow_auto)
 {
-    switch (rnd(6)) {
+    struct css_len l;
+
+    switch (rnd(7)) {
     case 0: return allow_auto ? LAUTO() : LPX(0);
     case 1: return LPX((int32_t)rnd(400));
     case 2: return LPX(-(int32_t)rnd(80));
     case 3: return LPCT((int32_t)rnd(200));
-    case 4: return LPX((int32_t)rnd(100000));
+    case 4:
+        l.type = CSS_LEN_CALC;
+        l.pct = (int32_t)rnd(100000);
+        l.v = (int32_t)rnd(80) - 20;
+        return l;
+    case 5: return LPX((int32_t)rnd(100000));
     default: return LAUTO();
     }
 }
@@ -2795,12 +2812,37 @@ static void rnd_style(struct computed_style *cs)
     cs->border_collapse = (uint8_t)rnd(CSS_BORDERCOLLAPSE_COUNT);
     cs->text_transform = (uint8_t)rnd(CSS_TEXTTRANSFORM_COUNT);
     cs->text_decoration = (uint8_t)rnd(16);
+    cs->box_sizing = (uint8_t)rnd(CSS_BOXSIZING_COUNT);
+    cs->flex_direction = (uint8_t)rnd(CSS_FLEXDIR_COUNT);
+    cs->flex_wrap = (uint8_t)rnd(CSS_FLEXWRAP_COUNT);
+    cs->justify_content = (uint8_t)rnd(CSS_JUSTIFY_COUNT);
+    cs->align_items = (uint8_t)rnd(CSS_ALIGN_COUNT);
     cs->font_weight = (uint16_t)(100 * (1 + rnd(9)));
     cs->font_style = (uint8_t)rnd(CSS_FONTSTYLE_COUNT);
     cs->font_size = (int32_t)(1 + rnd(120));
     cs->border_spacing = (int32_t)rnd(12);
     cs->z_auto = (uint8_t)rnd(2);
     cs->z_index = (int32_t)rnd(20) - 10;
+    cs->opacity = rnd(3) ? 1000 : (uint16_t)rnd(1001);
+    cs->flex_grow = rnd(3) ? 0 : (int32_t)rnd(4000);
+    cs->flex_shrink = rnd(3) ? 1000 : (int32_t)rnd(3000);
+    cs->flex_basis = rnd_len(1);
+    cs->gap = rnd(3) ? 0 : (int32_t)rnd(20);
+    cs->row_gap = rnd(3) ? 0 : (int32_t)rnd(20);
+    cs->column_gap = rnd(3) ? 0 : (int32_t)rnd(20);
+    cs->grid_ncols = (uint8_t)(rnd(4) ? 0 : (1 + rnd(6)));
+    for (i = 0; i < cs->grid_ncols; i++) {
+        static const uint8_t gk[] = { CSS_GRID_AUTO, CSS_GRID_PX,
+                                      CSS_GRID_PCT, CSS_GRID_FR };
+        cs->grid_cols[i].kind = gk[rnd(4)];
+        cs->grid_cols[i].val = (cs->grid_cols[i].kind == CSS_GRID_FR ||
+                                cs->grid_cols[i].kind == CSS_GRID_PCT)
+            ? (int32_t)rnd(3000) : (int32_t)rnd(120);
+    }
+    cs->grid_col_start = rnd(4) ? 0 : (int16_t)(1 + rnd(5));
+    cs->grid_col_span = (uint8_t)(1 + rnd(3));
+    cs->grid_row_start = rnd(4) ? 0 : (int16_t)(1 + rnd(4));
+    cs->grid_row_span = (uint8_t)(1 + rnd(2));
     cs->width = rnd_len(1);
     cs->height = rnd_len(1);
     cs->min_width = rnd(3) ? LPX(0) : rnd_len(0);
@@ -2812,12 +2854,32 @@ static void rnd_style(struct computed_style *cs)
         cs->margin[i] = rnd(2) ? LPX((int32_t)rnd(60) - 20) : rnd_len(1);
         cs->padding[i] = rnd(2) ? LPX((int32_t)rnd(30)) : rnd_len(0);
         cs->border_width[i] = (int32_t)rnd(8);
+        cs->border_radius[i] = rnd(3) ? 0 : (int32_t)rnd(32);
         cs->border_style[i] = (uint8_t)rnd(CSS_BORDERSTYLE_COUNT);
         cs->border_color[i] = 0xFF000000u | rnd(0xFFFFFF);
         cs->offset[i] = rnd(2) ? LAUTO() : rnd_len(1);
     }
     cs->color = 0xFF000000u | rnd(0xFFFFFF);
     cs->background_color = rnd(2) ? 0 : (0xFF000000u | rnd(0xFFFFFF));
+    if (rnd(5) == 0) {
+        cs->has_gradient = 1;
+        cs->grad_nstops = (uint8_t)(1 + rnd(CSS_GRAD_MAX_STOPS));
+        cs->grad_angle_deg = (int16_t)(rnd(720) - 180);
+        for (i = 0; i < cs->grad_nstops; i++) {
+            cs->grad_colors[i] = 0xFF000000u | rnd(0xFFFFFF);
+            cs->grad_pos[i] = (int16_t)(i * 1000 /
+                (cs->grad_nstops > 1 ? cs->grad_nstops - 1 : 1));
+        }
+    }
+    if (rnd(5) == 0) {
+        cs->has_shadow = 1;
+        cs->shadow_inset = (uint8_t)rnd(2);
+        cs->shadow_x = (int32_t)rnd(15) - 7;
+        cs->shadow_y = (int32_t)rnd(15) - 7;
+        cs->shadow_blur = (int32_t)rnd(12);
+        cs->shadow_spread = (int32_t)rnd(9) - 4;
+        cs->shadow_color = (0x80u << 24) | rnd(0xFFFFFF);
+    }
 }
 
 static const char *const fuzz_words[] = {
@@ -3108,6 +3170,583 @@ static void test_performance(void)
     tfree(t);
 }
 
+static struct css_len LCALC(int32_t pct_th, int32_t px)
+{
+    struct css_len l;
+
+    l.v = px;
+    l.pct = pct_th;
+    l.type = CSS_LEN_CALC;
+    return l;
+}
+
+static void test_box_sizing_and_calc(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *bb = st_block(t), *ov = st_block(t);
+    struct computed_style *mm = st_block(t);
+    struct computed_style *ib = st_disp(t, CSS_DISPLAY_INLINE_BLOCK);
+    struct computed_style *fl = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *fi = st_block(t);
+    struct computed_style *c1 = st_block(t), *c2 = st_block(t);
+    struct computed_style *c3 = st_block(t), *c4 = st_block(t);
+    struct dom_node *d, *nb, *nov, *nmm, *nib, *nfl, *nfi, *nc1, *nc2, *nc3, *nc4;
+    struct lay_document *L;
+    struct lay_box *b;
+
+    GROUP("box-sizing border-box and CSS_LEN_CALC");
+
+    root->width = LPX(400);
+
+    bb->box_sizing = CSS_BOXSIZING_BORDER;
+    bb->width = LPX(200);
+    bb->height = LPX(100);
+    set_padding(bb, 10, 10, 10, 10);
+    set_border(bb, 5, 0xFF000000u);
+
+    ov->box_sizing = CSS_BOXSIZING_BORDER;
+    ov->width = LPX(16);
+    ov->height = LPX(12);
+    set_padding(ov, 15, 15, 15, 15);
+    set_border(ov, 5, 0xFF000000u);
+
+    mm->box_sizing = CSS_BOXSIZING_BORDER;
+    mm->width = LPX(200);
+    mm->max_width = LPX(160);
+    mm->height = LPX(30);
+    set_padding(mm, 5, 10, 5, 10);
+
+    ib->box_sizing = CSS_BOXSIZING_BORDER;
+    ib->width = LPX(120);
+    ib->height = LPX(40);
+    set_padding(ib, 4, 10, 4, 10);
+    set_border(ib, 2, 0xFF000000u);
+
+    fl->width = LPX(300);
+    fi->box_sizing = CSS_BOXSIZING_BORDER;
+    fi->width = LPX(120);
+    fi->height = LPX(50);
+    set_padding(fi, 5, 10, 5, 10);
+    set_border(fi, 5, 0xFF000000u);
+
+    c1->width = LCALC(50000, -20);
+    c1->height = LPX(10);
+
+    c2->box_sizing = CSS_BOXSIZING_BORDER;
+    c2->width = LCALC(25000, 10);
+    c2->height = LPX(20);
+    set_padding(c2, 0, 5, 0, 5);
+
+    c3->width = LPX(40);
+    c3->height = LCALC(50000, 10); /* indefinite % -> height falls back to content */
+
+    c4->width = LPX(40);
+    c4->height = LCALC(0, 50);     /* 0% + 50px -> definite 50px */
+
+    d = el(t, 0, "div", root);
+    nb = el(t, d, "div", bb);
+    nov = el(t, d, "div", ov);
+    nmm = el(t, d, "div", mm);
+    nib = el(t, d, "span", ib);
+    nfl = el(t, d, "div", fl);
+    nfi = el(t, nfl, "div", fi);
+    nc1 = el(t, d, "div", c1);
+    nc2 = el(t, d, "div", c2);
+    nc3 = el(t, d, "div", c3);
+    nc4 = el(t, d, "div", c4);
+
+    L = run(t, d, 500, 400);
+
+    b = lay_box_for_node(L, nb);
+    CHECK_EQ(lay_border_rect(b).w, 200);
+    CHECK_EQ(lay_border_rect(b).h, 100);
+    CHECK_EQ(b->w, 170);
+    CHECK_EQ(b->h, 70);
+
+    b = lay_box_for_node(L, nov);
+    CHECK_EQ(b->w, 0);
+    CHECK_EQ(b->h, 0);
+    CHECK_EQ(lay_border_rect(b).w, 40);
+
+    b = lay_box_for_node(L, nmm);
+    CHECK_EQ(lay_border_rect(b).w, 160);
+    CHECK_EQ(b->w, 140);
+
+    b = lay_box_for_node(L, nib);
+    CHECK_EQ(lay_border_rect(b).w, 120);
+    CHECK_EQ(b->w, 96);
+
+    b = lay_box_for_node(L, nfi);
+    CHECK_EQ(lay_border_rect(b).w, 120);
+    CHECK_EQ(b->w, 90);
+    CHECK_EQ(lay_border_rect(b).h, 50);
+    CHECK_EQ(b->h, 30);
+
+    CHECK_EQ(lay_box_for_node(L, nc1)->w, 180);
+    b = lay_box_for_node(L, nc2);
+    CHECK_EQ(lay_border_rect(b).w, 110);
+    CHECK_EQ(b->w, 100);
+    CHECK_EQ(lay_box_for_node(L, nc3)->h, 0);
+    CHECK_EQ(lay_box_for_node(L, nc4)->h, 50);
+
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_flex_complete(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *fw = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *s1 = st_block(t), *s2 = st_block(t), *s3 = st_block(t);
+    struct computed_style *fsh = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *sh1 = st_block(t), *sh2 = st_block(t);
+    struct computed_style *fbl = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *bl1 = st_block(t), *bl2 = st_block(t);
+    struct computed_style *fcw = st_disp(t, CSS_DISPLAY_FLEX);
+    struct computed_style *cw1 = st_block(t), *cw2 = st_block(t);
+    struct dom_node *root, *d, *na, *nb, *nc, *nd_sh, *ns1, *ns2;
+    struct dom_node *nd_bl, *nb1, *nb2, *nd_cw, *nc1, *nc2;
+    struct lay_document *L;
+    struct lay_box *pa, *pb, *pc, *pfw;
+
+    GROUP("flexbox: wrap, gaps, flex-basis, flex-shrink, baseline");
+
+    root = el(t, 0, "div", st_block(t));
+
+    /* A: flex-wrap: wrap with column-gap, row-gap, space-between */
+    fw->width = LPX(200);
+    fw->flex_wrap = CSS_FLEXWRAP_WRAP;
+    fw->column_gap = 10;
+    fw->row_gap = 20;
+    fw->justify_content = CSS_JUSTIFY_SPACE_BETWEEN;
+    fw->align_items = CSS_ALIGN_START;
+    s1->width = LPX(80);  s1->height = LPX(30);
+    s2->width = LPX(90);  s2->height = LPX(40);
+    s3->width = LPX(70);  s3->height = LPX(25);
+    d = el(t, root, "div", fw);
+    na = el(t, d, "div", s1);
+    nb = el(t, d, "div", s2);
+    nc = el(t, d, "div", s3);
+
+    /* C: weighted flex-shrink + flex-basis */
+    fsh->width = LPX(200);
+    fsh->flex_wrap = CSS_FLEXWRAP_NOWRAP;
+    sh1->flex_basis = LPX(150); sh1->flex_shrink = 1000; sh1->height = LPX(20);
+    sh2->flex_basis = LPX(150); sh2->flex_shrink = 2000; sh2->height = LPX(20);
+    nd_sh = el(t, root, "div", fsh);
+    ns1 = el(t, nd_sh, "div", sh1);
+    ns2 = el(t, nd_sh, "div", sh2);
+
+    /* D: align-items: baseline across different font sizes */
+    fbl->width = LPX(200);
+    fbl->align_items = CSS_ALIGN_BASELINE;
+    bl1->font_size = 12;
+    bl2->font_size = 32;
+    nd_bl = el(t, root, "div", fbl);
+    nb1 = el(t, nd_bl, "div", bl1);
+    txt(t, nb1, "hi");
+    nb2 = el(t, nd_bl, "div", bl2);
+    txt(t, nb2, "HI");
+
+    /* E: column flex-wrap with gaps */
+    fcw->width = LPX(150);
+    fcw->height = LPX(100);
+    fcw->flex_direction = CSS_FLEXDIR_COLUMN;
+    fcw->flex_wrap = CSS_FLEXWRAP_WRAP;
+    fcw->align_items = CSS_ALIGN_START;
+    fcw->row_gap = 10;
+    fcw->column_gap = 15;
+    cw1->width = LPX(40); cw1->height = LPX(60);
+    cw2->width = LPX(40); cw2->height = LPX(60);
+    nd_cw = el(t, root, "div", fcw);
+    nc1 = el(t, nd_cw, "div", cw1);
+    nc2 = el(t, nd_cw, "div", cw2);
+
+    L = run(t, root, 400, 400);
+
+    pfw = lay_box_for_node(L, d);
+    pa = lay_box_for_node(L, na);
+    pb = lay_box_for_node(L, nb);
+    pc = lay_box_for_node(L, nc);
+    CHECK_EQ(pa->x, 0);
+    CHECK_EQ(pa->y, 0);
+    CHECK_EQ(pb->x, 110);
+    CHECK_EQ(pb->y, 0);
+    CHECK_EQ(pc->x, 0);
+    CHECK_EQ(pc->y, 60);
+    CHECK_EQ(pfw->h, 85);
+
+    CHECK_EQ(lay_box_for_node(L, ns1)->w, 117);
+    CHECK_EQ(lay_box_for_node(L, ns2)->w, 83);
+
+    {
+        struct lay_box *lb1 = lay_box_for_node(L, nb1);
+        struct lay_box *lb2 = lay_box_for_node(L, nb2);
+
+        CHECK(lb1->y > lb2->y);
+    }
+
+    CHECK_EQ(lay_box_for_node(L, nc1)->x, 0);
+    CHECK_EQ(lay_box_for_node(L, nc1)->y, lay_box_for_node(L, nd_cw)->y);
+    CHECK_EQ(lay_box_for_node(L, nc2)->x, 55);
+    CHECK_EQ(lay_box_for_node(L, nc2)->y, lay_box_for_node(L, nc1)->y);
+    lay_free(L);
+
+    /* B: flex-wrap: wrap-reverse puts line 2 above line 1 */
+    fw->flex_wrap = CSS_FLEXWRAP_WRAP_REVERSE;
+    L = run(t, root, 400, 400);
+    pa = lay_box_for_node(L, na);
+    pb = lay_box_for_node(L, nb);
+    pc = lay_box_for_node(L, nc);
+    CHECK_EQ(pc->y, 0);
+    CHECK_EQ(pa->y, 45);
+    CHECK_EQ(pb->y, 45);
+
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_grid(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *g1 = st_disp(t, CSS_DISPLAY_GRID);
+    struct computed_style *c0 = st_block(t), *c1 = st_block(t);
+    struct computed_style *c2 = st_block(t), *c3 = st_block(t);
+    struct computed_style *g2 = st_disp(t, CSS_DISPLAY_INLINE_GRID);
+    struct computed_style *a0 = st_block(t), *a1 = st_block(t);
+    struct computed_style *g3 = st_disp(t, CSS_DISPLAY_GRID);
+    struct computed_style *s0 = st_block(t), *s1 = st_block(t);
+    struct dom_node *d, *ng1, *n0, *n1, *n2, *n3, *ng2, *na0, *na1, *ng3, *ns0, *ns1;
+    struct lay_document *L;
+    struct lay_box *b;
+
+    GROUP("css grid: tracks, span, placement, auto, inline-grid");
+
+    root->width = LPX(400);
+
+    g1->width = LPX(320);
+    g1->grid_ncols = 3;
+    g1->grid_cols[0].kind = CSS_GRID_PX;  g1->grid_cols[0].val = 60;
+    g1->grid_cols[1].kind = CSS_GRID_FR;  g1->grid_cols[1].val = 1000;
+    g1->grid_cols[2].kind = CSS_GRID_FR;  g1->grid_cols[2].val = 2000;
+    g1->column_gap = 10;
+    g1->row_gap = 15;
+    g1->align_items = CSS_ALIGN_START;
+
+    c0->height = LPX(30);
+    c1->grid_col_span = 2; c1->height = LPX(20);
+    c2->height = LPX(50); c2->box_sizing = CSS_BOXSIZING_BORDER;
+    set_padding(c2, 5, 5, 5, 5);
+    c3->grid_col_start = 3; c3->height = LPX(25);
+
+    g2->grid_ncols = 2;
+    g2->grid_cols[0].kind = CSS_GRID_AUTO;
+    g2->grid_cols[1].kind = CSS_GRID_AUTO;
+    g2->column_gap = 10;
+    g2->align_items = CSS_ALIGN_CENTER;
+    a0->width = LPX(50); a0->height = LPX(40);
+    a1->width = LPX(70); a1->height = LPX(20);
+
+    g3->width = LPX(200);
+    g3->grid_ncols = 0; /* defaults to 1fr */
+    g3->row_gap = 10;
+    s0->height = LPX(25);
+    s1->height = LPX(25);
+
+    d = el(t, 0, "div", root);
+    ng1 = el(t, d, "div", g1);
+    n0 = el(t, ng1, "div", c0);
+    n1 = el(t, ng1, "div", c1);
+    n2 = el(t, ng1, "div", c2);
+    n3 = el(t, ng1, "div", c3);
+
+    ng2 = el(t, d, "div", g2);
+    na0 = el(t, ng2, "div", a0);
+    na1 = el(t, ng2, "div", a1);
+
+    ng3 = el(t, d, "div", g3);
+    ns0 = el(t, ng3, "div", s0);
+    ns1 = el(t, ng3, "div", s1);
+
+    L = run(t, d, 500, 400);
+
+    CHECK_EQ(lay_box_for_node(L, ng1)->h, 95);
+    CHECK_EQ(lay_box_for_node(L, n0)->x, 0);
+    CHECK_EQ(lay_box_for_node(L, n0)->w, 60);
+    CHECK_EQ(lay_box_for_node(L, n1)->x, 70);
+    CHECK_EQ(lay_box_for_node(L, n1)->w, 250);
+    b = lay_box_for_node(L, n2);
+    CHECK_EQ(b->x, 5);
+    CHECK_EQ(b->y, 50);
+    CHECK_EQ(b->w, 50);
+    CHECK_EQ(lay_border_rect(b).w, 60);
+    CHECK_EQ(lay_border_rect(b).h, 50);
+    CHECK_EQ(lay_box_for_node(L, n3)->x, 160);
+    CHECK_EQ(lay_box_for_node(L, n3)->w, 160);
+
+    CHECK_EQ(lay_box_for_node(L, ng2)->w, 130);
+    CHECK_EQ(lay_box_for_node(L, ng2)->h, 40);
+    CHECK_EQ(lay_box_for_node(L, na0)->w, 50);
+    CHECK_EQ(lay_box_for_node(L, na1)->x, 60);
+    CHECK_EQ(lay_box_for_node(L, na1)->y - lay_box_for_node(L, na0)->y, 10);
+
+    CHECK_EQ(lay_box_for_node(L, ng3)->h, 60);
+    CHECK_EQ(lay_box_for_node(L, ns0)->w, 200);
+    CHECK_EQ(lay_box_for_node(L, ns1)->y - lay_box_for_node(L, ns0)->y, 35);
+
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_fixed_and_sticky_paint_hit(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *fix = st_block(t);
+    struct computed_style *sec = st_block(t);
+    struct computed_style *sp = st_block(t), *stk = st_block(t);
+    struct dom_node *d, *nfix, *nsec, *nstk;
+    struct lay_document *L;
+    struct paint_target tg = mk_target(200, 100);
+    struct paint_opts o;
+
+    GROUP("position fixed and sticky under scroll and hit-testing");
+
+    root->width = LPX(200);
+    root->height = LPX(400);
+    root->overflow = CSS_OVERFLOW_HIDDEN;
+    root->background_color = CSS_RGB(0xFF, 0xFF, 0xFF);
+
+    fix->position = CSS_POSITION_FIXED;
+    fix->offset[CSS_LEFT] = LPX(10);
+    fix->offset[CSS_TOP] = LPX(10);
+    fix->width = LPX(40);
+    fix->height = LPX(20);
+    fix->background_color = CSS_RGB(0xFF, 0x00, 0x00);
+
+    sec->width = LPX(100);
+    sec->height = LPX(200);
+    set_margin(sec, 20, 0, 0, 70);
+
+    sp->height = LPX(40);
+
+    stk->position = CSS_POSITION_STICKY;
+    stk->offset[CSS_TOP] = LPX(5);
+    stk->width = LPX(50);
+    stk->height = LPX(20);
+    stk->background_color = CSS_RGB(0x00, 0xFF, 0x00);
+
+    d = el(t, 0, "div", root);
+    nfix = el(t, d, "div", fix);
+    nsec = el(t, d, "div", sec);
+    (void)el(t, nsec, "div", sp);
+    nstk = el(t, nsec, "div", stk);
+
+    L = run(t, d, 200, 100);
+    paint_opts_init(&o);
+    o.canvas = CSS_RGB(0xFF, 0xFF, 0xFF);
+
+    o.scroll_y = 0;
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 100), &o, 0);
+    CHECK_EQ(px_at(&tg, 20, 20), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 90, 70), 0x00FF00);
+    CHECK_EQ(px_at(&tg, 90, 10), 0xFFFFFF);
+
+    /* Scrolled: fixed stays anchored, sticky sticks at viewport y = 5..25 */
+    o.scroll_y = 100;
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 100), &o, 0);
+    CHECK_EQ(px_at(&tg, 20, 20), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 90, 10), 0x00FF00);
+    CHECK(lay_hit_test_view(L, 20, 20, 0, 100) == lay_box_for_node(L, nfix));
+    CHECK(lay_hit_test_view(L, 90, 10, 0, 100) == lay_box_for_node(L, nstk));
+
+    /* Scrolled past bottom of containing section (220 - 20 = 200): clamps */
+    o.scroll_y = 210;
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 100), &o, 0);
+    CHECK_EQ(px_at(&tg, 20, 20), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 90, 5), 0x00FF00);
+    CHECK_EQ(px_at(&tg, 90, 15), 0xFFFFFF);
+
+    /* Section completely off-screen: sticky gone, fixed still visible */
+    o.scroll_y = 250;
+    lay_paint(L, &tg, lay_mkrect(0, 0, 200, 100), &o, 0);
+    CHECK_EQ(px_at(&tg, 20, 20), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 90, 5), 0xFFFFFF);
+
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_paint_modern_effects(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *rr = st_block(t), *rrc = st_block(t);
+    struct computed_style *gr = st_block(t), *sh = st_block(t);
+    struct computed_style *op = st_block(t);
+    struct dom_node *d, *nrr, *nsh;
+    struct lay_document *L;
+    struct paint_target tg = mk_target(120, 120);
+    struct paint_opts o;
+    uint32_t px;
+
+    GROUP("paint: AA border-radius, linear-gradient, box-shadow, opacity");
+
+    root->width = LPX(120);
+    root->height = LPX(120);
+    root->position = CSS_POSITION_RELATIVE;
+
+    /* 1. Rounded box + overflow: hidden clips corner of blue child */
+    rr->position = CSS_POSITION_ABSOLUTE;
+    rr->offset[CSS_LEFT] = LPX(10); rr->offset[CSS_TOP] = LPX(10);
+    rr->width = LPX(40); rr->height = LPX(40);
+    rr->border_radius[0] = rr->border_radius[1] =
+        rr->border_radius[2] = rr->border_radius[3] = 12;
+    rr->overflow = CSS_OVERFLOW_HIDDEN;
+    rr->background_color = CSS_RGB(0xFF, 0x00, 0x00);
+    rrc->width = LPX(40); rrc->height = LPX(40);
+    rrc->background_color = CSS_RGB(0x00, 0x00, 0xFF);
+
+    /* 2. Linear gradient 90deg (left blue -> right red) */
+    gr->position = CSS_POSITION_ABSOLUTE;
+    gr->offset[CSS_LEFT] = LPX(60); gr->offset[CSS_TOP] = LPX(10);
+    gr->width = LPX(40); gr->height = LPX(40);
+    gr->has_gradient = 1;
+    gr->grad_nstops = 2;
+    gr->grad_angle_deg = 90;
+    gr->grad_colors[0] = CSS_RGB(0x00, 0x00, 0xFF);
+    gr->grad_pos[0] = 0;
+    gr->grad_colors[1] = CSS_RGB(0xFF, 0x00, 0x00);
+    gr->grad_pos[1] = 1000;
+
+    /* 3. Drop shadow */
+    sh->position = CSS_POSITION_ABSOLUTE;
+    sh->offset[CSS_LEFT] = LPX(20); sh->offset[CSS_TOP] = LPX(70);
+    sh->width = LPX(30); sh->height = LPX(20);
+    sh->background_color = CSS_RGB(0xFF, 0xFF, 0xFF);
+    sh->has_shadow = 1;
+    sh->shadow_x = 6;
+    sh->shadow_y = 6;
+    sh->shadow_blur = 6;
+    sh->shadow_color = CSS_RGB(0x00, 0x00, 0x00);
+
+    /* 4. Opacity 50% */
+    op->position = CSS_POSITION_ABSOLUTE;
+    op->offset[CSS_LEFT] = LPX(70); op->offset[CSS_TOP] = LPX(70);
+    op->width = LPX(30); op->height = LPX(20);
+    op->opacity = 500;
+    op->background_color = CSS_RGB(0x00, 0x00, 0x00);
+
+    d = el(t, 0, "div", root);
+    nrr = el(t, d, "div", rr);
+    (void)el(t, nrr, "div", rrc);
+    (void)el(t, d, "div", gr);
+    nsh = el(t, d, "div", sh);
+    (void)el(t, d, "div", op);
+
+    L = run(t, d, 120, 120);
+    paint_opts_init(&o);
+    o.canvas = CSS_RGB(0xFF, 0xFF, 0xFF);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 120, 120), &o, 0);
+
+    CHECK_EQ(px_at(&tg, 10, 10), 0xFFFFFF);
+    CHECK_EQ(px_at(&tg, 30, 30), 0x0000FF);
+
+    px = px_at(&tg, 62, 30);
+    CHECK((px & 0xFF) > 200 && ((px >> 16) & 0xFF) < 50);
+    px = px_at(&tg, 98, 30);
+    CHECK(((px >> 16) & 0xFF) > 200 && (px & 0xFF) < 50);
+
+    CHECK(lay_paint_rect(lay_box_for_node(L, nsh)).w >
+          lay_border_rect(lay_box_for_node(L, nsh)).w);
+    CHECK(px_at(&tg, 40, 92) < 0xFFFFFFu);
+    CHECK_EQ(px_at(&tg, 5, 70), 0xFFFFFF);
+
+    px = px_at(&tg, 85, 80);
+    CHECK((px & 0xFF) >= 110 && (px & 0xFF) <= 145);
+
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
+}
+
+static void test_paint_svg_modern(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *cs = st_block(t);
+    struct dom_node *svg, *hole, *smooth, *quad, *svg_none, *nr;
+    struct lay_document *L;
+    struct paint_target tg;
+    struct paint_opts o;
+
+    GROUP("paint: modern SVG subpaths, S/T beziers, currentColor, aspect");
+
+    cs->color = CSS_RGB(0x00, 0xAA, 0x44);
+
+    svg = el(t, 0, "svg", cs);
+    dom_set_attr(svg, "width", "100");
+    dom_set_attr(svg, "height", "80");
+
+    /* Compound even-odd square with center cutout filled via currentColor */
+    hole = el(t, svg, "path", cs);
+    dom_set_attr(hole, "d",
+                 "M 10 10 L 50 10 L 50 50 L 10 50 Z "
+                 "M 20 20 L 20 40 L 40 40 L 40 20 Z");
+    dom_set_attr(hole, "fill", "currentColor");
+
+    /* Smooth cubic S curve stroked in currentColor */
+    smooth = el(t, svg, "path", cs);
+    dom_set_attr(smooth, "d", "M 60 20 C 70 5 80 5 82 25 S 95 40 95 20");
+    dom_set_attr(smooth, "fill", "none");
+    dom_set_attr(smooth, "stroke", "currentColor");
+    dom_set_attr(smooth, "stroke-width", "2");
+
+    /* Smooth quadratic T curve */
+    quad = el(t, svg, "path", cs);
+    dom_set_attr(quad, "d", "M 60 60 Q 70 45 80 60 T 95 60");
+    dom_set_attr(quad, "fill", "none");
+    dom_set_attr(quad, "stroke", "#FF0000");
+    dom_set_attr(quad, "stroke-width", "2");
+
+    L = run(t, svg, 100, 80);
+    tg = mk_target(100, 80);
+    paint_opts_init(&o);
+    o.canvas = CSS_RGB(0xFF, 0xFF, 0xFF);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 100, 80), &o, 0);
+
+    CHECK_EQ(px_at(&tg, 15, 15), 0x00AA44);
+    CHECK_EQ(px_at(&tg, 30, 30), 0xFFFFFF);
+    CHECK_EQ(px_at(&tg, 95, 20), 0x00AA44);
+    CHECK(count_color(&tg, 0xFF0000) > 10);
+
+    free(tg.px);
+    lay_free(L);
+
+    /* preserveAspectRatio="none" stretches 200x100 viewBox across 100x100 */
+    svg_none = el(t, 0, "svg", cs);
+    dom_set_attr(svg_none, "width", "100");
+    dom_set_attr(svg_none, "height", "100");
+    dom_set_attr(svg_none, "viewBox", "0 0 200 100");
+    dom_set_attr(svg_none, "preserveAspectRatio", "none");
+    nr = el(t, svg_none, "rect", cs);
+    dom_set_attr(nr, "width", "200");
+    dom_set_attr(nr, "height", "100");
+    dom_set_attr(nr, "fill", "#FF0000");
+
+    L = run(t, svg_none, 100, 100);
+    tg = mk_target(100, 100);
+    lay_paint(L, &tg, lay_mkrect(0, 0, 100, 100), &o, 0);
+    CHECK_EQ(px_at(&tg, 50, 10), 0xFF0000);
+    CHECK_EQ(px_at(&tg, 50, 90), 0xFF0000);
+
+    free(tg.px);
+    lay_free(L);
+    tfree(t);
+}
+
 /* ================================================================== *
  * main
  * ================================================================== */
@@ -3206,6 +3845,13 @@ int main(int argc, char **argv)
     test_paint_clip();
     test_paint_text_and_scroll();
     test_paint_selection_caret();
+
+    test_box_sizing_and_calc();
+    test_flex_complete();
+    test_grid();
+    test_fixed_and_sticky_paint_hit();
+    test_paint_modern_effects();
+    test_paint_svg_modern();
 
     render_pages();
     test_pathological();

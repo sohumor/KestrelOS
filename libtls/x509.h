@@ -16,11 +16,12 @@
  * docs/BROWSER-PLAN.md as part of the honest ceiling.
  *
  * Space, measured rather than guessed, because the user stack is 64 KiB:
- * a struct x509_cert is 768 bytes, so a full ten-certificate chain is
- * 7.7 KiB; the deepest call inside verification (chain -> signature ->
- * PKCS#1 -> public op -> modexp -> Montgomery) uses about 14 KiB. A
- * struct x509_store is 49 KiB and must live on the heap or in static
- * storage.
+ * with X509_MAX_SAN == 128 a struct x509_cert is ~2.5 KiB, so certificate
+ * chains (X509_MAX_CHAIN == 12, ~30 KiB) are heap-allocated in tls.c and
+ * never placed on the stack; the deepest call inside verification (chain ->
+ * signature -> PKCS#1 -> public op -> modexp -> Montgomery) uses about
+ * 14 KiB. A struct x509_store is ~164 KiB and must live on the heap or in
+ * static storage.
  */
 
 #include <stdint.h>
@@ -131,8 +132,8 @@ int  pem_next(struct pem_iter *it, char *label, size_t label_cap,
 /* ================================================================== */
 
 #define X509_MAX_CN     128
-#define X509_MAX_SAN    16
-#define X509_MAX_CHAIN  10
+#define X509_MAX_SAN    128
+#define X509_MAX_CHAIN  12
 #define X509_STORE_MAX  64
 #define X509_ERR_LEN    192
 #define X509_MIN_RSA_BITS 2048
@@ -214,6 +215,9 @@ struct x509_cert {
     uint32_t       eku;
     int            n_san;
     struct x509_san san[X509_MAX_SAN];
+    int            san_overflow;/* non-zero if cert carried > X509_MAX_SAN */
+    const uint8_t *san_raw;     /* raw SAN extension value for overflow scan */
+    size_t         san_raw_len;
 
     int            unknown_critical;   /* a critical extension we do not know */
     char           unknown_critical_oid[64];
@@ -235,7 +239,7 @@ struct x509_store {
     uint8_t         *owned[X509_STORE_MAX];   /* malloc'ed copies of the DER */
 };
 
-/* A store is 49 KiB. Put it on the heap or in static storage, never on
+/* A store is ~164 KiB. Put it on the heap or in static storage, never on
  * the 64 KiB user stack. */
 void x509_store_init(struct x509_store *s);
 int  x509_store_add_der(struct x509_store *s, const uint8_t *der, size_t len);

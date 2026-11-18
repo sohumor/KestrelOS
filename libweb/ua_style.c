@@ -127,6 +127,11 @@ static const char ua_css[] =
 "  nav, aside, form { display: none }\n"
 "}\n"
 
+/* ---- noscript hides when scripting is enabled ---- */
+"@media (scripting: enabled) {\n"
+"  noscript { display: none !important }\n"
+"}\n"
+
 /* ---- hidden regardless ---- */
 "[hidden] { display: none }\n"
 "[disabled] { color: #808080 }\n";

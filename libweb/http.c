@@ -88,20 +88,6 @@ static int ci_prefix(const char *s, const char *pfx)
     return 1;
 }
 
-/* Case-insensitive substring, for comma lists like Cache-Control. */
-static const char *ci_str(const char *hay, const char *needle)
-{
-    unsigned long n = strlen(needle);
-
-    if (n == 0)
-        return hay;
-    for (; *hay; hay++)
-        if (ci_prefix(hay, needle))
-            return hay;
-    (void)n;
-    return 0;
-}
-
 static unsigned long parse_ul(const char *s, int *ok)
 {
     unsigned long v = 0;
@@ -396,6 +382,12 @@ int http_tcp_transport(const char *host, int port, int timeout_ms,
 
 struct hconn {
     char origin[URL_HOST_MAX + 32];
+    char scheme[URL_SCHEME_MAX];
+    char host[URL_HOST_MAX];
+    int port;
+    int is_tls;
+    http_transport_fn factory;
+    void *factory_user;
     struct http_transport t;
     unsigned char buf[HTTP_RXBUF];
     int pos, len;
@@ -424,6 +416,12 @@ static void hc_shutdown(struct hconn *c)
     c->eof = 0;
     c->broken = 0;
     c->origin[0] = '\0';
+    c->scheme[0] = '\0';
+    c->host[0] = '\0';
+    c->port = 0;
+    c->is_tls = 0;
+    c->factory = 0;
+    c->factory_user = 0;
 }
 
 /* Arm the transport's read deadline. */
@@ -549,7 +547,10 @@ static int hc_send(struct hconn *c, const void *buf, unsigned long len,
 
 /* ---- connection pool -------------------------------------------------- */
 
-static struct hconn *pool_take(struct http_client *c, const char *origin)
+static struct hconn *pool_take(struct http_client *c, const char *origin,
+                               const char *scheme, const char *host, int port,
+                               int is_tls, http_transport_fn factory,
+                               void *factory_user)
 {
     int i;
     unsigned long now = now_ms();
@@ -563,6 +564,10 @@ static struct hconn *pool_take(struct http_client *c, const char *origin)
     for (i = 0; i < HTTP_POOL_MAX; i++) {
         struct hconn *e = &c->pool[i];
         if (e->open && e->pooled && !e->broken && !e->eof &&
+            e->pos == e->len &&
+            e->is_tls == is_tls && e->port == port &&
+            e->factory == factory && e->factory_user == factory_user &&
+            ci_eq(e->scheme, scheme) && ci_eq(e->host, host) &&
             strcmp(e->origin, origin) == 0) {
             e->pooled = 0;
             return e;
@@ -812,6 +817,17 @@ static int read_body_chunked(struct hconn *c, wire_sink fn, void *u,
         size = parse_hex(line, &ok);
         if (!ok)
             return HTTP_E_PROTO;
+        {
+            const char *p = line;
+            while (h_digit((unsigned char)*p) ||
+                   (h_lower((unsigned char)*p) >= 'a' &&
+                    h_lower((unsigned char)*p) <= 'f'))
+                p++;
+            while (*p && h_space((unsigned char)*p))
+                p++;
+            if (*p != '\0' && *p != ';')
+                return HTTP_E_PROTO;
+        }
         if (++chunks > 1000000UL)
             return HTTP_E_TOOBIG;
         if (size == 0)
@@ -842,6 +858,8 @@ static int read_body_chunked(struct hconn *c, wire_sink fn, void *u,
             return (int)ln;
         if (ln == 0)
             break;
+        if (strchr(line, ':') == 0)
+            return HTTP_E_PROTO;
         if (raw && raw->len + (unsigned long)ln + 1 < raw->max) {
             hb_add(raw, line, (unsigned long)ln);
             hb_add(raw, "\n", 1);
@@ -1180,12 +1198,11 @@ static int read_head(struct hconn *conn, struct exch *e,
             return (int)ln;
         if (ln == 0)
             continue;                    /* tolerate a stray leading CRLF */
-        if (!ci_prefix(line, "HTTP/1."))
+        if (!ci_prefix(line, "HTTP/1.") || line[7] < '0' || line[7] > '9' ||
+            line[8] != ' ')
             return HTTP_E_PROTO;
         res->http_minor = line[7] == '0' ? 0 : 1;
-        sp = strchr(line, ' ');
-        if (sp == 0)
-            return HTTP_E_PROTO;
+        sp = line + 8;
         while (*sp == ' ')
             sp++;
         code = (int)parse_ul(sp, &ok);
@@ -1200,8 +1217,9 @@ static int read_head(struct hconn *conn, struct exch *e,
                 r++;
             free(res->reason);
             res->reason = malloc(strlen(r) + 1);
-            if (res->reason)
-                strcpy(res->reason, r);
+            if (res->reason == 0)
+                return HTTP_E_NOMEM;
+            strcpy(res->reason, r);
         }
 
         hb_free(&e->raw);
@@ -1251,26 +1269,70 @@ struct framing {
     int determinate;
 };
 
+static int header_has_token(const struct http_response *res, const char *hdr,
+                            const char *tok)
+{
+    int i;
+    unsigned long tl = strlen(tok);
+
+    for (i = 0;; i++) {
+        const char *v = http_header_nth(res, hdr, i);
+        const char *p;
+        if (v == 0)
+            break;
+        p = v;
+        while (*p) {
+            const char *end;
+            while (*p && (h_space((unsigned char)*p) || *p == ','))
+                p++;
+            if (*p == '\0')
+                break;
+            end = p;
+            while (*end && *end != ',' && !h_space((unsigned char)*end))
+                end++;
+            if ((unsigned long)(end - p) == tl && ci_prefix(p, tok))
+                return 1;
+            while (*end && *end != ',')
+                end++;
+            p = *end == ',' ? end + 1 : end;
+        }
+    }
+    return 0;
+}
+
 static int decide_framing(struct http_response *res, struct exch *e,
                           struct framing *f)
 {
     const char *te;
+    const char *last_tok = 0;
+    unsigned long last_len = 0;
+    int seen_te = 0;
     int i;
 
     memset(f, 0, sizeof(*f));
     f->determinate = 1;
 
-    te = http_header_get(res, "Transfer-Encoding");
-    if (te) {
-        const char *last = te;
-        const char *comma = te;
-        while ((comma = strchr(comma, ',')) != 0) {
-            last = comma + 1;
-            comma++;
+    for (i = 0; (te = http_header_nth(res, "Transfer-Encoding", i)) != 0; i++) {
+        const char *p = te;
+        seen_te = 1;
+        while (*p) {
+            const char *end;
+            while (*p && (h_space((unsigned char)*p) || *p == ','))
+                p++;
+            if (*p == '\0')
+                break;
+            end = p;
+            while (*end && *end != ',' && !h_space((unsigned char)*end))
+                end++;
+            last_tok = p;
+            last_len = (unsigned long)(end - p);
+            while (*end && *end != ',')
+                end++;
+            p = *end == ',' ? end + 1 : end;
         }
-        while (*last && h_space((unsigned char)*last))
-            last++;
-        if (ci_prefix(last, "chunked"))
+    }
+    if (seen_te) {
+        if (last_tok && last_len == 7 && ci_prefix(last_tok, "chunked"))
             f->chunked = 1;
         else
             f->determinate = 0;          /* unknown coding: read to close */
@@ -1315,19 +1377,24 @@ static int decide_framing(struct http_response *res, struct exch *e,
 static int should_keep_alive(struct http_response *res, struct framing *f,
                              const struct http_request *req)
 {
-    const char *conn = http_header_get(res, "Connection");
-
     if (req->flags & HTTP_F_NO_KEEPALIVE)
         return 0;
     if (!f->determinate)
         return 0;
-    if (conn) {
-        if (ci_str(conn, "close"))
-            return 0;
-        if (res->http_minor == 0 && ci_str(conn, "keep-alive"))
-            return 1;
-    }
+    if (res->status == 101)
+        return 0;
+    if (f->chunked && http_header_get(res, "Content-Length") != 0)
+        return 0;
+    if (header_has_token(res, "Connection", "close"))
+        return 0;
+    if (res->http_minor == 0)
+        return header_has_token(res, "Connection", "keep-alive");
     return res->http_minor >= 1;
+}
+
+static int is_idempotent_retryable(const char *method)
+{
+    return ci_eq(method, "GET") || ci_eq(method, "HEAD");
 }
 
 /* ---- the exchange ----------------------------------------------------- */
@@ -1336,12 +1403,13 @@ static int exchange(struct http_client *c, struct exch *e,
                     struct http_response *res)
 {
     char origin[URL_HOST_MAX + 32];
+    struct scheme_ent *se;
     struct hconn *conn = 0;
     struct hbuf head;
     struct hbuf coded;
     struct framing f;
     char *line = 0;
-    int rc = HTTP_OK, attempt, ncod = 0;
+    int rc = HTTP_OK, attempt, ncod = 0, port, is_tls;
     int codings[3] = { 0, 0, 0 };
     unsigned long deadline;
     int connect_ms = e->req->connect_timeout_ms > 0
@@ -1353,6 +1421,11 @@ static int exchange(struct http_client *c, struct exch *e,
 
     if (url_origin(e->u, origin, sizeof(origin)) != URL_OK)
         return HTTP_E_URL;
+    se = scheme_find(e->u->scheme);
+    if (se == 0)
+        return HTTP_E_SCHEME;
+    port = url_effective_port(e->u);
+    is_tls = ci_eq(e->u->scheme, "https");
 
     hb_init(&head, REQ_HEAD_MAX);
     rc = build_request(c, e, &head);
@@ -1367,37 +1440,43 @@ static int exchange(struct http_client *c, struct exch *e,
     }
 
     /* Two attempts: a pooled connection the server closed while idle is a
-     * normal race, so a request that fails on a reused socket is retried
-     * once on a fresh one. A fresh connection is never retried. */
+     * normal race, so an idempotent request that fails on send or sees
+     * EOF before any response bytes on a reused socket is retried once on
+     * a fresh one. A fresh connection is never retried. */
     for (attempt = 0; attempt < 2; attempt++) {
         int reused = 0;
+        unsigned long rx_before;
 
-        conn = pool_take(c, origin);
+        conn = pool_take(c, origin, e->u->scheme, e->u->host, port, is_tls,
+                         se->fn, se->user);
         if (conn) {
             reused = 1;
         } else {
-            struct scheme_ent *se = scheme_find(e->u->scheme);
-            if (se == 0) {
-                rc = HTTP_E_SCHEME;
-                goto done;
-            }
             conn = pool_slot(c);
             if (conn == 0) {
                 rc = HTTP_E_CONNECT;
                 goto done;
             }
             memset(conn, 0, sizeof(*conn));
-            rc = se->fn(e->u->host, url_effective_port(e->u), connect_ms,
-                        se->user, &conn->t);
-            if (rc != HTTP_OK)
+            rc = se->fn(e->u->host, port, connect_ms, se->user, &conn->t);
+            if (rc != HTTP_OK) {
+                conn = 0;
                 goto done;
+            }
             conn->open = 1;
             snprintf(conn->origin, sizeof(conn->origin), "%s", origin);
+            snprintf(conn->scheme, sizeof(conn->scheme), "%s", e->u->scheme);
+            snprintf(conn->host, sizeof(conn->host), "%s", e->u->host);
+            conn->port = port;
+            conn->is_tls = is_tls;
+            conn->factory = se->fn;
+            conn->factory_user = se->user;
             c->st.connections++;
         }
         if (reused)
             c->st.reused++;
 
+        rx_before = c->st.bytes_in;
         deadline = now_ms() + (unsigned long)head_ms;
         rc = hc_send(conn, head.p, head.len, c);
         if (rc == HTTP_OK && e->req->body && e->req->body_len > 0)
@@ -1408,10 +1487,17 @@ static int exchange(struct http_client *c, struct exch *e,
         if (rc == HTTP_OK)
             break;
         hc_shutdown(conn);
+        conn = 0;
         if (!reused)
             goto done;
-        if (reused)
-            c->st.reused--;
+        c->st.reused--;
+        if (!is_idempotent_retryable(e->method) ||
+            (rc != HTTP_E_SEND &&
+             !(rc == HTTP_E_RECV && c->st.bytes_in == rx_before)))
+            goto done;
+        http_response_free(res);
+        hb_free(&e->raw);
+        hb_init(&e->raw, HTTP_HEADERS_MAX);
         /* retry once on a fresh connection */
     }
     if (rc != HTTP_OK)
@@ -1471,14 +1557,18 @@ static int exchange(struct http_client *c, struct exch *e,
     if (rc == HTTP_OK && f.chunked)
         headers_build(res, &e->raw);
 
-    if (rc == HTTP_OK && should_keep_alive(res, &f, e->req)) {
+    if (rc == HTTP_OK && conn->pos == conn->len && !conn->eof &&
+        !conn->broken && should_keep_alive(res, &f, e->req)) {
         conn->pooled = 1;
         conn->idle_at = now_ms();
     } else {
         hc_shutdown(conn);
+        conn = 0;
     }
 
 done:
+    if (conn && !conn->pooled)
+        hc_shutdown(conn);
     free(line);
     hb_free(&head);
     return rc;

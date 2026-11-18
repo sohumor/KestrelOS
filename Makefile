@@ -336,7 +336,13 @@ test-net: test-tcp test-checksum
 test-random:
 	sh tools/run-random-tests.sh
 
-test-browser-host:
+test-jpeg-prog:
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
+	  -o $(BUILD)/test_jpeg_prog tools/test_jpeg_prog.c \
+	  libimg/*.c libz/inflate.c libz/adler32.c libz/crc32.c
+	$(BUILD)/test_jpeg_prog
+
+test-browser-host: test-jpeg-prog
 	sh tools/run-jsdom-tests.sh
 	sh tools/run-browser-stack.sh
 

@@ -41,9 +41,9 @@
 
 /* ---- limits (all overridable per request where it makes sense) ------- */
 #define HTTP_BODY_MAX       (16UL * 1024UL * 1024UL)
-#define HTTP_HEADERS_MAX    (32UL * 1024UL)  /* whole header block */
-#define HTTP_LINE_MAX       8192             /* one header line, unfolded */
-#define HTTP_HEADER_COUNT   128
+#define HTTP_HEADERS_MAX    (48UL * 1024UL)  /* whole header block */
+#define HTTP_LINE_MAX       16384            /* one header line, unfolded */
+#define HTTP_HEADER_COUNT   256
 #define HTTP_REDIRECT_MAX   10
 #define HTTP_POOL_MAX       6                /* live pooled connections */
 #define HTTP_RXBUF          4096             /* per-connection read buffer */

@@ -151,6 +151,7 @@ static struct tnode *tn_parse(const char *s)
                     vbuf[vl] = 0;
                     if (ns[0] == '_') {
                         if (!strncmp(ns, "_hover", 6))    n->state |= CSS_STATE_HOVER;
+                        if (!strncmp(ns, "_active", 7))   n->state |= CSS_STATE_ACTIVE;
                         if (!strncmp(ns, "_visited", 8))  n->state |= CSS_STATE_VISITED;
                         if (!strncmp(ns, "_focus", 6))    n->state |= CSS_STATE_FOCUS;
                         if (!strncmp(ns, "_checked", 8))  n->state |= CSS_STATE_CHECKED;
@@ -229,11 +230,14 @@ static const char *const d_display[]   = { CSS_DISPLAY_LIST(X_STR) 0 };
 static const char *const d_position[]  = { CSS_POSITION_LIST(X_STR) 0 };
 static const char *const d_float[]     = { CSS_FLOAT_LIST(X_STR) 0 };
 static const char *const d_clear[]     = { CSS_CLEAR_LIST(X_STR) 0 };
+static const char *const d_boxsizing[] = { CSS_BOXSIZING_LIST(X_STR) 0 };
 static const char *const d_talign[]    = { CSS_TEXTALIGN_LIST(X_STR) 0 };
 static const char *const d_valign[]    = { CSS_VALIGN_LIST(X_STR) 0 };
 static const char *const d_flexdir[]   = { CSS_FLEXDIR_LIST(X_STR) 0 };
+static const char *const d_flexwrap[]  = { CSS_FLEXWRAP_LIST(X_STR) 0 };
 static const char *const d_justify[]   = { CSS_JUSTIFY_LIST(X_STR) 0 };
 static const char *const d_align[]     = { CSS_ALIGN_LIST(X_STR) 0 };
+static const char *const d_colorscheme[] = { CSS_COLORSCHEME_LIST(X_STR) 0 };
 static const char *const d_ws[]        = { CSS_WHITESPACE_LIST(X_STR) 0 };
 static const char *const d_ovf[]       = { CSS_OVERFLOW_LIST(X_STR) 0 };
 static const char *const d_vis[]       = { CSS_VISIBILITY_LIST(X_STR) 0 };
@@ -271,6 +275,11 @@ static void fmt_len(struct css_len l, char *out)
     case CSS_LEN_NORMAL: strcpy(out, "normal"); break;
     case CSS_LEN_PCT:    fmt_milli(l.v, t); sprintf(out, "%s%%", t); break;
     case CSS_LEN_NUMBER: fmt_milli(l.v, out); break;
+    case CSS_LEN_CALC:
+        fmt_milli(l.pct, t);
+        sprintf(out, "calc(%s%% %c %dpx)", t, l.v < 0 ? '-' : '+',
+                l.v < 0 ? (int)(-l.v) : (int)l.v);
+        break;
     default:             sprintf(out, "%dpx", (int)l.v); break;
     }
 }
@@ -300,6 +309,8 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
         strcpy(out, kwname(d_float, cs->css_float, CSS_FLOAT_COUNT)); return 1;
     case CSS_PROP_CLEAR:
         strcpy(out, kwname(d_clear, cs->clear, CSS_CLEAR_COUNT)); return 1;
+    case CSS_PROP_BOX_SIZING:
+        strcpy(out, kwname(d_boxsizing, cs->box_sizing, CSS_BOXSIZING_COUNT)); return 1;
     case CSS_PROP_TEXT_ALIGN:
         strcpy(out, kwname(d_talign, cs->text_align, CSS_TEXTALIGN_COUNT)); return 1;
     case CSS_PROP_WHITE_SPACE:
@@ -329,14 +340,25 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
     case CSS_PROP_FLEX_DIRECTION:
         strcpy(out, kwname(d_flexdir, cs->flex_direction,
                            CSS_FLEXDIR_COUNT)); return 1;
+    case CSS_PROP_FLEX_WRAP:
+        strcpy(out, kwname(d_flexwrap, cs->flex_wrap,
+                           CSS_FLEXWRAP_COUNT)); return 1;
     case CSS_PROP_JUSTIFY_CONTENT:
         strcpy(out, kwname(d_justify, cs->justify_content,
                            CSS_JUSTIFY_COUNT)); return 1;
     case CSS_PROP_ALIGN_ITEMS:
         strcpy(out, kwname(d_align, cs->align_items,
                            CSS_ALIGN_COUNT)); return 1;
-    case CSS_PROP_FLEX_GROW: fmt_milli(cs->flex_grow, out); return 1;
-    case CSS_PROP_GAP:       sprintf(out, "%dpx", (int)cs->gap); return 1;
+    case CSS_PROP_COLOR_SCHEME:
+        strcpy(out, kwname(d_colorscheme, cs->color_scheme,
+                           CSS_COLORSCHEME_COUNT)); return 1;
+    case CSS_PROP_OPACITY:     fmt_milli(cs->opacity, out); return 1;
+    case CSS_PROP_FLEX_GROW:   fmt_milli(cs->flex_grow, out); return 1;
+    case CSS_PROP_FLEX_SHRINK: fmt_milli(cs->flex_shrink, out); return 1;
+    case CSS_PROP_FLEX_BASIS:  fmt_len(cs->flex_basis, out); return 1;
+    case CSS_PROP_GAP:         sprintf(out, "%dpx", (int)cs->gap); return 1;
+    case CSS_PROP_ROW_GAP:     sprintf(out, "%dpx", (int)cs->row_gap); return 1;
+    case CSS_PROP_COLUMN_GAP:  sprintf(out, "%dpx", (int)cs->column_gap); return 1;
     case CSS_PROP_FONT_SIZE:   sprintf(out, "%dpx", (int)cs->font_size); return 1;
     case CSS_PROP_FONT_WEIGHT: sprintf(out, "%d", (int)cs->font_weight); return 1;
     case CSS_PROP_Z_INDEX:
@@ -347,7 +369,67 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
     case CSS_PROP_COLOR:            fmt_color(cs->color, out); return 1;
     case CSS_PROP_BACKGROUND_COLOR: fmt_color(cs->background_color, out); return 1;
     case CSS_PROP_BACKGROUND_IMAGE:
-        strcpy(out, cs->background_image ? cs->background_image : "none"); return 1;
+        if (cs->has_gradient) {
+            int i, pos = sprintf(out, "linear-gradient(%ddeg", (int)cs->grad_angle_deg);
+            for (i = 0; i < cs->grad_nstops; i++) {
+                char cb[32];
+                fmt_color(cs->grad_colors[i], cb);
+                pos += sprintf(out + pos, ",%s@%d", cb, (int)cs->grad_pos[i]);
+            }
+            strcpy(out + pos, ")");
+        } else {
+            strcpy(out, cs->background_image ? cs->background_image : "none");
+        }
+        return 1;
+    case CSS_PROP_BOX_SHADOW:
+        if (!cs->has_shadow) {
+            strcpy(out, "none");
+        } else {
+            char cb[32];
+            fmt_color(cs->shadow_color, cb);
+            sprintf(out, "%s%dpx %dpx %dpx %dpx %s",
+                    cs->shadow_inset ? "inset " : "",
+                    (int)cs->shadow_x, (int)cs->shadow_y,
+                    (int)cs->shadow_blur, (int)cs->shadow_spread, cb);
+        }
+        return 1;
+    case CSS_PROP_GRID_TEMPLATE_COLS:
+        if (cs->grid_ncols == 0) {
+            strcpy(out, "none");
+        } else {
+            int i, pos = 0;
+            for (i = 0; i < cs->grid_ncols; i++) {
+                const struct css_grid_track *tr = &cs->grid_cols[i];
+                char tb[32];
+                if (i > 0) out[pos++] = ' ';
+                if (tr->kind == CSS_GRID_AUTO) strcpy(tb, "auto");
+                else if (tr->kind == CSS_GRID_PX) sprintf(tb, "%dpx", (int)tr->val);
+                else if (tr->kind == CSS_GRID_PCT) {
+                    char mb[24]; fmt_milli(tr->val, mb); sprintf(tb, "%s%%", mb);
+                } else {
+                    char mb[24]; fmt_milli(tr->val, mb); sprintf(tb, "%sfr", mb);
+                }
+                strcpy(out + pos, tb);
+                pos += (int)strlen(tb);
+            }
+        }
+        return 1;
+    case CSS_PROP_GRID_COL_START:
+        if (cs->grid_col_start == 0) strcpy(out, "auto");
+        else sprintf(out, "%d", (int)cs->grid_col_start);
+        return 1;
+    case CSS_PROP_GRID_COL_END:
+        if (cs->grid_col_end == 0) strcpy(out, "auto");
+        else sprintf(out, "%d", (int)cs->grid_col_end);
+        return 1;
+    case CSS_PROP_GRID_ROW_START:
+        if (cs->grid_row_start == 0) strcpy(out, "auto");
+        else sprintf(out, "%d", (int)cs->grid_row_start);
+        return 1;
+    case CSS_PROP_GRID_ROW_END:
+        if (cs->grid_row_end == 0) strcpy(out, "auto");
+        else sprintf(out, "%d", (int)cs->grid_row_end);
+        return 1;
     case CSS_PROP_WIDTH:      fmt_len(cs->width, out); return 1;
     case CSS_PROP_HEIGHT:     fmt_len(cs->height, out); return 1;
     case CSS_PROP_MIN_WIDTH:  fmt_len(cs->min_width, out); return 1;
@@ -384,6 +466,10 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
     case CSS_PROP_BORDER_RIGHT_COLOR:  fmt_color(cs->border_color[CSS_RIGHT], out); return 1;
     case CSS_PROP_BORDER_BOTTOM_COLOR: fmt_color(cs->border_color[CSS_BOTTOM], out); return 1;
     case CSS_PROP_BORDER_LEFT_COLOR:   fmt_color(cs->border_color[CSS_LEFT], out); return 1;
+    case CSS_PROP_BORDER_TL_RADIUS: sprintf(out, "%dpx", (int)cs->border_radius[CSS_TL]); return 1;
+    case CSS_PROP_BORDER_TR_RADIUS: sprintf(out, "%dpx", (int)cs->border_radius[CSS_TR]); return 1;
+    case CSS_PROP_BORDER_BR_RADIUS: sprintf(out, "%dpx", (int)cs->border_radius[CSS_BR]); return 1;
+    case CSS_PROP_BORDER_BL_RADIUS: sprintf(out, "%dpx", (int)cs->border_radius[CSS_BL]); return 1;
     case CSS_PROP_TEXT_DECORATION: {
         out[0] = 0;
         if (!cs->text_decoration) { strcpy(out, "none"); return 1; }
@@ -399,6 +485,14 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
     }
     if (!strcmp(prop, "font-family-name")) {
         strcpy(out, cs->font_family_name ? cs->font_family_name : "-");
+        return 1;
+    }
+    if (!strcmp(prop, "grid-col-span")) {
+        sprintf(out, "%d", (int)cs->grid_col_span);
+        return 1;
+    }
+    if (!strcmp(prop, "grid-row-span")) {
+        sprintf(out, "%d", (int)cs->grid_row_span);
         return 1;
     }
     return 0;
@@ -754,8 +848,11 @@ static const struct tcase cases[] = {
 {"supports-flex",
  "@supports (display: flex) { #t { color: blue } }",
  "<p id=t/>", "t", "color=#0000ff", 0},
-{"supports-not-grid",
- "@supports not (grid-template-columns: 1fr) { #t { color: blue } }",
+{"supports-grid",
+ "@supports (grid-template-columns: 1fr) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
+{"supports-not-unknown",
+ "@supports not (writing-mode: vertical-rl) { #t { color: blue } }",
  "<p id=t/>", "t", "color=#0000ff", 0},
 {"supports-and",
  "@supports (display:flex) and (gap:1px) { #t { color: blue } }",
@@ -806,7 +903,7 @@ static const struct tcase cases[] = {
  "color=#ff0000", 0},
 {"bad-important", "#t { color: blue !importan; display: block }", "<p id=t/>", "t",
  "color=#000000;display=block", 0},
-{"calc-dropped", "#t { width: calc(100% - 10px); height: 4px }", "<p id=t/>", "t",
+{"calc-malformed-dropped", "#t { width: calc(100% - ); height: 4px }", "<p id=t/>", "t",
  "width=auto;height=4px", 0},
 {"nested-parens", "#t { background: foo(bar(1,2)); color: red }", "<p id=t/>", "t",
  "color=#ff0000", 0},
@@ -847,6 +944,8 @@ static const struct tcase cases[] = {
  "color=#551a8b", F_UA},
 {"ua-head-hidden", "", "<html><head id=t/></html>", "t", "display=none", F_UA},
 {"ua-script-hidden", "", "<body><script id=t/></body>", "t", "display=none", F_UA},
+{"ua-noscript-default-visible", "", "<body><noscript id=t/></body>", "t",
+ "display=inline", F_UA},
 {"ua-ul", "", "<body><ul id=t/></body>", "t",
  "display=block;padding-left=40px;list-style-type=disc", F_UA},
 {"ua-ol", "", "<body><ol id=t/></body>", "t", "list-style-type=decimal", F_UA},
@@ -877,7 +976,201 @@ static const struct tcase cases[] = {
 {"ua-submit-button", "", "<body><input id=t type=submit/></body>", "t",
  "border-top-style=outset;text-align=center", F_UA},
 {"ua-hidden-input", "", "<body><input id=t type=hidden/></body>", "t",
- "display=none", F_UA}
+ "display=none", F_UA},
+
+/* ---------------- Wave 4B: selectors & range media ---------------- */
+{"sel-active", "button:active { color: red }", "<button id=t _active/>", "t",
+ "color=#ff0000", 0},
+{"sel-focus", "input:focus { border: 2px solid blue }", "<input id=t _focus/>", "t",
+ "border-top-color=#0000ff;border-top-width=2px", 0},
+{"sel-not-first-child", "li:not(:first-child) { margin-top: 8px }",
+ "<ul><li/><li id=t/></ul>", "t", "margin-top=8px", 0},
+{"media-range-ge-in", "@media (width >= 600px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#ff0000", 0},
+{"media-range-ge-out", "@media (width >= 1200px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#000000", 0},
+{"media-range-le-in", "@media (width <= 1024px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#ff0000", 0},
+{"media-range-gt-in", "@media (width > 500px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#ff0000", 0},
+{"media-range-gt-boundary", "@media (width > 1024px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#000000", 0},
+{"media-range-between-in", "@media (600px <= width <= 1200px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#ff0000", 0},
+{"media-range-between-out", "@media (600px <= width < 1024px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#000000", 0},
+{"media-range-mismatch-dir", "@media (600px <= width >= 1200px) { #t { color: red } }",
+ "<p id=t/>", "t", "color=#000000", 0},
+{"media-prefers-light-default", "@media (prefers-color-scheme: light) { #t { color: green } }",
+ "<p id=t/>", "t", "color=#008000", 0},
+{"media-prefers-dark-default-off", "@media (prefers-color-scheme: dark) { #t { color: green } }",
+ "<p id=t/>", "t", "color=#000000", 0},
+{"media-scripting-none-default", "@media (scripting: none) { #t { color: blue } }",
+ "<p id=t/>", "t", "color=#0000ff", 0},
+
+/* ---------------- Wave 4B: --custom & var() ---------------- */
+{"var-basic", ":root { --accent: #3b82f6; } #t { color: var(--accent) }",
+ "<html><body><p id=t/></body></html>", "t", "color=#3b82f6", 0},
+{"var-inherit-override",
+ "#a { --c: #ff0000; } #b { --c: #00ff00; } #b p { color: var(--c); }",
+ "<div id=a><div id=b><p id=t/></div></div>", "t", "color=#00ff00", 0},
+{"var-fallback", "#t { color: var(--missing, #123456) }",
+ "<p id=t/>", "t", "color=#123456", 0},
+{"var-nested-fallback", "#t { --x: 24px; width: var(--a, var(--b, var(--x))) }",
+ "<p id=t/>", "t", "width=24px", 0},
+{"var-chain", "#t { --a: 10px; --b: calc(var(--a) * 2); width: var(--b) }",
+ "<p id=t/>", "t", "width=20px", 0},
+{"var-parent-scope",
+ "#p { --a: 10px; --b: var(--a); } #c { --a: 25px; width: var(--b); }",
+ "<div id=p><div id=c id2=x><p id=unused/></div></div>", "c", "width=10px", 0},
+{"var-forward-ref", "#t { --a: var(--b); --b: 18px; width: var(--a) }",
+ "<p id=t/>", "t", "width=18px", 0},
+{"var-cycle-guard",
+ "#t { --a: var(--b); --b: var(--a); width: var(--a); color: var(--a, #abcdef) }",
+ "<p id=t/>", "t", "width=auto;color=#abcdef", 0},
+{"var-self-cycle-invalid",
+ "#t { --a: var(--a, 40px); width: var(--a) }",
+ "<p id=t/>", "t", "width=auto", 0},
+{"var-inline-override",
+ "#t { --c: #0000ff; color: var(--c) }",
+ "<p id=t style='--c: #ff0000'/>", "t", "color=#ff0000", 0},
+{"var-important-custom",
+ "#p { --w: 50px !important; } #p.k { --w: 99px; } #t { width: var(--w) }",
+ "<div id=p class=k><p id=t/></div>", "t", "width=50px", 0},
+{"var-in-shorthand-margin",
+ "#t { --m: 6px 12px; margin: var(--m); margin-top: 2px }",
+ "<p id=t/>", "t", "margin-top=2px;margin-right=12px;margin-bottom=6px;margin-left=12px", 0},
+{"var-in-shorthand-border",
+ "#t { --bc: #00aa55; border: 2px solid var(--bc) }",
+ "<p id=t/>", "t", "border-top-width=2px;border-top-style=solid;border-top-color=#00aa55", 0},
+{"var-in-shorthand-flex",
+ "#t { --f: 2 0 150px; flex: var(--f) }",
+ "<p id=t/>", "t", "flex-grow=2;flex-shrink=0;flex-basis=150px", 0},
+
+/* ---------------- Wave 4B: calc() / min() / max() / clamp() ---------------- */
+{"calc-mixed-pct-px", "#t { width: calc(100% - 10px); height: 4px }",
+ "<p id=t/>", "t", "width=calc(100% - 10px);height=4px", 0},
+{"calc-arith-prec", "#t { width: calc(10px + 2 * 15px) }",
+ "<p id=t/>", "t", "width=40px", 0},
+{"calc-parens-div", "#t { width: calc((10px + 20px) / 3) }",
+ "<p id=t/>", "t", "width=10px", 0},
+{"calc-units-em-rem-pt",
+ "#t { font-size: 10px; width: calc(2em + 1rem + 12pt) }",
+ "<div><p id=t/></div>", "t", "width=52px", 0},
+{"calc-negative-width-clamp", "#t { width: calc(10px - 25px) }",
+ "<p id=t/>", "t", "width=0px", 0},
+{"box-shadow-calc", "#t { box-shadow: calc(2px + 3px) 4px calc(1px * 2) #112233 }",
+ "<p id=t/>", "t", "box-shadow=5px 4px 2px 0px #112233", 0},
+{"linear-gradient-var",
+ ":root { --c1: #ff0000; --c2: #0000ff } #t { background-image: linear-gradient(90deg, var(--c1), var(--c2)) }",
+ "<html><body id=t/></html>", "t",
+ "background-image=linear-gradient(90deg,#ff0000@0,#0000ff@1000)", 0},
+{"grid-repeat-multi",
+ "#t { grid-template-columns: repeat(2, 60px 1fr) }", "<div id=t/>", "t",
+ "grid-template-columns=60px 1fr 60px 1fr", 0},
+{"calc-vw-vh", "#t { width: calc(50vw - 12px); height: calc(25vh + 8px) }",
+ "<p id=t/>", "t", "width=500px;height=200px", 0},
+{"calc-div-zero", "#t { width: calc(100px / 0); height: 10px }",
+ "<p id=t/>", "t", "width=auto;height=10px", 0},
+{"calc-min", "#t { width: min(100px, 40px, 60px) }",
+ "<p id=t/>", "t", "width=40px", 0},
+{"calc-max", "#t { font-size: 16px; width: max(10px, 2em) }",
+ "<p id=t/>", "t", "width=32px", 0},
+{"calc-clamp", "#t { width: clamp(100px, 50vw, 400px); min-width: clamp(100px, 5vw, 400px) }",
+ "<p id=t/>", "t", "width=400px;min-width=100px", 0},
+{"calc-clamp-mid", "#t { width: clamp(100px, 25vw, 400px) }",
+ "<p id=t/>", "t", "width=256px", 0},
+{"calc-font-size", "#a { font-size: 20px } #t { font-size: calc(150% + 2px) }",
+ "<div id=a><p id=t/></div>", "t", "font-size=32px", 0},
+{"calc-opacity", "#t { opacity: calc(0.25 + 0.5) }",
+ "<p id=t/>", "t", "opacity=0.75", 0},
+
+/* ---------------- Wave 4B: light-dark() & color-scheme ---------------- */
+{"light-dark-default-light", "#t { color: light-dark(#111111, #eeeeee) }",
+ "<p id=t/>", "t", "color=#111111", 0},
+{"light-dark-scheme-dark",
+ "#t { color-scheme: dark; color: light-dark(#111111, #eeeeee) }",
+ "<p id=t/>", "t", "color-scheme=dark;color=#eeeeee", 0},
+{"light-dark-scheme-inherited",
+ "#p { color-scheme: dark } #t { color: light-dark(#111111, #eeeeee) }",
+ "<div id=p><p id=t/></div>", "t", "color-scheme=dark;color=#eeeeee", 0},
+{"light-dark-with-var",
+ "#t { color-scheme: dark; --fg: light-dark(#111111, #eeeeee); color: var(--fg) }",
+ "<p id=t/>", "t", "color=#eeeeee", 0},
+
+/* ---------------- Wave 4B: shorthands & new properties ---------------- */
+{"box-sizing-border",
+ "#p { box-sizing: border-box } #t { } #b { box-sizing: border-box }",
+ "<div id=p><p id=t/><p id=b/></div>", "b", "box-sizing=border-box", 0},
+{"box-sizing-no-inherit",
+ "#p { box-sizing: border-box } #t { }",
+ "<div id=p><p id=t/></div>", "t", "box-sizing=content-box", 0},
+{"border-radius-1", "#t { border-radius: 8px }", "<p id=t/>", "t",
+ "border-top-left-radius=8px;border-top-right-radius=8px;"
+ "border-bottom-right-radius=8px;border-bottom-left-radius=8px", 0},
+{"border-radius-4", "#t { border-radius: 2px 4px 6px 8px }", "<p id=t/>", "t",
+ "border-top-left-radius=2px;border-top-right-radius=4px;"
+ "border-bottom-right-radius=6px;border-bottom-left-radius=8px", 0},
+{"border-radius-pct", "#t { width: 100px; height: 40px; border-radius: 50% }",
+ "<p id=t/>", "t", "border-top-left-radius=20px;border-bottom-right-radius=20px", 0},
+{"opacity-values",
+ "#a { opacity: 0.5 } #b { opacity: 25% } #c { opacity: 2 } #d { opacity: -1 }",
+ "<div><p id=a/><p id=b/><p id=c/><p id=d/></div>", "a", "opacity=0.5", 0},
+{"opacity-pct-clamp",
+ "#b { opacity: 25% } #c { opacity: 2 } #d { opacity: -1 }",
+ "<div><p id=b/><p id=c/><p id=d/></div>", "d", "opacity=0", 0},
+{"opacity-clamp-hi", "#c { opacity: 2 }", "<p id=c/>", "c", "opacity=1", 0},
+{"opacity-no-inherit", "#p { opacity: 0.2 } #t { }",
+ "<div id=p><p id=t/></div>", "t", "opacity=1", 0},
+{"box-shadow-basic", "#t { box-shadow: 2px 4px 8px rgba(0, 0, 0, 0.5) }",
+ "<p id=t/>", "t", "box-shadow=2px 4px 8px 0px #7f000000", 0},
+{"box-shadow-inset-spread", "#t { box-shadow: inset 1px 2px 3px 4px #ff0000 }",
+ "<p id=t/>", "t", "box-shadow=inset 1px 2px 3px 4px #ff0000", 0},
+{"box-shadow-currentcolor-none",
+ "#a { color: #00aa00; box-shadow: 1px 2px } #b { box-shadow: 1px 2px #f00; box-shadow: none }",
+ "<div><p id=a/><p id=b/></div>", "a", "box-shadow=1px 2px 0px 0px #00aa00", 0},
+{"box-shadow-none", "#b { box-shadow: 1px 2px #f00; box-shadow: none }",
+ "<p id=b/>", "b", "box-shadow=none", 0},
+{"flex-1", "#t { flex: 1; flex-wrap: wrap }", "<div id=t/>", "t",
+ "flex-grow=1;flex-shrink=1;flex-basis=0px;flex-wrap=wrap", 0},
+{"flex-auto", "#t { flex: auto }", "<div id=t/>", "t",
+ "flex-grow=1;flex-shrink=1;flex-basis=auto", 0},
+{"flex-none", "#t { flex: none }", "<div id=t/>", "t",
+ "flex-grow=0;flex-shrink=0;flex-basis=auto", 0},
+{"flex-3part", "#t { flex: 2 0 120px; flex-wrap: wrap-reverse }", "<div id=t/>", "t",
+ "flex-grow=2;flex-shrink=0;flex-basis=120px;flex-wrap=wrap-reverse", 0},
+{"gap-2val", "#t { gap: 10px 24px }", "<div id=t/>", "t",
+ "gap=10px;row-gap=10px;column-gap=24px", 0},
+{"gap-override", "#t { row-gap: 30px; gap: 8px }", "<div id=t/>", "t",
+ "gap=8px;row-gap=8px;column-gap=8px", 0},
+{"linear-gradient-to-right",
+ "#t { background: linear-gradient(to right, #ff0000, #0000ff) }",
+ "<div id=t/>", "t",
+ "background-color=transparent;background-image=linear-gradient(90deg,#ff0000@0,#0000ff@1000)", 0},
+{"linear-gradient-3stops",
+ "#t { background-image: linear-gradient(135deg, #ff0000, #00ff00, #0000ff) }",
+ "<div id=t/>", "t",
+ "background-image=linear-gradient(135deg,#ff0000@0,#00ff00@500,#0000ff@1000)", 0},
+{"linear-gradient-pos",
+ "#t { background-image: linear-gradient(#ff0000 10%, #00ff00, #0000ff 90%) }",
+ "<div id=t/>", "t",
+ "background-image=linear-gradient(180deg,#ff0000@100,#00ff00@500,#0000ff@900)", 0},
+{"grid-repeat-3",
+ "#t { display: grid; grid-template-columns: repeat(3, 1fr) }",
+ "<div id=t/>", "t",
+ "display=grid;grid-template-columns=1fr 1fr 1fr", 0},
+{"grid-minmax-mixed",
+ "#t { grid-template-columns: 100px 25% auto minmax(0, 1.5fr) }",
+ "<div id=t/>", "t",
+ "grid-template-columns=100px 25% auto 1.5fr", 0},
+{"grid-col-row-lines",
+ "#t { grid-column: 1 / 4; grid-row: 2 / span 3 }",
+ "<div id=t/>", "t",
+ "grid-column-start=1;grid-column-end=4;grid-col-span=3;"
+ "grid-row-start=2;grid-row-end=auto;grid-row-span=3", 0},
+{"grid-col-span-only",
+ "#t { grid-column: span 2 }", "<div id=t/>", "t",
+ "grid-column-start=auto;grid-column-end=auto;grid-col-span=2", 0}
 };
 
 #define NCASES ((int)(sizeof(cases) / sizeof(cases[0])))
@@ -1052,7 +1345,7 @@ static void api_tests(void)
     /* @media re-evaluation on a resize */
     {
         const char *src = "@media (max-width: 600px) { p { color: red } }";
-        struct css_media m = { 1024, 768, 96, 1, 0 };
+        struct css_media m = { 1024, 768, 96, 1, 0, 0, 0 };
         struct css_stylesheet *ss;
         struct tnode *root;
         struct style_engine *se;
@@ -1073,6 +1366,87 @@ static void api_tests(void)
         describe(tn_find(root, "t")->cs, "color", got);
         expect_str("media narrow: included", got, "#ff0000");
 
+        style_engine_free(se);
+        tn_free(root);
+        css_free(ss);
+    }
+    /* prefers-color-scheme, light-dark(), scripting & UA noscript */
+    {
+        const char *src =
+            "@media (prefers-color-scheme: dark) { #a { border-top-color: #222222 } }\n"
+            "#a { color: light-dark(#111111, #eeeeee);"
+            "     box-shadow: 0 2px 4px light-dark(#000000, #ffffff) }\n"
+            "#b { color-scheme: light; color: light-dark(#111111, #eeeeee) }";
+        struct css_media m = { 800, 600, 96, 1, 0, 1, 1 };
+        struct css_stylesheet *sh[2];
+        struct style_engine *se;
+        struct tnode *root;
+        char got[128];
+
+        sh[0] = css_parse(css_ua_stylesheet(), css_ua_stylesheet_len(),
+                          CSS_ORIGIN_UA, &m);
+        sh[1] = css_parse(src, strlen(src), CSS_ORIGIN_AUTHOR, &m);
+        root = tn_parse("<body><div id=a><p id=b/><noscript id=ns/></div></body>");
+        se = style_engine_new(sh, 2, &test_ops);
+        style_compute_tree(se, root, 0, sink, 0);
+
+        describe(tn_find(root, "a")->cs, "color", got);
+        expect_str("dark prefers_dark light-dark()", got, "#eeeeee");
+        describe(tn_find(root, "a")->cs, "border-top-color", got);
+        expect_str("media prefers-color-scheme: dark", got, "#222222");
+        describe(tn_find(root, "a")->cs, "box-shadow", got);
+        expect_str("box-shadow light-dark() dark", got, "0px 2px 4px 0px #ffffff");
+        describe(tn_find(root, "b")->cs, "color", got);
+        expect_str("color-scheme: light overrides dark", got, "#111111");
+        describe(tn_find(root, "ns")->cs, "display", got);
+        expect_str("ua noscript hidden when scripting=1", got, "none");
+
+        /* toggle back to light + scripting=0 */
+        m.prefers_dark = 0;
+        m.scripting = 0;
+        css_set_media(sh[0], &m);
+        css_set_media(sh[1], &m);
+        tn_free(root);
+        root = tn_parse("<body><div id=a><p id=b/><noscript id=ns/></div></body>");
+        style_compute_tree(se, root, 0, sink, 0);
+        describe(tn_find(root, "a")->cs, "color", got);
+        expect_str("light prefers_dark light-dark()", got, "#111111");
+        describe(tn_find(root, "ns")->cs, "display", got);
+        expect_str("ua noscript visible when scripting=0", got, "inline");
+
+        expect_int("mq range in",
+                   css_media_query_matches("(600px <= width <= 1200px)", 26, &m), 1);
+        expect_int("mq range out",
+                   css_media_query_matches("(width > 800px)", 15, &m), 0);
+        m.prefers_dark = 1;
+        m.scripting = 1;
+        expect_int("mq prefers dark",
+                   css_media_query_matches("(prefers-color-scheme: dark)", 28, &m), 1);
+        expect_int("mq scripting enabled",
+                   css_media_query_matches("(scripting: enabled)", 20, &m), 1);
+
+        style_engine_free(se);
+        tn_free(root);
+        css_free(sh[0]);
+        css_free(sh[1]);
+    }
+    /* direct style_compute() custom property inheritance & root_font_size */
+    {
+        const char *src = "#p { --pad: 14px }";
+        struct css_stylesheet *ss = css_parse(src, strlen(src),
+                                              CSS_ORIGIN_AUTHOR, 0);
+        struct tnode *root = tn_parse("<div id=p><span id=c/></div>");
+        struct style_engine *se = style_engine_new(&ss, 1, &test_ops);
+        struct computed_style *pcs = style_compute(se, tn_find(root, "p"), 0, 0, 20);
+        struct computed_style *ccs = style_compute(se, tn_find(root, "c"), pcs,
+                                                   "padding: var(--pad); width: calc(2rem + 8px)", 20);
+        char got[64];
+        describe(ccs, "padding-left", got);
+        expect_str("direct style_compute var()", got, "14px");
+        describe(ccs, "width", got);
+        expect_str("calc() with root_font_size=20", got, "48px");
+        free(pcs);
+        free(ccs);
         style_engine_free(se);
         tn_free(root);
         css_free(ss);
@@ -1411,7 +1785,9 @@ static const char *const corpus[] = {
     "@supports (a:b) { p { q: r } } @page :first { margin: 1cm }",
     "div{}p{;;}q{color:}r{color:red!important}s{color:red !important;}",
     "\\65 scaped { color: \\72 ed } .a\\.b { width: 3ex }",
-    "@media print, (orientation: landscape), not screen { td { border-collapse: collapse } }"
+    "@media print, (orientation: landscape), not screen { td { border-collapse: collapse } }",
+    ":root { --a: 10px; --b: var(--a, 4px) } p { width: calc(100% - var(--b)); color: light-dark(#111, #eee) }",
+    "@media (600px <= width <= 1200px) and (prefers-color-scheme: dark) { div { box-shadow: 0 2px 4px #000; grid-template-columns: repeat(3, 1fr) } }"
 };
 #define NCORPUS ((int)(sizeof(corpus) / sizeof(corpus[0])))
 
@@ -1420,7 +1796,7 @@ static void fuzz(int iters)
     char buf[4096];
     int i, kept = 0, truncated = 0;
     unsigned long total_rules = 0;
-    struct css_media m = { 800, 600, 96, 1, 0 };
+    struct css_media m = { 800, 600, 96, 1, 0, 0, 0 };
 
     for (i = 0; i < iters; i++) {
         const char *base = corpus[rnd() % NCORPUS];

@@ -69,12 +69,12 @@ static uint32_t tls_now_unix(void)
 #define PT_CAP          REC_MAX_CIPHER     /* inner plaintext ceiling      */
 
 /* The largest handshake message that will be reassembled. This is the
- * Certificate message in practice: ten certificates of 3 KiB each still
- * fit, and real chains are under 10 KiB. It is a cap on a peer-controlled
+ * Certificate message in practice: CDN leaf certs with many SANs plus
+ * intermediates and SCTs can exceed 32 KiB. It is a cap on a peer-controlled
  * allocation, which is the reason it exists at all. */
-#define TLS_HS_MAX      32768
+#define TLS_HS_MAX      65536
 /* ...plus room for the record that carried the last of it. */
-#define HS_CAP          (TLS_HS_MAX + REC_MAX_PLAIN + 8)
+#define HS_CAP          (TLS_HS_MAX + REC_MAX_CIPHER + 8)
 #define SCRATCH_CAP     2048               /* messages we build ourselves  */
 #define COOKIE_MAX      1024
 
@@ -720,7 +720,7 @@ struct tls_conn {
     /* peer certificates */
     uint8_t *certbuf;
     unsigned long certbuf_len;
-    struct x509_cert chain[X509_MAX_CHAIN];
+    struct x509_cert *chain;
     int    chain_len;
     int    verified;
     int    want_rsa_retry;             /* the chain used a curve we lack */
@@ -1921,6 +1921,13 @@ static int parse_certificate(struct tls_conn *c, const uint8_t *body,
     memcpy(c->certbuf, certs, certslen);
     c->certbuf_len = certslen;
 
+    if (!c->chain) {
+        c->chain = calloc(X509_MAX_CHAIN, sizeof(*c->chain));
+        if (!c->chain)
+            return fail(c, TLS_E_NOMEM, A_INTERNAL_ERROR,
+                        "out of memory for certificate chain");
+    }
+
     rb_init(&list, c->certbuf, certslen);
     while (rb_left(&list) > 0) {
         unsigned long dlen, extlen;
@@ -2068,7 +2075,7 @@ static int parse_certificate_verify(struct tls_conn *c, const uint8_t *body,
     if (rvec16(&r, &sig, &siglen) < 0 || rb_left(&r) != 0)
         return fail(c, TLS_E_PROTO, A_DECODE_ERROR,
                     "the CertificateVerify message is malformed");
-    if (c->chain_len == 0)
+    if (c->chain_len == 0 || !c->chain)
         return fail(c, TLS_E_PROTO, A_UNEXPECTED_MESSAGE,
                     "the server sent a CertificateVerify without a "
                     "Certificate");
@@ -2415,6 +2422,8 @@ static int do_handshake(struct tls_conn *c)
     c->handshake_done = 1;
     c->state = ST_READY;
 
+    free(c->chain);
+    c->chain = 0;
     free(c->certbuf);
     c->certbuf = 0;
     return TLS_OK;
@@ -2650,6 +2659,7 @@ void tls_close(struct tls_conn *c)
     }
     if (c->own_lower && c->lower.close)
         c->lower.close(c->lower.ctx);
+    free(c->chain);
     free(c->certbuf);
     /* Every secret in the connection dies here. */
     wipe(c->secret, sizeof(c->secret));
@@ -3131,6 +3141,7 @@ static struct tls_conn *client_run(const struct tls_transport *lower,
     if (rc != TLS_OK) {
         copy_error(c, err);
         *want_rsa = c->want_rsa_retry;
+        free(c->chain);
         free(c->certbuf);
         free(c);
         return 0;

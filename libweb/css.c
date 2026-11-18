@@ -896,6 +896,9 @@ static const char *const kw_borderwidth[] = { "thin", "medium", "thick", 0 };
 static const char *const kw_none_only[]   = { "none", 0 };
 static const char *const kw_decor[]       = { "none", "underline", "overline",
                                               "line-through", "blink", 0 };
+static const char *const kw_boxsizing[]   = { CSS_BOXSIZING_LIST(CSS_STR_X) 0 };
+static const char *const kw_flexwrap[]    = { CSS_FLEXWRAP_LIST(CSS_STR_X) 0 };
+static const char *const kw_colorscheme[] = { CSS_COLORSCHEME_LIST(CSS_STR_X) 0 };
 
 static const char *const prop_names[] = { CSS_PROP_LIST(CSS_STR_X) 0 };
 
@@ -918,6 +921,7 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_POSITION]            = { 0, 0, kw_position },
     [CSS_PROP_FLOAT]               = { 0, 0, kw_float },
     [CSS_PROP_CLEAR]               = { 0, 0, kw_clear },
+    [CSS_PROP_BOX_SIZING]          = { 0, 0, kw_boxsizing },
     [CSS_PROP_WIDTH]               = { 0, PA_LEN|PA_PCT|PA_AUTO, 0 },
     [CSS_PROP_HEIGHT]              = { 0, PA_LEN|PA_PCT|PA_AUTO, 0 },
     [CSS_PROP_MIN_WIDTH]           = { 0, PA_LEN|PA_PCT|PA_AUTO, 0 },
@@ -948,13 +952,20 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_BORDER_RIGHT_COLOR]  = { 0, PA_COLOR, 0 },
     [CSS_PROP_BORDER_BOTTOM_COLOR] = { 0, PA_COLOR, 0 },
     [CSS_PROP_BORDER_LEFT_COLOR]   = { 0, PA_COLOR, 0 },
+    [CSS_PROP_BORDER_TL_RADIUS]    = { 0, PA_LEN|PA_PCT, 0 },
+    [CSS_PROP_BORDER_TR_RADIUS]    = { 0, PA_LEN|PA_PCT, 0 },
+    [CSS_PROP_BORDER_BR_RADIUS]    = { 0, PA_LEN|PA_PCT, 0 },
+    [CSS_PROP_BORDER_BL_RADIUS]    = { 0, PA_LEN|PA_PCT, 0 },
     [CSS_PROP_FONT_FAMILY]         = { 1, 0, kw_fontfamily },
     [CSS_PROP_FONT_SIZE]           = { 1, PA_LEN|PA_PCT, kw_fontsize },
     [CSS_PROP_FONT_WEIGHT]         = { 1, PA_NUM, kw_fontweight },
     [CSS_PROP_FONT_STYLE]          = { 1, 0, kw_fontstyle },
     [CSS_PROP_COLOR]               = { 1, PA_COLOR, 0 },
+    [CSS_PROP_COLOR_SCHEME]        = { 1, 0, kw_colorscheme },
+    [CSS_PROP_OPACITY]             = { 0, PA_NUM|PA_PCT|PA_NEG, 0 },
     [CSS_PROP_BACKGROUND_COLOR]    = { 0, PA_COLOR, 0 },
     [CSS_PROP_BACKGROUND_IMAGE]    = { 0, PA_URL, kw_none_only },
+    [CSS_PROP_BOX_SHADOW]          = { 0, 0, kw_none_only },
     [CSS_PROP_TEXT_ALIGN]          = { 1, 0, kw_textalign },
     [CSS_PROP_TEXT_DECORATION]     = { 0, 0, kw_decor },
     [CSS_PROP_TEXT_INDENT]         = { 1, PA_LEN|PA_PCT|PA_NEG, 0 },
@@ -970,11 +981,33 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_BORDER_SPACING]      = { 1, PA_LEN, 0 },
     [CSS_PROP_Z_INDEX]             = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
     [CSS_PROP_FLEX_DIRECTION]      = { 0, 0, kw_flexdir },
+    [CSS_PROP_FLEX_WRAP]           = { 0, 0, kw_flexwrap },
     [CSS_PROP_JUSTIFY_CONTENT]     = { 0, 0, kw_justify },
     [CSS_PROP_ALIGN_ITEMS]         = { 0, 0, kw_align },
     [CSS_PROP_FLEX_GROW]           = { 0, PA_NUM, 0 },
-    [CSS_PROP_GAP]                 = { 0, PA_LEN, 0 }
+    [CSS_PROP_FLEX_SHRINK]         = { 0, PA_NUM, 0 },
+    [CSS_PROP_FLEX_BASIS]          = { 0, PA_LEN|PA_PCT|PA_AUTO, 0 },
+    [CSS_PROP_GAP]                 = { 0, PA_LEN, 0 },
+    [CSS_PROP_ROW_GAP]             = { 0, PA_LEN, 0 },
+    [CSS_PROP_COLUMN_GAP]          = { 0, PA_LEN, 0 },
+    [CSS_PROP_GRID_TEMPLATE_COLS]  = { 0, 0, kw_none_only },
+    [CSS_PROP_GRID_COL_START]      = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
+    [CSS_PROP_GRID_COL_END]        = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
+    [CSS_PROP_GRID_ROW_START]      = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 },
+    [CSS_PROP_GRID_ROW_END]        = { 0, PA_NUM|PA_AUTO|PA_NEG, 0 }
 };
+
+static int css_stricmp_n(const char *a, const char *b, unsigned long n)
+{
+    unsigned long i;
+    for (i = 0; i < n; i++) {
+        int x = lc((unsigned char)a[i]);
+        int y = lc((unsigned char)b[i]);
+        if (x != y || !a[i] || !b[i])
+            return x - y;
+    }
+    return 0;
+}
 
 const char *css_property_name(int prop)
 {
@@ -1018,8 +1051,8 @@ static int kw_index(const char *const *table, const char *s)
 
 enum { MT_ALL = 0, MT_SCREEN, MT_PRINT, MT_OTHER };
 enum { MF_UNKNOWN = 0, MF_WIDTH, MF_HEIGHT, MF_ORIENTATION, MF_RESOLUTION,
-       MF_COLOR, MF_MONOCHROME };
-enum { MOP_EQ = 0, MOP_MIN, MOP_MAX };
+       MF_COLOR, MF_MONOCHROME, MF_PREFERS_DARK, MF_SCRIPTING };
+enum { MOP_EQ = 0, MOP_MIN, MOP_MAX, MOP_LT, MOP_GT };
 
 struct media_feat {
     uint8_t feature, op, unit;
@@ -1093,6 +1126,20 @@ struct css_stylesheet {
 #define VAL_SLASH 101
 #define VAL_BAD   102
 
+/* Shorthand raw-expr markers stored in css_value.kw (must match style.c). */
+#define CSS_RAW_NONE       0
+#define CSS_RAW_BOX_TOP    1
+#define CSS_RAW_BOX_RIGHT  2
+#define CSS_RAW_BOX_BOTTOM 3
+#define CSS_RAW_BOX_LEFT   4
+#define CSS_RAW_BORDER     5
+#define CSS_RAW_BG         6
+#define CSS_RAW_FLEX       7
+#define CSS_RAW_GAP        8
+#define CSS_RAW_GRID_LINE  9
+#define CSS_RAW_FONT       10
+#define CSS_RAW_LIST_STYLE 11
+
 struct css_parser {
     struct css_lex lex;
     struct css_tok tok;
@@ -1102,10 +1149,14 @@ struct css_parser {
     struct css_simple simples[CSS_MAX_COMPOUNDS * CSS_MAX_SIMPLES];
     struct css_compound compounds[CSS_MAX_COMPOUNDS];
     struct css_decl block[CSS_MAX_BLOCK_DECLS];
+    struct css_custom_decl custom_block[CSS_MAX_BLOCK_DECLS];
     struct css_selector sels[CSS_MAX_SEL_LIST];
     int nblock;
+    int ncustom_block;
     struct css_value comp[CSS_MAX_COMPONENTS];
     int ncomp;
+    int saw_expr;
+    int saw_bad_tok;
 };
 
 static void nx(struct css_parser *p) { lex_next(&p->lex, &p->tok); }
@@ -1203,6 +1254,19 @@ static int unit_to_px_milli(css_num v, int unit, int64_t *out)
  * component values
  * ================================================================== */
 
+static int is_expr_fn(const char *fname)
+{
+    return css_stricmp(fname, "var") == 0 ||
+           css_stricmp(fname, "calc") == 0 ||
+           css_stricmp(fname, "min") == 0 ||
+           css_stricmp(fname, "max") == 0 ||
+           css_stricmp(fname, "clamp") == 0 ||
+           css_stricmp(fname, "light-dark") == 0 ||
+           css_stricmp(fname, "linear-gradient") == 0 ||
+           css_stricmp(fname, "repeat") == 0 ||
+           css_stricmp(fname, "minmax") == 0;
+}
+
 static int color_function(struct css_parser *p, const char *fname,
                           struct css_value *out);
 
@@ -1252,6 +1316,7 @@ static int read_component(struct css_parser *p, struct css_value *v)
         int u = unit_id(p->tok.unit);
         if (u == CSS_UNIT_NONE) {
             v->type = VAL_BAD;
+            p->saw_bad_tok = 1;
         } else {
             v->type = CSS_VAL_LENGTH;
             v->unit = (uint8_t)u;
@@ -1267,6 +1332,7 @@ static int read_component(struct css_parser *p, struct css_value *v)
             v->color = c;
         } else {
             v->type = VAL_BAD;
+            p->saw_bad_tok = 1;
         }
         nx(p);
         return 1;
@@ -1294,8 +1360,9 @@ static int read_component(struct css_parser *p, struct css_value *v)
                 return 1;
             }
         }
-        if (!color_function(p, fname, v)) {
-            /* Unknown function: swallow it balanced and poison the value. */
+        if (color_function(p, fname, v))
+            return 1;
+        {
             int depth = 1;
             while (p->tok.type != T_EOF && depth > 0) {
                 if (p->tok.type == T_LPAREN || p->tok.type == T_FUNCTION)
@@ -1304,7 +1371,14 @@ static int read_component(struct css_parser *p, struct css_value *v)
                     depth--;
                 nx(p);
             }
-            v->type = VAL_BAD;
+            if (is_expr_fn(fname) && depth == 0) {
+                p->saw_expr = 1;
+                v->type = CSS_VAL_RAW_EXPR;
+                v->str = 0;
+            } else {
+                v->type = VAL_BAD;
+                p->saw_bad_tok = 1;
+            }
         }
         return 1;
     }
@@ -1319,11 +1393,13 @@ static int read_component(struct css_parser *p, struct css_value *v)
             return 1;
         }
         v->type = VAL_BAD;
+        p->saw_bad_tok = 1;
         nx(p);
         return 1;
     case T_BADSTRING:
     case T_BADURL:
         v->type = VAL_BAD;
+        p->saw_bad_tok = 1;
         nx(p);
         return 1;
     default:
@@ -1372,6 +1448,21 @@ static int color_function(struct css_parser *p, const char *fname,
             if (n < 4) { arg[n] = 0; argpct[n] = 0; n++; }
             nx(p);
             continue;
+        }
+        if (p->tok.type == T_FUNCTION && is_expr_fn(p->tok.text)) {
+            int depth = 1;
+            nx(p);
+            while (p->tok.type != T_EOF && depth > 0) {
+                if (p->tok.type == T_LPAREN || p->tok.type == T_FUNCTION)
+                    depth++;
+                else if (p->tok.type == T_RPAREN)
+                    depth--;
+                nx(p);
+            }
+            p->saw_expr = 1;
+            out->type = CSS_VAL_RAW_EXPR;
+            out->str = 0;
+            return 1;
         }
         if (p->tok.type == T_EOF)
             return 0;
@@ -1422,6 +1513,8 @@ static int read_value(struct css_parser *p, int *important)
     int ok = 1;
 
     p->ncomp = 0;
+    p->saw_expr = 0;
+    p->saw_bad_tok = 0;
     *important = 0;
     for (;;) {
         skip_ws(p);
@@ -1437,6 +1530,7 @@ static int read_value(struct css_parser *p, int *important)
                 nx(p);
             } else {
                 ok = 0;
+                p->saw_bad_tok = 1;
             }
             continue;
         }
@@ -1457,6 +1551,497 @@ static int read_value(struct css_parser *p, int *important)
     if (p->ncomp == 0)
         ok = 0;
     return ok;
+}
+
+#define CSS_RAW_CAP 2048
+
+static int read_raw_span(struct css_lex *L, char *buf, int cap, int *out_len,
+                         int *important, int stop_rparen, int *had_tok)
+{
+    int len = 0, depth = 0, ok = 1, saw_any = 0, last_ws = 1, overflow = 0;
+
+    *important = 0;
+    *out_len = 0;
+    if (had_tok) *had_tok = 0;
+
+    while (L->i < L->n) {
+        int c = (unsigned char)L->s[L->i];
+
+        if (depth == 0) {
+            if (c == ';' || c == '}')
+                break;
+            if (stop_rparen && c == ')')
+                break;
+        }
+        if (c == '/' && L->i + 1 < L->n && L->s[L->i + 1] == '*') {
+            L->i += 2;
+            while (L->i + 1 < L->n &&
+                   !(L->s[L->i] == '*' && L->s[L->i + 1] == '/'))
+                L->i++;
+            L->i = (L->i + 1 < L->n) ? L->i + 2 : L->n;
+            if (!last_ws) {
+                if (len < cap - 1) buf[len++] = ' ';
+                else overflow = 1;
+                last_ws = 1;
+            }
+            continue;
+        }
+        if (is_ws(c)) {
+            while (L->i < L->n && is_ws((unsigned char)L->s[L->i]))
+                L->i++;
+            saw_any = 1;
+            if (!last_ws) {
+                if (len < cap - 1) buf[len++] = ' ';
+                else overflow = 1;
+                last_ws = 1;
+            }
+            continue;
+        }
+        saw_any = 1;
+        last_ws = 0;
+        if (c == '"' || c == '\'') {
+            int q = c, closed = 0;
+            if (len < cap - 1) buf[len++] = (char)q;
+            else overflow = 1;
+            L->i++;
+            while (L->i < L->n) {
+                int sc = (unsigned char)L->s[L->i];
+                if (sc == q) {
+                    if (len < cap - 1) buf[len++] = (char)q;
+                    else overflow = 1;
+                    L->i++;
+                    closed = 1;
+                    break;
+                }
+                if (sc == '\n') {
+                    ok = 0;
+                    break;
+                }
+                if (sc == '\\') {
+                    if (L->i + 1 < L->n && L->s[L->i + 1] == '\n') {
+                        L->i += 2;
+                        continue;
+                    }
+                    if (len < cap - 1) buf[len++] = '\\';
+                    else overflow = 1;
+                    L->i++;
+                    if (L->i < L->n) {
+                        if (len < cap - 1) buf[len++] = L->s[L->i];
+                        else overflow = 1;
+                        L->i++;
+                    }
+                    continue;
+                }
+                if (len < cap - 1) buf[len++] = (char)sc;
+                else overflow = 1;
+                L->i++;
+            }
+            if (!closed)
+                ok = 0;
+            continue;
+        }
+        if (c == '\\') {
+            if (len < cap - 1) buf[len++] = '\\';
+            else overflow = 1;
+            L->i++;
+            if (L->i < L->n && L->s[L->i] != '\n') {
+                if (len < cap - 1) buf[len++] = L->s[L->i];
+                else overflow = 1;
+                L->i++;
+            }
+            continue;
+        }
+        if (c == '(' || c == '[' || c == '{') {
+            if (depth < CSS_MAX_NEST) depth++;
+            else ok = 0;
+            if (len < cap - 1) buf[len++] = (char)c;
+            else overflow = 1;
+            L->i++;
+            continue;
+        }
+        if (c == ')' || c == ']' || c == '}') {
+            if (depth > 0) {
+                depth--;
+                if (len < cap - 1) buf[len++] = (char)c;
+                else overflow = 1;
+                L->i++;
+            } else {
+                ok = 0;
+                L->i++;
+            }
+            continue;
+        }
+        if (len < cap - 1) buf[len++] = (char)c;
+        else overflow = 1;
+        L->i++;
+    }
+    while (len > 0 && buf[len - 1] == ' ')
+        len--;
+    buf[len] = 0;
+
+    if (depth != 0 || overflow)
+        ok = 0;
+
+    if (len >= 10 && css_stricmp_n(buf + len - 9, "important", 9) == 0) {
+        int j = len - 10;
+        if (j >= 0 && buf[j] == ' ')
+            j--;
+        if (j >= 0 && buf[j] == '!') {
+            *important = 1;
+            len = j;
+            while (len > 0 && buf[len - 1] == ' ')
+                len--;
+            buf[len] = 0;
+        }
+    }
+    if (had_tok) *had_tok = saw_any;
+    *out_len = len;
+    return ok;
+}
+
+static int contains_var_ci(const char *s)
+{
+    unsigned long i;
+    for (i = 0; s[i]; i++) {
+        if (lc((unsigned char)s[i]) == 'v' &&
+            css_stricmp_n(s + i, "var(", 4) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int validate_math_fn(struct css_lex *L, const char *fname, int depth)
+{
+    int is_calc = (css_stricmp(fname, "calc") == 0);
+    int is_clamp = (css_stricmp(fname, "clamp") == 0);
+    int arg_count = 1, tok_in_arg = 0, prev_op = 0;
+    struct css_tok t;
+
+    if (depth > 16)
+        return 0;
+    for (;;) {
+        lex_next(L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            return 0;
+        if (t.type == T_RPAREN)
+            break;
+        if (t.type == T_COMMA) {
+            if (is_calc || tok_in_arg == 0 || prev_op)
+                return 0;
+            arg_count++;
+            tok_in_arg = 0;
+            prev_op = 0;
+            continue;
+        }
+        if (t.type == T_NUMBER || t.type == T_PERCENT) {
+            if (tok_in_arg > 0 && !prev_op)
+                return 0;
+            tok_in_arg++;
+            prev_op = 0;
+            continue;
+        }
+        if (t.type == T_DIMENSION) {
+            if (unit_id(t.unit) == CSS_UNIT_NONE)
+                return 0;
+            if (tok_in_arg > 0 && !prev_op)
+                return 0;
+            tok_in_arg++;
+            prev_op = 0;
+            continue;
+        }
+        if (t.type == T_LPAREN) {
+            if (tok_in_arg > 0 && !prev_op)
+                return 0;
+            if (!validate_math_fn(L, "calc", depth + 1))
+                return 0;
+            tok_in_arg++;
+            prev_op = 0;
+            continue;
+        }
+        if (t.type == T_FUNCTION) {
+            if (css_stricmp(t.text, "calc") != 0 &&
+                css_stricmp(t.text, "min") != 0 &&
+                css_stricmp(t.text, "max") != 0 &&
+                css_stricmp(t.text, "clamp") != 0)
+                return 0;
+            if (tok_in_arg > 0 && !prev_op)
+                return 0;
+            if (!validate_math_fn(L, t.text, depth + 1))
+                return 0;
+            tok_in_arg++;
+            prev_op = 0;
+            continue;
+        }
+        if (t.type == T_DELIM && (t.delim == '+' || t.delim == '-' ||
+                                  t.delim == '*' || t.delim == '/')) {
+            if (t.delim == '*' || t.delim == '/') {
+                if (tok_in_arg == 0 || prev_op)
+                    return 0;
+                prev_op = 1;
+            } else {
+                if (prev_op == 2)
+                    return 0;
+                prev_op = (tok_in_arg == 0 || prev_op == 1) ? 2 : 1;
+            }
+            continue;
+        }
+        return 0;
+    }
+    if (tok_in_arg == 0 || prev_op)
+        return 0;
+    if (is_clamp && arg_count != 3)
+        return 0;
+    return 1;
+}
+
+static int validate_fn_args_count(struct css_lex *L, int min_args, int max_args)
+{
+    int depth = 1, narg = 1, tok_in_arg = 0;
+    struct css_tok t;
+
+    for (;;) {
+        lex_next(L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            return 0;
+        if (t.type == T_LPAREN || t.type == T_FUNCTION) {
+            depth++;
+            tok_in_arg++;
+            continue;
+        }
+        if (t.type == T_RPAREN) {
+            depth--;
+            if (depth == 0)
+                break;
+            tok_in_arg++;
+            continue;
+        }
+        if (depth == 1 && t.type == T_COMMA) {
+            if (tok_in_arg == 0)
+                return 0;
+            narg++;
+            tok_in_arg = 0;
+            continue;
+        }
+        if (t.type == T_BADSTRING || t.type == T_BADURL)
+            return 0;
+        tok_in_arg++;
+    }
+    if (tok_in_arg == 0)
+        return 0;
+    if (narg < min_args)
+        return 0;
+    if (max_args > 0 && narg > max_args)
+        return 0;
+    return 1;
+}
+
+static int validate_expr_raw(const char *s)
+{
+    struct css_lex L;
+    struct css_tok t;
+
+    if (!s || !*s)
+        return 0;
+    if (contains_var_ci(s))
+        return 1;
+    L.s = s;
+    L.n = strlen(s);
+    L.i = 0;
+    for (;;) {
+        lex_next(&L, &t);
+        if (t.type == T_EOF)
+            break;
+        if (t.type == T_BADSTRING || t.type == T_BADURL)
+            return 0;
+        if (t.type == T_FUNCTION) {
+            if (css_stricmp(t.text, "calc") == 0 ||
+                css_stricmp(t.text, "min") == 0 ||
+                css_stricmp(t.text, "max") == 0 ||
+                css_stricmp(t.text, "clamp") == 0) {
+                if (!validate_math_fn(&L, t.text, 0))
+                    return 0;
+            } else if (css_stricmp(t.text, "light-dark") == 0) {
+                if (!validate_fn_args_count(&L, 2, 2))
+                    return 0;
+            } else if (css_stricmp(t.text, "linear-gradient") == 0) {
+                if (!validate_fn_args_count(&L, 2, 0))
+                    return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int validate_box_shadow(const char *s)
+{
+    struct css_lex L;
+    struct css_tok t;
+    int nlen = 0, ncolor = 0, inset = 0;
+
+    if (!s || !*s)
+        return 0;
+    if (contains_var_ci(s))
+        return 1;
+    if (css_stricmp(s, "none") == 0)
+        return 1;
+    L.s = s;
+    L.n = strlen(s);
+    L.i = 0;
+    for (;;) {
+        lex_next(&L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            break;
+        if (t.type == T_COMMA) {
+            if (nlen < 2 || nlen > 4)
+                return 0;
+            nlen = 0;
+            ncolor = 0;
+            inset = 0;
+            continue;
+        }
+        if (t.type == T_DIMENSION) {
+            if (unit_id(t.unit) == CSS_UNIT_NONE)
+                return 0;
+            nlen++;
+            continue;
+        }
+        if (t.type == T_NUMBER && t.num == 0) {
+            nlen++;
+            continue;
+        }
+        if (t.type == T_HASH) {
+            uint32_t c;
+            if (ncolor || !parse_hex_color(t.text, (unsigned long)t.tlen, &c))
+                return 0;
+            ncolor = 1;
+            continue;
+        }
+        if (t.type == T_IDENT) {
+            uint32_t c;
+            if (css_stricmp(t.text, "inset") == 0) {
+                if (inset) return 0;
+                inset = 1;
+                continue;
+            }
+            if (!ncolor && (css_stricmp(t.text, "transparent") == 0 ||
+                            css_stricmp(t.text, "currentcolor") == 0 ||
+                            named_color_lookup(t.text, &c))) {
+                ncolor = 1;
+                continue;
+            }
+            return 0;
+        }
+        if (t.type == T_FUNCTION) {
+            if (css_stricmp(t.text, "rgb") == 0 ||
+                css_stricmp(t.text, "rgba") == 0 ||
+                css_stricmp(t.text, "hsl") == 0 ||
+                css_stricmp(t.text, "hsla") == 0 ||
+                css_stricmp(t.text, "light-dark") == 0) {
+                int depth = 1;
+                if (ncolor) return 0;
+                while (depth > 0) {
+                    lex_next(&L, &t);
+                    if (t.type == T_EOF) return 0;
+                    if (t.type == T_LPAREN || t.type == T_FUNCTION) depth++;
+                    else if (t.type == T_RPAREN) depth--;
+                }
+                ncolor = 1;
+                continue;
+            }
+            if (css_stricmp(t.text, "calc") == 0 ||
+                css_stricmp(t.text, "min") == 0 ||
+                css_stricmp(t.text, "max") == 0 ||
+                css_stricmp(t.text, "clamp") == 0) {
+                if (!validate_math_fn(&L, t.text, 0))
+                    return 0;
+                nlen++;
+                continue;
+            }
+            return 0;
+        }
+        return 0;
+    }
+    return (nlen >= 2 && nlen <= 4);
+}
+
+static int validate_grid_cols(const char *s)
+{
+    struct css_lex L;
+    struct css_tok t;
+    int ntrack = 0;
+
+    if (!s || !*s)
+        return 0;
+    if (contains_var_ci(s))
+        return 1;
+    if (css_stricmp(s, "none") == 0)
+        return 1;
+    L.s = s;
+    L.n = strlen(s);
+    L.i = 0;
+    for (;;) {
+        lex_next(&L, &t);
+        if (t.type == T_WS)
+            continue;
+        if (t.type == T_EOF)
+            break;
+        if (t.type == T_LBRACK) {
+            while (t.type != T_RBRACK && t.type != T_EOF)
+                lex_next(&L, &t);
+            if (t.type != T_RBRACK)
+                return 0;
+            continue;
+        }
+        if (t.type == T_IDENT) {
+            if (css_stricmp(t.text, "auto") == 0 ||
+                css_stricmp(t.text, "min-content") == 0 ||
+                css_stricmp(t.text, "max-content") == 0) {
+                ntrack++;
+                continue;
+            }
+            return 0;
+        }
+        if (t.type == T_PERCENT || (t.type == T_NUMBER && t.num == 0)) {
+            if (t.num < 0) return 0;
+            ntrack++;
+            continue;
+        }
+        if (t.type == T_DIMENSION) {
+            if (t.num < 0) return 0;
+            if (unit_id(t.unit) == CSS_UNIT_NONE &&
+                css_stricmp(t.unit, "fr") != 0)
+                return 0;
+            ntrack++;
+            continue;
+        }
+        if (t.type == T_FUNCTION) {
+            if (css_stricmp(t.text, "repeat") == 0 ||
+                css_stricmp(t.text, "minmax") == 0) {
+                if (!validate_fn_args_count(&L, 2, 2))
+                    return 0;
+                ntrack++;
+                continue;
+            }
+            if (css_stricmp(t.text, "calc") == 0 ||
+                css_stricmp(t.text, "min") == 0 ||
+                css_stricmp(t.text, "max") == 0 ||
+                css_stricmp(t.text, "clamp") == 0) {
+                if (!validate_math_fn(&L, t.text, 0))
+                    return 0;
+                ntrack++;
+                continue;
+            }
+            return 0;
+        }
+        return 0;
+    }
+    return ntrack > 0;
 }
 
 /* ================================================================== *
@@ -1966,10 +2551,273 @@ static int store_font_weight(struct css_parser *p, int important)
     return 0;
 }
 
+static const int side_radius[4] = {
+    CSS_PROP_BORDER_TL_RADIUS, CSS_PROP_BORDER_TR_RADIUS,
+    CSS_PROP_BORDER_BR_RADIUS, CSS_PROP_BORDER_BL_RADIUS
+};
+
+static int expand_border_radius(struct css_parser *p, int important)
+{
+    struct css_value v[4];
+    int i, n = 0;
+
+    for (i = 0; i < p->ncomp; i++) {
+        if (p->comp[i].type == VAL_SLASH)
+            break;
+        if (n >= 4)
+            return 0;
+        if (!coerce(CSS_PROP_BORDER_TL_RADIUS, &p->comp[i], &v[n]))
+            return 0;
+        n++;
+    }
+    if (n < 1 || n > 4)
+        return 0;
+    if (i < p->ncomp && p->comp[i].type == VAL_SLASH) {
+        int m = 0;
+        i++;
+        for (; i < p->ncomp; i++) {
+            struct css_value tmp;
+            if (m >= 4 || !coerce(CSS_PROP_BORDER_TL_RADIUS, &p->comp[i], &tmp))
+                return 0;
+            m++;
+        }
+        if (m < 1)
+            return 0;
+    }
+    if (n == 1) { v[1] = v[0]; v[2] = v[0]; v[3] = v[0]; }
+    else if (n == 2) { v[2] = v[0]; v[3] = v[1]; }
+    else if (n == 3) { v[3] = v[1]; }
+    for (i = 0; i < 4; i++)
+        emit(p, side_radius[i], &v[i], important);
+    return 1;
+}
+
+static int expand_flex(struct css_parser *p, int important)
+{
+    struct css_value grow, shrink, basis;
+    css_num nums[2];
+    int n_num = 0, have_basis = 0, i;
+
+    memset(&grow, 0, sizeof(grow));
+    memset(&shrink, 0, sizeof(shrink));
+    memset(&basis, 0, sizeof(basis));
+    grow.type = CSS_VAL_NUMBER;
+    shrink.type = CSS_VAL_NUMBER;
+
+    if (p->ncomp == 1 && p->comp[0].type == CSS_VAL_IDENT) {
+        if (css_stricmp(p->comp[0].str, "none") == 0) {
+            grow.num = 0;
+            shrink.num = 0;
+            basis.type = CSS_VAL_AUTO;
+            emit(p, CSS_PROP_FLEX_GROW, &grow, important);
+            emit(p, CSS_PROP_FLEX_SHRINK, &shrink, important);
+            emit(p, CSS_PROP_FLEX_BASIS, &basis, important);
+            return 1;
+        }
+        if (css_stricmp(p->comp[0].str, "auto") == 0) {
+            grow.num = 1000;
+            shrink.num = 1000;
+            basis.type = CSS_VAL_AUTO;
+            emit(p, CSS_PROP_FLEX_GROW, &grow, important);
+            emit(p, CSS_PROP_FLEX_SHRINK, &shrink, important);
+            emit(p, CSS_PROP_FLEX_BASIS, &basis, important);
+            return 1;
+        }
+        return 0;
+    }
+
+    for (i = 0; i < p->ncomp; i++) {
+        struct css_value *c = &p->comp[i];
+        struct css_value tmp;
+        if (c->type == CSS_VAL_NUMBER) {
+            if (c->num < 0)
+                return 0;
+            if (n_num < 2 && !(have_basis && n_num > 0)) {
+                nums[n_num++] = c->num;
+                continue;
+            }
+            if (n_num == 2 && !have_basis && c->num == 0) {
+                basis.type = CSS_VAL_LENGTH;
+                basis.unit = CSS_UNIT_PX;
+                basis.num = 0;
+                have_basis = 1;
+                continue;
+            }
+            return 0;
+        }
+        if (!have_basis && coerce(CSS_PROP_FLEX_BASIS, c, &tmp)) {
+            basis = tmp;
+            have_basis = 1;
+            continue;
+        }
+        return 0;
+    }
+    if (n_num == 0 && !have_basis)
+        return 0;
+    grow.num = (n_num >= 1) ? nums[0] : 1000;
+    shrink.num = (n_num >= 2) ? nums[1] : 1000;
+    if (!have_basis) {
+        basis.type = CSS_VAL_LENGTH;
+        basis.unit = CSS_UNIT_PX;
+        basis.num = 0;
+    }
+    emit(p, CSS_PROP_FLEX_GROW, &grow, important);
+    emit(p, CSS_PROP_FLEX_SHRINK, &shrink, important);
+    emit(p, CSS_PROP_FLEX_BASIS, &basis, important);
+    return 1;
+}
+
+static int parse_gap_val(const struct css_value *in, struct css_value *out)
+{
+    if (in->type == CSS_VAL_IDENT && css_stricmp(in->str, "normal") == 0) {
+        memset(out, 0, sizeof(*out));
+        out->type = CSS_VAL_LENGTH;
+        out->unit = CSS_UNIT_PX;
+        out->num = 0;
+        return 1;
+    }
+    return coerce(CSS_PROP_ROW_GAP, in, out);
+}
+
+static int expand_gap(struct css_parser *p, int important)
+{
+    struct css_value r, c;
+
+    if (p->ncomp < 1 || p->ncomp > 2)
+        return 0;
+    if (!parse_gap_val(&p->comp[0], &r))
+        return 0;
+    if (p->ncomp == 2) {
+        if (!parse_gap_val(&p->comp[1], &c))
+            return 0;
+    } else {
+        c = r;
+    }
+    emit(p, CSS_PROP_ROW_GAP, &r, important);
+    emit(p, CSS_PROP_COLUMN_GAP, &c, important);
+    emit(p, CSS_PROP_GAP, &r, important);
+    return 1;
+}
+
+static int parse_grid_line_comps(struct css_parser *p, int start, int end,
+                                 struct css_value *out)
+{
+    int n = end - start;
+    memset(out, 0, sizeof(*out));
+    if (n <= 0 || n > 2)
+        return 0;
+    if (n == 1) {
+        const struct css_value *c = &p->comp[start];
+        if (c->type == CSS_VAL_INHERIT || c->type == CSS_VAL_INITIAL ||
+            c->type == CSS_VAL_UNSET) {
+            *out = *c;
+            return 1;
+        }
+        if (c->type == CSS_VAL_AUTO ||
+            (c->type == CSS_VAL_IDENT && css_stricmp(c->str, "auto") == 0)) {
+            out->type = CSS_VAL_AUTO;
+            return 1;
+        }
+        if (c->type == CSS_VAL_IDENT && css_stricmp(c->str, "span") == 0) {
+            out->type = CSS_VAL_KEYWORD;
+            out->kw = 1;
+            out->num = 1;
+            return 1;
+        }
+        if (c->type == CSS_VAL_NUMBER && c->kw && c->num != 0) {
+            *out = *c;
+            return 1;
+        }
+        return 0;
+    }
+    {
+        const struct css_value *a = &p->comp[start];
+        const struct css_value *b = &p->comp[start + 1];
+        const struct css_value *num_tok = 0;
+        if (a->type == CSS_VAL_IDENT && css_stricmp(a->str, "span") == 0)
+            num_tok = b;
+        else if (b->type == CSS_VAL_IDENT && css_stricmp(b->str, "span") == 0)
+            num_tok = a;
+        if (!num_tok || num_tok->type != CSS_VAL_NUMBER ||
+            !num_tok->kw || num_tok->num <= 0)
+            return 0;
+        out->type = CSS_VAL_KEYWORD;
+        out->kw = 1;
+        out->num = num_tok->num / 1000;
+        if (out->num < 1) out->num = 1;
+        if (out->num > 255) out->num = 255;
+        return 1;
+    }
+}
+
+static int expand_grid_line(struct css_parser *p, int start_prop, int end_prop,
+                            int important)
+{
+    int slash = -1, i;
+    struct css_value vs, ve;
+
+    for (i = 0; i < p->ncomp; i++) {
+        if (p->comp[i].type == VAL_SLASH) {
+            if (slash >= 0)
+                return 0;
+            slash = i;
+        }
+    }
+    if (slash < 0) {
+        if (!parse_grid_line_comps(p, 0, p->ncomp, &vs))
+            return 0;
+        memset(&ve, 0, sizeof(ve));
+        ve.type = CSS_VAL_AUTO;
+    } else {
+        if (!parse_grid_line_comps(p, 0, slash, &vs))
+            return 0;
+        if (!parse_grid_line_comps(p, slash + 1, p->ncomp, &ve))
+            return 0;
+        if (vs.type == CSS_VAL_INHERIT || vs.type == CSS_VAL_INITIAL ||
+            vs.type == CSS_VAL_UNSET || ve.type == CSS_VAL_INHERIT ||
+            ve.type == CSS_VAL_INITIAL || ve.type == CSS_VAL_UNSET)
+            return 0;
+    }
+    emit(p, start_prop, &vs, important);
+    emit(p, end_prop, &ve, important);
+    return 1;
+}
+
+static int store_color_scheme(struct css_parser *p, int important)
+{
+    if (p->ncomp == 1) {
+        const struct css_value *c = &p->comp[0];
+        if (c->type == CSS_VAL_INHERIT || c->type == CSS_VAL_INITIAL ||
+            c->type == CSS_VAL_UNSET) {
+            emit(p, CSS_PROP_COLOR_SCHEME, c, important);
+            return 1;
+        }
+        if (c->type == CSS_VAL_IDENT) {
+            int k = kw_index(kw_colorscheme, c->str);
+            if (k < 0) return 0;
+            emit_kw(p, CSS_PROP_COLOR_SCHEME, k, important);
+            return 1;
+        }
+        return 0;
+    }
+    if (p->ncomp == 2 && p->comp[0].type == CSS_VAL_IDENT &&
+        p->comp[1].type == CSS_VAL_IDENT) {
+        int a = kw_index(kw_colorscheme, p->comp[0].str);
+        int b = kw_index(kw_colorscheme, p->comp[1].str);
+        if ((a == CSS_COLORSCHEME_LIGHT && b == CSS_COLORSCHEME_DARK) ||
+            (a == CSS_COLORSCHEME_DARK && b == CSS_COLORSCHEME_LIGHT)) {
+            emit_kw(p, CSS_PROP_COLOR_SCHEME, CSS_COLORSCHEME_NORMAL, important);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 enum {
     SH_NONE = 0, SH_MARGIN, SH_PADDING, SH_BORDER, SH_BORDER_TOP,
     SH_BORDER_RIGHT, SH_BORDER_BOTTOM, SH_BORDER_LEFT, SH_BORDER_WIDTH,
-    SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BACKGROUND, SH_FONT, SH_LIST_STYLE
+    SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_RADIUS, SH_BACKGROUND,
+    SH_FONT, SH_LIST_STYLE, SH_FLEX, SH_GAP, SH_GRID_COL, SH_GRID_ROW
 };
 
 static int shorthand_id(const char *n)
@@ -1984,10 +2832,116 @@ static int shorthand_id(const char *n)
     if (css_stricmp(n, "border-width") == 0)  return SH_BORDER_WIDTH;
     if (css_stricmp(n, "border-style") == 0)  return SH_BORDER_STYLE;
     if (css_stricmp(n, "border-color") == 0)  return SH_BORDER_COLOR;
+    if (css_stricmp(n, "border-radius") == 0) return SH_BORDER_RADIUS;
     if (css_stricmp(n, "background") == 0)    return SH_BACKGROUND;
     if (css_stricmp(n, "font") == 0)          return SH_FONT;
     if (css_stricmp(n, "list-style") == 0)    return SH_LIST_STYLE;
+    if (css_stricmp(n, "flex") == 0)          return SH_FLEX;
+    if (css_stricmp(n, "gap") == 0)           return SH_GAP;
+    if (css_stricmp(n, "grid-column") == 0)   return SH_GRID_COL;
+    if (css_stricmp(n, "grid-row") == 0)      return SH_GRID_ROW;
     return SH_NONE;
+}
+
+static void emit_raw(struct css_parser *p, int prop, int raw_kw,
+                     const char *raw_str, int important)
+{
+    struct css_value v;
+    memset(&v, 0, sizeof(v));
+    v.type = CSS_VAL_RAW_EXPR;
+    v.kw = (int16_t)raw_kw;
+    v.str = raw_str;
+    emit(p, prop, &v, important);
+}
+
+static int emit_raw_for_decl(struct css_parser *p, const char *name,
+                             const char *raw, int important)
+{
+    const char *s = arena_str(&p->ss->arena, raw, (unsigned long)strlen(raw));
+    int sh, prop, i;
+
+    if (!s)
+        return 0;
+    sh = shorthand_id(name);
+    if (sh != SH_NONE) {
+        switch (sh) {
+        case SH_MARGIN:
+            for (i = 0; i < 4; i++) emit_raw(p, side_margin[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_PADDING:
+            for (i = 0; i < 4; i++) emit_raw(p, side_padding[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_BORDER_WIDTH:
+            for (i = 0; i < 4; i++) emit_raw(p, side_bw[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_BORDER_STYLE:
+            for (i = 0; i < 4; i++) emit_raw(p, side_bs[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_BORDER_COLOR:
+            for (i = 0; i < 4; i++) emit_raw(p, side_bc[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_BORDER_RADIUS:
+            for (i = 0; i < 4; i++) emit_raw(p, side_radius[i], CSS_RAW_BOX_TOP + i, s, important);
+            return 1;
+        case SH_BORDER:
+            for (i = 0; i < 4; i++) {
+                emit_raw(p, side_bw[i], CSS_RAW_BORDER, s, important);
+                emit_raw(p, side_bs[i], CSS_RAW_BORDER, s, important);
+                emit_raw(p, side_bc[i], CSS_RAW_BORDER, s, important);
+            }
+            return 1;
+        case SH_BORDER_TOP:
+        case SH_BORDER_RIGHT:
+        case SH_BORDER_BOTTOM:
+        case SH_BORDER_LEFT: {
+            int side = sh - SH_BORDER_TOP;
+            emit_raw(p, side_bw[side], CSS_RAW_BORDER, s, important);
+            emit_raw(p, side_bs[side], CSS_RAW_BORDER, s, important);
+            emit_raw(p, side_bc[side], CSS_RAW_BORDER, s, important);
+            return 1;
+        }
+        case SH_BACKGROUND:
+            emit_raw(p, CSS_PROP_BACKGROUND_COLOR, CSS_RAW_BG, s, important);
+            emit_raw(p, CSS_PROP_BACKGROUND_IMAGE, CSS_RAW_BG, s, important);
+            return 1;
+        case SH_FLEX:
+            emit_raw(p, CSS_PROP_FLEX_GROW, CSS_RAW_FLEX, s, important);
+            emit_raw(p, CSS_PROP_FLEX_SHRINK, CSS_RAW_FLEX, s, important);
+            emit_raw(p, CSS_PROP_FLEX_BASIS, CSS_RAW_FLEX, s, important);
+            return 1;
+        case SH_GAP:
+            emit_raw(p, CSS_PROP_ROW_GAP, CSS_RAW_GAP, s, important);
+            emit_raw(p, CSS_PROP_COLUMN_GAP, CSS_RAW_GAP, s, important);
+            emit_raw(p, CSS_PROP_GAP, CSS_RAW_GAP, s, important);
+            return 1;
+        case SH_GRID_COL:
+            emit_raw(p, CSS_PROP_GRID_COL_START, CSS_RAW_GRID_LINE, s, important);
+            emit_raw(p, CSS_PROP_GRID_COL_END, CSS_RAW_GRID_LINE, s, important);
+            return 1;
+        case SH_GRID_ROW:
+            emit_raw(p, CSS_PROP_GRID_ROW_START, CSS_RAW_GRID_LINE, s, important);
+            emit_raw(p, CSS_PROP_GRID_ROW_END, CSS_RAW_GRID_LINE, s, important);
+            return 1;
+        case SH_FONT:
+            emit_raw(p, CSS_PROP_FONT_STYLE, CSS_RAW_FONT, s, important);
+            emit_raw(p, CSS_PROP_FONT_WEIGHT, CSS_RAW_FONT, s, important);
+            emit_raw(p, CSS_PROP_FONT_SIZE, CSS_RAW_FONT, s, important);
+            emit_raw(p, CSS_PROP_LINE_HEIGHT, CSS_RAW_FONT, s, important);
+            emit_raw(p, CSS_PROP_FONT_FAMILY, CSS_RAW_FONT, s, important);
+            return 1;
+        case SH_LIST_STYLE:
+            emit_raw(p, CSS_PROP_LIST_STYLE_TYPE, CSS_RAW_LIST_STYLE, s, important);
+            emit_raw(p, CSS_PROP_LIST_STYLE_POSITION, CSS_RAW_LIST_STYLE, s, important);
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    prop = css_property_id(name);
+    if (prop == CSS_PROP_NONE)
+        return 0;
+    emit_raw(p, prop, CSS_RAW_NONE, s, important);
+    return 1;
 }
 
 /* Apply one property name + parsed value. Returns 0 if the declaration is
@@ -2009,16 +2963,39 @@ static int apply_declaration(struct css_parser *p, const char *name,
             const int *set = 0;
             int i;
             switch (sh) {
-            case SH_MARGIN:  set = side_margin;  break;
-            case SH_PADDING: set = side_padding; break;
-            case SH_BORDER_WIDTH: set = side_bw; break;
-            case SH_BORDER_STYLE: set = side_bs; break;
-            case SH_BORDER_COLOR: set = side_bc; break;
+            case SH_MARGIN:        set = side_margin;  break;
+            case SH_PADDING:       set = side_padding; break;
+            case SH_BORDER_WIDTH:  set = side_bw; break;
+            case SH_BORDER_STYLE:  set = side_bs; break;
+            case SH_BORDER_COLOR:  set = side_bc; break;
+            case SH_BORDER_RADIUS: set = side_radius; break;
             default: break;
             }
             if (set) {
                 for (i = 0; i < 4; i++)
                     emit(p, set[i], &p->comp[0], important);
+                return 1;
+            }
+            if (sh == SH_FLEX) {
+                emit(p, CSS_PROP_FLEX_GROW, &p->comp[0], important);
+                emit(p, CSS_PROP_FLEX_SHRINK, &p->comp[0], important);
+                emit(p, CSS_PROP_FLEX_BASIS, &p->comp[0], important);
+                return 1;
+            }
+            if (sh == SH_GAP) {
+                emit(p, CSS_PROP_ROW_GAP, &p->comp[0], important);
+                emit(p, CSS_PROP_COLUMN_GAP, &p->comp[0], important);
+                emit(p, CSS_PROP_GAP, &p->comp[0], important);
+                return 1;
+            }
+            if (sh == SH_GRID_COL) {
+                emit(p, CSS_PROP_GRID_COL_START, &p->comp[0], important);
+                emit(p, CSS_PROP_GRID_COL_END, &p->comp[0], important);
+                return 1;
+            }
+            if (sh == SH_GRID_ROW) {
+                emit(p, CSS_PROP_GRID_ROW_START, &p->comp[0], important);
+                emit(p, CSS_PROP_GRID_ROW_END, &p->comp[0], important);
                 return 1;
             }
         }
@@ -2028,6 +3005,7 @@ static int apply_declaration(struct css_parser *p, const char *name,
         case SH_BORDER_WIDTH: ok = expand_box(p, side_bw, important); break;
         case SH_BORDER_STYLE: ok = expand_box(p, side_bs, important); break;
         case SH_BORDER_COLOR: ok = expand_box(p, side_bc, important); break;
+        case SH_BORDER_RADIUS: ok = expand_border_radius(p, important); break;
         case SH_BORDER:
             ok = expand_border(p, 0, 1, 2, 3, important); break;
         case SH_BORDER_TOP:
@@ -2041,6 +3019,14 @@ static int apply_declaration(struct css_parser *p, const char *name,
         case SH_BACKGROUND:   ok = expand_background(p, important); break;
         case SH_FONT:         ok = expand_font(p, important); break;
         case SH_LIST_STYLE:   ok = expand_list_style(p, important); break;
+        case SH_FLEX:         ok = expand_flex(p, important); break;
+        case SH_GAP:          ok = expand_gap(p, important); break;
+        case SH_GRID_COL:
+            ok = expand_grid_line(p, CSS_PROP_GRID_COL_START,
+                                  CSS_PROP_GRID_COL_END, important); break;
+        case SH_GRID_ROW:
+            ok = expand_grid_line(p, CSS_PROP_GRID_ROW_START,
+                                  CSS_PROP_GRID_ROW_END, important); break;
         default: break;
         }
         if (!ok)
@@ -2073,6 +3059,24 @@ static int apply_declaration(struct css_parser *p, const char *name,
         return store_line_height(p, important);
     case CSS_PROP_FONT_WEIGHT:
         return store_font_weight(p, important);
+    case CSS_PROP_COLOR_SCHEME:
+        return store_color_scheme(p, important);
+    case CSS_PROP_GRID_COL_START:
+    case CSS_PROP_GRID_COL_END:
+    case CSS_PROP_GRID_ROW_START:
+    case CSS_PROP_GRID_ROW_END:
+        if (!parse_grid_line_comps(p, 0, p->ncomp, &v))
+            return 0;
+        emit(p, prop, &v, important);
+        return 1;
+    case CSS_PROP_ROW_GAP:
+    case CSS_PROP_COLUMN_GAP:
+        if (p->ncomp == 1 && p->comp[0].type == CSS_VAL_IDENT &&
+            css_stricmp(p->comp[0].str, "normal") == 0) {
+            emit_len(p, prop, 0, CSS_UNIT_PX, important);
+            return 1;
+        }
+        break;
     default:
         break;
     }
@@ -2084,6 +3088,61 @@ static int apply_declaration(struct css_parser *p, const char *name,
     return 1;
 }
 
+static int parse_decl_value_and_apply(struct css_parser *p, const char *name,
+                                      struct css_lex colon_lex,
+                                      int stop_rparen, int *important)
+{
+    int is_shadow = (css_stricmp(name, "box-shadow") == 0);
+    int is_grid_cols = (css_stricmp(name, "grid-template-columns") == 0);
+    char raw_buf[CSS_RAW_CAP];
+    int raw_len = 0, raw_ok = 0, ok = 0;
+
+    *important = 0;
+    if (is_shadow || is_grid_cols) {
+        p->lex = colon_lex;
+        raw_ok = read_raw_span(&p->lex, raw_buf, sizeof(raw_buf), &raw_len,
+                               important, stop_rparen, 0);
+        nx(p);
+        if (!raw_ok || raw_len == 0)
+            return 0;
+        if (is_shadow ? !validate_box_shadow(raw_buf)
+                      : !validate_grid_cols(raw_buf))
+            return 0;
+        return emit_raw_for_decl(p, name, raw_buf, *important);
+    }
+
+    ok = read_value(p, important);
+    if (p->saw_expr && !p->saw_bad_tok) {
+        int sh = shorthand_id(name);
+        int prop = css_property_id(name);
+        if (sh == SH_NONE && prop == CSS_PROP_NONE)
+            return 0;
+        if (sh == SH_NONE && prop != CSS_PROP_FONT_FAMILY &&
+            prop != CSS_PROP_TEXT_DECORATION && prop != CSS_PROP_COLOR_SCHEME &&
+            prop != CSS_PROP_GRID_COL_START && prop != CSS_PROP_GRID_COL_END &&
+            prop != CSS_PROP_GRID_ROW_START && prop != CSS_PROP_GRID_ROW_END &&
+            prop != CSS_PROP_BACKGROUND_IMAGE && p->ncomp != 1)
+            return 0;
+        if (!stop_rparen && p->tok.type != T_SEMI &&
+            p->tok.type != T_RBRACE && p->tok.type != T_EOF)
+            return 0;
+        if (stop_rparen && p->tok.type != T_RPAREN)
+            return 0;
+        p->lex = colon_lex;
+        raw_ok = read_raw_span(&p->lex, raw_buf, sizeof(raw_buf), &raw_len,
+                               important, stop_rparen, 0);
+        nx(p);
+        if (!raw_ok || raw_len == 0)
+            return 0;
+        if (!validate_expr_raw(raw_buf))
+            return 0;
+        return emit_raw_for_decl(p, name, raw_buf, *important);
+    }
+    if (ok)
+        return apply_declaration(p, name, *important);
+    return 0;
+}
+
 /* ================================================================== *
  * declaration block
  * ================================================================== */
@@ -2091,6 +3150,7 @@ static int apply_declaration(struct css_parser *p, const char *name,
 static void parse_block(struct css_parser *p)
 {
     p->nblock = 0;
+    p->ncustom_block = 0;
     for (;;) {
         skip_ws(p);
         if (p->tok.type == T_RBRACE) {
@@ -2109,6 +3169,7 @@ static void parse_block(struct css_parser *p)
         }
         {
             char name[CSS_MAX_IDENT];
+            struct css_lex colon_lex;
             int important = 0, ok;
             memcpy(name, p->tok.text, (unsigned long)p->tok.tlen + 1);
             nx(p);
@@ -2117,10 +3178,36 @@ static void parse_block(struct css_parser *p)
                 skip_declaration(p);
                 continue;
             }
+            colon_lex = p->lex;
+            if (name[0] == '-' && name[1] == '-' && name[2] != 0) {
+                char raw_buf[CSS_RAW_CAP];
+                int raw_len = 0, had_tok = 0;
+                ok = read_raw_span(&p->lex, raw_buf, sizeof(raw_buf),
+                                   &raw_len, &important, 0, &had_tok);
+                nx(p);
+                if (ok && had_tok) {
+                    if (p->ncustom_block >= CSS_MAX_BLOCK_DECLS) {
+                        p->ss->truncated = 1;
+                    } else {
+                        const char *cn = arena_str(&p->ss->arena, name,
+                                                   (unsigned long)strlen(name));
+                        const char *cv = arena_str(&p->ss->arena, raw_buf,
+                                                   (unsigned long)raw_len);
+                        if (cn && cv) {
+                            p->custom_block[p->ncustom_block].name = cn;
+                            p->custom_block[p->ncustom_block].value = cv;
+                            p->custom_block[p->ncustom_block].important =
+                                (uint8_t)important;
+                            p->ncustom_block++;
+                        }
+                    }
+                }
+                if (p->tok.type == T_SEMI)
+                    nx(p);
+                continue;
+            }
             nx(p);
-            ok = read_value(p, &important);
-            if (ok)
-                ok = apply_declaration(p, name, important);
+            ok = parse_decl_value_and_apply(p, name, colon_lex, 0, &important);
             (void)ok;
             if (p->tok.type == T_SEMI)
                 nx(p);
@@ -2295,12 +3382,14 @@ static int parse_compound(struct css_parser *p, struct sel_build *sb,
             if (p->tok.type != T_IDENT && p->tok.type != T_FUNCTION)
                 return 0;
             memcpy(pname, p->tok.text, (unsigned long)p->tok.tlen + 1);
-            if (!allow_pseudo)
+            if (!allow_pseudo && is_element)
                 return 0;
             if (p->tok.type == T_FUNCTION) {
                 int fn_not = (css_stricmp(pname, "not") == 0);
                 int fn_nth = (css_stricmp(pname, "nth-child") == 0);
                 int fn_nthl = (css_stricmp(pname, "nth-last-child") == 0);
+                if (!allow_pseudo && fn_not)
+                    return 0;
                 nx(p);
                 if (fn_not) {
                     struct css_compound *cp;
@@ -2640,7 +3729,8 @@ static void parse_qualified_rule(struct css_parser *p)
     struct css_selector *sels = p->sels;
     int nsel = 0, i, bad = 0;
     const struct css_decl *shared = 0;
-    int ndecl;
+    const struct css_custom_decl *shared_custom = 0;
+    int ndecl, ncustom;
 
     sb.simples = p->simples;
     sb.parts = p->compounds;
@@ -2699,18 +3789,29 @@ static void parse_qualified_rule(struct css_parser *p)
     nx(p);
     parse_block(p);
     ndecl = p->nblock;
+    ncustom = p->ncustom_block;
     /* A syntax error anywhere in the selector list throws the entire
      * rule away, per CSS 2.1 section 4.1.7. The block was still parsed,
      * which is what put the reader back in a known place. */
-    if (bad || nsel == 0 || ndecl == 0)
+    if (bad || nsel == 0 || (ndecl == 0 && ncustom == 0))
         return;
-    {
+    if (ndecl > 0) {
         struct css_decl *d = (struct css_decl *)arena_alloc(&p->ss->arena,
                 sizeof(struct css_decl) * (unsigned long)ndecl);
         if (!d)
             return;
         memcpy(d, p->block, sizeof(struct css_decl) * (unsigned long)ndecl);
         shared = d;
+    }
+    if (ncustom > 0) {
+        struct css_custom_decl *c = (struct css_custom_decl *)
+            arena_alloc(&p->ss->arena,
+                        sizeof(struct css_custom_decl) * (unsigned long)ncustom);
+        if (!c)
+            return;
+        memcpy(c, p->custom_block,
+               sizeof(struct css_custom_decl) * (unsigned long)ncustom);
+        shared_custom = c;
     }
     for (i = 0; i < nsel; i++) {
         struct css_rule *r;
@@ -2720,6 +3821,8 @@ static void parse_qualified_rule(struct css_parser *p)
         r->sel = sels[i];
         r->decls = shared;
         r->ndecl = ndecl;
+        r->customs = shared_custom;
+        r->ncustom = ncustom;
         r->order = (uint32_t)p->ss->nrule;
         r->media = (int16_t)current_media(p);
         r->origin = (uint8_t)p->ss->origin;
@@ -2745,6 +3848,8 @@ static int media_feature_id(const char *n, int *op)
     if (css_stricmp(base, "resolution") == 0)  return MF_RESOLUTION;
     if (css_stricmp(base, "color") == 0)       return MF_COLOR;
     if (css_stricmp(base, "monochrome") == 0)  return MF_MONOCHROME;
+    if (css_stricmp(n, "prefers-color-scheme") == 0) return MF_PREFERS_DARK;
+    if (css_stricmp(n, "scripting") == 0)      return MF_SCRIPTING;
     return MF_UNKNOWN;
 }
 
@@ -2768,10 +3873,14 @@ static int eval_query(const struct media_query *q, const struct css_media *m)
             continue;
         case MF_MONOCHROME: have = m->monochrome ? 1 : 0; break;
         case MF_COLOR:      have = m->monochrome ? 0 : 8; break;
+        case MF_PREFERS_DARK: have = m->prefers_dark ? 1 : 0; break;
+        case MF_SCRIPTING:  have = m->scripting ? 1 : 0; break;
         default:            r = 0; continue;
         }
         if (f->op == MOP_MIN && have < f->value) r = 0;
         else if (f->op == MOP_MAX && have > f->value) r = 0;
+        else if (f->op == MOP_GT && have <= f->value) r = 0;
+        else if (f->op == MOP_LT && have >= f->value) r = 0;
         else if (f->op == MOP_EQ && have != f->value) r = 0;
     }
     return q->negated ? !r : r;
@@ -2816,6 +3925,78 @@ static int sheet_add_media(struct css_stylesheet *ss, struct media_block *mb)
     }
     ss->media[ss->nmedia] = mb;
     return ss->nmedia++;
+}
+
+enum { MCMP_NONE = 0, MCMP_LT, MCMP_LE, MCMP_GT, MCMP_GE, MCMP_EQ };
+
+static int parse_media_cmp(struct css_parser *p)
+{
+    if (p->tok.type == T_DELIM && p->tok.delim == '=') {
+        nx(p);
+        return MCMP_EQ;
+    }
+    if (p->tok.type == T_DELIM && p->tok.delim == '<') {
+        nx(p);
+        if (p->tok.type == T_DELIM && p->tok.delim == '=') {
+            nx(p);
+            return MCMP_LE;
+        }
+        return MCMP_LT;
+    }
+    if (p->tok.type == T_DELIM && p->tok.delim == '>') {
+        nx(p);
+        if (p->tok.type == T_DELIM && p->tok.delim == '=') {
+            nx(p);
+            return MCMP_GE;
+        }
+        return MCMP_GT;
+    }
+    return MCMP_NONE;
+}
+
+static int media_cmp_to_op(int cmp, int lhs_val)
+{
+    switch (cmp) {
+    case MCMP_LT: return lhs_val ? MOP_GT  : MOP_LT;
+    case MCMP_LE: return lhs_val ? MOP_MIN : MOP_MAX;
+    case MCMP_GT: return lhs_val ? MOP_LT  : MOP_GT;
+    case MCMP_GE: return lhs_val ? MOP_MAX : MOP_MIN;
+    case MCMP_EQ: return MOP_EQ;
+    default:      return MOP_EQ;
+    }
+}
+
+static int parse_media_num(struct css_parser *p, int32_t *out_val)
+{
+    if (p->tok.type == T_DIMENSION) {
+        int64_t px;
+        int u = unit_id(p->tok.unit);
+        if (unit_to_px_milli(p->tok.num, u, &px)) {
+            *out_val = milli_round(px);
+            nx(p);
+            return 1;
+        }
+        nx(p);
+        return 0;
+    }
+    if (p->tok.type == T_NUMBER) {
+        *out_val = (int32_t)(p->tok.num / 1000);
+        nx(p);
+        return 1;
+    }
+    return 0;
+}
+
+static int media_push_feat(struct media_query *q, int fid, int op, int32_t val)
+{
+    if (q->nfeat >= CSS_MAX_MEDIA_FEATS)
+        return 0;
+    q->f[q->nfeat].feature = (uint8_t)fid;
+    q->f[q->nfeat].op = (uint8_t)op;
+    q->f[q->nfeat].unit = 0;
+    q->f[q->nfeat].value = val;
+    q->nfeat++;
+    return 1;
 }
 
 /* Parse the query list after "@media", stopping at '{'. */
@@ -2873,7 +4054,127 @@ static int parse_media_list(struct css_parser *p, int parent)
                 break;
             nx(p);
             skip_ws(p);
-            if (p->tok.type != T_IDENT) {
+            if (p->tok.type == T_IDENT) {
+                char fname[CSS_MAX_IDENT];
+                int op, fid, cmp;
+                memcpy(fname, p->tok.text, (unsigned long)p->tok.tlen + 1);
+                fid = media_feature_id(fname, &op);
+                nx(p);
+                skip_ws(p);
+                if (p->tok.type == T_COLON) {
+                    int32_t val = 0;
+                    int ok = 1;
+                    nx(p);
+                    skip_ws(p);
+                    if (fid == MF_PREFERS_DARK) {
+                        if (p->tok.type == T_IDENT &&
+                            css_stricmp(p->tok.text, "dark") == 0)
+                            val = 1;
+                        else if (p->tok.type == T_IDENT &&
+                                 css_stricmp(p->tok.text, "light") == 0)
+                            val = 0;
+                        else
+                            ok = 0;
+                        if (p->tok.type == T_IDENT) nx(p);
+                    } else if (fid == MF_SCRIPTING) {
+                        if (p->tok.type == T_IDENT &&
+                            css_stricmp(p->tok.text, "enabled") == 0)
+                            val = 1;
+                        else if (p->tok.type == T_IDENT &&
+                                 css_stricmp(p->tok.text, "none") == 0)
+                            val = 0;
+                        else if (p->tok.type == T_IDENT &&
+                                 css_stricmp(p->tok.text, "initial-only") == 0)
+                            val = 2;
+                        else
+                            ok = 0;
+                        if (p->tok.type == T_IDENT) nx(p);
+                    } else if (fid == MF_ORIENTATION) {
+                        if (p->tok.type == T_IDENT &&
+                            css_stricmp(p->tok.text, "landscape") == 0)
+                            val = 1;
+                        else if (p->tok.type == T_IDENT &&
+                                 css_stricmp(p->tok.text, "portrait") == 0)
+                            val = 0;
+                        else
+                            ok = 0;
+                        if (p->tok.type == T_IDENT) nx(p);
+                    } else {
+                        ok = parse_media_num(p, &val);
+                    }
+                    skip_ws(p);
+                    if (p->tok.type != T_RPAREN)
+                        ok = 0;
+                    media_push_feat(q, ok ? fid : MF_UNKNOWN, op, val);
+                } else if (p->tok.type == T_RPAREN) {
+                    if (fid == MF_PREFERS_DARK)
+                        media_push_feat(q, fid, MOP_MIN, 0);
+                    else
+                        media_push_feat(q, fid, MOP_MIN, 1);
+                } else if ((cmp = parse_media_cmp(p)) != MCMP_NONE) {
+                    int32_t val = 0;
+                    int ok = (op == MOP_EQ) &&
+                             (fid == MF_WIDTH || fid == MF_HEIGHT ||
+                              fid == MF_RESOLUTION || fid == MF_COLOR ||
+                              fid == MF_MONOCHROME);
+                    skip_ws(p);
+                    if (!parse_media_num(p, &val))
+                        ok = 0;
+                    skip_ws(p);
+                    if (p->tok.type != T_RPAREN)
+                        ok = 0;
+                    media_push_feat(q, ok ? fid : MF_UNKNOWN,
+                                    media_cmp_to_op(cmp, 0), val);
+                } else {
+                    media_push_feat(q, MF_UNKNOWN, MOP_EQ, 0);
+                }
+            } else if (p->tok.type == T_DIMENSION || p->tok.type == T_NUMBER) {
+                int32_t v1 = 0, v2 = 0;
+                int cmp1, cmp2 = MCMP_NONE, fid = MF_UNKNOWN, op = MOP_EQ;
+                int ok = parse_media_num(p, &v1);
+                skip_ws(p);
+                cmp1 = parse_media_cmp(p);
+                if (cmp1 == MCMP_NONE)
+                    ok = 0;
+                skip_ws(p);
+                if (p->tok.type == T_IDENT) {
+                    fid = media_feature_id(p->tok.text, &op);
+                    nx(p);
+                } else {
+                    ok = 0;
+                }
+                if (op != MOP_EQ || (fid != MF_WIDTH && fid != MF_HEIGHT &&
+                                     fid != MF_RESOLUTION && fid != MF_COLOR &&
+                                     fid != MF_MONOCHROME))
+                    ok = 0;
+                skip_ws(p);
+                cmp2 = parse_media_cmp(p);
+                if (cmp2 != MCMP_NONE) {
+                    int dir1 = (cmp1 == MCMP_LT || cmp1 == MCMP_LE) ? -1 :
+                               (cmp1 == MCMP_GT || cmp1 == MCMP_GE) ? 1 : 0;
+                    int dir2 = (cmp2 == MCMP_LT || cmp2 == MCMP_LE) ? -1 :
+                               (cmp2 == MCMP_GT || cmp2 == MCMP_GE) ? 1 : 0;
+                    if (dir1 == 0 || dir1 != dir2)
+                        ok = 0;
+                    skip_ws(p);
+                    if (!parse_media_num(p, &v2))
+                        ok = 0;
+                    skip_ws(p);
+                    if (p->tok.type != T_RPAREN)
+                        ok = 0;
+                    if (ok && q->nfeat + 1 < CSS_MAX_MEDIA_FEATS) {
+                        media_push_feat(q, fid, media_cmp_to_op(cmp1, 1), v1);
+                        media_push_feat(q, fid, media_cmp_to_op(cmp2, 0), v2);
+                    } else {
+                        media_push_feat(q, MF_UNKNOWN, MOP_EQ, 0);
+                    }
+                } else {
+                    if (p->tok.type != T_RPAREN)
+                        ok = 0;
+                    media_push_feat(q, ok ? fid : MF_UNKNOWN,
+                                    media_cmp_to_op(cmp1, 1), v1);
+                }
+            } else {
                 while (p->tok.type != T_RPAREN && p->tok.type != T_LBRACE &&
                        p->tok.type != T_EOF)
                     nx(p);
@@ -2881,56 +4182,6 @@ static int parse_media_list(struct css_parser *p, int parent)
                     nx(p);
                 q->type = MT_OTHER;      /* unparseable feature: never match */
                 continue;
-            }
-            {
-                char fname[CSS_MAX_IDENT];
-                int op, fid;
-                memcpy(fname, p->tok.text, (unsigned long)p->tok.tlen + 1);
-                fid = media_feature_id(fname, &op);
-                nx(p);
-                skip_ws(p);
-                if (p->tok.type == T_COLON) {
-                    nx(p);
-                    skip_ws(p);
-                    if (q->nfeat < CSS_MAX_MEDIA_FEATS) {
-                        struct media_feat *f = &q->f[q->nfeat];
-                        f->feature = (uint8_t)fid;
-                        f->op = (uint8_t)op;
-                        f->unit = 0;
-                        f->value = 0;
-                        if (p->tok.type == T_DIMENSION) {
-                            int64_t px;
-                            int u = unit_id(p->tok.unit);
-                            if (unit_to_px_milli(p->tok.num, u, &px))
-                                f->value = milli_round(px);
-                            else
-                                f->feature = MF_UNKNOWN;
-                            nx(p);
-                        } else if (p->tok.type == T_NUMBER) {
-                            f->value = (int32_t)(p->tok.num / 1000);
-                            nx(p);
-                        } else if (p->tok.type == T_IDENT) {
-                            if (css_stricmp(p->tok.text, "landscape") == 0)
-                                f->value = 1;
-                            else if (css_stricmp(p->tok.text, "portrait") == 0)
-                                f->value = 0;
-                            else
-                                f->feature = MF_UNKNOWN;
-                            nx(p);
-                        } else {
-                            f->feature = MF_UNKNOWN;
-                        }
-                        q->nfeat++;
-                    }
-                } else if (q->nfeat < CSS_MAX_MEDIA_FEATS) {
-                    /* a boolean feature: (color) */
-                    struct media_feat *f = &q->f[q->nfeat];
-                    f->feature = (uint8_t)fid;
-                    f->op = MOP_MIN;
-                    f->value = 1;
-                    f->unit = 0;
-                    q->nfeat++;
-                }
             }
             while (p->tok.type != T_RPAREN && p->tok.type != T_LBRACE &&
                    p->tok.type != T_EOF)
@@ -2989,12 +4240,23 @@ static int parse_supports_term(struct css_parser *p)
         nx(p);
         skip_ws(p);
         if (p->tok.type == T_COLON) {
+            struct css_lex colon_lex = p->lex;
             int important = 0, saved = p->nblock;
 
-            nx(p);
-            if (read_value(p, &important) &&
-                p->tok.type == T_RPAREN)
-                value = apply_declaration(p, name, important);
+            if (name[0] == '-' && name[1] == '-' && name[2] != 0) {
+                char raw_buf[CSS_RAW_CAP];
+                int raw_len = 0, had_tok = 0;
+                int ok = read_raw_span(&p->lex, raw_buf, sizeof(raw_buf),
+                                       &raw_len, &important, 1, &had_tok);
+                nx(p);
+                value = ok && had_tok && (p->tok.type == T_RPAREN);
+            } else {
+                nx(p);
+                value = parse_decl_value_and_apply(p, name, colon_lex, 1,
+                                                   &important);
+                if (p->tok.type != T_RPAREN)
+                    value = 0;
+            }
             p->nblock = saved;
         } else {
             /* An identifier-led non-declaration condition is unknown. */
@@ -3334,7 +4596,12 @@ static void build_index(struct css_stylesheet *ss)
  * public parse entry points
  * ================================================================== */
 
-static const struct css_media default_media = { 1024, 768, 96, 1, 0 };
+static const struct css_media default_media = { 1024, 768, 96, 1, 0, 0, 0 };
+
+int css_stylesheet_prefers_dark(const struct css_stylesheet *ss)
+{
+    return ss ? (ss->env.prefers_dark != 0) : 0;
+}
 
 static struct css_stylesheet *sheet_new(int origin, const struct css_media *m)
 {
@@ -3408,16 +4675,29 @@ struct css_stylesheet *css_parse_style_attr(const char *text)
     p->lex.n = len;
     nx(p);
     parse_block(p);
-    if (p->nblock > 0 && sheet_grow_rules(ss)) {
-        struct css_decl *d = (struct css_decl *)arena_alloc(&ss->arena,
-                sizeof(struct css_decl) * (unsigned long)p->nblock);
+    if ((p->nblock > 0 || p->ncustom_block > 0) && sheet_grow_rules(ss)) {
+        struct css_decl *d = 0;
+        struct css_custom_decl *cd = 0;
         struct css_compound *cp = (struct css_compound *)
                 arena_alloc(&ss->arena, sizeof(*cp));
         struct css_simple *sim = (struct css_simple *)
                 arena_alloc(&ss->arena, sizeof(*sim));
-        if (d && cp && sim) {
-            memcpy(d, p->block,
-                   sizeof(struct css_decl) * (unsigned long)p->nblock);
+        int ok = (cp && sim);
+        if (ok && p->nblock > 0) {
+            d = (struct css_decl *)arena_alloc(&ss->arena,
+                    sizeof(struct css_decl) * (unsigned long)p->nblock);
+            if (!d) ok = 0;
+            else memcpy(d, p->block,
+                        sizeof(struct css_decl) * (unsigned long)p->nblock);
+        }
+        if (ok && p->ncustom_block > 0) {
+            cd = (struct css_custom_decl *)arena_alloc(&ss->arena,
+                    sizeof(struct css_custom_decl) * (unsigned long)p->ncustom_block);
+            if (!cd) ok = 0;
+            else memcpy(cd, p->custom_block,
+                        sizeof(struct css_custom_decl) * (unsigned long)p->ncustom_block);
+        }
+        if (ok) {
             memset(sim, 0, sizeof(*sim));
             sim->kind = CSS_SIMPLE_UNIVERSAL;
             cp->simples = sim;
@@ -3428,6 +4708,8 @@ struct css_stylesheet *css_parse_style_attr(const char *text)
             ss->rules[0].sel.specificity = 0;
             ss->rules[0].decls = d;
             ss->rules[0].ndecl = p->nblock;
+            ss->rules[0].customs = cd;
+            ss->rules[0].ncustom = p->ncustom_block;
             ss->rules[0].order = 0;
             ss->rules[0].media = -1;
             ss->rules[0].origin = CSS_ORIGIN_INLINE;

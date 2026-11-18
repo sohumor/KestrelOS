@@ -1,14 +1,15 @@
-/* KestrelOS libimg: baseline sequential DCT JPEG (ITU-T T.81).
+/* KestrelOS libimg: baseline sequential & progressive DCT JPEG (ITU-T T.81).
  *
- * Supported: SOI, APPn, COM, DQT (8- and 16-bit tables), SOF0/SOF1, DHT,
- * SOS, DRI with RSTn restart markers, EOI; Huffman entropy coding; 1- and
- * 3-component images with any sampling factors in 1..4, which covers
- * 4:4:4, 4:2:2, 4:2:0, 4:1:1 and 4:4:0; an integer inverse DCT; YCbCr to
- * RGB.
+ * Supported: SOI, APPn, COM, DQT (8- and 16-bit tables), SOF0/SOF1/SOF2,
+ * DHT, SOS (single and multi-scan progressive with spectral selection and
+ * successive approximation), DRI with RSTn restart markers, EOI; Huffman
+ * entropy coding; 1- and 3-component images with any sampling factors in
+ * 1..4, which covers 4:4:4, 4:2:2, 4:2:0, 4:1:1 and 4:4:0; an integer
+ * inverse DCT; YCbCr to RGB.
  *
  * Not supported, and reported as such rather than decoded into garbage:
- * progressive (SOF2), arithmetic coding (SOF9/SOF10), lossless and
- * hierarchical modes, 12-bit precision, and 4-component (CMYK/YCCK) data.
+ * arithmetic coding (SOF9/SOF10), lossless and hierarchical modes, 12-bit
+ * precision, and 4-component (CMYK/YCCK) data.
  *
  * The IDCT is derived here rather than lifted: the 8-point transform is
  * split into its even and odd halves, the even half collapsing to four
@@ -16,6 +17,7 @@
  * fixed point over 64-bit accumulators so no input can overflow it.
  */
 
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,7 +55,10 @@ struct comp {
     int td, ta;
     long dcpred;
     long pw, ph;            /* plane size, a whole number of MCUs */
+    long bw, bh;            /* blocks in MCU-padded plane (pw/8, ph/8) */
+    long scan_w, scan_h;    /* blocks in non-interleaved scan (T.81 A.2.2) */
     uint8_t *plane;
+    int16_t *coef;          /* progressive quantized coeffs (zigzag), else NULL */
 };
 
 struct jpg {
@@ -71,10 +76,19 @@ struct jpg {
     long mcux, mcuy;
     long restart_interval;
 
+    /* progressive scan state */
+    int      progressive;
+    int      scan_ns;
+    int      scan_comp[4];
+    int      ss, se, ah, al;
+    long     eobrun;
+
     /* entropy bit reader */
     uint32_t bb;
     int      bc;
     int      hit_marker;
+    int      hit_eof;
+    unsigned long eof_bits;
 };
 
 /* ------------------------------------------------------------ bit reader
@@ -93,10 +107,13 @@ static void bit_fill(struct jpg *j)
         if (!j->hit_marker) {
             if (j->pos >= j->len) {
                 j->hit_marker = 1;
+                j->hit_eof = 1;
             } else {
                 c = j->d[j->pos++];
                 if (c == 0xff) {
                     int c2 = (j->pos < j->len) ? j->d[j->pos] : 0xd9;
+                    if (j->pos >= j->len)
+                        j->hit_eof = 1;
                     if (c2 == 0) {
                         j->pos++;            /* stuffed: a literal 0xff */
                     } else {
@@ -107,6 +124,8 @@ static void bit_fill(struct jpg *j)
                 }
             }
         }
+        if (j->hit_marker)
+            j->eof_bits += 8;
         j->bb = (j->bb << 8) | (uint32_t)(unsigned)c;
         j->bc += 8;
     }
@@ -325,18 +344,28 @@ static int decode_block(struct jpg *j, struct comp *ci, uint8_t *dst,
 }
 
 /* Resynchronise at a restart marker: byte-align, find the RSTn, and clear
- * the DC predictors. */
+ * the DC predictors and EOB run. */
 static int do_restart(struct jpg *j)
 {
     int i;
 
+    if (j->progressive && (unsigned long)j->bc < j->eof_bits)
+        return j->hit_eof ? IMG_ERR_TRUNCATED : IMG_ERR_CORRUPT;
+
     j->bb = 0;
     j->bc = 0;
     j->hit_marker = 0;
+    j->hit_eof = 0;
+    j->eof_bits = 0;
+    j->eobrun = 0;
 
     while (j->pos + 1 < j->len) {
-        if (j->d[j->pos] == 0xff && j->d[j->pos + 1] != 0)
-            break;
+        if (j->d[j->pos] == 0xff) {
+            while (j->pos + 1 < j->len && j->d[j->pos + 1] == 0xff)
+                j->pos++;
+            if (j->pos + 1 < j->len && j->d[j->pos + 1] != 0)
+                break;
+        }
         j->pos++;
     }
     if (j->pos + 1 >= j->len)
@@ -359,6 +388,8 @@ static int decode_scan(struct jpg *j)
     j->bb = 0;
     j->bc = 0;
     j->hit_marker = 0;
+    j->hit_eof = 0;
+    j->eof_bits = 0;
 
     for (my = 0; my < j->mcuy; my++) {
         for (mx = 0; mx < j->mcux; mx++) {
@@ -367,8 +398,8 @@ static int decode_scan(struct jpg *j)
                 if (rc != IMG_OK)
                     return rc;
             }
-            for (i = 0; i < j->ncomp; i++) {
-                struct comp *ci = &j->comp[i];
+            for (i = 0; i < j->scan_ns; i++) {
+                struct comp *ci = &j->comp[j->scan_comp[i]];
                 int bx, by;
 
                 for (by = 0; by < ci->v; by++) {
@@ -387,6 +418,228 @@ static int decode_scan(struct jpg *j)
             seen++;
         }
     }
+    return IMG_OK;
+}
+
+/* ------------------------------------------------------------ progressive */
+
+static int refine_nonzero(struct jpg *j, int16_t *c, long p1)
+{
+    if (bit_get(j, 1)) {
+        long nv = (long)*c + (*c > 0 ? p1 : -p1);
+        if (nv < -32768 || nv > 32767)
+            return IMG_ERR_CORRUPT;
+        *c = (int16_t)nv;
+    }
+    return IMG_OK;
+}
+
+static int prog_dc_first(struct jpg *j, struct comp *ci, int16_t *coef)
+{
+    int t = huff_decode(j, &j->hdc[ci->td]);
+    long v;
+
+    if (t < 0 || t > 15)
+        return IMG_ERR_CORRUPT;
+    ci->dcpred += extend(bit_get(j, t), t);
+    v = ci->dcpred * (1L << j->al);
+    if (v < -32768 || v > 32767)
+        return IMG_ERR_CORRUPT;
+    coef[0] = (int16_t)v;
+    return IMG_OK;
+}
+
+static int prog_dc_refine(struct jpg *j, int16_t *coef)
+{
+    if (bit_get(j, 1))
+        coef[0] = (int16_t)((uint16_t)coef[0] | (uint16_t)(1u << j->al));
+    return IMG_OK;
+}
+
+static int prog_ac_first(struct jpg *j, struct comp *ci, int16_t *coef)
+{
+    int k;
+
+    if (j->eobrun > 0) {
+        j->eobrun--;
+        return IMG_OK;
+    }
+    k = j->ss;
+    while (k <= j->se) {
+        int rs = huff_decode(j, &j->hac[ci->ta]);
+        int r, s;
+        long v;
+
+        if (rs < 0)
+            return IMG_ERR_CORRUPT;
+        r = rs >> 4;
+        s = rs & 15;
+        if (s == 0) {
+            if (r == 15) {
+                k += 16;
+                continue;
+            }
+            j->eobrun = (1L << r) + (long)bit_get(j, r);
+            j->eobrun--;
+            break;
+        }
+        k += r;
+        if (k > j->se)
+            return IMG_ERR_CORRUPT;
+        v = extend(bit_get(j, s), s) * (1L << j->al);
+        if (v < -32768 || v > 32767)
+            return IMG_ERR_CORRUPT;
+        coef[k] = (int16_t)v;
+        k++;
+    }
+    return IMG_OK;
+}
+
+static int prog_ac_refine(struct jpg *j, struct comp *ci, int16_t *coef)
+{
+    long p1 = 1L << j->al;
+    int k = j->ss;
+    int rc;
+
+    if (j->eobrun == 0) {
+        while (k <= j->se) {
+            int rs = huff_decode(j, &j->hac[ci->ta]);
+            int r, s;
+
+            if (rs < 0)
+                return IMG_ERR_CORRUPT;
+            r = rs >> 4;
+            s = rs & 15;
+            if (s == 0) {
+                if (r != 15) {
+                    j->eobrun = (1L << r) + (long)bit_get(j, r);
+                    break;
+                }
+                while (k <= j->se) {
+                    if (coef[k] != 0) {
+                        rc = refine_nonzero(j, &coef[k], p1);
+                        if (rc != IMG_OK)
+                            return rc;
+                    } else {
+                        if (r == 0) {
+                            k++;
+                            break;
+                        }
+                        r--;
+                    }
+                    k++;
+                }
+            } else if (s == 1) {
+                long val = bit_get(j, 1) ? p1 : -p1;
+                for (;;) {
+                    if (k > j->se)
+                        return IMG_ERR_CORRUPT;
+                    if (coef[k] != 0) {
+                        rc = refine_nonzero(j, &coef[k], p1);
+                        if (rc != IMG_OK)
+                            return rc;
+                    } else {
+                        if (r == 0)
+                            break;
+                        r--;
+                    }
+                    k++;
+                }
+                coef[k] = (int16_t)val;
+                k++;
+            } else {
+                return IMG_ERR_CORRUPT;
+            }
+        }
+    }
+    if (j->eobrun > 0) {
+        for (; k <= j->se; k++) {
+            if (coef[k] != 0) {
+                rc = refine_nonzero(j, &coef[k], p1);
+                if (rc != IMG_OK)
+                    return rc;
+            }
+        }
+        j->eobrun--;
+    }
+    return IMG_OK;
+}
+
+static int decode_prog_scan(struct jpg *j)
+{
+    long mx, my, seen = 0;
+    int i, rc;
+
+    for (i = 0; i < j->ncomp; i++)
+        j->comp[i].dcpred = 0;
+    j->bb = 0;
+    j->bc = 0;
+    j->hit_marker = 0;
+    j->hit_eof = 0;
+    j->eof_bits = 0;
+    j->eobrun = 0;
+
+    if (j->scan_ns == 1) {
+        struct comp *ci = &j->comp[j->scan_comp[0]];
+        long bx, by;
+
+        for (by = 0; by < ci->scan_h; by++) {
+            for (bx = 0; bx < ci->scan_w; bx++) {
+                int16_t *coef = ci->coef +
+                    ((size_t)by * (size_t)ci->bw + (size_t)bx) * 64;
+
+                if (j->restart_interval && seen &&
+                    seen % j->restart_interval == 0) {
+                    rc = do_restart(j);
+                    if (rc != IMG_OK)
+                        return rc;
+                }
+                if (j->ss == 0) {
+                    rc = (j->ah == 0) ? prog_dc_first(j, ci, coef)
+                                      : prog_dc_refine(j, coef);
+                } else {
+                    rc = (j->ah == 0) ? prog_ac_first(j, ci, coef)
+                                      : prog_ac_refine(j, ci, coef);
+                }
+                if (rc != IMG_OK)
+                    return rc;
+                seen++;
+            }
+        }
+    } else {
+        for (my = 0; my < j->mcuy; my++) {
+            for (mx = 0; mx < j->mcux; mx++) {
+                if (j->restart_interval && seen &&
+                    seen % j->restart_interval == 0) {
+                    rc = do_restart(j);
+                    if (rc != IMG_OK)
+                        return rc;
+                }
+                for (i = 0; i < j->scan_ns; i++) {
+                    struct comp *ci = &j->comp[j->scan_comp[i]];
+                    int bx, by;
+
+                    for (by = 0; by < ci->v; by++) {
+                        for (bx = 0; bx < ci->h; bx++) {
+                            long bbx = mx * ci->h + bx;
+                            long bby = my * ci->v + by;
+                            int16_t *coef = ci->coef +
+                                ((size_t)bby * (size_t)ci->bw + (size_t)bbx) * 64;
+
+                            rc = (j->ah == 0) ? prog_dc_first(j, ci, coef)
+                                              : prog_dc_refine(j, coef);
+                            if (rc != IMG_OK)
+                                return rc;
+                        }
+                    }
+                }
+                seen++;
+            }
+        }
+    }
+
+    if ((unsigned long)j->bc < j->eof_bits)
+        return j->hit_eof ? IMG_ERR_TRUNCATED : IMG_ERR_CORRUPT;
     return IMG_OK;
 }
 
@@ -454,13 +707,18 @@ static void jpg_cleanup(struct jpg *j)
             free(j->comp[i].plane);
             j->comp[i].plane = 0;
         }
+        if (j->comp[i].coef) {
+            free(j->comp[i].coef);
+            j->comp[i].coef = 0;
+        }
     }
 }
 
-static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n)
+static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n,
+                     int progressive)
 {
-    unsigned long need;
-    int i;
+    size_t need, total_samples = 0;
+    int i, k;
 
     if (n < 6)
         return IMG_ERR_CORRUPT;
@@ -469,6 +727,7 @@ static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n)
     j->h = (long)rd16(p + 1);
     j->w = (long)rd16(p + 3);
     j->ncomp = p[5];
+    j->progressive = progressive;
     if (j->w <= 0 || j->h <= 0)
         return IMG_ERR_CORRUPT;
     if (j->w > IMG_MAX_DIM || j->h > IMG_MAX_DIM ||
@@ -488,6 +747,10 @@ static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n)
         c->tq = p[8 + i * 3];
         if (c->h < 1 || c->h > 4 || c->v < 1 || c->v > 4 || c->tq > 3)
             return IMG_ERR_CORRUPT;
+        for (k = 0; k < i; k++) {
+            if (j->comp[k].id == c->id)
+                return IMG_ERR_CORRUPT;
+        }
         if (c->h > j->hmax) j->hmax = c->h;
         if (c->v > j->vmax) j->vmax = c->v;
     }
@@ -503,17 +766,34 @@ static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n)
 
     for (i = 0; i < j->ncomp; i++) {
         struct comp *c = &j->comp[i];
-        c->pw = j->mcux * c->h * 8;
-        c->ph = j->mcuy * c->v * 8;
-        need = (unsigned long)c->pw * (unsigned long)c->ph;
+        long xi = (j->w * c->h + j->hmax - 1) / j->hmax;
+        long yi = (j->h * c->v + j->vmax - 1) / j->vmax;
+
+        c->bw = j->mcux * c->h;
+        c->bh = j->mcuy * c->v;
+        c->pw = c->bw * 8;
+        c->ph = c->bh * 8;
+        c->scan_w = (xi + 7) / 8;
+        c->scan_h = (yi + 7) / 8;
+        need = (size_t)c->pw * (size_t)c->ph;
         if (need == 0 || need > JPEG_MAX_PLANE)
             return IMG_ERR_TOOBIG;
-        if (c->plane)
+        if (c->plane || c->coef)
             return IMG_ERR_CORRUPT;            /* a second SOF */
-        c->plane = (uint8_t *)malloc(need);
-        if (!c->plane)
-            return IMG_ERR_NOMEM;
-        memset(c->plane, 128, need);
+        if (progressive) {
+            if (need > (~(size_t)0) / sizeof(int16_t) ||
+                need > (size_t)JPEG_MAX_PLANE - total_samples)
+                return IMG_ERR_TOOBIG;
+            total_samples += need;
+            c->coef = (int16_t *)calloc(need, sizeof(int16_t));
+            if (!c->coef)
+                return IMG_ERR_NOMEM;
+        } else {
+            c->plane = (uint8_t *)malloc(need);
+            if (!c->plane)
+                return IMG_ERR_NOMEM;
+            memset(c->plane, 128, need);
+        }
     }
     return IMG_OK;
 }
@@ -521,29 +801,90 @@ static int parse_sof(struct jpg *j, const uint8_t *p, unsigned long n)
 static int parse_sos(struct jpg *j, const uint8_t *p, unsigned long n)
 {
     int ns, i, k;
+    unsigned seen_mask = 0;
 
     if (n < 1)
         return IMG_ERR_CORRUPT;
     ns = p[0];
+    if (ns < 1 || ns > 4 || ns > j->ncomp)
+        return IMG_ERR_CORRUPT;
     if (n < 1 + (unsigned long)ns * 2 + 3)
         return IMG_ERR_CORRUPT;
-    if (ns != j->ncomp)
+    if (!j->progressive && ns != j->ncomp)
         return IMG_ERR_UNSUPPORTED;            /* non-interleaved multi-scan */
 
+    j->scan_ns = ns;
     for (i = 0; i < ns; i++) {
         int cs = p[1 + i * 2];
         int tt = p[2 + i * 2];
         for (k = 0; k < j->ncomp; k++) {
             if (j->comp[k].id == cs) {
+                if (seen_mask & (1u << k))
+                    return IMG_ERR_CORRUPT;
+                seen_mask |= (1u << k);
                 j->comp[k].td = tt >> 4;
                 j->comp[k].ta = tt & 15;
                 if (j->comp[k].td > 3 || j->comp[k].ta > 3)
                     return IMG_ERR_CORRUPT;
+                j->scan_comp[i] = k;
                 break;
             }
         }
         if (k == j->ncomp)
             return IMG_ERR_CORRUPT;
+    }
+
+    j->ss = p[1 + ns * 2];
+    j->se = p[2 + ns * 2];
+    j->ah = p[3 + ns * 2] >> 4;
+    j->al = p[3 + ns * 2] & 15;
+
+    if (j->progressive) {
+        if (j->ss > 63 || j->se > 63 || j->ss > j->se)
+            return IMG_ERR_CORRUPT;
+        if (j->ah > 13 || j->al > 13)
+            return IMG_ERR_CORRUPT;
+        if (j->ah > 0 && j->ah != j->al + 1)
+            return IMG_ERR_CORRUPT;
+        if (j->ss == 0 && j->se != 0)
+            return IMG_ERR_CORRUPT;
+        if (j->ss > 0 && ns != 1)
+            return IMG_ERR_CORRUPT;
+    }
+    return IMG_OK;
+}
+
+static int prog_finish(struct jpg *j)
+{
+    int i;
+
+    for (i = 0; i < j->ncomp; i++) {
+        struct comp *ci = &j->comp[i];
+        const uint16_t *q = j->qt[ci->tq];
+        size_t need = (size_t)ci->pw * (size_t)ci->ph;
+        long bx, by;
+
+        if (!j->qt_present[ci->tq])
+            return IMG_ERR_CORRUPT;
+        ci->plane = (uint8_t *)malloc(need);
+        if (!ci->plane)
+            return IMG_ERR_NOMEM;
+        for (by = 0; by < ci->bh; by++) {
+            for (bx = 0; bx < ci->bw; bx++) {
+                const int16_t *src = ci->coef +
+                    ((size_t)by * (size_t)ci->bw + (size_t)bx) * 64;
+                long blk[64];
+                int k;
+                for (k = 0; k < 64; k++)
+                    blk[zigzag[k]] = (long)src[k] * (long)q[k];
+                idct_block(blk,
+                           ci->plane + (size_t)by * 8 * (size_t)ci->pw +
+                           (size_t)bx * 8,
+                           ci->pw);
+            }
+        }
+        free(ci->coef);
+        ci->coef = 0;
     }
     return IMG_OK;
 }
@@ -555,7 +896,7 @@ int jpeg_decode(const void *data, unsigned long len, struct image *out)
     const uint8_t *d = (const uint8_t *)data;
     struct jpg *j;
     struct image im;
-    int rc = IMG_OK, seen_sof = 0, done = 0, i;
+    int rc = IMG_OK, seen_sof = 0, seen_sos = 0, done = 0, i;
 
     if (!out)
         return IMG_ERR_INVAL;
@@ -591,8 +932,11 @@ int jpeg_decode(const void *data, unsigned long len, struct image *out)
         }
         m = d[j->pos++];
 
-        if (m == 0xd9)                          /* EOI */
+        if (m == 0xd9) {                        /* EOI */
+            if (j->progressive && seen_sof && seen_sos)
+                done = 1;
             break;
+        }
         if (m == 0x01 || m == 0xd8 || (m >= 0xd0 && m <= 0xd7))
             continue;                           /* standalone markers */
 
@@ -611,19 +955,16 @@ int jpeg_decode(const void *data, unsigned long len, struct image *out)
         switch (m) {
         case 0xc0:                              /* SOF0 baseline */
         case 0xc1:                              /* SOF1 extended sequential */
+        case 0xc2:                              /* SOF2 progressive */
             if (seen_sof) {
                 rc = IMG_ERR_CORRUPT;
                 goto out;
             }
-            rc = parse_sof(j, body, seglen);
+            rc = parse_sof(j, body, seglen, m == 0xc2);
             if (rc != IMG_OK)
                 goto out;
             seen_sof = 1;
             break;
-
-        case 0xc2:                              /* SOF2 */
-            rc = IMG_ERR_PROGRESSIVE;
-            goto out;
 
         case 0xc3: case 0xc5: case 0xc6: case 0xc7:
         case 0xc9: case 0xca: case 0xcb:
@@ -691,13 +1032,31 @@ int jpeg_decode(const void *data, unsigned long len, struct image *out)
             rc = parse_sos(j, body, seglen);
             if (rc != IMG_OK)
                 goto out;
-            for (i = 0; i < j->ncomp; i++) {
-                if (!j->qt_present[j->comp[i].tq]) {
+            for (i = 0; i < j->scan_ns; i++) {
+                struct comp *ci = &j->comp[j->scan_comp[i]];
+                if (!j->qt_present[ci->tq]) {
                     rc = IMG_ERR_CORRUPT;
                     goto out;
                 }
+                if (j->progressive) {
+                    if (j->ss == 0 && j->ah == 0 && !j->hdc[ci->td].present) {
+                        rc = IMG_ERR_CORRUPT;
+                        goto out;
+                    }
+                    if (j->ss > 0 && !j->hac[ci->ta].present) {
+                        rc = IMG_ERR_CORRUPT;
+                        goto out;
+                    }
+                }
             }
             j->pos += seglen + 2;
+            if (j->progressive) {
+                rc = decode_prog_scan(j);
+                if (rc != IMG_OK)
+                    goto out;
+                seen_sos = 1;
+                continue;                       /* more scans until EOI */
+            }
             rc = decode_scan(j);
             if (rc != IMG_OK)
                 goto out;
@@ -714,6 +1073,12 @@ int jpeg_decode(const void *data, unsigned long len, struct image *out)
     if (!seen_sof || !done) {
         rc = seen_sof ? IMG_ERR_TRUNCATED : IMG_ERR_CORRUPT;
         goto out;
+    }
+
+    if (j->progressive) {
+        rc = prog_finish(j);
+        if (rc != IMG_OK)
+            goto out;
     }
 
     rc = img__alloc(&im, j->w, j->h, 0);

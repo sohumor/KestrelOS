@@ -23,6 +23,7 @@ void output_end(uint64_t flags)
 
 void output_putc_locked(char c)
 {
+    serial_poll_rx();
     console_putc(c);
     serial_putc(c);
 }
