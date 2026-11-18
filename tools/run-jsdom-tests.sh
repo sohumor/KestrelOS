@@ -16,7 +16,7 @@ for src in \
     libweb/jsdom.c \
     libtls/hash.c \
     libjs/value.c libjs/lex.c libjs/parse.c libjs/interp.c libjs/builtin.c \
-    libjs/webapi.c
+    libjs/webapi.c libjs/crypto.c
 do
     obj=$(printf '%s' "$src" | tr '/.' '__')
     # shellcheck disable=SC2086

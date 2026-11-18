@@ -43,6 +43,7 @@ compile libjs/parse.c js_parse
 compile libjs/interp.c js_interp
 compile libjs/builtin.c js_builtin
 compile libjs/webapi.c js_webapi
+compile libjs/crypto.c js_crypto
 compile libtls/hash.c tls_hash
 compile libgui/font.c font
 compile libgui/font_data.c font_data
@@ -54,6 +55,7 @@ compile libgui/draw.c draw
     "$OUT/url.o" "$OUT/storage.o" "$OUT/jsdom.o" "$OUT/layout.o" "$OUT/paint.o" \
     "$OUT/js_value.o" "$OUT/js_lex.o" "$OUT/js_parse.o" \
     "$OUT/js_interp.o" "$OUT/js_builtin.o" "$OUT/js_webapi.o" \
+    "$OUT/js_crypto.o" \
     "$OUT/tls_hash.o" \
     "$OUT/font.o" \
     "$OUT/font_data.o" "$OUT/draw.o"

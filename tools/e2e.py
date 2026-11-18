@@ -1297,6 +1297,10 @@ def _marker_handler(marker):
                     "<img id=\"svgimg\" src=/modern/badge.svg>"
                     "<img id=\"icoimg\" src=/modern/favicon.ico>"
                     "<div id=\"ratio\" class=\"ratio\"></div>"
+                    "<details><summary>DET-SUMMARY</summary>"
+                    "<p>DET-HIDDEN</p></details>"
+                    "<dialog open><p>DLG-OPEN</p></dialog>"
+                    "<dialog><p>DLG-CLOSED</p></dialog>"
                     "<div id=\"grid\" class=\"grid\">"
                     "<div id=\"cell\" class=\"cell\"></div></div>"
                     "<canvas id=\"cv\" width=\"16\" height=\"16\"></canvas>"
@@ -1476,6 +1480,54 @@ def _marker_handler(marker):
                     "mediaOk+':'+urlOk+':'+jsOk+':'+rr.width+'x'+rr.height+"
                     "':'+sr.width+'x'+sr.height+':'+ir.width+'x'+ir.height);\n"
                     "document.body.appendChild(w7Node);\n"
+                    "async function runWave8(){\n"
+                    "  const w8Node=document.createElement('p');\n"
+                    "  try{\n"
+                    "    const u4=crypto.randomUUID();\n"
+                    "    const uuidOk=typeof u4==='string' && u4.length===36 && "
+                    "u4.charAt(14)==='4' && u4.charAt(8)==='-';\n"
+                    "    const dig=new Uint8Array(await crypto.subtle.digest("
+                    "'SHA-256', new TextEncoder().encode('abc')));\n"
+                    "    const shaOk=dig.length===32 && dig[0]===0xba && "
+                    "dig[1]===0x78 && dig[2]===0x16 && dig[3]===0xbf;\n"
+                    "    const ac=new AbortController();\n"
+                    "    ac.abort();\n"
+                    "    let abFetch=false;\n"
+                    "    try{await fetch('/modern/api',{signal:ac.signal});}"
+                    "catch(e){abFetch=!!(e && e.name==='AbortError');}\n"
+                    "    const ac2=new AbortController();\n"
+                    "    ac2.abort('custom');\n"
+                    "    const abortOk=ac.signal.aborted && abFetch && "
+                    "ac2.signal.reason==='custom';\n"
+                    "    const bl=new Blob(['hi ', new Uint8Array([111,115])],"
+                    "{type:'TEXT/PLAIN'});\n"
+                    "    const blText=await bl.text();\n"
+                    "    const fd=new FormData();\n"
+                    "    fd.append('a','1'); fd.append('a','2');\n"
+                    "    const blobFdOk=bl.size===5 && bl.type==='text/plain' && "
+                    "blText==='hi os' && fd.get('a')==='1' && "
+                    "fd.getAll('a').length===2;\n"
+                    "    const gr=ctx.createLinearGradient(8,0,16,0);\n"
+                    "    gr.addColorStop(0,'#0000ff'); gr.addColorStop(1,'#0000ff');\n"
+                    "    ctx.fillStyle=gr; ctx.fillRect(8,0,8,8);\n"
+                    "    const id1=ctx.getImageData(10,2,1,1);\n"
+                    "    const id2=new ImageData(2,2);\n"
+                    "    id2.data[0]=12; id2.data[1]=34; id2.data[2]=56; id2.data[3]=255;\n"
+                    "    ctx.putImageData(id2,0,8);\n"
+                    "    const id3=ctx.getImageData(0,8,1,1);\n"
+                    "    const canvasW8Ok=(id1 instanceof ImageData) && "
+                    "id1.data[2]===255 && id1.data[3]===255 && "
+                    "id3.data[0]===12 && id3.data[1]===34 && id3.data[2]===56;\n"
+                    "    w8Node.textContent=(uuidOk && shaOk && abortOk && "
+                    "blobFdOk && canvasW8Ok)?'MODERN-WAVE8-OK':("
+                    "'MODERN-WAVE8-BAD:'+uuidOk+':'+shaOk+':'+abortOk+':'+"
+                    "blobFdOk+':'+canvasW8Ok);\n"
+                    "  }catch(e){\n"
+                    "    w8Node.textContent='MODERN-WAVE8-ERR:'+(e&&e.message?e.message:e);\n"
+                    "  }\n"
+                    "  document.body.appendChild(w8Node);\n"
+                    "}\n"
+                    "runWave8();\n"
                 ).encode("ascii")
             elif path == "/modern-dep.mjs":
                 content_type = "text/javascript"
@@ -2110,6 +2162,37 @@ def t_flight(h):
     wait_prompt(h)
 
 
+def t_aerie_krec(h):
+    """Exercise Wave 8 @krec /dev/{procs,sockets,caps,parcels} views."""
+    h.send("ls /dev")
+    h.expect(r"\n- +\d+ +procs\n", regex=True)
+    wait_prompt(h)
+
+    h.send('cat /dev/procs | where "name == init" | pick -r pid,name,state')
+    h.expect("@krec pid:int name:str state:str")
+    h.expect(r"\n\d+\tinit\t\S+\n", regex=True)
+    wait_prompt(h)
+
+    h.send('cat /dev/caps | where "pid == 1" | pick -r pid,caps')
+    h.expect("@krec pid:int caps:str")
+    h.expect(r"\n1\t\S+\n", regex=True)
+    wait_prompt(h)
+
+    h.send("cat /dev/sockets")
+    h.expect("@krec slot:int pid:int state:str local_port:int peer_ip:str "
+             "peer_port:int rx_bytes:int tx_bytes:int")
+    wait_prompt(h)
+
+    h.send('talon put -t text -l aerie "AERIE-PARCEL-OK"')
+    h.expect(r"parcel \d+ \(text, 15 bytes\)", regex=True)
+    wait_prompt(h)
+
+    h.send('cat /dev/parcels | where "label == aerie" | pick -r type,label')
+    h.expect("@krec type:str label:str")
+    h.expect(r"\ntext\taerie\n", regex=True)
+    wait_prompt(h)
+
+
 # ---- kernel log and services ------------------------------------------
 
 
@@ -2505,10 +2588,14 @@ def t_browser_modern_web(h):
     accept_delta = browser_fixtures.http.accept_count - accept_before
     for marker in ("MODERN-CSS-OK", "MODERN-ES6-ASYNC-OK",
                    "MODERN-MODULE-OK", "MODERN-CANVAS-OK",
-                   "MODERN-WAVE7-OK"):
+                   "MODERN-WAVE7-OK", "MODERN-WAVE8-OK",
+                   "DET-SUMMARY", "DLG-OPEN"):
         if marker not in block:
             raise TimeoutError("modern web marker %s was absent "
                                "(resource requests %r)" % (marker, counts))
+    for hidden in ("DET-HIDDEN", "DLG-CLOSED"):
+        if hidden in block:
+            raise TimeoutError("hidden details/dialog content %s leaked" % hidden)
     statuses = re.findall(r"(?m)^BROWSER-MODERN-STATUS-(-?\d+)$", block)
     if statuses != ["0"]:
         raise TimeoutError("browser modern status was %r" % statuses)
@@ -2525,6 +2612,17 @@ def t_browser_modern_web(h):
         raise TimeoutError("expected HTTP Keep-Alive connection reuse "
                            "(accept_delta=%d, requests=%d)"
                            % (accept_delta, len(modern_paths)))
+    wait_prompt(h, timeout=NET_TIMEOUT)
+
+    vs_end = "BROWSER-VS-END"
+    h.send("/bin/browser -t -v view-source:%s; "
+           "echo BROWSER-VS-STATUS-$?; echo %s"
+           % (browser_fixtures.modern_url, vs_end))
+    vs_block = h.capture_until(r"\n%s\n" % vs_end, timeout=NET_TIMEOUT, regex=True)
+    if "VIEW SOURCE" not in vs_block or "MODERN-WEB-START" not in vs_block:
+        raise TimeoutError("view-source output missing expected source markers")
+    if re.findall(r"(?m)^BROWSER-VS-STATUS-(-?\d+)$", vs_block) != ["0"]:
+        raise TimeoutError("browser view-source returned non-zero status")
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
@@ -2788,6 +2886,7 @@ TESTS = [
     ("kjs-cli", t_kjs_cli),
     ("dev", t_dev),
     ("flight", t_flight),
+    ("aerie-krec", t_aerie_krec),
     ("dmesg", t_dmesg),
     ("service-list", t_service_list),
     ("service-lifecycle", t_service_lifecycle),
