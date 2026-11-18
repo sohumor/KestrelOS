@@ -23,6 +23,7 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "flight.h"
 #include "tcp.h"
 #include "parcel.h"
+#include "net.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -77,6 +78,9 @@ static const struct devdesc devtab[] = {
     { "sockets", DEV_SOCKETS, 0444 },
     { "caps",    DEV_CAPS,    0444 },
     { "parcels", DEV_PARCELS, 0444 },
+    { "net",     DEV_NET,     0444 },
+    { "arp",     DEV_ARP,     0444 },
+    { "dns",     DEV_DNS,     0444 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -267,7 +271,8 @@ static uint32_t blk_size_bytes(struct blockdev *bd)
 static bool is_krec_dev(int id)
 {
     return id == DEV_FLIGHT || id == DEV_PROCS || id == DEV_SOCKETS ||
-           id == DEV_CAPS || id == DEV_PARCELS;
+           id == DEV_CAPS || id == DEV_PARCELS || id == DEV_NET ||
+           id == DEV_ARP || id == DEV_DNS;
 }
 
 static uint32_t krec_dev_cap(int id)
@@ -301,6 +306,25 @@ static uint32_t render_krec_view(int id, char *buf, uint32_t cap)
         return proc_caps_snapshot_krec(buf, cap);
     case DEV_PARCELS:
         return parcel_snapshot_krec(buf, cap);
+    case DEV_NET:
+        return net_snapshot_krec(buf, cap);
+    case DEV_ARP:
+        return arp_snapshot_krec(buf, cap);
+    case DEV_DNS:
+#ifdef CONFIG_DNS
+        return dns_snapshot_krec(buf, cap);
+#else
+    {
+        struct krec_kbuf b;
+        if (cap == 0)
+            return 0;
+        krec_kbuf_init(&b, buf, cap);
+        krec_kbuf_puts(&b, "@krec name:str ip:ip ttl_s:int hits:int\n");
+        if (b.overflow)
+            b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+#endif
     default:
         return 0;
     }
@@ -614,6 +638,9 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
     case DEV_SOCKETS:
     case DEV_CAPS:
     case DEV_PARCELS:
+    case DEV_NET:
+    case DEV_ARP:
+    case DEV_DNS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);
