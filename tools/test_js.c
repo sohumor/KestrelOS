@@ -89,7 +89,7 @@ static const tcase cases[] = {
 { "0.3-0.1", "0.19999999999999998" },
 { "1e308*10", "Infinity" },
 { "Math.pow(2,53)+1", "9007199254740992" },
-{ "2**0", "!SyntaxError" },
+{ "2**0", "1" },
 
 /* ---- coercion corner cases ---- */
 { "'5'-2", "3" },
@@ -352,6 +352,9 @@ static const tcase cases[] = {
 { "var o={a:1}; Object.freeze(o); o.a=2; o.a", "1" },
 { "var o={a:1}; Object.freeze(o); Object.isFrozen(o)", "true" },
 { "var o={a:1}; Object.preventExtensions(o); o.b=2; o.b", "undefined" },
+{ "var a=[1,2]; Object.freeze(a); a[0]=9; Object.isFrozen(a) && a[0]===1", "true" },
+{ "var a=[1,2]; Object.freeze(a); try{a.push(3); 'no'}catch(e){e.name}", "TypeError" },
+{ "var a=[1,2]; Object.seal(a); a[0]=5; Object.isSealed(a) && !Object.isFrozen(a) && a[0]===5", "true" },
 { "Object.getOwnPropertyDescriptor({a:1},'a').writable", "true" },
 { "({}).toString()", "[object Object]" },
 { "[].toString()", "" },
@@ -670,6 +673,112 @@ static const tcase cases[] = {
 { "var w=new WeakMap(),s=new WeakSet();typeof w.keys+','+typeof w.size+','+typeof s.values+','+typeof s.clear", "undefined,undefined,undefined,undefined" },
 { "try{WeakMap();'no'}catch(e){e.name}", "TypeError" },
 
+/* ---- ES6 let / const / block scoping / TDZ ---- */
+{ "{ let x = 1; { let x = 2; } x }", "1" },
+{ "let x = 10; if (true) { let x = 20; } x", "10" },
+{ "const c = 42; c", "42" },
+{ "const c;", "!SyntaxError" },
+{ "const c = 1; c = 2", "!TypeError" },
+{ "const c = 1; c++", "!TypeError" },
+{ "const c = 1; c += 2", "!TypeError" },
+{ "let r = ''; try { r += y; } catch (e) { r += e.name; } let y = 1; r", "ReferenceError" },
+{ "(function(){ try { return t; } catch(e) { return e.name; } let t = 5; })()", "ReferenceError" },
+{ "(function(){ try { return typeof t; } catch(e) { return e.name; } const t = 5; })()", "ReferenceError" },
+{ "let fns = []; for (let i = 0; i < 4; i++) { fns.push(() => i); } fns.map(f => f()).join(',')", "0,1,2,3" },
+{ "let fns = []; for (let i = 0, s = 10; i < 3; i++, s += 10) { fns.push(() => i + ':' + s); } fns.map(f => f()).join(',')", "0:10,1:20,2:30" },
+{ "let fns = []; for (const v of [10, 20, 30]) fns.push(() => v); fns.map(f => f()).join(',')", "10,20,30" },
+{ "let fns = []; const o = {a:1, b:2}; for (const k in o) fns.push(() => k); fns.map(f => f()).join(',')", "a,b" },
+{ "try { throw 'ok'; } catch { 'caught' }", "caught" },
+{ "var x = 1; { let x = 2; var z = x; } x + ',' + z", "1,2" },
+{ "let r = 0; switch (1) { case 1: { let a = 5; r = a; break; } } r + ',' + typeof a", "5,undefined" },
+
+/* ---- template literals & tagged templates ---- */
+{ "`hello ${1 + 2} world`", "hello 3 world" },
+{ "`a ${`b ${ {x:7}.x } c`} d`", "a b 7 c d" },
+{ "var s = `line1\nline2\\t\\\\\\`\\$${1+1}`; s.split('\\n').join('|')", "line1|line2\t\\`$2" },
+{ "function tag(s, ...v) { return s.join('|') + ':' + s.raw.join('|') + ':' + v.join(','); } tag`a\\nb${1+2}c\\`d`", "a\nb|c`d:a\\nb|c\\`d:3" },
+{ "function tag(s) { return String(s[0]) + ':' + s.raw[0]; } tag`\\uZZZZ`", "undefined:\\uZZZZ" },
+{ "`\\uZZZZ`", "!SyntaxError" },
+{ "try { `${Symbol('a')}`; 'no' } catch(e) { e.name }", "TypeError" },
+{ "String.raw`a\\nb${1+2}`", "a\\nb3" },
+
+/* ---- destructuring, default params, rest & spread ---- */
+{ "const [a, , b = 2, [c, ...d], ...rest] = [10, 99, undefined, [3, 4, 5], 6, 7]; [a, b, c, d.join('+'), rest.join('-')].join('|')", "10|2|3|4+5|6-7" },
+{ "let x = 1, y = 2; [x, y] = [y, x]; x + ',' + y", "2,1" },
+{ "const obj = {}; [obj.a, {b: obj.b = 9}] = [4, {}]; obj.a + ',' + obj.b", "4,9" },
+{ "const k = 'dyn'; const { a, b: renamed = 5, [k]: val, ...rest } = { a: 1, dyn: 7, c: 3, d: 4 }; [a, renamed, val, Object.keys(rest).sort().join(',')].join('|')", "1|5|7|c,d" },
+{ "function f(a = 10, b = a * 2, ...r) { return [a, String(b), r.join(',')].join(':'); } f() + '|' + f(undefined, null, 3, 4) + '|' + f.length", "10:20:|10:null:3,4|0" },
+{ "function g(a, b = 1, c) { return a; } g.length + ',' + ((x, y = 2) => x + y).length", "1,1" },
+{ "const fn = ({x, y = 2}, [head, ...tail], ...extra) => x + y + head + tail.length + extra.length; fn({x:3}, [4,5,6], 7, 8)", "13" },
+{ "const a = [1, 2], b = [4, 5]; [...a, 3, ...b, ...'xy'].join(',')", "1,2,3,4,5,x,y" },
+{ "Math.max(0, ...[3, 9, 2], 5)", "9" },
+{ "function Pair(a, b, c) { this.s = a + '-' + b + '-' + c; } new Pair(...[1, 2], 3).s", "1-2-3" },
+{ "const o1 = {a: 1, b: 2}, o2 = {b: 20, c: 30}; const m = {...o1, ...o2, c: 300}; m.a + ',' + m.b + ',' + m.c", "1,20,300" },
+{ "((a, b, c) => a + b + c)(...new Set([10, 20, 30]))", "60" },
+{ "for (const [k, v] of [['a', 1], ['b', 2]]) { if (k === 'b') { var found = v; } } found", "2" },
+
+/* ---- for..of & iterable protocols ---- */
+{ "let out = ''; outer: for (const a of [1, 2]) { for (const b of [10, 20, 30]) { if (b === 20) continue; if (a === 2 && b === 30) break outer; out += a + ':' + b + ','; } } out", "1:10,1:30,2:10," },
+{ "[...'a\\u03B1b'].join(',')", "a,\u03B1,b" },
+{ "let s = 0; for (const b of new Uint8Array([7, 8, 9])) s += b; s", "24" },
+{ "let out = []; for (const [k, v] of new Map([['x', 1], ['y', 2]])) out.push(k + '=' + v); out.join(',')", "x=1,y=2" },
+{ "let out = []; for (const v of new Set(['p', 'q', 'p'])) out.push(v); out.join(',')", "p,q" },
+{ "let out = []; for (const [k, v] of new URLSearchParams('a=1&b=two&a=3')) out.push(k + ':' + v); out.join(',')", "a:1,b:two,a:3" },
+{ "(function(){ let s = ''; for (const x of arguments) s += x; return s; })('x', 'y', 'z')", "xyz" },
+{ "let s = ''; for (const x of {0: 'u', 1: 'v', length: 2}) s += x; s", "uv" },
+{ "const range = { [Symbol.iterator]() { let i = 0; return { next() { return i < 3 ? { value: i++, done: false } : { done: true }; } }; } }; [...range].join(',')", "0,1,2" },
+{ "[...[10, 20].entries()].map(([i, v]) => i + ':' + v).join(',')", "0:10,1:20" },
+{ "try { for (const x of 123) {} 'no' } catch(e) { e.name }", "TypeError" },
+
+/* ---- modern operators: ?., ??, ??=, &&=, ||=, **, **= ---- */
+{ "let c = 0; const x = null; [x?.a, x?.(), x?.[c++], x?.a.b[c++], c].map(String).join(',')", "undefined,undefined,undefined,undefined,0" },
+{ "try { (null?.a).b; 'no' } catch(e) { e.name }", "TypeError" },
+{ "const o = { v: 42, f() { return this.v; } }; [o?.f(), o.f?.(), o.missing?.()].map(String).join(',')", "42,42,undefined" },
+{ "const o = { a: 1 }; (delete o?.a) + ',' + ('a' in o) + ',' + (delete (null)?.a)", "true,false,true" },
+{ "(true?.5:1) + ',' + (false?.5:1)", "0.5,1" },
+{ "[null ?? 'a', undefined ?? 'b', 0 ?? 'c', '' ?? 'd', false ?? 'e'].join('|')", "a|b|0||false" },
+{ "1 ?? 2 || 3", "!SyntaxError" },
+{ "1 && 2 ?? 3", "!SyntaxError" },
+{ "(1 ?? 2) || 3", "1" },
+{ "let sets = 0; const o = { get a(){ return 1; }, set a(v){ sets++; }, get b(){ return null; }, set b(v){ sets++; } }; o.a ||= 9; o.a ?\?= 9; o.b &&= 9; let x; x ?\?= 5; let y = 2; y &&= 7; let z = 0; z ||= 4; [sets, x, y, z].join(',')", "0,5,7,4" },
+{ "(2 ** 3 ** 2) + ',' + ((-2) ** 2) + ',' + (-(2 ** 2)) + ',' + (2 ** -1)", "512,4,-4,0.5" },
+{ "-2 ** 2", "!SyntaxError" },
+{ "let x = 3; x **= 4; x", "81" },
+
+/* ---- classes / extends / super / static / get / set ---- */
+{ "class Animal { constructor(n) { this.n = n; } speak() { return this.n + '!'; } static kind() { return 'animal'; } } class Dog extends Animal { constructor(n, b) { super(n); this.b = b; } speak() { return super.speak() + ':' + this.b; } static kind() { return super.kind() + '>dog'; } get desc() { return this.n + '/' + this.b; } set desc(v) { this.b = v; } } const d = new Dog('Rex', 'Lab'); d.desc = 'Pug'; [d.speak(), Dog.kind(), d.desc, d instanceof Animal, d instanceof Dog, Object.getPrototypeOf(Dog) === Animal, Object.getPrototypeOf(Dog.prototype) === Animal.prototype, Object.keys(d).sort().join(',')].join('|')", "Rex!:Pug|animal>dog|Rex/Pug|true|true|true|true|b,n" },
+{ "class Bad extends Object { constructor() {} } try { new Bad(); 'no' } catch(e) { e.name }", "ReferenceError" },
+{ "class Bad2 extends Object { constructor() { this.x = 1; } } try { new Bad2(); 'no' } catch(e) { e.name }", "ReferenceError" },
+{ "class C {} try { C(); 'no' } catch(e) { e.name }", "TypeError" },
+{ "const C = class Named { who() { return typeof Named; } }; new C().who() + ',' + typeof Named", "function,undefined" },
+{ "try { new Late(); 'no' } catch(e) { e.name }; class Late {}", "ReferenceError" },
+{ "const s = Symbol('m'); class X { [s]() { return 7; } } new X()[s]()", "7" },
+
+/* ---- ES6+ built-ins: Symbol, Map/Set, Object, Array, String, Math ---- */
+{ "const s1 = Symbol('a'), s2 = Symbol('a'); [typeof s1, s1 === s2, s1.description, Symbol().description, s1.toString(), String(s1)].map(String).join('|')", "symbol|false|a|undefined|Symbol(a)|Symbol(a)" },
+{ "Symbol('x')", "Symbol(x)" },
+{ "try { '' + Symbol('a'); 'no' } catch(e) { e.name }", "TypeError" },
+{ "try { new Symbol(); 'no' } catch(e) { e.name }", "TypeError" },
+{ "const g1 = Symbol.for('k'), g2 = Symbol.for('k'); [g1 === g2, Symbol.keyFor(g1), Symbol.keyFor(Symbol('k'))].map(String).join(',')", "true,k,undefined" },
+{ "const sym = Symbol('hidden'); const o = { [sym]: 42, a: 1 }; const c = Object.assign({}, o); [c[sym], c.a, Object.keys(o).join(','), Object.getOwnPropertySymbols(o).length, JSON.stringify(o), JSON.stringify([sym])].join('|')", "42|1|a|1|{\"a\":1}|[null]" },
+{ "const custom = { [Symbol.toStringTag]: 'Custom' }; Object.prototype.toString.call(custom)", "[object Custom]" },
+{ "const s = Symbol('mapk'); const m = new Map([[s, 9]]); const st = new Set('abca'); [m.get(s), m.has(s), st.size, [...st].join('')].join(',')", "9,true,3,abc" },
+{ "const u = new URLSearchParams('x=1&y=2'); const m = new Map(u); const o = Object.fromEntries(u); [m.get('y'), o.x, o.y].join(',')", "2,1,2" },
+{ "Object.is(+0, -0) + ',' + Object.is(NaN, NaN) + ',' + Object.is(0, 0)", "false,true,true" },
+{ "const a = { p: 1 }, b = {}; Object.setPrototypeOf(b, a); let cyc = ''; try { Object.setPrototypeOf(a, b); } catch(e) { cyc = e.name; } b.p + ',' + cyc", "1,TypeError" },
+{ "Array.from(new Set([1, 2, 3]), x => x * 10).join(',') + '|' + Array.from('hi').join(',')", "10,20,30|h,i" },
+{ "[10, 20, 30].at(-1) + ',' + String([1].at(-2)) + ',' + 'abc'.at(-1) + ',' + String('a'.at(5))", "30,undefined,c,undefined" },
+{ "[1, 2, 3, 4].fill(9, 1, 3).join(',') + '|' + [1, 2, 3, 4, 5].copyWithin(0, 3).join(',') + '|' + [1, 2, 3, 4, 5].copyWithin(2, 0, 3).join(',')", "1,9,9,4|4,5,3,4,5|1,2,1,2,3" },
+{ "[Math.trunc(-3.9), Object.is(Math.sign(-0), -0), Math.sign(-42), Math.hypot(3, 4), Math.hypot(Infinity, NaN), Math.imul(0xffffffff, 5)].join(',')", "-3,true,-1,5,Infinity,-5" },
+{ "Array.prototype[Symbol.iterator] === Array.prototype.values && Map.prototype[Symbol.iterator] === Map.prototype.entries && Set.prototype[Symbol.iterator] === Set.prototype.values && Set.prototype.keys === Set.prototype.values", "true" },
+{ "class Base { constructor(a, b) { this.sum = a + b; } greet() { return 'hi'; } } class Mid extends Base { greet() { return super.greet() + '!'; } } class Sub extends Mid {} const s = new Sub(3, 4); [s.sum, s.greet(), s instanceof Base, s instanceof Mid, s instanceof Sub].join(',')", "7,hi!,true,true,true" },
+{ "function f(){ function g(){ return x; } let e = ''; try { g(); } catch(err) { e = err.name; } const x = 7; return e + ',' + g(); } f()", "ReferenceError,7" },
+{ "const i = 99; const fns = []; for (let {a, b} of [{a:1,b:2},{a:3,b:4}]) fns.push(() => a + ':' + b); i + '|' + fns.map(f => f()).join(',')", "99|1:2,3:4" },
+{ "const o = {}; let a; [a, ...o.rest] = [1, 2, 3, 4]; a + ':' + o.rest.join('-')", "1:2-3-4" },
+{ "const k = 'b'; const { [k]: bv, a, ...rest } = { a: 1, b: 2, c: 3 }; [a, bv, Object.keys(rest).join(',')].join('|')", "1|2|c" },
+{ "const u = {...null, ...undefined, a: 1, ...{b: 2}}; u.a + ',' + u.b", "1,2" },
+{ "`a\r\nb`.length + ':' + `a\r\nb`.replace('\\n', '|')", "3:a|b" },
+
 { 0, 0 }
 };
 
@@ -695,6 +804,15 @@ static void render(js_ctx *ctx, int rc, js_value v, char *out, unsigned long n)
         else
             snprintf(out, n, "!?");
         return;
+    }
+    if (js_is_symbol(v)) {
+        js_value str_fn;
+        if (js_get(ctx, js_global(ctx), "String", &str_fn) == JS_OK &&
+            js_call(ctx, str_fn, js_undefined(), 1, &v, &s) == JS_OK &&
+            s.type == JS_STRING) {
+            snprintf(out, n, "%s", js_string_bytes(s, 0));
+            return;
+        }
     }
     if (js_to_string(ctx, v, &s) != JS_OK) {
         snprintf(out, n, "<tostring failed>");
@@ -1005,6 +1123,141 @@ static int embed_demo(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Async / await + microtask queue tests                              */
+/* ------------------------------------------------------------------ */
+
+#define MAX_TEST_DEFERS 256
+static struct {
+    js_value prom;
+    js_value val;
+    int      reject;
+} g_defers[MAX_TEST_DEFERS];
+static int g_defer_count;
+
+static int native_later(js_ctx *ctx, js_value this_val, int argc,
+                        js_value *argv, js_value *ret)
+{
+    js_value p;
+    (void)this_val;
+    if (g_defer_count >= MAX_TEST_DEFERS)
+        return js_throw_error(ctx, JS_ERR_RANGE, "too many test defers");
+    p = js_promise_new(ctx);
+    if (p.type != JS_OBJECT) return JS_THROW;
+    g_defers[g_defer_count].prom = p;
+    g_defers[g_defer_count].val = argc > 0 ? argv[0] : js_undefined();
+    g_defers[g_defer_count].reject = 0;
+    g_defer_count++;
+    *ret = p;
+    return JS_OK;
+}
+
+static int native_later_reject(js_ctx *ctx, js_value this_val, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_value p;
+    (void)this_val;
+    if (g_defer_count >= MAX_TEST_DEFERS)
+        return js_throw_error(ctx, JS_ERR_RANGE, "too many test defers");
+    p = js_promise_new(ctx);
+    if (p.type != JS_OBJECT) return JS_THROW;
+    g_defers[g_defer_count].prom = p;
+    g_defers[g_defer_count].val = argc > 0 ? argv[0] : js_undefined();
+    g_defers[g_defer_count].reject = 1;
+    g_defer_count++;
+    *ret = p;
+    return JS_OK;
+}
+
+static const struct { const char *src; const char *want; } async_cases[] = {
+{ "async function f(){ return 42; } f()", "42" },
+{ "async function f(){ return await 21 + await Promise.resolve(21); } f()", "42" },
+{ "((async (x) => await __later(x + 1))(41))", "42" },
+{ "async function f(){ const a = await __later(10); const b = await __later(a + 20); return a + b; } f()", "40" },
+{ "async function f(){ return await { then(res){ res(99); } }; } f()", "99" },
+{ "async function f(){ throw new RangeError('boom'); } f()", "!RangeError" },
+{ "async function f(){ await __later(1); throw new TypeError('after'); } f()", "!TypeError" },
+{ "async function f(){ try { await Promise.reject(new TypeError('bad')); return 'no'; } catch (e) { return await __later(e.name + ':ok'); } } f()", "TypeError:ok" },
+{ "async function f(){ try { await __laterReject(new Error('fail')); return 'no'; } catch (e) { return 'caught:' + e.message; } } f()", "caught:fail" },
+{ "async function f(){ const log = []; async function inner(){ try { log.push(await __later('a')); return 'ret'; } finally { log.push(await __later('b')); } } const v = await inner(); return log.join(',') + ':' + v; } f()", "a,b:ret" },
+{ "async function f(){ const fns = []; for (let i = 0; i < 4; i++) { const v = await __later(i * 10); if (i === 1) continue; fns.push(() => i + '=' + v); if (i === 2) break; } return fns.map(g => g()).join(','); } f()", "0=0,2=20" },
+{ "async function f(){ let i = 0, s = 0; while (i < 3) { s += await __later(++i); } do { s += await __later(10); } while (s < 16); return s; } f()", "16" },
+{ "async function f(){ let s = ''; for (const [k, v] of new Map([['a', 1], ['b', 2]])) { s += k + (await __later(v)); } return s; } f()", "a1b2" },
+{ "async function fact(n){ if (n <= 1) return 1; return n * await fact(await __later(n - 1)); } fact(6)", "720" },
+{ "async function sum(){ let s = 0; for (let i = 1; i <= 150; i++) s += await __later(i); return s; } sum()", "11325" },
+{ "class A { async val(x = 5){ return await __later(x * 2); } } class B extends A { async val(x){ return (await super.val(x)) + await __later(32); } } const obj = { async m(){ return await new B().val(); } }; obj.m()", "42" },
+{ "async function item(x){ const a = await __later(x); return await __later(a * 10); } async function run(){ const xs = await Promise.all(new Set([item(1), item(2), item(3)])); return xs.join(','); } run()", "10,20,30" },
+{ "async function f(k){ let r = ''; switch (await __later(k)) { case 1: r = await __later('one'); break; default: r = 'def'; } return r; } f(1)", "one" },
+{ "await 1", "!SyntaxError" },
+{ "async function f(){ const a = (await __later(null)) ?? (await __later(7)); const b = (await __later({ x: 3 }))?.x; return a + ',' + b; } f()", "7,3" },
+{ "async function f(){ const [a, b] = [await __later(3), await __later(4)]; return `${a}+${b}=${a+b}`; } f()", "3+4=7" },
+{ "const fn = async x => await __later(x * 3); fn(14)", "42" },
+{ "async function f(){ return Promise.reject(new RangeError('rejected')); } f()", "!RangeError" },
+{ "async function f(){ try { try { await __laterReject(new TypeError('inner')); } catch (e) { await __later(1); throw e; } } catch (outer) { return 'outer:' + outer.name; } } f()", "outer:TypeError" },
+{ "async function f({a = 1}, ...r) { return a + await __later(r.length); } f({}, 10, 20)", "3" },
+{ 0, 0 }
+};
+
+static void run_async_one(const char *src, char *out, unsigned long n)
+{
+    js_config cfg;
+    js_ctx *ctx;
+    js_value r, tmp;
+    int rc, di = 0;
+
+    g_defer_count = 0;
+    js_config_default(&cfg);
+    cfg.max_steps = 2000000;
+    ctx = js_new(&cfg);
+    if (!ctx) { snprintf(out, n, "<no context>"); return; }
+    js_define_native(ctx, js_global(ctx).u.obj, "__later", native_later, 1);
+    js_define_native(ctx, js_global(ctx).u.obj, "__laterReject", native_later_reject, 1);
+    if (js_eval(ctx, "var __as='PENDING', __av='';", "init", &tmp) != JS_OK) {
+        snprintf(out, n, "<init failed>");
+        js_free(ctx);
+        return;
+    }
+    rc = js_eval(ctx, src, "test", &r);
+    if (rc != JS_OK) {
+        render(ctx, rc, r, out, n);
+        js_free(ctx);
+        return;
+    }
+    js_set(ctx, js_global(ctx), "__p", r);
+    if (js_eval(ctx,
+                "if (!__p || typeof __p.then !== 'function') {"
+                "  __as='ERR'; __av='!NotPromise';"
+                "} else {"
+                "  __p.then(function(v){ __as='OK'; __av=String(v); },"
+                "           function(e){ __as='ERR'; __av='!'+((e&&e.name)?e.name:String(e)); });"
+                "}",
+                "hook", &tmp) != JS_OK) {
+        render(ctx, 1, js_exception(ctx), out, n);
+        js_free(ctx);
+        return;
+    }
+    for (;;) {
+        int jobs = js_run_jobs(ctx, 10000);
+        if (jobs < 0 || js_fatal(ctx)) {
+            snprintf(out, n, "!Fatal");
+            js_free(ctx);
+            return;
+        }
+        if (di < g_defer_count) {
+            if (g_defers[di].reject)
+                js_promise_reject(ctx, g_defers[di].prom, g_defers[di].val);
+            else
+                js_promise_resolve(ctx, g_defers[di].prom, g_defers[di].val);
+            di++;
+            continue;
+        }
+        break;
+    }
+    rc = js_eval(ctx, "__as === 'PENDING' ? '!PENDING' : __av", "read", &tmp);
+    render(ctx, rc, tmp, out, n);
+    js_free(ctx);
+}
+
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv)
 {
@@ -1053,6 +1306,17 @@ int main(int argc, char **argv)
             fail++;
             printf("FAIL [%d] %s\n     want: %s\n     got:  %s\n",
                    i, cases[i].src, cases[i].want, out);
+        }
+    }
+    for (i = 0; async_cases[i].src; i++) {
+        run_async_one(async_cases[i].src, out, sizeof(out));
+        if (strcmp(out, async_cases[i].want) == 0) {
+            pass++;
+            if (verbose) printf("ok   [async %d] %s\n", i, async_cases[i].src);
+        } else {
+            fail++;
+            printf("FAIL [async %d] %s\n     want: %s\n     got:  %s\n",
+                   i, async_cases[i].src, async_cases[i].want, out);
         }
     }
     printf("\n%d/%d passed, %d failed\n", pass, pass + fail, fail);

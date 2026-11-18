@@ -113,6 +113,340 @@ static int fetch_sink(void *user, const char *url, const char *method,
         ? 0 : -1;
 }
 
+static struct dom_node *test_box_target;
+static int scroll_hook_calls;
+static double scroll_hook_x, scroll_hook_y;
+static char clip_hook_buf[128];
+static int clip_write_calls;
+
+static int test_box_rect(void *user, struct dom_node *node,
+                         float *x, float *y, float *w, float *h)
+{
+    (void)user;
+    if (node == test_box_target) {
+        *x = 12.0f;
+        *y = 24.0f;
+        *w = 180.0f;
+        *h = 64.0f;
+        return 1;
+    }
+    return 0;
+}
+
+static void test_scroll_hook(void *user, double x, double y)
+{
+    (void)user;
+    scroll_hook_calls++;
+    scroll_hook_x = x;
+    scroll_hook_y = y;
+}
+
+static int test_clip_write(void *user, const char *text, unsigned long len)
+{
+    (void)user;
+    if (len >= sizeof(clip_hook_buf))
+        return -1;
+    memcpy(clip_hook_buf, text, len);
+    clip_hook_buf[len] = 0;
+    clip_write_calls++;
+    return 0;
+}
+
+static char *test_clip_read(void *user, unsigned long *len_out)
+{
+    unsigned long n = strlen(clip_hook_buf);
+    char *copy = (char *)malloc(n + 1);
+    (void)user;
+    if (copy)
+        memcpy(copy, clip_hook_buf, n + 1);
+    if (len_out)
+        *len_out = copy ? n : 0;
+    return copy;
+}
+
+static void test_wave5b_features(void)
+{
+    struct jsdom_config cfg;
+    struct dom_document *doc;
+    struct dom_node *cv_node;
+    struct jsdom *j;
+    char err[256];
+
+    /* 1. Selectors, contextual SVG/template/DOMParser, classList/dataset/style/getComputedStyle */
+    {
+        static const char html[] =
+            "<!doctype html><html><head>"
+            "<style>"
+            "body { color: rgb(10, 20, 30); --accent: #336699; }"
+            "#box .item { display: flex; opacity: 0.5; grid-template-columns: 1fr 2fr; }"
+            "#box > p.first + p { border-radius: 6px; background-color: var(--accent); }"
+            "</style>"
+            "</head><body>"
+            "<div id='box'>"
+            "  <p class='first item a' data-role='alpha-one'>one</p>"
+            "  <p class='second item b' data-role='beta-two'>two</p>"
+            "  <span class='skip' data-role='gamma-end'>three</span>"
+            "</div>"
+            "<svg id='stage'></svg>"
+            "<template id='tpl'><span class='in'>hello</span></template>"
+            "<canvas id='cv' width='40' height='30'></canvas>"
+            "<canvas id='huge' width='9999' height='9999'></canvas>"
+            "</body></html>";
+
+        doc = html_parse_document(html, sizeof(html) - 1);
+        CHECK(doc != 0, "wave5b html parsed");
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.url = "https://example.test/wave5b";
+        cfg.viewport_width = 800;
+        cfg.viewport_height = 600;
+        j = jsdom_new(doc, &cfg);
+        CHECK(j != 0, "wave5b jsdom created");
+
+        CHECK(jsdom_eval(j,
+              "var q1 = document.querySelectorAll('#box > p.first + p');"
+              "if (q1.length !== 1 || q1[0].textContent !== 'two') throw Error('adj');"
+              "var q2 = document.querySelectorAll('#box > p.first ~ span');"
+              "if (q2.length !== 1 || !q2[0].matches('.skip[data-role$=end]')) throw Error('sib');"
+              "var q3 = document.querySelectorAll('#box > :nth-child(2):not(.skip)');"
+              "if (q3.length !== 1 || q3[0].closest('#box').id !== 'box') throw Error('nth-not');"
+              "var q4 = document.querySelectorAll('[data-role^=alpha],[data-role*=beta]');"
+              "if (q4.length !== 2) throw Error('attr-ops');"
+              "var syntaxErr = false;"
+              "try { document.querySelectorAll('div >> span'); }"
+              "catch (e) { syntaxErr = (e instanceof DOMException && e.name === 'SyntaxError'); }"
+              "if (!syntaxErr) throw Error('syntaxerr');",
+              "selectors.js", err, sizeof(err)) == 0,
+              err[0] ? err : "CSS selector combinators, pseudo-classes and SyntaxError");
+
+        CHECK(jsdom_eval(j,
+              "var svg = document.getElementById('stage');"
+              "svg.innerHTML = '<circle cx=\"5\" cy=\"5\" r=\"3\"/><path d=\"M0 0\"/>';"
+              "svg.insertAdjacentHTML('beforeend', '<rect width=\"2\" height=\"2\"/>');"
+              "if (svg.children.length !== 3 ||"
+              " svg.firstElementChild.namespaceURI !== 'http://www.w3.org/2000/svg' ||"
+              " svg.lastElementChild.localName !== 'rect' ||"
+              " svg.lastElementChild.namespaceURI !== 'http://www.w3.org/2000/svg')"
+              " throw Error('svg ctx');"
+              "var tpl = document.getElementById('tpl');"
+              "if (!(tpl instanceof HTMLTemplateElement) ||"
+              " tpl.childNodes.length !== 0 ||"
+              " !(tpl.content instanceof DocumentFragment) ||"
+              " tpl.content.firstChild.className !== 'in')"
+              " throw Error('template initial');"
+              "tpl.innerHTML = '<b data-k=\"9\">bold</b>';"
+              "if (tpl.content.firstChild.tagName !== 'B' ||"
+              " tpl.innerHTML.indexOf('<b') < 0 ||"
+              " tpl.cloneNode(true).content.firstChild.textContent !== 'bold')"
+              " throw Error('template roundtrip');"
+              "var dp = new DOMParser();"
+              "var hdoc = dp.parseFromString('<section id=s>ok</section>', 'text/html');"
+              "if (hdoc.contentType !== 'text/html' || hdoc.getElementById('s').textContent !== 'ok')"
+              " throw Error('domparser html');"
+              "var sdoc = dp.parseFromString('<svg viewBox=\"0 0 10 10\"><circle r=\"4\"/></svg>', 'image/svg+xml');"
+              "if (sdoc.contentType !== 'image/svg+xml' ||"
+              " sdoc.documentElement.namespaceURI !== 'http://www.w3.org/2000/svg' ||"
+              " sdoc.querySelector('circle').namespaceURI !== 'http://www.w3.org/2000/svg')"
+              " throw Error('domparser svg');"
+              "var xdoc = dp.parseFromString('<root><item name=\"a&amp;b\"/></root>', 'text/xml');"
+              "if (xdoc.contentType !== 'text/xml' ||"
+              " xdoc.querySelector('item').getAttribute('name') !== 'a&b')"
+              " throw Error('domparser xml');",
+              "markup.js", err, sizeof(err)) == 0,
+              err[0] ? err : "Contextual SVG, <template>.content, and DOMParser");
+
+        CHECK(jsdom_eval(j,
+              "var p1 = document.querySelector('#box p.first');"
+              "var cl = p1.classList;"
+              "if (cl !== p1.classList || cl[0] !== 'first' || cl[2] !== 'a')"
+              " throw Error('classlist id/idx');"
+              "p1.className = 'alpha beta';"
+              "if (cl.length !== 2 || cl[0] !== 'alpha' || cl[1] !== 'beta' || cl[2] !== undefined)"
+              " throw Error('classlist live sync');"
+              "p1.className = 'first item a';"
+              "if (cl.length !== 3 || cl[0] !== 'first') throw Error('classlist restore');"
+              "p1.dataset.userId = '77';"
+              "if (p1.getAttribute('data-user-id') !== '77' ||"
+              " document.querySelector('[data-user-id=\"77\"]') !== p1)"
+              " throw Error('dataset two-way');"
+              "delete p1.dataset.userId;"
+              "p1.getAttribute('data-user-id');"
+              "if (p1.hasAttribute('data-user-id')) throw Error('dataset delete');"
+              "p1.style.backgroundColor = '#112233';"
+              "p1.style.borderRadius = '4px';"
+              "if (p1.style !== p1.style || p1.style.backgroundColor !== '#112233' ||"
+              " p1.style.borderRadius !== '4px')"
+              " throw Error('style props');"
+              "p1.style.backgroundColor = null;"
+              "if (p1.style.backgroundColor !== '') throw Error('style clear');"
+              "var p2 = document.querySelector('#box p.second');"
+              "var cs = getComputedStyle(p2);"
+              "if (cs.display !== 'flex' || cs.opacity !== '0.5' ||"
+              " cs.color !== 'rgb(10, 20, 30)' ||"
+              " cs.backgroundColor !== 'rgb(51, 102, 153)' ||"
+              " cs['border-radius'] !== '6px' ||"
+              " cs.gridTemplateColumns !== '1fr 2fr' ||"
+              " cs.getPropertyValue('--accent') !== '#336699')"
+              " throw Error('getComputedStyle: ' + cs.display + '/' + cs.backgroundColor + '/' + cs['border-radius']);",
+              "cssom.js", err, sizeof(err)) == 0,
+              err[0] ? err : "classList identity, dataset two-way sync, style, and getComputedStyle");
+
+        CHECK(jsdom_eval(j,
+              "var cv = document.getElementById('cv');"
+              "var huge = document.getElementById('huge');"
+              "var hctx = huge.getContext('2d');"
+              "if (huge.width > 2048 || huge.height > 2048)"
+              " throw Error('canvas clamp');"
+              "if (!(cv instanceof HTMLCanvasElement) || cv.width !== 40 || cv.height !== 30)"
+              " throw Error('canvas dims');"
+              "var ctx = cv.getContext('2d');"
+              "if (!(ctx instanceof CanvasRenderingContext2D) ||"
+              " ctx !== cv.getContext('2d') || ctx.canvas !== cv ||"
+              " cv.getContext('webgl') !== null)"
+              " throw Error('canvas ctx identity');"
+              "ctx.fillStyle = '#ff0000'; ctx.fillRect(2, 2, 10, 10);"
+              "ctx.clearRect(4, 4, 2, 2);"
+              "ctx.save(); ctx.translate(15, 5); ctx.scale(2, 2);"
+              "ctx.fillStyle = 'rgba(0, 255, 0, 0.5)'; ctx.fillRect(0, 0, 3, 3);"
+              "ctx.restore();"
+              "if (ctx.fillStyle !== '#ff0000') throw Error('canvas save/restore');"
+              "ctx.beginPath(); ctx.moveTo(2, 20); ctx.lineTo(12, 20); ctx.lineTo(7, 28);"
+              "ctx.closePath(); ctx.fillStyle = '#0000ff'; ctx.fill();"
+              "ctx.beginPath(); ctx.arc(28, 22, 5, 0, 6.2831853, false);"
+              "ctx.fillStyle = 'rgb(255, 255, 0)'; ctx.fill();"
+              "ctx.beginPath(); ctx.moveTo(15, 20); ctx.bezierCurveTo(16, 15, 20, 15, 21, 20);"
+              "ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();"
+              "ctx.fillStyle = '#00ff00'; ctx.font = '14px monospace';"
+              "if (ctx.measureText('Hi').width <= 0) throw Error('measureText');"
+              "ctx.fillText('Hi', 2, 16);"
+              "var id = ctx.createImageData(2, 2);"
+              "id.data[0] = 12; id.data[1] = 34; id.data[2] = 56; id.data[3] = 255;"
+              "ctx.putImageData(id, 36, 26);"
+              "var got = ctx.getImageData(36, 26, 1, 1);"
+              "if (got.data[0] !== 12 || got.data[1] !== 34 || got.data[2] !== 56 || got.data[3] !== 255)"
+              " throw Error('put/getImageData');"
+              "var url = cv.toDataURL('image/png');"
+              "if (url.indexOf('data:image/png;base64,') !== 0)"
+              " throw Error('toDataURL prefix');"
+              "var raw = atob(url.split(',')[1]);"
+              "if (raw.charCodeAt(0) !== 0x89 || raw.charCodeAt(1) !== 80 ||"
+              " raw.charCodeAt(2) !== 78 || raw.charCodeAt(3) !== 71)"
+              " throw Error('png sig');",
+              "canvas.js", err, sizeof(err)) == 0,
+              err[0] ? err : "HTMLCanvasElement and CanvasRenderingContext2D");
+
+        cv_node = dom_get_element_by_id(doc, "cv");
+        CHECK(cv_node && cv_node->canvas && cv_node->canvas->w == 40 &&
+              cv_node->canvas->h == 30 &&
+              cv_node->canvas->px[2 * 40 + 2] == 0x00FF0000u &&
+              cv_node->canvas->alpha[2 * 40 + 2] == 255 &&
+              cv_node->canvas->alpha[4 * 40 + 4] == 0 &&
+              cv_node->canvas->px[24 * 40 + 7] == 0x000000FFu &&
+              cv_node->canvas->px[22 * 40 + 28] == 0x00FFFF00u,
+              "canvas pixels materialized directly onto struct dom_canvas");
+        CHECK(jsdom_dirty(j) != 0, "canvas draw marks document dirty");
+
+        jsdom_free(j);
+        dom_document_free(doc);
+    }
+
+    /* 2. Geometry, Scroll, Viewport, Observers, CustomEvent, Clipboard */
+    {
+        static const char html2[] =
+            "<!doctype html><html><body><div id='target'>box</div></body></html>";
+
+        doc = html_parse_document(html2, sizeof(html2) - 1);
+        test_box_target = dom_get_element_by_id(doc, "target");
+        scroll_hook_calls = 0;
+        scroll_hook_x = 0.0;
+        scroll_hook_y = 0.0;
+        clip_hook_buf[0] = 0;
+        clip_write_calls = 0;
+
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.url = "https://example.test/runtime";
+        cfg.viewport_width = 900;
+        cfg.viewport_height = 620;
+        cfg.get_box_rect = test_box_rect;
+        cfg.scroll_cb = test_scroll_hook;
+        cfg.clipboard_write = test_clip_write;
+        cfg.clipboard_read = test_clip_read;
+        j = jsdom_new(doc, &cfg);
+        CHECK(j != 0, "wave5b runtime jsdom created");
+
+        CHECK(jsdom_eval(j,
+              "var t = document.getElementById('target');"
+              "var rect = t.getBoundingClientRect();"
+              "if (rect.x !== 12 || rect.y !== 24 || rect.width !== 180 || rect.height !== 64 ||"
+              " rect.right !== 192 || rect.bottom !== 88 ||"
+              " t.offsetWidth !== 180 || t.clientHeight !== 64 || t.offsetLeft !== 12)"
+              " throw Error('rect');"
+              "var ce1 = new CustomEvent('ping');"
+              "var ce2 = new CustomEvent('ping', {});"
+              "var ce3 = new CustomEvent('ping', { detail: { ok: 7 } });"
+              "if (ce1.detail !== null || ce2.detail !== null || ce3.detail.ok !== 7)"
+              " throw Error('CustomEvent');"
+              "if (!Array.isArray(navigator.languages) || navigator.languages[0] !== 'en-US' ||"
+              " !Object.isFrozen(navigator.languages))"
+              " throw Error('languages');"
+              "window.scrollTo(10, 40); window.scrollBy(5, 10);"
+              "if (window.scrollX !== 15 || window.scrollY !== 50 ||"
+              " window.pageXOffset !== 15 || window.pageYOffset !== 50)"
+              " throw Error('scroll');"
+              "window.__roCount = 0; window.__roW = 0; window.__ioCount = 0; window.__resizeEvents = 0;"
+              "window.addEventListener('resize', function() { window.__resizeEvents++; });"
+              "var ro = new ResizeObserver(function(entries) {"
+              "  window.__roCount += entries.length;"
+              "  window.__roW = entries[0].contentRect.width;"
+              "});"
+              "ro.observe(t);"
+              "var io = new IntersectionObserver(function(entries) {"
+              "  window.__ioCount += entries.length;"
+              "  window.__ioHit = entries[0].isIntersecting;"
+              "});"
+              "io.observe(t);"
+              "window.__rafTs = 0;"
+              "var cId = requestAnimationFrame(function() { window.__rafCancelled = true; });"
+              "cancelAnimationFrame(cId);"
+              "requestAnimationFrame(function(ts) { window.__rafTs = ts; });"
+              "navigator.clipboard.writeText('KestrelClip').then(function() {"
+              "  return navigator.clipboard.readText();"
+              "}).then(function(txt) { window.__clip = txt; });",
+              "runtime.js", err, sizeof(err)) == 0,
+              err[0] ? err : "geometry, scroll, CustomEvent, languages, observers, rAF & clipboard");
+
+        CHECK(scroll_hook_calls == 2 && scroll_hook_x == 15.0 &&
+              scroll_hook_y == 50.0 && jsdom_scroll_x(j) == 15.0 &&
+              jsdom_scroll_y(j) == 50.0,
+              "scrollTo/scrollBy invoke scroll_cb and sync C accessors");
+        CHECK(jsdom_pump(j, err, sizeof(err)) > 0,
+              err[0] ? err : "observers, rAF and clipboard promises pump");
+
+        jsdom_set_scroll(j, 30.0, 80.0);
+        jsdom_notify_resize(j, 1280, 720, err, sizeof(err));
+
+        CHECK(jsdom_eval(j,
+              "if (window.__roCount < 2 || window.__roW !== 180)"
+              " throw Error('ro: ' + window.__roCount);"
+              "if (window.__ioCount < 1 || !window.__ioHit)"
+              " throw Error('io');"
+              "if (window.__resizeEvents !== 1 || window.innerWidth !== 1280 || window.innerHeight !== 720)"
+              " throw Error('resize');"
+              "if (window.scrollX !== 30 || window.scrollY !== 80)"
+              " throw Error('jsdom_set_scroll');"
+              "if (window.__rafCancelled || window.__rafTs <= 0)"
+              " throw Error('rAF');"
+              "if (window.__clip !== 'KestrelClip') throw Error('clipboard');",
+              "runtime-after.js", err, sizeof(err)) == 0,
+              err[0] ? err : "ResizeObserver, IntersectionObserver, resize, set_scroll, rAF and clipboard");
+        CHECK(clip_write_calls == 1 && !strcmp(clip_hook_buf, "KestrelClip"),
+              "clipboard hooks invoked");
+
+        jsdom_free(j);
+        dom_document_free(doc);
+        test_box_target = 0;
+    }
+}
+
 int main(void)
 {
     static const char html[] =
@@ -2223,6 +2557,7 @@ int main(void)
     dom_document_free(doc);
     web_storage_free(session_store);
     web_storage_free(local_store);
+    test_wave5b_features();
     printf("%d passed, %d failed\n", checks - failures, failures);
     return failures ? 1 : 0;
 }

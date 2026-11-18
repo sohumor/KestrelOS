@@ -1127,6 +1127,11 @@ static struct lay_box *build_node(struct build_env *e, struct dom_node *n,
         }
         if (!iw) attr_px(n, "width", &iw);
         if (!ih) attr_px(n, "height", &ih);
+        if (n->tag_id == HTAG_CANVAS && n->canvas &&
+            n->canvas->w > 0 && n->canvas->h > 0) {
+            if (!iw) iw = n->canvas->w;
+            if (!ih) ih = n->canvas->h;
+        }
         control_intrinsic(n, &iw, &ih);
         b->intrinsic_w = iw;
         b->intrinsic_h = ih;

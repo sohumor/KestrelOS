@@ -854,11 +854,31 @@ static int aget(js_ctx *ctx, js_object *o, unsigned long i, js_value *v)
     return js_obj_get(ctx, o, k, js_object_value(o), v);
 }
 
+static int check_array_mutable(js_ctx *ctx, js_object *o, int resize_op)
+{
+    if (o->cls != JS_CLASS_ARRAY)
+        return JS_OK;
+    if (o->integrity & JS_OBJ_FROZEN)
+        return js_throw_error(ctx, JS_ERR_TYPE, "array is frozen");
+    if (resize_op && ((o->integrity & JS_OBJ_SEALED) || !o->extensible))
+        return js_throw_error(ctx, JS_ERR_TYPE, "array is not extensible");
+    return JS_OK;
+}
+
 static int aput(js_ctx *ctx, js_object *o, unsigned long i, js_value v)
 {
     js_string *k;
 
-    if (o->cls == JS_CLASS_ARRAY && i < o->elen) { o->elems[i] = v; return JS_OK; }
+    if (o->cls == JS_CLASS_ARRAY) {
+        if (i < o->elen) {
+            if (o->integrity & JS_OBJ_FROZEN)
+                return js_throw_error(ctx, JS_ERR_TYPE, "array is frozen");
+            o->elems[i] = v;
+            return JS_OK;
+        }
+        if (!o->extensible)
+            return js_throw_error(ctx, JS_ERR_TYPE, "array is not extensible");
+    }
     k = idx_key(ctx, i);
     if (!k) return JS_THROW;
     return js_obj_put(ctx, o, k, v);
@@ -897,25 +917,67 @@ static const char *class_name(int cls)
     case JS_CLASS_SET:       return "Set";
     case JS_CLASS_WEAKMAP:   return "WeakMap";
     case JS_CLASS_WEAKSET:   return "WeakSet";
+    case JS_CLASS_SYMBOL:    return "Symbol";
     default:                 return "Object";
     }
+}
+
+static int prop_symbol_value(js_ctx *ctx, js_string *key, js_value *out)
+{
+    unsigned long id = 0, i;
+
+    if (!key || key->len <= 5 || memcmp(key->data, "@sym#", 5) != 0)
+        return 0;
+    for (i = 5; i < key->len; i++) {
+        unsigned char c = (unsigned char)key->data[i];
+        if (c < '0' || c > '9')
+            return 0;
+        id = id * 10 + (unsigned long)(c - '0');
+    }
+    if (id >= ctx->nsymbols || !ctx->symbols[id])
+        return 0;
+    out->type = JS_SYMBOL;
+    out->pad = 0;
+    out->u.obj = ctx->symbols[id];
+    return 1;
 }
 
 static int bi_obj_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
                            js_value *ret)
 {
     char buf[48];
+    const char *base;
+    js_value tag = js_undefined();
 
     (void)argc; (void)argv;
     if (t.type == JS_UNDEFINED) return ret_str(ctx, "[object Undefined]", 18, ret);
     if (t.type == JS_NULL)      return ret_str(ctx, "[object Null]", 13, ret);
     if (t.type != JS_OBJECT) {
-        const char *n = t.type == JS_STRING ? "String"
-                      : t.type == JS_NUMBER ? "Number" : "Boolean";
-        snprintf(buf, sizeof(buf), "[object %s]", n);
-        return ret_str(ctx, buf, strlen(buf), ret);
+        base = t.type == JS_STRING ? "String"
+             : t.type == JS_NUMBER ? "Number"
+             : t.type == JS_SYMBOL ? "Symbol" : "Boolean";
+        if (ctx->sym_tostringtag_key &&
+            js_wrap_get_key(ctx, t, ctx->sym_tostringtag_key, 1, &tag) != JS_OK)
+            return JS_THROW;
+    } else {
+        base = class_name(t.u.obj->cls);
+        if (ctx->sym_tostringtag_key &&
+            js_obj_get_key(ctx, t.u.obj, ctx->sym_tostringtag_key, 1,
+                           t, &tag) != JS_OK)
+            return JS_THROW;
     }
-    snprintf(buf, sizeof(buf), "[object %s]", class_name(t.u.obj->cls));
+    if (tag.type == JS_STRING) {
+        js_sbuf b;
+        js_sb_init(&b, ctx);
+        if (js_sb_puts(&b, "[object ") != JS_OK ||
+            js_sb_put(&b, tag.u.str->data, tag.u.str->len) != JS_OK ||
+            js_sb_putc(&b, ']') != JS_OK) {
+            js_sb_free(&b);
+            return JS_THROW;
+        }
+        return js_sb_finish(&b, ret);
+    }
+    snprintf(buf, sizeof(buf), "[object %s]", base);
     return ret_str(ctx, buf, strlen(buf), ret);
 }
 
@@ -929,12 +991,13 @@ static int bi_obj_valueof(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_obj_hasown(js_ctx *ctx, js_value t, int argc, js_value *argv,
                          js_value *ret)
 {
-    js_value k;
+    js_string *k;
+    int is_sym = 0;
     js_object *o;
 
-    if (js_to_string(ctx, arg(argc, argv, 0), &k) != JS_OK) return JS_THROW;
+    if (js_to_propkey(ctx, arg(argc, argv, 0), &k, &is_sym) != JS_OK) return JS_THROW;
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
-    *ret = js_bool(js_obj_has_own(ctx, o, k.u.str));
+    *ret = js_bool(js_obj_has_own_key(ctx, o, k, is_sym));
     return JS_OK;
 }
 
@@ -956,19 +1019,22 @@ static int bi_obj_isproto(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_obj_propenum(js_ctx *ctx, js_value t, int argc, js_value *argv,
                            js_value *ret)
 {
-    js_value k;
+    js_string *k;
+    int is_sym = 0;
     js_object *o;
     js_prop *p;
     long i;
 
-    if (js_to_string(ctx, arg(argc, argv, 0), &k) != JS_OK) return JS_THROW;
+    if (js_to_propkey(ctx, arg(argc, argv, 0), &k, &is_sym) != JS_OK) return JS_THROW;
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
-    i = js_array_index(k.u.str);
-    if (o->cls == JS_CLASS_ARRAY && i >= 0 && (uint32_t)i < o->elen) {
-        *ret = js_bool(1);
-        return JS_OK;
+    if (!is_sym) {
+        i = js_array_index(k);
+        if (o->cls == JS_CLASS_ARRAY && i >= 0 && (uint32_t)i < o->elen) {
+            *ret = js_bool(1);
+            return JS_OK;
+        }
     }
-    p = js_own_prop(o, k.u.str);
+    p = js_own_prop_key(o, k, is_sym);
     *ret = js_bool(p && (p->flags & JS_P_ENUM));
     return JS_OK;
 }
@@ -995,9 +1061,33 @@ static int own_names(js_ctx *ctx, js_value v, int only_enum, js_value *ret)
     }
     for (i = 0; i < o->nprops; i++) {
         js_prop *p = &o->props[i];
-        if (p->flags & JS_P_DEAD) continue;
+        if (p->flags & (JS_P_DEAD | JS_P_SYMBOL)) continue;
         if (only_enum && !(p->flags & JS_P_ENUM)) continue;
         if (js_array_push(ctx, a, js_string_value(p->key)) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(a);
+    return JS_OK;
+}
+
+static int own_symbols(js_ctx *ctx, js_value v, int only_enum, js_value *ret)
+{
+    js_object *o, *a;
+    uint32_t i;
+
+    if (v.type != JS_OBJECT)
+        return js_throw_error(ctx, JS_ERR_TYPE, "argument is not an object");
+    o = v.u.obj;
+    a = js_new_array(ctx);
+    if (!a) return JS_THROW;
+    for (i = 0; i < o->nprops; i++) {
+        js_prop *p = &o->props[i];
+        js_value sv;
+        if (p->flags & JS_P_DEAD) continue;
+        if (!(p->flags & JS_P_SYMBOL)) continue;
+        if (only_enum && !(p->flags & JS_P_ENUM)) continue;
+        if (prop_symbol_value(ctx, p->key, &sv) &&
+            js_array_push(ctx, a, sv) != JS_OK)
             return JS_THROW;
     }
     *ret = js_object_value(a);
@@ -1018,6 +1108,17 @@ static int bi_object_names(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return own_names(ctx, arg(argc, argv, 0), 0, ret);
 }
 
+static int bi_object_getsyms(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                             js_value *ret)
+{
+    js_value v;
+
+    (void)t;
+    if (js_to_object(ctx, arg(argc, argv, 0), &v) != JS_OK)
+        return JS_THROW;
+    return own_symbols(ctx, v, 0, ret);
+}
+
 static int bi_object_assign(js_ctx *ctx, js_value t, int argc,
                             js_value *argv, js_value *ret)
 {
@@ -1028,7 +1129,7 @@ static int bi_object_assign(js_ctx *ctx, js_value t, int argc,
     if (js_to_object(ctx, arg(argc, argv, 0), &target) != JS_OK)
         return JS_THROW;
     for (source_index = 1; source_index < argc; source_index++) {
-        js_value source = argv[source_index], names;
+        js_value source = argv[source_index], names, syms;
         unsigned long length, i;
 
         if (source.type == JS_UNDEFINED || source.type == JS_NULL)
@@ -1044,6 +1145,22 @@ static int bi_object_assign(js_ctx *ctx, js_value t, int argc,
                 js_obj_get(ctx, source.u.obj, key.u.str, source, &value) !=
                     JS_OK ||
                 js_obj_put(ctx, target.u.obj, key.u.str, value) != JS_OK)
+                return JS_THROW;
+        }
+        if (own_symbols(ctx, source, 1, &syms) != JS_OK ||
+            alen(ctx, syms.u.obj, &length) != JS_OK)
+            return JS_THROW;
+        for (i = 0; i < length; i++) {
+            js_value sv, value;
+            js_string *sk;
+
+            if (aget(ctx, syms.u.obj, i, &sv) != JS_OK ||
+                sv.type != JS_SYMBOL)
+                return JS_THROW;
+            sk = (js_string *)sv.u.obj->host;
+            if (js_obj_get_key(ctx, source.u.obj, sk, 1, source, &value) !=
+                    JS_OK ||
+                js_obj_put_key(ctx, target.u.obj, sk, 1, value) != JS_OK)
                 return JS_THROW;
         }
     }
@@ -1127,15 +1244,17 @@ static int bi_object_entries(js_ctx *ctx, js_value t, int argc,
 
 static int from_entries_add(js_ctx *ctx, js_object *out, js_value entry)
 {
-    js_value key, value, converted;
+    js_value key, value;
+    js_string *pk;
+    int is_sym = 0;
 
     if (entry.type != JS_OBJECT)
         return js_throw_error(ctx, JS_ERR_TYPE,
                               "Object.fromEntries entry must be an object");
     if (aget(ctx, entry.u.obj, 0, &key) != JS_OK ||
         aget(ctx, entry.u.obj, 1, &value) != JS_OK ||
-        js_to_string(ctx, key, &converted) != JS_OK ||
-        js_obj_put(ctx, out, converted.u.str, value) != JS_OK)
+        js_to_propkey(ctx, key, &pk, &is_sym) != JS_OK ||
+        js_obj_put_key(ctx, out, pk, is_sym, value) != JS_OK)
         return JS_THROW;
     return JS_OK;
 }
@@ -1159,15 +1278,43 @@ static int bi_object_fromentries(js_ctx *ctx, js_value t, int argc,
 
         for (i = 0; i < length; i++) {
             js_value key = object.u.obj->collection_keys->elems[i];
-            js_value converted;
+            js_string *pk;
+            int is_sym = 0;
 
-            if (js_to_string(ctx, key, &converted) != JS_OK ||
-                js_obj_put(ctx, out, converted.u.str,
-                           object.u.obj->collection_values->elems[i]) != JS_OK)
+            if (js_to_propkey(ctx, key, &pk, &is_sym) != JS_OK ||
+                js_obj_put_key(ctx, out, pk, is_sym,
+                               object.u.obj->collection_values->elems[i]) != JS_OK)
                 return JS_THROW;
         }
         *ret = js_object_value(out);
         return JS_OK;
+    }
+
+    if (ctx->sym_iterator_key) {
+        js_value iter_fn = js_undefined();
+        if (js_wrap_get_key(ctx, input, ctx->sym_iterator_key, 1,
+                            &iter_fn) != JS_OK)
+            return JS_THROW;
+        if (iter_fn.type != JS_UNDEFINED) {
+            js_iter it;
+            if (js_iter_open(ctx, input, &it) != JS_OK)
+                return JS_THROW;
+            for (i = 0; i < FROM_ENTRIES_MAX; i++) {
+                js_value entry;
+                int done = 0;
+                if (js_step(ctx) != JS_OK ||
+                    js_iter_next(ctx, &it, &entry, &done) != JS_OK)
+                    return JS_THROW;
+                if (done) {
+                    *ret = js_object_value(out);
+                    return JS_OK;
+                }
+                if (from_entries_add(ctx, out, entry) != JS_OK)
+                    return JS_THROW;
+            }
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "Object.fromEntries iterator is too large");
+        }
     }
 
     if (js_get(ctx, object, "next", &next) != JS_OK)
@@ -1227,7 +1374,42 @@ static int bi_object_getproto(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
-static int define_one(js_ctx *ctx, js_object *o, js_string *key, js_value desc)
+static int bi_object_setproto(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                              js_value *ret)
+{
+    js_value ov = arg(argc, argv, 0), pv = arg(argc, argv, 1);
+    js_object *np, *walk;
+    int guard = 0;
+
+    (void)t;
+    if (ov.type == JS_UNDEFINED || ov.type == JS_NULL)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Object.setPrototypeOf called on null or undefined");
+    if (pv.type != JS_OBJECT && pv.type != JS_NULL)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Object prototype may only be an Object or null");
+    if (ov.type != JS_OBJECT) {
+        *ret = ov;
+        return JS_OK;
+    }
+    np = pv.type == JS_OBJECT ? pv.u.obj : 0;
+    if (ov.u.obj->proto != np) {
+        if (!ov.u.obj->extensible)
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "object is not extensible");
+        for (walk = np; walk && guard < 1000; walk = walk->proto, guard++) {
+            if (walk == ov.u.obj)
+                return js_throw_error(ctx, JS_ERR_TYPE,
+                                      "Cyclic __proto__ value");
+        }
+        ov.u.obj->proto = np;
+    }
+    *ret = ov;
+    return JS_OK;
+}
+
+static int define_one(js_ctx *ctx, js_object *o, js_string *key, int is_sym,
+                      js_value desc)
 {
     js_value v;
     js_prop *p;
@@ -1251,13 +1433,14 @@ static int define_one(js_ctx *ctx, js_object *o, js_string *key, js_value desc)
 
     /* An array index would otherwise land in the dense element vector,
      * where per-property attributes have nowhere to live. */
-    if (o->cls == JS_CLASS_ARRAY && js_array_index(key) >= 0 && !is_acc) {
+    if (!is_sym && o->cls == JS_CLASS_ARRAY && js_array_index(key) >= 0 && !is_acc) {
         if (js_obj_get(ctx, desc.u.obj, ctx->s_value, desc, &v) != JS_OK) return JS_THROW;
         return js_obj_put(ctx, o, key, v);
     }
-    p = js_add_prop(ctx, o, key, flags);
+    p = js_add_prop_key(ctx, o, key, flags | (is_sym ? (uint32_t)JS_P_SYMBOL : 0u));
     if (!p) return JS_THROW;
-    p->flags = flags | (is_acc ? (uint32_t)JS_P_ACCESSOR : 0u);
+    p->flags = flags | (is_acc ? (uint32_t)JS_P_ACCESSOR : 0u)
+                     | (is_sym ? (uint32_t)JS_P_SYMBOL : 0u);
     if (is_acc) {
         p->value = getter;
         p->setter = setter;
@@ -1275,13 +1458,15 @@ static int bi_object_defprops(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_object_defprop(js_ctx *ctx, js_value t, int argc, js_value *argv,
                              js_value *ret)
 {
-    js_value o = arg(argc, argv, 0), k;
+    js_value o = arg(argc, argv, 0);
+    js_string *k;
+    int is_sym = 0;
 
     (void)t;
     if (o.type != JS_OBJECT)
         return js_throw_error(ctx, JS_ERR_TYPE, "argument is not an object");
-    if (js_to_string(ctx, arg(argc, argv, 1), &k) != JS_OK) return JS_THROW;
-    if (define_one(ctx, o.u.obj, k.u.str, arg(argc, argv, 2)) != JS_OK)
+    if (js_to_propkey(ctx, arg(argc, argv, 1), &k, &is_sym) != JS_OK) return JS_THROW;
+    if (define_one(ctx, o.u.obj, k, is_sym, arg(argc, argv, 2)) != JS_OK)
         return JS_THROW;
     *ret = o;
     return JS_OK;
@@ -1298,10 +1483,14 @@ static int bi_object_defprops(js_ctx *ctx, js_value t, int argc, js_value *argv,
         return js_throw_error(ctx, JS_ERR_TYPE, "argument is not an object");
     for (i = 0; i < d.u.obj->nprops; i++) {
         js_prop *p = &d.u.obj->props[i];
+        int is_sym = (p->flags & JS_P_SYMBOL) != 0;
+        js_string *key = p->key;
         js_value desc;
         if ((p->flags & JS_P_DEAD) || !(p->flags & JS_P_ENUM)) continue;
-        if (js_obj_get(ctx, d.u.obj, p->key, d, &desc) != JS_OK) return JS_THROW;
-        if (define_one(ctx, o.u.obj, p->key, desc) != JS_OK) return JS_THROW;
+        if (js_obj_get_key(ctx, d.u.obj, key, is_sym, d, &desc) != JS_OK)
+            return JS_THROW;
+        if (define_one(ctx, o.u.obj, key, is_sym, desc) != JS_OK)
+            return JS_THROW;
     }
     *ret = o;
     return JS_OK;
@@ -1333,7 +1522,9 @@ static int bi_object_create(js_ctx *ctx, js_value t, int argc, js_value *argv,
 static int bi_object_getdesc(js_ctx *ctx, js_value t, int argc, js_value *argv,
                              js_value *ret)
 {
-    js_value ov = arg(argc, argv, 0), k;
+    js_value ov = arg(argc, argv, 0);
+    js_string *k;
+    int is_sym = 0;
     js_object *d;
     js_prop *p;
 
@@ -1341,18 +1532,20 @@ static int bi_object_getdesc(js_ctx *ctx, js_value t, int argc, js_value *argv,
     *ret = js_undefined();
     if (ov.type != JS_OBJECT)
         return js_throw_error(ctx, JS_ERR_TYPE, "argument is not an object");
-    if (js_to_string(ctx, arg(argc, argv, 1), &k) != JS_OK) return JS_THROW;
-    p = js_own_prop(ov.u.obj, k.u.str);
+    if (js_to_propkey(ctx, arg(argc, argv, 1), &k, &is_sym) != JS_OK) return JS_THROW;
+    p = js_own_prop_key(ov.u.obj, k, is_sym);
     if (!p) {
-        long i = js_array_index(k.u.str);
+        long i = is_sym ? -1 : js_array_index(k);
         if (ov.u.obj->cls == JS_CLASS_ARRAY && i >= 0 &&
             (uint32_t)i < ov.u.obj->elen) {
             d = js_new_object(ctx);
             if (!d) return JS_THROW;
             if (js_define_enum(ctx, d, "value", ov.u.obj->elems[i]) != JS_OK ||
-                js_define_enum(ctx, d, "writable", js_bool(1)) != JS_OK ||
+                js_define_enum(ctx, d, "writable",
+                               js_bool(!(ov.u.obj->integrity & JS_OBJ_FROZEN))) != JS_OK ||
                 js_define_enum(ctx, d, "enumerable", js_bool(1)) != JS_OK ||
-                js_define_enum(ctx, d, "configurable", js_bool(1)) != JS_OK)
+                js_define_enum(ctx, d, "configurable",
+                               js_bool(!(ov.u.obj->integrity & JS_OBJ_SEALED))) != JS_OK)
                 return JS_THROW;
             *ret = js_object_value(d);
         }
@@ -1388,6 +1581,7 @@ static int lock_object(js_ctx *ctx, js_value v, int freeze, js_value *ret)
     if (v.type != JS_OBJECT)
         return JS_OK;
     v.u.obj->extensible = 0;
+    v.u.obj->integrity |= freeze ? (JS_OBJ_SEALED | JS_OBJ_FROZEN) : JS_OBJ_SEALED;
     for (i = 0; i < v.u.obj->nprops; i++) {
         js_prop *p = &v.u.obj->props[i];
         if (p->flags & JS_P_DEAD) continue;
@@ -1431,7 +1625,9 @@ static int is_locked(js_value v, int frozen)
 
     if (v.type != JS_OBJECT) return 1;
     if (v.u.obj->extensible) return 0;
-    if (frozen && v.u.obj->cls == JS_CLASS_ARRAY && v.u.obj->elen) return 0;
+    if (v.u.obj->cls == JS_CLASS_ARRAY && v.u.obj->elen &&
+        !(v.u.obj->integrity & (frozen ? JS_OBJ_FROZEN : JS_OBJ_SEALED)))
+        return 0;
     for (i = 0; i < v.u.obj->nprops; i++) {
         js_prop *p = &v.u.obj->props[i];
         if (p->flags & JS_P_DEAD) continue;
@@ -1593,6 +1789,14 @@ static int bi_array_isarray(js_ctx *ctx, js_value t, int argc, js_value *argv,
 
 #define ARRAY_FROM_MAX 1000000UL
 
+static int bi_iter_self(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    (void)ctx; (void)argc; (void)argv;
+    *ret = t;
+    return JS_OK;
+}
+
 static int bi_array_from(js_ctx *ctx, js_value t, int argc, js_value *argv,
                          js_value *ret)
 {
@@ -1602,23 +1806,60 @@ static int bi_array_from(js_ctx *ctx, js_value t, int argc, js_value *argv,
     unsigned long length, i;
 
     (void)t;
-    if (js_to_object(ctx, input, &object) != JS_OK)
-        return JS_THROW;
     if (mapper.type != JS_UNDEFINED && !js_is_function(mapper))
         return js_throw_error(ctx, JS_ERR_TYPE,
                               "Array.from mapper must be a function");
+    if (input.type == JS_UNDEFINED || input.type == JS_NULL)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "cannot convert undefined or null to object");
+    out = js_new_array(ctx);
+    if (!out)
+        return JS_THROW;
+    if (ctx->sym_iterator_key) {
+        js_value iter_fn = js_undefined();
+        if (js_wrap_get_key(ctx, input, ctx->sym_iterator_key, 1,
+                            &iter_fn) != JS_OK)
+            return JS_THROW;
+        if (iter_fn.type != JS_UNDEFINED) {
+            js_iter it;
+            if (js_iter_open(ctx, input, &it) != JS_OK)
+                return JS_THROW;
+            for (i = 0; ; i++) {
+                js_value value;
+                int done = 0;
+                if (i >= ARRAY_FROM_MAX)
+                    return js_throw_error(ctx, JS_ERR_RANGE,
+                                          "Array.from input is too large");
+                if (js_step(ctx) != JS_OK ||
+                    js_iter_next(ctx, &it, &value, &done) != JS_OK)
+                    return JS_THROW;
+                if (done) break;
+                if (mapper.type != JS_UNDEFINED) {
+                    js_value map_args[2], mapped;
+                    map_args[0] = value;
+                    map_args[1] = js_number((double)i);
+                    if (js_call(ctx, mapper, this_arg, 2, map_args, &mapped) != JS_OK)
+                        return JS_THROW;
+                    value = mapped;
+                }
+                if (js_array_push(ctx, out, value) != JS_OK)
+                    return JS_THROW;
+            }
+            *ret = js_object_value(out);
+            return JS_OK;
+        }
+    }
+    if (js_to_object(ctx, input, &object) != JS_OK)
+        return JS_THROW;
     if (alen(ctx, object.u.obj, &length) != JS_OK)
         return JS_THROW;
     if (length > ARRAY_FROM_MAX)
         return js_throw_error(ctx, JS_ERR_RANGE,
                               "Array.from input is too large");
-    out = js_new_array(ctx);
-    if (!out)
-        return JS_THROW;
     for (i = 0; i < length; i++) {
         js_value value;
 
-        if (aget(ctx, object.u.obj, i, &value) != JS_OK)
+        if (js_step(ctx) != JS_OK || aget(ctx, object.u.obj, i, &value) != JS_OK)
             return JS_THROW;
         if (mapper.type != JS_UNDEFINED) {
             js_value map_args[2], mapped;
@@ -1649,6 +1890,97 @@ static int bi_array_of(js_ctx *ctx, js_value t, int argc, js_value *argv,
         if (js_array_push(ctx, out, argv[i]) != JS_OK)
             return JS_THROW;
     *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static unsigned long rel_index(double d, unsigned long len);
+
+static int bi_array_at(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                       js_value *ret)
+{
+    js_object *o;
+    unsigned long n;
+    double d = 0;
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    if (d < 0) d += (double)n;
+    if (d < 0 || d >= (double)n) {
+        *ret = js_undefined();
+        return JS_OK;
+    }
+    return aget(ctx, o, (unsigned long)d, ret);
+}
+
+static int bi_array_fill(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_object *o;
+    unsigned long n, start, stop, i;
+    double sd = 0, ed;
+    js_value val = arg(argc, argv, 0);
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    ed = (double)n;
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[1], &sd) != JS_OK)
+        return JS_THROW;
+    if (argc > 2 && argv[2].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[2], &ed) != JS_OK)
+        return JS_THROW;
+    start = rel_index(sd, n);
+    stop = rel_index(ed, n);
+    for (i = start; i < stop; i++) {
+        if (js_step(ctx) != JS_OK || aput(ctx, o, i, val) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(o);
+    return JS_OK;
+}
+
+static int bi_array_copywithin(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                               js_value *ret)
+{
+    js_object *o;
+    unsigned long n, to, from, fin, count, rem1, rem2;
+    double td = 0, sd = 0, ed;
+    long dir = 1;
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    ed = (double)n;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &td) != JS_OK) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 1), &sd) != JS_OK) return JS_THROW;
+    if (argc > 2 && argv[2].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[2], &ed) != JS_OK)
+        return JS_THROW;
+    to = rel_index(td, n);
+    from = rel_index(sd, n);
+    fin = rel_index(ed, n);
+    if (fin <= from || to >= n) {
+        *ret = js_object_value(o);
+        return JS_OK;
+    }
+    rem1 = fin - from;
+    rem2 = n - to;
+    count = rem1 < rem2 ? rem1 : rem2;
+    if (from < to && to < from + count) {
+        dir = -1;
+        from += count - 1;
+        to += count - 1;
+    }
+    while (count > 0) {
+        js_value v;
+        if (js_step(ctx) != JS_OK || aget(ctx, o, from, &v) != JS_OK ||
+            aput(ctx, o, to, v) != JS_OK)
+            return JS_THROW;
+        from = (unsigned long)((long)from + dir);
+        to = (unsigned long)((long)to + dir);
+        count--;
+    }
+    *ret = js_object_value(o);
     return JS_OK;
 }
 
@@ -1723,6 +2055,15 @@ static int array_iterator(js_ctx *ctx, js_value t, js_value *ret, int kind)
         js_define_native(ctx, iterator, "next",
                          array_iterator_next, 0) != JS_OK)
         return JS_THROW;
+    if (ctx->sym_iterator.type == JS_SYMBOL) {
+        js_object *self_fn = js_new_native(ctx, bi_iter_self,
+                                           "[Symbol.iterator]", 0);
+        if (!self_fn ||
+            js_define_symbol_prop(ctx, iterator, ctx->sym_iterator,
+                                  js_object_value(self_fn),
+                                  JS_P_HIDDEN) != JS_OK)
+            return JS_THROW;
+    }
     *ret = js_object_value(iterator);
     return JS_OK;
 }
@@ -1808,6 +2149,7 @@ static int bi_array_push(js_ctx *ctx, js_value t, int argc, js_value *argv,
     int i;
 
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (check_array_mutable(ctx, o, argc > 0) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
     for (i = 0; i < argc; i++) {
         if (o->cls == JS_CLASS_ARRAY) {
@@ -1831,6 +2173,7 @@ static int bi_array_pop(js_ctx *ctx, js_value t, int argc, js_value *argv,
     (void)argc; (void)argv;
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (check_array_mutable(ctx, o, n > 0) != JS_OK) return JS_THROW;
     if (n == 0) {
         *ret = js_undefined();
         return o->cls == JS_CLASS_ARRAY ? JS_OK : asetlen(ctx, o, 0);
@@ -1855,6 +2198,7 @@ static int bi_array_shift(js_ctx *ctx, js_value t, int argc, js_value *argv,
     (void)argc; (void)argv;
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (check_array_mutable(ctx, o, n > 0) != JS_OK) return JS_THROW;
     if (n == 0) { *ret = js_undefined(); return JS_OK; }
     if (aget(ctx, o, 0, ret) != JS_OK) return JS_THROW;
     if (o->cls == JS_CLASS_ARRAY) {
@@ -1877,6 +2221,7 @@ static int bi_array_unshift(js_ctx *ctx, js_value t, int argc, js_value *argv,
     unsigned long n, i;
 
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (check_array_mutable(ctx, o, argc > 0) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
     if (argc > 0) {
         for (i = 0; i < (unsigned long)argc; i++)
@@ -1943,6 +2288,8 @@ static int bi_array_splice(js_ctx *ctx, js_value t, int argc, js_value *argv,
         dcount = argc ? n - start : 0;
     }
     ins = argc > 2 ? (unsigned long)(argc - 2) : 0;
+    if (check_array_mutable(ctx, o, ins != dcount || dcount > 0) != JS_OK)
+        return JS_THROW;
 
     removed = js_new_array(ctx);
     if (!removed) return JS_THROW;
@@ -2245,6 +2592,7 @@ static int bi_array_reverse(js_ctx *ctx, js_value t, int argc, js_value *argv,
     (void)argc; (void)argv;
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (n > 1 && check_array_mutable(ctx, o, 0) != JS_OK) return JS_THROW;
     for (i = 0; i < n / 2; i++) {
         js_value a, b;
         if (aget(ctx, o, i, &a) != JS_OK) return JS_THROW;
@@ -2302,6 +2650,7 @@ static int bi_array_sort(js_ctx *ctx, js_value t, int argc, js_value *argv,
 
     if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
     if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (n >= 2 && check_array_mutable(ctx, o, 0) != JS_OK) return JS_THROW;
     *ret = js_object_value(o);
     if (n < 2) return JS_OK;
     if (n > 1000000UL)
@@ -2644,6 +2993,8 @@ static int bi_string_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
     js_value s;
 
     (void)t;
+    if (!ctx->new_target && argc > 0 && argv[0].type == JS_SYMBOL)
+        return js_symbol_to_string(ctx, argv[0], ret);
     if (argc == 0)
         s = js_string_value(ctx->s_empty);
     else if (js_to_string(ctx, argv[0], &s) != JS_OK)
@@ -2679,6 +3030,46 @@ static int bi_string_fromcharcode(js_ctx *ctx, js_value t, int argc,
     return js_sb_finish(&b, ret);
 }
 
+static int bi_string_raw(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_value cooked, raw_v, raw_obj;
+    unsigned long n, i;
+    js_sbuf b;
+
+    (void)t;
+    if (js_to_object(ctx, arg(argc, argv, 0), &cooked) != JS_OK)
+        return JS_THROW;
+    if (js_obj_get(ctx, cooked.u.obj, ctx->s_raw, cooked, &raw_v) != JS_OK ||
+        js_to_object(ctx, raw_v, &raw_obj) != JS_OK)
+        return JS_THROW;
+    if (alen(ctx, raw_obj.u.obj, &n) != JS_OK)
+        return JS_THROW;
+    if (n == 0)
+        return ret_str(ctx, "", 0, ret);
+    js_sb_init(&b, ctx);
+    for (i = 0; i < n; i++) {
+        js_value seg, s;
+        if (js_step(ctx) != JS_OK ||
+            aget(ctx, raw_obj.u.obj, i, &seg) != JS_OK ||
+            js_to_string(ctx, seg, &s) != JS_OK ||
+            js_sb_put(&b, s.u.str->data, s.u.str->len) != JS_OK)
+            goto fail;
+        if (i + 1 == n)
+            break;
+        if ((unsigned long)argc > i + 1) {
+            js_value sub;
+            if (js_to_string(ctx, argv[i + 1], &sub) != JS_OK ||
+                js_sb_put(&b, sub.u.str->data, sub.u.str->len) != JS_OK)
+                goto fail;
+        }
+    }
+    return js_sb_finish(&b, ret);
+fail:
+    js_sb_free(&b);
+    return JS_THROW;
+}
+
 static int bi_string_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
                               js_value *ret)
 {
@@ -2690,6 +3081,106 @@ static int bi_string_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
     }
     return js_throw_error(ctx, JS_ERR_TYPE,
                           "String.prototype.toString on a non-string");
+}
+
+static int bi_string_at(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    js_string *s;
+    double d = 0;
+
+    if (this_string(ctx, t, &s) != JS_OK) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    if (d < 0) d += (double)s->len;
+    if (d < 0 || d >= (double)s->len) {
+        *ret = js_undefined();
+        return JS_OK;
+    }
+    return ret_str(ctx, s->data + (unsigned long)d, 1, ret);
+}
+
+static unsigned long utf8_char_span(const char *s, unsigned long rem)
+{
+    unsigned char b0;
+
+    if (!rem) return 0;
+    b0 = (unsigned char)s[0];
+    if (b0 < 0x80) return 1;
+    if ((b0 & 0xE0) == 0xC0 && rem >= 2 &&
+        (((unsigned char)s[1] & 0xC0) == 0x80))
+        return 2;
+    if ((b0 & 0xF0) == 0xE0 && rem >= 3 &&
+        (((unsigned char)s[1] & 0xC0) == 0x80) &&
+        (((unsigned char)s[2] & 0xC0) == 0x80))
+        return 3;
+    if ((b0 & 0xF8) == 0xF0 && rem >= 4 &&
+        (((unsigned char)s[1] & 0xC0) == 0x80) &&
+        (((unsigned char)s[2] & 0xC0) == 0x80) &&
+        (((unsigned char)s[3] & 0xC0) == 0x80))
+        return 4;
+    return 1;
+}
+
+static int string_iterator_next(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret)
+{
+    js_value sv, idxv;
+    js_object *res;
+    unsigned long idx;
+    js_string *s;
+
+    (void)argc; (void)argv;
+    if (t.type != JS_OBJECT ||
+        js_get(ctx, t, "__string", &sv) != JS_OK ||
+        js_get(ctx, t, "__index", &idxv) != JS_OK ||
+        sv.type != JS_STRING || idxv.type != JS_NUMBER)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid String iterator");
+    s = sv.u.str;
+    idx = idxv.u.num < 0 ? 0 : (unsigned long)idxv.u.num;
+    res = js_new_object(ctx);
+    if (!res) return JS_THROW;
+    if (idx >= s->len) {
+        if (js_define_enum(ctx, res, "value", js_undefined()) != JS_OK ||
+            js_define_enum(ctx, res, "done", js_bool(1)) != JS_OK)
+            return JS_THROW;
+    } else {
+        unsigned long span = utf8_char_span(s->data + idx, s->len - idx);
+        js_value ch;
+        if (ret_str(ctx, s->data + idx, span, &ch) != JS_OK ||
+            js_define_enum(ctx, res, "value", ch) != JS_OK ||
+            js_define_enum(ctx, res, "done", js_bool(0)) != JS_OK ||
+            js_set(ctx, t, "__index", js_number((double)(idx + span))) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(res);
+    return JS_OK;
+}
+
+static int bi_string_iterator(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_string *s;
+    js_object *iter;
+
+    (void)argc; (void)argv;
+    if (this_string(ctx, t, &s) != JS_OK) return JS_THROW;
+    iter = js_new_object(ctx);
+    if (!iter ||
+        js_define(ctx, iter, "__string", js_string_value(s)) != JS_OK ||
+        js_define(ctx, iter, "__index", js_number(0)) != JS_OK ||
+        js_define_native(ctx, iter, "next", string_iterator_next, 0) != JS_OK)
+        return JS_THROW;
+    if (ctx->sym_iterator.type == JS_SYMBOL) {
+        js_object *self_fn = js_new_native(ctx, bi_iter_self,
+                                           "[Symbol.iterator]", 0);
+        if (!self_fn ||
+            js_define_symbol_prop(ctx, iter, ctx->sym_iterator,
+                                  js_object_value(self_fn),
+                                  JS_P_HIDDEN) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(iter);
+    return JS_OK;
 }
 
 static int bi_string_charat(js_ctx *ctx, js_value t, int argc, js_value *argv,
@@ -3792,6 +4283,84 @@ static int bi_math_random(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+static int bi_math_trunc(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    double d = 0;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    *ret = js_number(js_trunc(d));
+    return JS_OK;
+}
+
+static int bi_math_sign(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    double d = 0;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    if (js_isnan(d) || d == 0.0) {
+        *ret = js_number(d);
+        return JS_OK;
+    }
+    *ret = js_number(d > 0.0 ? 1.0 : -1.0);
+    return JS_OK;
+}
+
+static int bi_math_hypot(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    double max = 0.0, sum = 0.0;
+    int has_inf = 0, has_nan = 0, i;
+    double stack_vals[16];
+    double *vals = stack_vals;
+
+    (void)t;
+    if (argc == 0) {
+        *ret = js_number(0.0);
+        return JS_OK;
+    }
+    if (argc > 16) {
+        vals = (double *)js_alloc_raw(ctx, (unsigned long)argc * sizeof(double));
+        if (!vals) return JS_THROW;
+    }
+    for (i = 0; i < argc; i++) {
+        double d;
+        if (js_to_number(ctx, argv[i], &d) != JS_OK) return JS_THROW;
+        if (js_isinf(d)) has_inf = 1;
+        else if (js_isnan(d)) has_nan = 1;
+        else {
+            double a = js_fabs(d);
+            if (a > max) max = a;
+        }
+        vals[i] = d;
+    }
+    if (has_inf) { *ret = js_number(js_inf(0)); return JS_OK; }
+    if (has_nan) { *ret = js_number(js_nan()); return JS_OK; }
+    if (max == 0.0) { *ret = js_number(0.0); return JS_OK; }
+    for (i = 0; i < argc; i++) {
+        double r = vals[i] / max;
+        sum += r * r;
+    }
+    *ret = js_number(max * js_sqrt(sum));
+    return JS_OK;
+}
+
+static int bi_math_imul(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    uint32_t a = 0, b = 0;
+
+    (void)t;
+    if (js_to_uint32(ctx, arg(argc, argv, 0), &a) != JS_OK ||
+        js_to_uint32(ctx, arg(argc, argv, 1), &b) != JS_OK)
+        return JS_THROW;
+    *ret = js_number((double)(int32_t)(a * b));
+    return JS_OK;
+}
+
 /* ================================================================== */
 /* JSON                                                                */
 /* ================================================================== */
@@ -3872,6 +4441,7 @@ static int json_write(jsonw *w, js_value v)
 
     switch (v.type) {
     case JS_UNDEFINED:
+    case JS_SYMBOL:
         return 0;
     case JS_NULL:
         return js_sb_puts(w->b, "null") == JS_OK ? 1 : -1;
@@ -3891,6 +4461,8 @@ static int json_write(jsonw *w, js_value v)
     }
 
     if (v.u.obj->cls == JS_CLASS_FUNCTION)
+        return 0;
+    if (v.u.obj->cls == JS_CLASS_SYMBOL)
         return 0;
     if (v.u.obj->cls == JS_CLASS_NUMBER || v.u.obj->cls == JS_CLASS_STRING ||
         v.u.obj->cls == JS_CLASS_BOOLEAN) {
@@ -3927,7 +4499,8 @@ static int json_write(jsonw *w, js_value v)
             js_value e;
             int r;
             unsigned long mark;
-            if ((p->flags & JS_P_DEAD) || !(p->flags & JS_P_ENUM)) continue;
+            if ((p->flags & (JS_P_DEAD | JS_P_SYMBOL)) || !(p->flags & JS_P_ENUM))
+                continue;
             if (js_obj_get(ctx, v.u.obj, p->key, v, &e) != JS_OK) { w->depth--; return -1; }
             mark = w->b->n;
             if (!first && js_sb_putc(w->b, ',') != JS_OK) { w->depth--; return -1; }
@@ -4879,6 +5452,110 @@ static int bi_console_log(js_ctx *ctx, js_value t, int argc, js_value *argv,
 /* Primitive wrappers                                                  */
 /* ================================================================== */
 
+static int this_symbol(js_ctx *ctx, js_value t, js_value *out)
+{
+    if (t.type == JS_SYMBOL) {
+        *out = t;
+        return JS_OK;
+    }
+    if (t.type == JS_OBJECT && t.u.obj->cls == JS_CLASS_SYMBOL &&
+        t.u.obj->prim.type == JS_SYMBOL) {
+        *out = t.u.obj->prim;
+        return JS_OK;
+    }
+    return js_throw_error(ctx, JS_ERR_TYPE,
+                          "Symbol.prototype method requires a Symbol");
+}
+
+static int bi_symbol_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                          js_value *ret)
+{
+    js_value desc = js_undefined();
+
+    (void)t;
+    if (ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE, "Symbol is not a constructor");
+    if (argc > 0 && argv[0].type != JS_UNDEFINED) {
+        if (js_to_string(ctx, argv[0], &desc) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_new_symbol(ctx, desc);
+    return ret->type == JS_SYMBOL ? JS_OK : JS_THROW;
+}
+
+static int bi_symbol_for(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_value key, sym;
+    js_prop *p;
+
+    (void)t;
+    if (js_to_string(ctx, arg(argc, argv, 0), &key) != JS_OK)
+        return JS_THROW;
+    p = js_own_prop(ctx->sym_registry, key.u.str);
+    if (p && p->value.type == JS_SYMBOL) {
+        *ret = p->value;
+        return JS_OK;
+    }
+    sym = js_new_symbol(ctx, key);
+    if (sym.type != JS_SYMBOL)
+        return JS_THROW;
+    if (js_obj_put(ctx, ctx->sym_registry, key.u.str, sym) != JS_OK)
+        return JS_THROW;
+    *ret = sym;
+    return JS_OK;
+}
+
+static int bi_symbol_keyfor(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                            js_value *ret)
+{
+    js_value sv = arg(argc, argv, 0);
+    uint32_t i;
+
+    (void)t;
+    if (sv.type != JS_SYMBOL)
+        return js_throw_error(ctx, JS_ERR_TYPE, "Symbol.keyFor requires a Symbol");
+    for (i = 0; i < ctx->sym_registry->nprops; i++) {
+        js_prop *p = &ctx->sym_registry->props[i];
+        if ((p->flags & JS_P_DEAD) || p->value.type != JS_SYMBOL)
+            continue;
+        if (p->value.u.obj == sv.u.obj) {
+            *ret = js_string_value(p->key);
+            return JS_OK;
+        }
+    }
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+static int bi_symbol_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                              js_value *ret)
+{
+    js_value sv;
+
+    (void)argc; (void)argv;
+    if (this_symbol(ctx, t, &sv) != JS_OK) return JS_THROW;
+    return js_symbol_to_string(ctx, sv, ret);
+}
+
+static int bi_symbol_valueof(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                             js_value *ret)
+{
+    (void)argc; (void)argv;
+    return this_symbol(ctx, t, ret);
+}
+
+static int bi_symbol_desc(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                          js_value *ret)
+{
+    js_value sv;
+
+    (void)argc; (void)argv;
+    if (this_symbol(ctx, t, &sv) != JS_OK) return JS_THROW;
+    *ret = sv.u.obj->prim;
+    return JS_OK;
+}
+
 int js_wrap_primitive(js_ctx *ctx, js_value v, js_value *out)
 {
     int cls, pi;
@@ -4888,6 +5565,7 @@ int js_wrap_primitive(js_ctx *ctx, js_value v, js_value *out)
     case JS_STRING: cls = JS_CLASS_STRING;  pi = P_STRING;  break;
     case JS_NUMBER: cls = JS_CLASS_NUMBER;  pi = P_NUMBER;  break;
     case JS_BOOL:   cls = JS_CLASS_BOOLEAN; pi = P_BOOLEAN; break;
+    case JS_SYMBOL: cls = JS_CLASS_SYMBOL;  pi = P_SYMBOL;  break;
     default:
         *out = v;
         return JS_OK;
@@ -4921,6 +5599,7 @@ static int same_value_zero(js_value a, js_value b)
     case JS_STRING:
         return js_str_eq(a.u.str, b.u.str);
     case JS_OBJECT:
+    case JS_SYMBOL:
         return a.u.obj == b.u.obj;
     default:
         return 0;
@@ -5006,6 +5685,23 @@ static js_object *collection_alloc(js_ctx *ctx, int cls)
     return collection;
 }
 
+static int collection_add_entry(js_ctx *ctx, js_object *collection, int cls,
+                                const char *name, js_value item)
+{
+    js_value key, value;
+
+    if (cls == JS_CLASS_SET || cls == JS_CLASS_WEAKSET)
+        return collection_store(ctx, collection, item, item);
+    if (item.type != JS_OBJECT)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "%s entry must be array-like", name);
+    if (aget(ctx, item.u.obj, 0, &key) != JS_OK ||
+        aget(ctx, item.u.obj, 1, &value) != JS_OK ||
+        collection_store(ctx, collection, key, value) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
 static int collection_ctor(js_ctx *ctx, int cls,
                            int argc, js_value *argv, js_value *ret)
 {
@@ -5022,6 +5718,30 @@ static int collection_ctor(js_ctx *ctx, int cls,
     if (!collection)
         return JS_THROW;
     if (input.type != JS_UNDEFINED && input.type != JS_NULL) {
+        if (ctx->sym_iterator_key) {
+            js_value iter_fn = js_undefined();
+            if (js_wrap_get_key(ctx, input, ctx->sym_iterator_key, 1,
+                                &iter_fn) != JS_OK)
+                return JS_THROW;
+            if (iter_fn.type != JS_UNDEFINED) {
+                js_iter it;
+                if (js_iter_open(ctx, input, &it) != JS_OK)
+                    return JS_THROW;
+                for (i = 0; ; i++) {
+                    js_value item;
+                    int done = 0;
+                    if (js_step(ctx) != JS_OK ||
+                        js_iter_next(ctx, &it, &item, &done) != JS_OK)
+                        return JS_THROW;
+                    if (done) break;
+                    if (collection_add_entry(ctx, collection, cls, name,
+                                             item) != JS_OK)
+                        return JS_THROW;
+                }
+                *ret = js_object_value(collection);
+                return JS_OK;
+            }
+        }
         if (input.type != JS_OBJECT)
             return js_throw_error(ctx, JS_ERR_TYPE,
                                   "collection input must be array-like");
@@ -5031,21 +5751,10 @@ static int collection_ctor(js_ctx *ctx, int cls,
             return js_throw_error(ctx, JS_ERR_RANGE,
                                   "collection input is too large");
         for (i = 0; i < length; i++) {
-            js_value item, key, value;
+            js_value item;
 
-            if (aget(ctx, input.u.obj, i, &item) != JS_OK)
-                return JS_THROW;
-            if (cls == JS_CLASS_SET || cls == JS_CLASS_WEAKSET) {
-                if (collection_store(ctx, collection, item, item) != JS_OK)
-                    return JS_THROW;
-                continue;
-            }
-            if (item.type != JS_OBJECT)
-                return js_throw_error(ctx, JS_ERR_TYPE,
-                                      "%s entry must be array-like", name);
-            if (aget(ctx, item.u.obj, 0, &key) != JS_OK ||
-                aget(ctx, item.u.obj, 1, &value) != JS_OK ||
-                collection_store(ctx, collection, key, value) != JS_OK)
+            if (aget(ctx, input.u.obj, i, &item) != JS_OK ||
+                collection_add_entry(ctx, collection, cls, name, item) != JS_OK)
                 return JS_THROW;
         }
     }
@@ -5304,6 +6013,15 @@ static int collection_iterator(js_ctx *ctx, js_value t,
         js_define_native(ctx, iterator, "next",
                          collection_iterator_next, 0) != JS_OK)
         return JS_THROW;
+    if (ctx->sym_iterator.type == JS_SYMBOL) {
+        js_object *self_fn = js_new_native(ctx, bi_iter_self,
+                                           "[Symbol.iterator]", 0);
+        if (!self_fn ||
+            js_define_symbol_prop(ctx, iterator, ctx->sym_iterator,
+                                  js_object_value(self_fn),
+                                  JS_P_HIDDEN) != JS_OK)
+            return JS_THROW;
+    }
     *ret = js_object_value(iterator);
     return JS_OK;
 }
@@ -5366,8 +6084,8 @@ static int promise_queue(js_ctx *ctx, js_object *source,
     return JS_OK;
 }
 
-static int promise_add_reaction(js_ctx *ctx, js_object *source,
-                                js_promise_reaction *reaction)
+int js_promise_add_reaction(js_ctx *ctx, js_object *source,
+                            js_promise_reaction *reaction)
 {
     js_promise_reaction **tail;
 
@@ -5408,7 +6126,7 @@ static int promise_settle(js_ctx *ctx, js_object *promise, int state,
             reaction->on_fulfilled = js_undefined();
             reaction->on_rejected = js_undefined();
             reaction->child = promise;
-            return promise_add_reaction(ctx, other, reaction);
+            return js_promise_add_reaction(ctx, other, reaction);
         } else {
             state = other->promise_state;
             value = other->promise_result;
@@ -5464,7 +6182,7 @@ static int promise_then(js_ctx *ctx, js_value t, int argc, js_value *argv,
     reaction->on_rejected =
         argc > 1 && js_is_function(argv[1]) ? argv[1] : js_undefined();
     reaction->child = child.u.obj;
-    if (promise_add_reaction(ctx, t.u.obj, reaction) != JS_OK)
+    if (js_promise_add_reaction(ctx, t.u.obj, reaction) != JS_OK)
         return JS_THROW;
     *ret = child;
     return JS_OK;
@@ -5562,20 +6280,61 @@ static int promise_ctor(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+int js_promise_resolve_value(js_ctx *ctx, js_value value, js_value *out_promise)
+{
+    js_value p;
+
+    if (js_is_promise(value)) {
+        *out_promise = value;
+        return JS_OK;
+    }
+    p = js_promise_new(ctx);
+    if (!js_is_promise(p))
+        return JS_THROW;
+    if (value.type == JS_OBJECT) {
+        js_string *then_k = js_str_intern(ctx, "then", 4);
+        js_value then_fn;
+
+        if (!then_k)
+            return JS_THROW;
+        if (js_obj_get(ctx, value.u.obj, then_k, value, &then_fn) != JS_OK) {
+            if (ctx->fatal) return JS_THROW;
+            js_value reason = js_exception(ctx);
+            js_clear_exception(ctx);
+            if (js_promise_reject(ctx, p, reason) != JS_OK) return JS_THROW;
+            *out_promise = p;
+            return JS_OK;
+        }
+        if (js_is_function(then_fn)) {
+            js_value resolve, reject, args[2], ignored;
+            if (bound_resolver(ctx, p, promise_resolver, "resolve", &resolve) != JS_OK ||
+                bound_resolver(ctx, p, promise_rejecter, "reject", &reject) != JS_OK)
+                return JS_THROW;
+            args[0] = resolve;
+            args[1] = reject;
+            if (js_call(ctx, then_fn, value, 2, args, &ignored) != JS_OK) {
+                if (ctx->fatal) return JS_THROW;
+                js_value reason = js_exception(ctx);
+                js_clear_exception(ctx);
+                if (js_promise_reject(ctx, p, reason) != JS_OK) return JS_THROW;
+            }
+            *out_promise = p;
+            return JS_OK;
+        }
+    }
+    if (js_promise_resolve(ctx, p, value) != JS_OK)
+        return JS_THROW;
+    *out_promise = p;
+    return JS_OK;
+}
+
 static int promise_static_resolve(js_ctx *ctx, js_value t, int argc,
                                   js_value *argv, js_value *ret)
 {
     js_value value = argc ? argv[0] : js_undefined();
     (void)t;
 
-    if (js_is_promise(value)) {
-        *ret = value;
-        return JS_OK;
-    }
-    *ret = js_promise_new(ctx);
-    if (!js_is_promise(*ret))
-        return JS_THROW;
-    return js_promise_resolve(ctx, *ret, value);
+    return js_promise_resolve_value(ctx, value, ret);
 }
 
 static int promise_static_reject(js_ctx *ctx, js_value t, int argc,
@@ -5888,6 +6647,55 @@ static int promise_all_item(js_ctx *ctx, js_value t, int argc,
     return left ? JS_OK : js_promise_resolve(ctx, result, values);
 }
 
+static int promise_iterable_to_array(js_ctx *ctx, js_value input, const char *who,
+                                     js_object **out, unsigned long *len)
+{
+    js_object *arr;
+    unsigned long i;
+
+    if (input.type == JS_UNDEFINED || input.type == JS_NULL)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "%s requires an iterable", who);
+    if (ctx->sym_iterator_key) {
+        js_value iter_fn = js_undefined();
+        if (js_wrap_get_key(ctx, input, ctx->sym_iterator_key, 1,
+                            &iter_fn) != JS_OK)
+            return JS_THROW;
+        if (iter_fn.type != JS_UNDEFINED) {
+            js_iter it;
+            if (js_iter_open(ctx, input, &it) != JS_OK)
+                return JS_THROW;
+            arr = js_new_array(ctx);
+            if (!arr)
+                return JS_THROW;
+            for (i = 0; ; i++) {
+                js_value item;
+                int done = 0;
+                if (i > 65535)
+                    return js_throw_error(ctx, JS_ERR_RANGE,
+                                          "%s input is too large", who);
+                if (js_step(ctx) != JS_OK ||
+                    js_iter_next(ctx, &it, &item, &done) != JS_OK)
+                    return JS_THROW;
+                if (done) break;
+                if (js_array_push(ctx, arr, item) != JS_OK)
+                    return JS_THROW;
+            }
+            *out = arr;
+            *len = arr->elen;
+            return JS_OK;
+        }
+    }
+    if (this_object(ctx, input, out) != JS_OK)
+        return JS_THROW;
+    if (alen(ctx, *out, len) != JS_OK)
+        return JS_THROW;
+    if (*len > 65535)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "%s input is too large", who);
+    return JS_OK;
+}
+
 static int promise_static_all(js_ctx *ctx, js_value t, int argc,
                               js_value *argv, js_value *ret)
 {
@@ -5898,14 +6706,10 @@ static int promise_static_all(js_ctx *ctx, js_value t, int argc,
 
     if (argc < 1)
         return js_throw_error(ctx, JS_ERR_TYPE,
-                              "Promise.all requires an array-like value");
-    if (this_object(ctx, argv[0], &input) != JS_OK)
+                              "Promise.all requires an iterable");
+    if (promise_iterable_to_array(ctx, argv[0], "Promise.all",
+                                  &input, &n) != JS_OK)
         return JS_THROW;
-    if (alen(ctx, input, &n) != JS_OK)
-        return JS_THROW;
-    if (n > 65535)
-        return js_throw_error(ctx, JS_ERR_RANGE,
-                              "Promise.all input is too large");
     result = js_promise_new(ctx);
     values = js_new_array(ctx);
     state = js_new_object(ctx);
@@ -5955,14 +6759,10 @@ static int promise_static_race(js_ctx *ctx, js_value t, int argc,
 
     if (argc < 1)
         return js_throw_error(ctx, JS_ERR_TYPE,
-                              "Promise.race requires an array-like value");
-    if (this_object(ctx, argv[0], &input) != JS_OK)
+                              "Promise.race requires an iterable");
+    if (promise_iterable_to_array(ctx, argv[0], "Promise.race",
+                                  &input, &n) != JS_OK)
         return JS_THROW;
-    if (alen(ctx, input, &n) != JS_OK)
-        return JS_THROW;
-    if (n > 65535)
-        return js_throw_error(ctx, JS_ERR_RANGE,
-                              "Promise.race input is too large");
     result = js_promise_new(ctx);
     if (!js_is_promise(result) ||
         bound_resolver(ctx, result, promise_resolver,
@@ -6080,22 +6880,34 @@ int js_run_jobs(js_ctx *ctx, unsigned long max_jobs)
         ctx->jobs_head = job->next;
         if (!ctx->jobs_head)
             ctx->jobs_tail = 0;
-        handler = source->promise_state == 1
-            ? reaction->on_fulfilled : reaction->on_rejected;
-        if (!js_is_function(handler)) {
-            rc = promise_settle(ctx, reaction->child,
-                                source->promise_state,
-                                source->promise_result);
+        if (reaction->async_task) {
+            rc = js_async_resume(ctx, reaction->async_task,
+                                 source->promise_state,
+                                 source->promise_result);
         } else {
-            result = js_undefined();
-            rc = js_call(ctx, handler, js_undefined(), 1,
-                         &source->promise_result, &result);
-            if (rc == JS_OK) {
-                rc = promise_settle(ctx, reaction->child, 1, result);
-            } else if (!ctx->fatal) {
-                js_value reason = js_exception(ctx);
-                js_clear_exception(ctx);
-                rc = promise_settle(ctx, reaction->child, 2, reason);
+            handler = source->promise_state == 1
+                ? reaction->on_fulfilled : reaction->on_rejected;
+            if (!js_is_function(handler)) {
+                rc = reaction->child
+                    ? promise_settle(ctx, reaction->child,
+                                     source->promise_state,
+                                     source->promise_result)
+                    : JS_OK;
+            } else {
+                result = js_undefined();
+                rc = js_call(ctx, handler, js_undefined(), 1,
+                             &source->promise_result, &result);
+                if (rc == JS_OK) {
+                    rc = reaction->child
+                        ? promise_settle(ctx, reaction->child, 1, result)
+                        : JS_OK;
+                } else if (!ctx->fatal) {
+                    js_value reason = js_exception(ctx);
+                    js_clear_exception(ctx);
+                    rc = reaction->child
+                        ? promise_settle(ctx, reaction->child, 2, reason)
+                        : JS_OK;
+                }
             }
         }
         if (rc != JS_OK || ctx->fatal)
@@ -6856,6 +7668,10 @@ int js_init_builtins(js_ctx *ctx)
     INTERN(s_boolean, "boolean");
     INTERN(s_object, "object");
     INTERN(s_function, "function");
+    INTERN(s_done, "done");
+    INTERN(s_next, "next");
+    INTERN(s_raw, "raw");
+    INTERN(s_iterator, "iterator");
 #undef INTERN
 
     ctx->proto[P_OBJECT] = js_obj_alloc(ctx, JS_CLASS_OBJECT, 0);
@@ -6870,13 +7686,57 @@ int js_init_builtins(js_ctx *ctx)
     if (!ctx->genv) return 0;
     ctx->genv->this_val = js_object_value(g);
 
-    for (i = P_ARRAY; i <= P_WEAKSET; i++) {
+    {
+        js_object *lex = js_obj_alloc(ctx, JS_CLASS_OBJECT, 0);
+        if (!lex) return 0;
+        ctx->lex_env = js_env_new(ctx, ctx->genv, lex);
+        if (!ctx->lex_env) return 0;
+        ctx->lex_env->this_val = js_object_value(g);
+        ctx->lex_env->is_lex = 1;
+    }
+
+    for (i = P_ARRAY; i <= P_SYMBOL; i++) {
         ctx->proto[i] = js_obj_alloc(ctx,
             i == P_ARRAY ? JS_CLASS_ARRAY : JS_CLASS_OBJECT, ctx->proto[P_OBJECT]);
         if (!ctx->proto[i]) return 0;
     }
     for (i = P_TYPEERROR; i <= P_URIERROR; i++)
         ctx->proto[i]->proto = ctx->proto[P_ERROR];
+
+    /* ---- Symbol (registered early so prototypes can use well-known symbols) ---- */
+    ctx->sym_registry = js_obj_alloc(ctx, JS_CLASS_OBJECT, 0);
+    if (!ctx->sym_registry) return 0;
+    ctx->sym_iterator = js_new_symbol(ctx, js_mkcstring(ctx, "Symbol.iterator"));
+    if (ctx->sym_iterator.type != JS_SYMBOL) return 0;
+    ctx->sym_iterator_key = (js_string *)ctx->sym_iterator.u.obj->host;
+    ctx->sym_tostringtag = js_new_symbol(ctx, js_mkcstring(ctx, "Symbol.toStringTag"));
+    if (ctx->sym_tostringtag.type != JS_SYMBOL) return 0;
+    ctx->sym_tostringtag_key = (js_string *)ctx->sym_tostringtag.u.obj->host;
+    {
+        js_object *sc;
+        p = ctx->proto[P_SYMBOL];
+        DEFN(p, "toString", bi_symbol_tostring, 0);
+        DEFN(p, "valueOf", bi_symbol_valueof, 0);
+        if (js_define_accessor(ctx, p, "description", bi_symbol_desc, 0, 0) != JS_OK)
+            return 0;
+        if (js_define_symbol_prop(ctx, p, ctx->sym_tostringtag,
+                                  js_mkcstring(ctx, "Symbol"),
+                                  JS_P_CONFIG) != JS_OK)
+            return 0;
+        sc = mkctor(ctx, bi_symbol_ctor, "Symbol", 0, p);
+        if (!sc) return 0;
+        DEFN(sc, "for", bi_symbol_for, 1);
+        DEFN(sc, "keyFor", bi_symbol_keyfor, 1);
+        {
+            js_prop *sp;
+            sp = js_add_prop(ctx, sc, ctx->s_iterator, 0);
+            if (!sp) return 0;
+            sp->value = ctx->sym_iterator;
+            sp = js_add_prop(ctx, sc, js_str_intern(ctx, "toStringTag", 11), 0);
+            if (!sp) return 0;
+            sp->value = ctx->sym_tostringtag;
+        }
+    }
 
     /* ---- Object ---- */
     p = ctx->proto[P_OBJECT];
@@ -6895,7 +7755,9 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(ctx->ctor_object, "assign", bi_object_assign, 2);
     DEFN(ctx->ctor_object, "is", bi_object_is, 2);
     DEFN(ctx->ctor_object, "getOwnPropertyNames", bi_object_names, 1);
+    DEFN(ctx->ctor_object, "getOwnPropertySymbols", bi_object_getsyms, 1);
     DEFN(ctx->ctor_object, "getPrototypeOf", bi_object_getproto, 1);
+    DEFN(ctx->ctor_object, "setPrototypeOf", bi_object_setproto, 2);
     DEFN(ctx->ctor_object, "defineProperty", bi_object_defprop, 3);
     DEFN(ctx->ctor_object, "defineProperties", bi_object_defprops, 2);
     DEFN(ctx->ctor_object, "create", bi_object_create, 2);
@@ -6934,8 +7796,19 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "findIndex", bi_array_findindex, 1);
     DEFN(p, "flat", bi_array_flat, 0);
     DEFN(p, "flatMap", bi_array_flatmap, 1);
+    DEFN(p, "at", bi_array_at, 1);
+    DEFN(p, "fill", bi_array_fill, 1);
+    DEFN(p, "copyWithin", bi_array_copywithin, 2);
     DEFN(p, "keys", bi_array_keys, 0);
-    DEFN(p, "values", bi_array_values, 0);
+    {
+        js_object *arr_vals = js_new_native(ctx, bi_array_values, "values", 0);
+        if (!arr_vals ||
+            js_define(ctx, p, "values", js_object_value(arr_vals)) != JS_OK ||
+            js_define_symbol_prop(ctx, p, ctx->sym_iterator,
+                                  js_object_value(arr_vals),
+                                  JS_P_HIDDEN) != JS_OK)
+            return 0;
+    }
     DEFN(p, "entries", bi_array_entries, 0);
     DEFN(p, "reverse", bi_array_reverse, 0);
     DEFN(p, "sort", bi_array_sort, 1);
@@ -6956,6 +7829,7 @@ int js_init_builtins(js_ctx *ctx)
     p = ctx->proto[P_STRING];
     DEFN(p, "toString", bi_string_tostring, 0);
     DEFN(p, "valueOf", bi_string_tostring, 0);
+    DEFN(p, "at", bi_string_at, 1);
     DEFN(p, "charAt", bi_string_charat, 1);
     DEFN(p, "charCodeAt", bi_string_charcodeat, 1);
     DEFN(p, "indexOf", bi_string_indexof, 1);
@@ -6986,9 +7860,19 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "match", bi_string_match, 1);
     DEFN(p, "search", bi_string_search, 1);
     {
+        js_object *str_iter = js_new_native(ctx, bi_string_iterator,
+                                            "[Symbol.iterator]", 0);
+        if (!str_iter ||
+            js_define_symbol_prop(ctx, p, ctx->sym_iterator,
+                                  js_object_value(str_iter),
+                                  JS_P_HIDDEN) != JS_OK)
+            return 0;
+    }
+    {
         js_object *c = mkctor(ctx, bi_string_ctor, "String", 1, p);
         if (!c) return 0;
         DEFN(c, "fromCharCode", bi_string_fromcharcode, 1);
+        DEFN(c, "raw", bi_string_raw, 1);
     }
 
     /* ---- Number ---- */
@@ -7125,6 +8009,17 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "subarray", uint8array_subarray, 2);
     DEFN(p, "slice", uint8array_slice, 2);
     DEFN(p, "fill", uint8array_fill, 3);
+    DEFN(p, "keys", bi_array_keys, 0);
+    {
+        js_object *u8_vals = js_new_native(ctx, bi_array_values, "values", 0);
+        if (!u8_vals ||
+            js_define(ctx, p, "values", js_object_value(u8_vals)) != JS_OK ||
+            js_define_symbol_prop(ctx, p, ctx->sym_iterator,
+                                  js_object_value(u8_vals),
+                                  JS_P_HIDDEN) != JS_OK)
+            return 0;
+    }
+    DEFN(p, "entries", bi_array_entries, 0);
     DEFV(p, "BYTES_PER_ELEMENT", js_number(1));
     {
         js_object *uint8_ctor_obj =
@@ -7146,7 +8041,16 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "forEach", collection_for_each, 1);
     DEFN(p, "keys", collection_keys, 0);
     DEFN(p, "values", collection_values, 0);
-    DEFN(p, "entries", collection_entries, 0);
+    {
+        js_object *map_ent = js_new_native(ctx, collection_entries,
+                                           "entries", 0);
+        if (!map_ent ||
+            js_define(ctx, p, "entries", js_object_value(map_ent)) != JS_OK ||
+            js_define_symbol_prop(ctx, p, ctx->sym_iterator,
+                                  js_object_value(map_ent),
+                                  JS_P_HIDDEN) != JS_OK)
+            return 0;
+    }
     if (!mkctor(ctx, map_ctor, "Map", 0, p))
         return 0;
 
@@ -7160,8 +8064,17 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "delete", collection_delete, 1);
     DEFN(p, "clear", collection_clear, 0);
     DEFN(p, "forEach", collection_for_each, 1);
-    DEFN(p, "keys", collection_keys, 0);
-    DEFN(p, "values", collection_values, 0);
+    {
+        js_object *set_vals = js_new_native(ctx, collection_values,
+                                            "values", 0);
+        if (!set_vals ||
+            js_define(ctx, p, "values", js_object_value(set_vals)) != JS_OK ||
+            js_define(ctx, p, "keys", js_object_value(set_vals)) != JS_OK ||
+            js_define_symbol_prop(ctx, p, ctx->sym_iterator,
+                                  js_object_value(set_vals),
+                                  JS_P_HIDDEN) != JS_OK)
+            return 0;
+    }
     DEFN(p, "entries", collection_entries, 0);
     if (!mkctor(ctx, set_ctor, "Set", 0, p))
         return 0;
@@ -7240,15 +8153,19 @@ int js_init_builtins(js_ctx *ctx)
         DEFN(m, "cos", bi_math_cos, 1);
         DEFN(m, "exp", bi_math_exp, 1);
         DEFN(m, "floor", bi_math_floor, 1);
+        DEFN(m, "hypot", bi_math_hypot, 2);
+        DEFN(m, "imul", bi_math_imul, 2);
         DEFN(m, "log", bi_math_log, 1);
         DEFN(m, "max", bi_math_max, 2);
         DEFN(m, "min", bi_math_min, 2);
         DEFN(m, "pow", bi_math_pow, 2);
         DEFN(m, "random", bi_math_random, 0);
         DEFN(m, "round", bi_math_round, 1);
+        DEFN(m, "sign", bi_math_sign, 1);
         DEFN(m, "sin", bi_math_sin, 1);
         DEFN(m, "sqrt", bi_math_sqrt, 1);
         DEFN(m, "tan", bi_math_tan, 1);
+        DEFN(m, "trunc", bi_math_trunc, 1);
         DEFV(g, "Math", js_object_value(m));
     }
 

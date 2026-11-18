@@ -13,6 +13,7 @@
 #include "../libjs/js.h"
 
 struct jsdom;
+struct css_stylesheet;
 
 struct jsdom_fetch_response {
     int status;
@@ -53,6 +54,13 @@ struct jsdom_config {
     /* Zero selects the browser's 900x620 compatibility viewport. */
     unsigned int viewport_width;
     unsigned int viewport_height;
+    /* Optional layout/viewport/clipboard/stylesheet hooks; zero-init selects defaults. */
+    int (*get_box_rect)(void *user, struct dom_node *node,
+                        float *x, float *y, float *w, float *h);
+    void (*scroll_cb)(void *user, double x, double y);
+    int (*clipboard_write)(void *user, const char *text, unsigned long len);
+    char *(*clipboard_read)(void *user, unsigned long *len_out);
+    const struct css_stylesheet *stylesheet;
 };
 
 struct jsdom *jsdom_new(struct dom_document *doc,
@@ -82,3 +90,12 @@ void jsdom_clear_navigation(struct jsdom *j);
 /* The current document URL may change without a navigation through
  * history.pushState()/replaceState(). */
 const char *jsdom_document_url(const struct jsdom *j);
+
+/* Viewport scroll coordinates synchronized with window.scrollTo/scrollBy. */
+double jsdom_scroll_x(const struct jsdom *j);
+double jsdom_scroll_y(const struct jsdom *j);
+void jsdom_set_scroll(struct jsdom *j, double x, double y);
+
+/* Notify the page that the viewport resized (fires ResizeObserver & resize). */
+void jsdom_notify_resize(struct jsdom *j, unsigned int vw, unsigned int vh,
+                         char *err, unsigned long errsz);

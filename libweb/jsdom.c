@@ -39,6 +39,13 @@
 #define JSDOM_MUTATION_FILTER_MAX 16
 #define JSDOM_MUTATION_ATTRIBUTE_MAX 128
 #define JSDOM_MUTATION_TARGETS_MAX 16
+#define JSDOM_CANVAS_MAX_DIM 2048
+#define JSDOM_CANVAS_MAX_PIXELS (4UL * 1024UL * 1024UL)
+#define JSDOM_CANVAS_STACK_MAX 16
+#define JSDOM_CANVAS_PATH_MAX 16384
+#define JSDOM_OBSERVERS_MAX 16
+#define JSDOM_OBSERVER_TARGETS_MAX 32
+#define JSDOM_CLIPBOARD_MAX (1024UL * 1024UL)
 
 /* Explicit task states make cancellation and re-entrancy observable instead
  * of overloading one "active" bit.  The browser remains single-threaded:
@@ -78,7 +85,13 @@ enum host_kind {
     HOST_NODE_ITERATOR,
     HOST_TREE_WALKER,
     HOST_RANGE,
-    HOST_SELECTION
+    HOST_SELECTION,
+    HOST_COMPUTED_STYLE,
+    HOST_CANVAS_2D,
+    HOST_IMAGE_DATA,
+    HOST_DOM_PARSER,
+    HOST_RESIZE_OBSERVER,
+    HOST_INTERSECTION_OBSERVER
 };
 
 enum response_kind {
@@ -264,6 +277,65 @@ struct attr_ref {
     char *local_name;
 };
 
+struct doc_ref {
+    struct dom_document *doc;
+    char content_type[40];
+};
+
+struct canvas_pt {
+    double x;
+    double y;
+    unsigned char kind; /* 0 = move, 1 = line, 2 = close */
+};
+
+struct canvas_2d_saved {
+    double m[6]; /* a, b, c, d, e, f */
+    uint32_t fill_color;
+    uint32_t stroke_color;
+    char fill_str[64];
+    char stroke_str[64];
+    double line_width;
+    double global_alpha;
+    char font[128];
+    double font_px;
+    unsigned char text_align;    /* 0 left/start, 1 center, 2 right/end */
+    unsigned char text_baseline; /* 0 alphabetic, 1 top, 2 middle, 3 bottom */
+};
+
+struct canvas_2d_state {
+    struct canvas_2d_saved cur;
+    struct canvas_2d_saved stack[JSDOM_CANVAS_STACK_MAX];
+    int sp;
+    struct canvas_pt *path;
+    unsigned int path_n;
+    unsigned int path_cap;
+    js_value canvas_obj;
+};
+
+struct observer_target {
+    struct dom_node *node;
+    float last_w;
+    float last_h;
+    unsigned char pending;
+};
+
+struct resize_observer_state {
+    js_value callback;
+    js_value self;
+    struct observer_target targets[JSDOM_OBSERVER_TARGETS_MAX];
+    unsigned int target_count;
+};
+
+struct intersection_observer_state {
+    js_value callback;
+    js_value self;
+    struct dom_node *root;
+    struct observer_target targets[JSDOM_OBSERVER_TARGETS_MAX];
+    unsigned int target_count;
+    js_value pending_records[JSDOM_MUTATION_RECORDS_MAX];
+    unsigned int pending_count;
+};
+
 struct jsdom {
     struct dom_document *doc;
     js_ctx *ctx;
@@ -273,6 +345,8 @@ struct jsdom {
     js_object *comment_proto;
     js_object *element_proto;
     js_object *html_element_proto;
+    js_object *canvas_element_proto;
+    js_object *template_element_proto;
     js_object *svg_element_proto;
     js_object *fragment_proto;
     js_object *doc_proto;
@@ -280,6 +354,12 @@ struct jsdom {
     js_object *location_proto;
     js_object *class_proto;
     js_object *style_proto;
+    js_object *computed_style_proto;
+    js_object *canvas_2d_proto;
+    js_object *image_data_proto;
+    js_object *dom_parser_proto;
+    js_object *resize_observer_proto;
+    js_object *intersection_observer_proto;
     js_object *response_proto;
     js_object *headers_proto;
     js_object *storage_proto;
@@ -329,6 +409,11 @@ struct jsdom {
                  const char *redirect,
                  struct jsdom_fetch_response *out,
                  char *err, unsigned long errsz);
+    int (*get_box_rect)(void *user, struct dom_node *node,
+                        float *x, float *y, float *w, float *h);
+    void (*scroll_cb)(void *user, double x, double y);
+    int (*clipboard_write)(void *user, const char *text, unsigned long len);
+    char *(*clipboard_read)(void *user, unsigned long *len_out);
     void *print_user;
     struct web_storage *local_storage;
     struct web_storage *session_storage;
@@ -373,6 +458,24 @@ struct jsdom {
     } object_urls[JSDOM_OBJECT_URL_MAX];
     struct mutation_observer_state
         *mutation_observers[JSDOM_MUTATION_OBSERVERS_MAX];
+    struct resize_observer_state
+        *resize_observers[JSDOM_OBSERVERS_MAX];
+    struct intersection_observer_state
+        *intersection_observers[JSDOM_OBSERVERS_MAX];
+    struct dom_node **dataset_nodes;
+    unsigned int dataset_node_count;
+    unsigned int dataset_node_cap;
+    struct dom_document **parsed_docs;
+    unsigned int parsed_doc_count;
+    unsigned int parsed_doc_cap;
+    struct css_stylesheet *author_sheet;
+    const struct css_stylesheet *external_sheet;
+    uint64_t initial_style_hash;
+    int style_sheet_dirty;
+    double scroll_x;
+    double scroll_y;
+    char *clipboard_text;
+    unsigned long clipboard_len;
     unsigned long object_url_counter;
     unsigned long event_turn;
     unsigned int viewport_width;
@@ -521,12 +624,66 @@ static void abort_release(struct abort_state *s)
         free(s);
 }
 
+static void free_node_canvas(struct dom_node *n)
+{
+    if (!n || !n->canvas)
+        return;
+    free(n->canvas->px);
+    free(n->canvas->alpha);
+    free(n->canvas);
+    n->canvas = 0;
+}
+
+static void free_subtree_canvases(struct dom_node *root)
+{
+    struct dom_node *n;
+
+    if (!root)
+        return;
+    for (n = root; n; n = dom_next_within(n, root))
+        free_node_canvas(n);
+}
+
+static void mark_dom_dirty(struct jsdom *j)
+{
+    if (!j)
+        return;
+    j->dirty = 1;
+    j->style_sheet_dirty = 1;
+}
+
+static struct dom_document *doc_of(const struct hostref *h)
+{
+    if (!h)
+        return 0;
+    if (h->kind == HOST_DOCUMENT && h->data)
+        return ((const struct doc_ref *)h->data)->doc;
+    return h->j ? h->j->doc : 0;
+}
+
+static struct dom_node *template_content_node(struct jsdom *j,
+                                              struct dom_node *tpl);
+
 static void host_free(void *user, void *ptr)
 {
     struct hostref *h = (struct hostref *)ptr;
 
     (void)user;
-    if (h && h->kind == HOST_RESPONSE)
+    if (h && h->kind == HOST_NODE) {
+        if (h->node)
+            free_node_canvas(h->node);
+    }
+    else if (h && h->kind == HOST_DOCUMENT) {
+        free(h->data);
+    }
+    else if (h && h->kind == HOST_CANVAS_2D) {
+        struct canvas_2d_state *st = (struct canvas_2d_state *)h->data;
+
+        if (st)
+            free(st->path);
+        free(st);
+    }
+    else if (h && h->kind == HOST_RESPONSE)
         response_release((struct response_state *)h->data);
     else if (h && h->kind == HOST_HEADERS)
         headers_release((struct headers_state *)h->data);
@@ -577,6 +734,28 @@ static void host_free(void *user, void *ptr)
                     h->j->mutation_observers[i] = 0;
         free(state);
     }
+    else if (h && h->kind == HOST_RESIZE_OBSERVER) {
+        struct resize_observer_state *state =
+            (struct resize_observer_state *)h->data;
+        unsigned int i;
+
+        if (h->j)
+            for (i = 0; i < JSDOM_OBSERVERS_MAX; i++)
+                if (h->j->resize_observers[i] == state)
+                    h->j->resize_observers[i] = 0;
+        free(state);
+    }
+    else if (h && h->kind == HOST_INTERSECTION_OBSERVER) {
+        struct intersection_observer_state *state =
+            (struct intersection_observer_state *)h->data;
+        unsigned int i;
+
+        if (h->j)
+            for (i = 0; i < JSDOM_OBSERVERS_MAX; i++)
+                if (h->j->intersection_observers[i] == state)
+                    h->j->intersection_observers[i] = 0;
+        free(state);
+    }
     free(h);
 }
 
@@ -618,7 +797,12 @@ static js_value wrap_node(struct jsdom *j, struct dom_node *n)
                  ? (n->namespace_id == DOM_NS_SVG
                     ? j->svg_element_proto :
                     n->namespace_id == DOM_NS_HTML
-                    ? j->html_element_proto : j->element_proto) :
+                    ? (n->tag_id == HTAG_CANVAS && j->canvas_element_proto
+                       ? j->canvas_element_proto :
+                       n->tag_id == HTAG_TEMPLATE && j->template_element_proto
+                       ? j->template_element_proto :
+                       j->html_element_proto)
+                    : j->element_proto) :
                  n->type == DOM_FRAGMENT ? j->fragment_proto :
                  n->type == DOM_TEXT ? j->text_proto :
                  n->type == DOM_COMMENT ? j->comment_proto :
@@ -626,6 +810,9 @@ static js_value wrap_node(struct jsdom *j, struct dom_node *n)
     if (!o)
         return js_undefined();
     n->user = o;
+    if (n->type == DOM_ELEMENT && n->tag_id == HTAG_TEMPLATE &&
+        n->namespace_id == DOM_NS_HTML)
+        (void)template_content_node(j, n);
     return js_object_value(o);
 }
 
@@ -889,10 +1076,12 @@ static int string_arg(js_ctx *c, int argc, js_value *argv, int i,
 static int set_text(struct jsdom *j, struct dom_node *n, const char *s)
 {
     struct dom_node *c, *next, *t;
+    struct dom_document *d;
 
     if (!n || (n->type != DOM_ELEMENT && n->type != DOM_DOCUMENT &&
                n->type != DOM_FRAGMENT))
         return 0;
+    d = n->doc ? n->doc : j->doc;
     for (c = n->first_child; c; c = next) {
         struct dom_node *previous = c->prev_sibling;
 
@@ -902,32 +1091,34 @@ static int set_text(struct jsdom *j, struct dom_node *n, const char *s)
             return 0;
     }
     if (*s) {
-        t = dom_create_text(j->doc, s, strlen(s));
+        t = dom_create_text(d, s, strlen(s));
         if (!t || !dom_append_child(n, t))
             return 0;
         if (mutation_child(j, n, t, 0, t->prev_sibling, 0) != JS_OK)
             return 0;
     }
-    j->dirty = 1;
+    mark_dom_dirty(j);
     return 1;
 }
 
-static struct dom_node *clone_subtree(struct jsdom *j,
-                                      const struct dom_node *src, int depth)
+static struct dom_node *clone_subtree_doc(struct jsdom *j,
+                                          struct dom_document *dst_doc,
+                                          const struct dom_node *src,
+                                          int depth)
 {
     struct dom_node *out, *c;
     unsigned int i;
 
-    if (!src || depth > 64)
+    if (!src || !dst_doc || depth > 64)
         return 0;
     if (src->type == DOM_TEXT)
-        return dom_create_text(j->doc, src->text, src->text_len);
+        return dom_create_text(dst_doc, src->text, src->text_len);
     if (src->type == DOM_COMMENT)
-        return dom_create_comment(j->doc, src->text, src->text_len);
+        return dom_create_comment(dst_doc, src->text, src->text_len);
     if (src->type == DOM_FRAGMENT)
-        out = dom_create_fragment(j->doc);
+        out = dom_create_fragment(dst_doc);
     else if (src->type == DOM_ELEMENT)
-        out = dom_create_element(j->doc, src->tag, (long)strlen(src->tag));
+        out = dom_create_element(dst_doc, src->tag, (long)strlen(src->tag));
     else
         return 0;
     if (!out)
@@ -948,38 +1139,176 @@ static struct dom_node *clone_subtree(struct jsdom *j,
             return 0;
     }
     for (c = src->first_child; c; c = c->next_sibling) {
-        struct dom_node *copy = clone_subtree(j, c, depth + 1);
+        struct dom_node *copy = clone_subtree_doc(j, dst_doc, c, depth + 1);
 
         if (!copy || !dom_append_child(out, copy))
             return 0;
     }
+    if (src->type == DOM_ELEMENT && src->tag_id == HTAG_TEMPLATE &&
+        src->namespace_id == DOM_NS_HTML && src->user && j) {
+        js_value cv = js_undefined();
+
+        if (js_get(j->ctx, js_object_value((js_object *)src->user),
+                   "__templateContent", &cv) == JS_OK &&
+            js_is_object(cv)) {
+            struct hostref *ch = host(cv, HOST_NODE);
+
+            if (ch && ch->node && ch->node->first_child) {
+                struct dom_node *out_frag = template_content_node(j, out);
+
+                if (out_frag) {
+                    for (c = ch->node->first_child; c; c = c->next_sibling) {
+                        struct dom_node *copy =
+                            clone_subtree_doc(j, dst_doc, c, depth + 1);
+
+                        if (!copy || !dom_append_child(out_frag, copy))
+                            return 0;
+                    }
+                }
+            }
+        }
+    }
     return out;
 }
 
-static int set_inner_html(struct jsdom *j, struct dom_node *target,
-                          const char *html)
+static struct dom_node *clone_subtree(struct jsdom *j,
+                                      const struct dom_node *src, int depth)
 {
-    static const char prefix[] = "<!doctype html><html><body>";
-    static const char suffix[] = "</body></html>";
-    struct dom_document *tmp;
-    struct dom_node *c, *next;
-    unsigned long n = strlen(html);
-    char *wrapped;
+    return clone_subtree_doc(j, j->doc, src, depth);
+}
 
-    if (n > DOM_MAX_INPUT - sizeof(prefix) - sizeof(suffix))
+static struct dom_node *template_content_node(struct jsdom *j,
+                                              struct dom_node *tpl)
+{
+    js_value tpl_val, content_val;
+    struct hostref *ch;
+    struct dom_node *frag, *c, *next;
+
+    if (!j || !tpl || tpl->type != DOM_ELEMENT ||
+        tpl->tag_id != HTAG_TEMPLATE)
         return 0;
-    wrapped = (char *)malloc(sizeof(prefix) - 1 + n + sizeof(suffix));
+    if (!tpl->user) {
+        tpl_val = wrap_node(j, tpl);
+        if (!js_is_object(tpl_val))
+            return 0;
+    } else {
+        tpl_val = js_object_value((js_object *)tpl->user);
+    }
+    if (js_get(j->ctx, tpl_val, "__templateContent", &content_val) == JS_OK &&
+        js_is_object(content_val)) {
+        ch = host(content_val, HOST_NODE);
+        if (ch && ch->node)
+            return ch->node;
+    }
+    frag = dom_create_fragment(tpl->doc ? tpl->doc : j->doc);
+    if (!frag)
+        return 0;
+    for (c = tpl->first_child; c; c = next) {
+        next = c->next_sibling;
+        dom_remove_child(tpl, c);
+        if (!dom_append_child(frag, c))
+            return 0;
+    }
+    content_val = wrap_node(j, frag);
+    if (!js_is_object(content_val) ||
+        js_define(j->ctx, (js_object *)tpl->user, "__templateContent",
+                  content_val) != JS_OK)
+        return 0;
+    return frag;
+}
+
+static void template_adopt_subtree(struct jsdom *j, struct dom_node *root)
+{
+    struct dom_node *n;
+
+    if (!j || !root)
+        return;
+    for (n = root->first_child; n; n = dom_next_within(n, root)) {
+        if (n->type == DOM_ELEMENT && n->tag_id == HTAG_TEMPLATE &&
+            n->namespace_id == DOM_NS_HTML) {
+            struct dom_node *frag = template_content_node(j, n);
+
+            if (frag)
+                template_adopt_subtree(j, frag);
+        }
+    }
+}
+
+static int set_inner_html_ctx(struct jsdom *j, struct dom_node *target,
+                              struct dom_node *ctx_node, const char *html)
+{
+    char prefix[80];
+    char suffix[64];
+    struct dom_document *tmp, *dst_doc;
+    struct dom_node *container = 0, *c, *next;
+    unsigned long n = strlen(html), plen, slen;
+    char *wrapped;
+    int depth_extract = 0;
+
+    if (!target || !html)
+        return 0;
+    dst_doc = target->doc ? target->doc : j->doc;
+    strcpy(prefix, "<!doctype html><html><body>");
+    strcpy(suffix, "</body></html>");
+    if (ctx_node && ctx_node->type == DOM_ELEMENT) {
+        if (ctx_node->namespace_id == DOM_NS_SVG &&
+            strcmp(ctx_node->tag, "foreignobject") != 0) {
+            strcpy(prefix, "<!doctype html><html><body><svg>");
+            strcpy(suffix, "</svg></body></html>");
+            depth_extract = 1;
+        } else if (ctx_node->tag_id == HTAG_TEMPLATE) {
+            strcpy(prefix, "<!doctype html><html><body><template>");
+            strcpy(suffix, "</template></body></html>");
+            depth_extract = 1;
+        } else if (ctx_node->tag_id == HTAG_TABLE) {
+            strcpy(prefix, "<!doctype html><html><body><table>");
+            strcpy(suffix, "</table></body></html>");
+            depth_extract = 1;
+        } else if (ctx_node->tag_id == HTAG_TBODY ||
+                   ctx_node->tag_id == HTAG_THEAD ||
+                   ctx_node->tag_id == HTAG_TFOOT) {
+            snprintf(prefix, sizeof(prefix),
+                     "<!doctype html><html><body><table><%s>",
+                     ctx_node->tag);
+            snprintf(suffix, sizeof(suffix),
+                     "</%s></table></body></html>", ctx_node->tag);
+            depth_extract = 2;
+        } else if (ctx_node->tag_id == HTAG_TR) {
+            strcpy(prefix, "<!doctype html><html><body><table><tbody><tr>");
+            strcpy(suffix, "</tr></tbody></table></body></html>");
+            depth_extract = 3;
+        } else if (ctx_node->tag_id == HTAG_SELECT) {
+            strcpy(prefix, "<!doctype html><html><body><select>");
+            strcpy(suffix, "</select></body></html>");
+            depth_extract = 1;
+        } else if (ctx_node->tag_id == HTAG_HTML) {
+            strcpy(prefix, "<!doctype html><html>");
+            strcpy(suffix, "</html>");
+            depth_extract = -1;
+        }
+    }
+    plen = strlen(prefix);
+    slen = strlen(suffix);
+    if (n > DOM_MAX_INPUT - plen - slen - 1)
+        return 0;
+    wrapped = (char *)malloc(plen + n + slen + 1);
     if (!wrapped)
         return 0;
-    memcpy(wrapped, prefix, sizeof(prefix) - 1);
-    memcpy(wrapped + sizeof(prefix) - 1, html, n);
-    memcpy(wrapped + sizeof(prefix) - 1 + n, suffix, sizeof(suffix));
-    tmp = html_parse_document(wrapped,
-                              sizeof(prefix) - 1 + n + sizeof(suffix) - 1);
+    memcpy(wrapped, prefix, plen);
+    memcpy(wrapped + plen, html, n);
+    memcpy(wrapped + plen + n, suffix, slen + 1);
+    tmp = html_parse_document(wrapped, plen + n + slen);
     free(wrapped);
     if (!tmp || tmp->oom) {
         dom_document_free(tmp);
         return 0;
+    }
+    if (depth_extract < 0) {
+        container = tmp->html;
+    } else {
+        container = tmp->body;
+        while (container && depth_extract-- > 0)
+            container = container->first_child;
     }
     for (c = target->first_child; c; c = next) {
         struct dom_node *previous = c->prev_sibling;
@@ -991,8 +1320,8 @@ static int set_inner_html(struct jsdom *j, struct dom_node *target,
             return 0;
         }
     }
-    for (c = tmp->body->first_child; c; c = c->next_sibling) {
-        struct dom_node *copy = clone_subtree(j, c, 0);
+    for (c = container ? container->first_child : 0; c; c = c->next_sibling) {
+        struct dom_node *copy = clone_subtree_doc(j, dst_doc, c, 0);
 
         if (!copy || !dom_append_child(target, copy)) {
             dom_document_free(tmp);
@@ -1005,7 +1334,8 @@ static int set_inner_html(struct jsdom *j, struct dom_node *target,
         }
     }
     dom_document_free(tmp);
-    j->dirty = 1;
+    template_adopt_subtree(j, target);
+    mark_dom_dirty(j);
     return 1;
 }
 
@@ -1051,173 +1381,290 @@ static char *children_html(const struct dom_node *n, unsigned long *out_len)
 }
 
 /* ------------------------------------------------------------------ */
-/* Selector subset: tag, #id, .class, [attr], [attr=value], compounds,
- * and descendant chains.  It covers the selectors most small scripts use
- * without pretending to be the CSS selector parser. */
+/* Selector engine backed by libweb/css.c */
 
-static int name_char(int c)
+static int throw_dom_exception(js_ctx *c, const char *name,
+                               const char *message);
+static void dataset_sync_all(struct jsdom *j);
+
+static const char *jsdom_css_tag(void *e)
 {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ':';
+    const struct dom_node *n = (const struct dom_node *)e;
+    return (n && n->tag) ? n->tag : "";
 }
 
-static int match_token(struct dom_node *n, const char *s, unsigned long len)
+static const char *jsdom_css_attr(void *e, const char *name)
 {
-    unsigned long p = 0, start;
+    return dom_get_attr((const struct dom_node *)e, name);
+}
 
-    if (!n || n->type != DOM_ELEMENT || !len)
-        return 0;
-    if (s[p] == '*')
-        p++;
-    else if (s[p] != '#' && s[p] != '.' && s[p] != '[') {
-        start = p;
-        while (p < len && name_char((unsigned char)s[p]))
-            p++;
-        if (p == start || !n->tag ||
-            !ci_eq_n(n->tag, strlen(n->tag), s + start, p - start))
-            return 0;
-    }
-    while (p < len) {
-        if (s[p] == '#') {
-            const char *id;
-            p++;
-            start = p;
-            while (p < len && name_char((unsigned char)s[p]))
-                p++;
-            id = dom_get_attr(n, "id");
-            if (p == start || !id ||
-                strlen(id) != p - start ||
-                memcmp(id, s + start, p - start) != 0)
-                return 0;
-        } else if (s[p] == '.') {
-            p++;
-            start = p;
-            while (p < len && name_char((unsigned char)s[p]))
-                p++;
-            if (p == start || !dom_has_class_n(n, s + start,
-                                                (long)(p - start)))
-                return 0;
-        } else if (s[p] == '[') {
-            const char *v;
-            unsigned long ns, ne, vs = 0, ve = 0;
-            int have_value = 0;
+static void *jsdom_css_parent(void *e)
+{
+    return dom_parent_element((const struct dom_node *)e);
+}
 
-            p++;
-            while (p < len && (s[p] == ' ' || s[p] == '\t')) p++;
-            ns = p;
-            while (p < len && name_char((unsigned char)s[p])) p++;
-            ne = p;
-            while (p < len && (s[p] == ' ' || s[p] == '\t')) p++;
-            if (p < len && s[p] == '=') {
-                int quote = 0;
-                have_value = 1;
-                p++;
-                while (p < len && (s[p] == ' ' || s[p] == '\t')) p++;
-                if (p < len && (s[p] == '\'' || s[p] == '"'))
-                    quote = s[p++];
-                vs = p;
-                if (quote) {
-                    while (p < len && s[p] != quote) p++;
-                    ve = p;
-                    if (p < len) p++;
-                } else {
-                    while (p < len && s[p] != ']' &&
-                           s[p] != ' ' && s[p] != '\t') p++;
-                    ve = p;
-                }
-                while (p < len && (s[p] == ' ' || s[p] == '\t')) p++;
+static void *jsdom_css_prev(void *e)
+{
+    struct dom_node *n = ((const struct dom_node *)e)->prev_sibling;
+
+    while (n && n->type != DOM_ELEMENT)
+        n = n->prev_sibling;
+    return n;
+}
+
+static void *jsdom_css_next(void *e)
+{
+    return dom_next_element_sibling((const struct dom_node *)e);
+}
+
+static void *jsdom_css_first_child(void *e)
+{
+    return dom_first_element_child((const struct dom_node *)e);
+}
+
+static const char *jsdom_css_id(void *e)
+{
+    return dom_get_attr((const struct dom_node *)e, "id");
+}
+
+static int jsdom_css_has_class(void *e, const char *cls)
+{
+    return dom_has_class((const struct dom_node *)e, cls);
+}
+
+static int jsdom_css_is_empty(void *e)
+{
+    return ((const struct dom_node *)e)->first_child == 0;
+}
+
+static unsigned jsdom_css_state(void *e)
+{
+    const struct dom_node *n = (const struct dom_node *)e;
+    unsigned st = 0;
+
+    if (dom_has_attr(n, "checked") || dom_has_attr(n, "selected"))
+        st |= CSS_STATE_CHECKED;
+    if (dom_has_attr(n, "disabled"))
+        st |= CSS_STATE_DISABLED;
+    return st;
+}
+
+static const struct css_elem_ops jsdom_css_ops = {
+    jsdom_css_tag, jsdom_css_attr, jsdom_css_parent, jsdom_css_prev,
+    jsdom_css_next, jsdom_css_first_child, jsdom_css_id, jsdom_css_has_class,
+    jsdom_css_state, jsdom_css_is_empty
+};
+
+static int css_ws_char(int ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n' || ch == '\f';
+}
+
+static int parse_dom_selector(js_ctx *c, const char *sel,
+                              struct css_stylesheet **out_ss)
+{
+    static const char tail[] = "{display:block}";
+    unsigned long i = 0, len;
+    int quote = 0, in_comment = 0, bracket = 0, paren = 0;
+    int saw_non_ws = 0, expected_sels = 1;
+    char *wrapped;
+    struct css_stylesheet *ss;
+
+    *out_ss = 0;
+    if (!sel)
+        return throw_dom_exception(c, "SyntaxError", "invalid selector");
+    len = strlen(sel);
+    if (len == 0 || len > 65536UL)
+        return throw_dom_exception(c, "SyntaxError", "invalid selector");
+    while (i < len) {
+        int ch = (unsigned char)sel[i];
+
+        if (in_comment) {
+            if (ch == '*' && i + 1 < len && sel[i + 1] == '/') {
+                in_comment = 0;
+                i += 2;
+            } else {
+                i++;
             }
-            if (p >= len || s[p++] != ']' || ne == ns)
-                return 0;
-            {
-                char name[129];
-                unsigned long nn = ne - ns;
-
-                if (nn >= sizeof(name))
-                    return 0;
-                memcpy(name, s + ns, nn);
-                name[nn] = 0;
-                v = dom_get_attr(n, name);
+            continue;
+        }
+        if (quote) {
+            if (ch == '\\' && i + 1 < len) {
+                i += 2;
+                continue;
             }
-            if (!v || (have_value &&
-                       (strlen(v) != ve - vs ||
-                        memcmp(v, s + vs, ve - vs) != 0)))
-                return 0;
-        } else {
-            return 0;
+            if (ch == '\n' || ch == '\r' || ch == '\f')
+                return throw_dom_exception(c, "SyntaxError",
+                                           "unterminated selector string");
+            if (ch == quote)
+                quote = 0;
+            i++;
+            continue;
         }
+        if (ch == '/' && i + 1 < len && sel[i + 1] == '*') {
+            in_comment = 1;
+            i += 2;
+            continue;
+        }
+        if (ch == '\\') {
+            if (i + 1 >= len)
+                return throw_dom_exception(c, "SyntaxError",
+                                           "trailing escape in selector");
+            saw_non_ws = 1;
+            i += 2;
+            continue;
+        }
+        if (ch == '"' || ch == '\'') {
+            quote = ch;
+            saw_non_ws = 1;
+            i++;
+            continue;
+        }
+        if (ch == '{' || ch == '}' || ch == ';' || ch == '@')
+            return throw_dom_exception(c, "SyntaxError", "invalid selector");
+        if (ch == '[')
+            bracket++;
+        else if (ch == ']') {
+            if (--bracket < 0)
+                return throw_dom_exception(c, "SyntaxError",
+                                           "unbalanced selector brackets");
+        } else if (ch == '(')
+            paren++;
+        else if (ch == ')') {
+            if (--paren < 0)
+                return throw_dom_exception(c, "SyntaxError",
+                                           "unbalanced selector parentheses");
+        } else if (ch == ',' && bracket == 0 && paren == 0) {
+            if (!saw_non_ws)
+                return throw_dom_exception(c, "SyntaxError",
+                                           "empty selector in list");
+            expected_sels++;
+            saw_non_ws = 0;
+            i++;
+            continue;
+        }
+        if (!css_ws_char(ch))
+            saw_non_ws = 1;
+        i++;
     }
-    return 1;
+    if (quote || in_comment || bracket != 0 || paren != 0 || !saw_non_ws)
+        return throw_dom_exception(c, "SyntaxError", "invalid selector");
+    wrapped = (char *)malloc(len + sizeof(tail));
+    if (!wrapped)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    memcpy(wrapped, sel, len);
+    memcpy(wrapped + len, tail, sizeof(tail));
+    ss = css_parse(wrapped, len + sizeof(tail) - 1, CSS_ORIGIN_AUTHOR, 0);
+    free(wrapped);
+    if (!ss || css_truncated(ss) || css_rule_count(ss) != expected_sels) {
+        css_free(ss);
+        return throw_dom_exception(c, "SyntaxError", "invalid selector");
+    }
+    *out_ss = ss;
+    return JS_OK;
 }
 
-static int selector_match(struct dom_node *n, const char *sel)
+static int selector_matches_ss(const struct css_stylesheet *ss,
+                               struct dom_node *n)
 {
-    const char *end = sel + strlen(sel);
-    int first = 1;
+    int i, count;
 
-    while (end > sel && (end[-1] == ' ' || end[-1] == '\t' ||
-                         end[-1] == '\r' || end[-1] == '\n'))
-        end--;
-    while (end > sel) {
-        const char *start = end;
-
-        while (start > sel && start[-1] != ' ' && start[-1] != '\t' &&
-               start[-1] != '\r' && start[-1] != '\n')
-            start--;
-        if (first) {
-            if (!match_token(n, start, (unsigned long)(end - start)))
-                return 0;
-            first = 0;
-        } else {
-            do {
-                n = dom_parent_element(n);
-            } while (n && !match_token(n, start,
-                                       (unsigned long)(end - start)));
-            if (!n)
-                return 0;
-        }
-        while (start > sel && (start[-1] == ' ' || start[-1] == '\t' ||
-                               start[-1] == '\r' || start[-1] == '\n'))
-            start--;
-        end = start;
-    }
-    return !first;
-}
-
-static struct dom_node *query_first(struct dom_node *root, const char *sel)
-{
-    struct dom_node *n;
-
-    if (!root || !sel || !*sel)
+    if (!ss || !n || n->type != DOM_ELEMENT)
         return 0;
-    n = root->first_child;
-    while (n) {
-        if (n->type == DOM_ELEMENT && selector_match(n, sel))
-            return n;
-        n = dom_next_within(n, root);
+    count = css_rule_count(ss);
+    for (i = 0; i < count; i++) {
+        const struct css_rule *r = css_rule_at(ss, i);
+
+        if (r && css_selector_matches(&r->sel, n, &jsdom_css_ops))
+            return 1;
     }
     return 0;
+}
+
+static int query_first(js_ctx *c, struct jsdom *j, struct dom_node *root,
+                       const char *sel, struct dom_node **out)
+{
+    struct css_stylesheet *ss;
+    struct dom_node *n;
+
+    *out = 0;
+    if (parse_dom_selector(c, sel, &ss) != JS_OK)
+        return JS_THROW;
+    dataset_sync_all(j);
+    n = root ? root->first_child : 0;
+    while (n) {
+        if (n->type == DOM_ELEMENT && selector_matches_ss(ss, n)) {
+            *out = n;
+            break;
+        }
+        n = dom_next_within(n, root);
+    }
+    css_free(ss);
+    return JS_OK;
 }
 
 static int query_all(js_ctx *c, struct jsdom *j, struct dom_node *root,
                      const char *sel, js_value *ret)
 {
-    js_object *a = js_new_array(c);
+    struct css_stylesheet *ss;
+    js_object *a;
     struct dom_node *n;
 
-    if (!a)
+    if (parse_dom_selector(c, sel, &ss) != JS_OK)
         return JS_THROW;
-    for (n = root ? root->first_child : 0; n; n = dom_next_within(n, root)) {
-        if (n->type == DOM_ELEMENT && selector_match(n, sel) &&
-            js_array_push(c, a, wrap_node(j, n)) != JS_OK)
-            return JS_THROW;
+    a = js_new_array(c);
+    if (!a) {
+        css_free(ss);
+        return JS_THROW;
     }
+    dataset_sync_all(j);
+    for (n = root ? root->first_child : 0; n; n = dom_next_within(n, root)) {
+        if (n->type == DOM_ELEMENT && selector_matches_ss(ss, n) &&
+            js_array_push(c, a, wrap_node(j, n)) != JS_OK) {
+            css_free(ss);
+            return JS_THROW;
+        }
+    }
+    css_free(ss);
     *ret = js_object_value(a);
     return JS_OK;
 }
 
 static struct hostref *node_or_document(js_value value);
 static struct dom_node *receiver_node(struct hostref *h);
+
+static int node_get_by_tag(js_ctx *c, js_value t,
+                           int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = node_or_document(t);
+    struct dom_node *root = receiver_node(h), *node;
+    const char *tag;
+    unsigned long tag_len;
+    int all;
+    js_object *result;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal Node receiver");
+    if (string_arg(c, ac, av, 0, &tag) != JS_OK)
+        return JS_THROW;
+    all = !strcmp(tag, "*");
+    tag_len = strlen(tag);
+    result = js_new_array(c);
+    if (!result)
+        return JS_THROW;
+    for (node = root ? root->first_child : 0;
+         node; node = dom_next_within(node, root)) {
+        if (node->type != DOM_ELEMENT)
+            continue;
+        if (!all && (!node->tag ||
+                     !ci_eq_n(node->tag, strlen(node->tag), tag, tag_len)))
+            continue;
+        if (js_array_push(c, result, wrap_node(h->j, node)) != JS_OK)
+            return JS_THROW;
+    }
+    *r = js_object_value(result);
+    return JS_OK;
+}
 
 static int class_names_match(const struct dom_node *node,
                              const char *names)
@@ -1322,10 +1769,17 @@ static int node_get_by_tag_ns(js_ctx *c, js_value t,
     return JS_OK;
 }
 
+static void dataset_sync_element(struct jsdom *j, struct dom_node *node);
+static void dataset_on_attr_removed(struct jsdom *j, struct dom_node *node,
+                                    const char *attr_name);
+static void classlist_sync_node(struct jsdom *j, struct dom_node *node);
+static void canvas_sync_attr_resize(struct jsdom *j, struct dom_node *node);
+
 static int doc_get_by_name(js_ctx *c, js_value t,
                            int ac, js_value *av, js_value *r)
 {
     struct hostref *h = host(t, HOST_DOCUMENT);
+    struct dom_document *d;
     struct dom_node *node;
     const char *name;
     js_object *result;
@@ -1335,11 +1789,12 @@ static int doc_get_by_name(js_ctx *c, js_value t,
                               "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK)
         return JS_THROW;
+    d = doc_of(h);
     result = js_new_array(c);
     if (!result)
         return JS_THROW;
-    for (node = h->j->doc->root->first_child; node;
-         node = dom_next_within(node, h->j->doc->root)) {
+    for (node = d->root->first_child; node;
+         node = dom_next_within(node, d->root)) {
         const char *value = dom_get_attr(node, "name");
 
         if (node->type == DOM_ELEMENT && value &&
@@ -1362,6 +1817,7 @@ static int node_get_attribute_names(js_ctx *c, js_value t,
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal Element receiver");
+    dataset_sync_element(h->j, h->node);
     result = js_new_array(c);
     if (!result)
         return JS_THROW;
@@ -1564,7 +2020,15 @@ static int attr_value_set(js_ctx *c, js_value t,
             : mutation_attribute(h->j, h->node,
                                  attribute->name, old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    if (!attribute->namespace_uri) {
+        if (ci_eq_n(attribute->name, strlen(attribute->name), "class", 5))
+            classlist_sync_node(h->j, h->node);
+        if (h->node->tag_id == HTAG_CANVAS && h->node->canvas &&
+            (ci_eq_n(attribute->name, strlen(attribute->name), "width", 5) ||
+             ci_eq_n(attribute->name, strlen(attribute->name), "height", 6)))
+            canvas_sync_attr_resize(h->j, h->node);
+    }
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -1698,6 +2162,7 @@ static int node_attributes_get(js_ctx *c, js_value t,
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal Element receiver");
+    dataset_sync_element(h->j, h->node);
     map = new_host(h->j, h->node, HOST_NAMED_NODE_MAP,
                    h->j->named_node_map_proto);
     if (!map)
@@ -1792,13 +2257,18 @@ static int node_html_get(js_ctx *c, js_value t, int ac, js_value *av,
                          js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct dom_node *src;
     char *html;
     unsigned long len;
     (void)ac; (void)av;
 
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
-    html = children_html(h->node, &len);
+    dataset_sync_all(h->j);
+    src = (h->node->tag_id == HTAG_TEMPLATE &&
+           h->node->namespace_id == DOM_NS_HTML)
+        ? template_content_node(h->j, h->node) : h->node;
+    html = children_html(src, &len);
     if (!html)
         return js_throw_error(c, JS_ERR_ERROR, "out of memory");
     *r = js_mkstring(c, html, len);
@@ -1810,13 +2280,17 @@ static int node_html_set(js_ctx *c, js_value t, int ac, js_value *av,
                          js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct dom_node *target;
     const char *html;
 
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &html) != JS_OK)
         return JS_THROW;
-    if (!set_inner_html(h->j, h->node, html))
+    target = (h->node->tag_id == HTAG_TEMPLATE &&
+              h->node->namespace_id == DOM_NS_HTML)
+        ? template_content_node(h->j, h->node) : h->node;
+    if (!target || !set_inner_html_ctx(h->j, target, h->node, html))
         return js_throw_error(c, JS_ERR_ERROR, "cannot set innerHTML");
     *r = js_undefined();
     return JS_OK;
@@ -1832,9 +2306,34 @@ static int node_outer_get(js_ctx *c, js_value t, int ac, js_value *av,
 
     if (!h)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Node receiver");
+    dataset_sync_all(h->j);
     html = dom_serialize(h->node, &len);
     if (!html)
         return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    if (h->node->type == DOM_ELEMENT && h->node->tag_id == HTAG_TEMPLATE &&
+        h->node->namespace_id == DOM_NS_HTML) {
+        struct dom_node *frag = template_content_node(h->j, h->node);
+        unsigned long ilen = 0;
+        char *inner = frag ? children_html(frag, &ilen) : 0;
+
+        if (inner && ilen) {
+            const char *close_tag = "</template>";
+            unsigned long clen = 11;
+            if (len >= clen && !memcmp(html + len - clen, close_tag, clen)) {
+                char *merged = (char *)malloc(len + ilen + 1);
+                if (merged) {
+                    memcpy(merged, html, len - clen);
+                    memcpy(merged + len - clen, inner, ilen);
+                    memcpy(merged + len - clen + ilen, close_tag, clen);
+                    merged[len + ilen] = 0;
+                    free(html);
+                    html = merged;
+                    len += ilen;
+                }
+            }
+        }
+        free(inner);
+    }
     *r = js_mkstring(c, html, len);
     free(html);
     return js_fatal(c) ? JS_THROW : JS_OK;
@@ -1868,7 +2367,9 @@ static int attr_set_named(js_ctx *c, js_value t, int ac, js_value *av,
         return js_throw_error(c, JS_ERR_ERROR, "cannot set attribute");
     if (mutation_attribute(h->j, h->node, name, old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    if (!strcmp(name, "class"))
+        classlist_sync_node(h->j, h->node);
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -1945,7 +2446,7 @@ static int bool_attr_set(js_ctx *c, js_value t, int ac, js_value *av,
     if (!!old != !!on &&
         mutation_attribute(h->j, h->node, name, old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2065,6 +2566,10 @@ static int node_namespace_get(js_ctx *c, js_value t,
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
+static void dataset_sync_element(struct jsdom *j, struct dom_node *node);
+static void classlist_sync_node(struct jsdom *j, struct dom_node *node);
+static void canvas_sync_attr_resize(struct jsdom *j, struct dom_node *node);
+
 static int node_owner_document_get(js_ctx *c, js_value t,
                                    int ac, js_value *av, js_value *r)
 {
@@ -2073,6 +2578,11 @@ static int node_owner_document_get(js_ctx *c, js_value t,
 
     if (!h || h->kind == HOST_DOCUMENT) {
         *r = js_null();
+        return JS_OK;
+    }
+    if (h->node && h->node->doc && h->node->doc != h->j->doc &&
+        h->node->doc->root && h->node->doc->root->user) {
+        *r = js_object_value((js_object *)h->node->doc->root->user);
         return JS_OK;
     }
     if (js_get(c, js_global(c), "document", r) != JS_OK)
@@ -2100,6 +2610,7 @@ static int node_node_value_set(js_ctx *c, js_value t, int ac, js_value *av,
 {
     struct hostref *h = host(t, HOST_NODE);
     struct dom_node *replacement, *parent, *old_node;
+    struct dom_document *d;
     const char *value, *old_value;
 
     if (!h)
@@ -2110,9 +2621,10 @@ static int node_node_value_set(js_ctx *c, js_value t, int ac, js_value *av,
     }
     if (string_arg(c, ac, av, 0, &value) != JS_OK)
         return JS_THROW;
+    d = h->node->doc ? h->node->doc : h->j->doc;
     replacement = h->node->type == DOM_TEXT
-        ? dom_create_text(h->j->doc, value, strlen(value))
-        : dom_create_comment(h->j->doc, value, strlen(value));
+        ? dom_create_text(d, value, strlen(value))
+        : dom_create_comment(d, value, strlen(value));
     if (!replacement)
         return js_throw_error(c, JS_ERR_ERROR, "cannot set nodeValue");
     old_node = h->node;
@@ -2133,7 +2645,7 @@ static int node_node_value_set(js_ctx *c, js_value t, int ac, js_value *av,
     old_node->user = 0;
     h->node = replacement;
     replacement->user = t.u.obj;
-    h->j->dirty = 1;
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2241,7 +2753,7 @@ static int node_is_connected_get(js_ctx *c, js_value t,
 
     for (n = h ? h->node : 0; n && n->parent; n = n->parent)
         ;
-    *r = js_bool(h && n == h->j->doc->root);
+    *r = js_bool(h && n && (n == h->j->doc->root || n->type == DOM_DOCUMENT));
     return JS_OK;
 }
 
@@ -2266,9 +2778,15 @@ static int node_children_get(js_ctx *c, js_value t, int ac, js_value *av,
 
 static struct dom_node *receiver_node(struct hostref *h)
 {
+    struct dom_document *d;
+
     if (!h)
         return 0;
-    return h->kind == HOST_DOCUMENT ? h->j->doc->root : h->node;
+    if (h->kind == HOST_DOCUMENT) {
+        d = doc_of(h);
+        return d ? d->root : 0;
+    }
+    return h->node;
 }
 
 static int node_child_nodes_get(js_ctx *c, js_value t, int ac, js_value *av,
@@ -2320,6 +2838,10 @@ static int node_get_root(js_ctx *c, js_value t,
         node = node->parent;
     if (node == h->j->doc->root)
         return js_get(c, js_global(c), "document", r);
+    if (node->type == DOM_DOCUMENT && node->user) {
+        *r = js_object_value((js_object *)node->user);
+        return JS_OK;
+    }
     *r = wrap_node(h->j, node);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
@@ -2332,6 +2854,8 @@ static int node_get_attr(js_ctx *c, js_value t, int ac, js_value *av,
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK) return JS_THROW;
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_sync_element(h->j, h->node);
     v = dom_get_attr(h->node, name);
     *r = v ? js_mkcstring(c, v) : js_null();
     return js_fatal(c) ? JS_THROW : JS_OK;
@@ -2346,12 +2870,20 @@ static int node_set_attr(js_ctx *c, js_value t, int ac, js_value *av,
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK ||
         string_arg(c, ac, av, 1, &value) != JS_OK) return JS_THROW;
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_sync_element(h->j, h->node);
     old = dom_get_attr(h->node, name);
     if (!dom_set_attr(h->node, name, value))
         return js_throw_error(c, JS_ERR_ERROR, "cannot set attribute");
     if (mutation_attribute(h->j, h->node, name, old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    if (ci_eq_n(name, strlen(name), "class", 5))
+        classlist_sync_node(h->j, h->node);
+    if (h->node->tag_id == HTAG_CANVAS && h->node->canvas &&
+        (ci_eq_n(name, strlen(name), "width", 5) ||
+         ci_eq_n(name, strlen(name), "height", 6)))
+        canvas_sync_attr_resize(h->j, h->node);
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2364,11 +2896,21 @@ static int node_remove_attr(js_ctx *c, js_value t, int ac, js_value *av,
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK) return JS_THROW;
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_sync_element(h->j, h->node);
     old = dom_get_attr(h->node, name);
     dom_remove_attr(h->node, name);
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_on_attr_removed(h->j, h->node, name);
     if (old && mutation_attribute(h->j, h->node, name, old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    if (ci_eq_n(name, strlen(name), "class", 5))
+        classlist_sync_node(h->j, h->node);
+    if (h->node->tag_id == HTAG_CANVAS && h->node->canvas &&
+        (ci_eq_n(name, strlen(name), "width", 5) ||
+         ci_eq_n(name, strlen(name), "height", 6)))
+        canvas_sync_attr_resize(h->j, h->node);
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2381,6 +2923,8 @@ static int node_has_attr(js_ctx *c, js_value t, int ac, js_value *av,
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK) return JS_THROW;
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_sync_element(h->j, h->node);
     *r = js_bool(dom_has_attr(h->node, name));
     return JS_OK;
 }
@@ -2396,6 +2940,8 @@ static int node_toggle_attr(js_ctx *c, js_value t, int ac, js_value *av,
         return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK)
         return JS_THROW;
+    if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+        dataset_sync_element(h->j, h->node);
     present = dom_has_attr(h->node, name);
     {
         const char *old = dom_get_attr(h->node, name);
@@ -2406,12 +2952,16 @@ static int node_toggle_attr(js_ctx *c, js_value t, int ac, js_value *av,
                                   "cannot set attribute");
     } else if (present) {
         dom_remove_attr(h->node, name);
+        if (strlen(name) > 5 && ci_eq_n(name, 5, "data-", 5))
+            dataset_on_attr_removed(h->j, h->node, name);
     }
     if (present != enabled &&
         mutation_attribute(h->j, h->node, name, old) != JS_OK)
         return JS_THROW;
     }
-    h->j->dirty = 1;
+    if (ci_eq_n(name, strlen(name), "class", 5))
+        classlist_sync_node(h->j, h->node);
+    mark_dom_dirty(h->j);
     *r = js_bool(enabled);
     return JS_OK;
 }
@@ -2908,10 +3458,18 @@ static int node_insert_adjacent_html(js_ctx *c, js_value t,
         *r = js_undefined();
         return JS_OK;
     }
-    container = dom_create_element(owner->j->doc, "div", 3);
-    if (!container || !set_inner_html(owner->j, container, html))
-        return js_throw_error(c, JS_ERR_ERROR,
-                              "cannot parse adjacent HTML");
+    {
+        struct dom_document *dst_doc = (parent && parent->doc) ? parent->doc :
+            (owner->node->doc ? owner->node->doc : owner->j->doc);
+        struct dom_node *ctx_node = (parent == owner->node) ? owner->node :
+            (parent && parent->type == DOM_ELEMENT ? parent : 0);
+
+        container = dom_create_element(dst_doc, "div", 3);
+        if (!container ||
+            !set_inner_html_ctx(owner->j, container, ctx_node, html))
+            return js_throw_error(c, JS_ERR_ERROR,
+                                  "cannot parse adjacent HTML");
+    }
     while ((node = container->first_child) != 0) {
         struct mutation_node_snapshot snapshot[JSDOM_MUTATION_NODES_MAX];
         unsigned int count;
@@ -2926,7 +3484,7 @@ static int node_insert_adjacent_html(js_ctx *c, js_value t,
                                        snapshot, count) != JS_OK)
             return JS_THROW;
     }
-    owner->j->dirty = 1;
+    mark_dom_dirty(owner->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2956,7 +3514,7 @@ static int node_outer_set(js_ctx *c, js_value t,
     if (mutation_child(owner->j, parent, 0, owner->node,
                        previous, next) != JS_OK)
         return JS_THROW;
-    owner->j->dirty = 1;
+    mark_dom_dirty(owner->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -2965,20 +3523,27 @@ static int node_clone(js_ctx *c, js_value t,
                       int ac, js_value *av, js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct dom_document *dst_doc;
     struct dom_node *copy;
     int deep = ac && js_to_boolean(av[0]);
 
     if (!h)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Node receiver");
+    dst_doc = h->node->doc ? h->node->doc : h->j->doc;
     if (h->node->type == DOM_TEXT)
-        copy = dom_create_text(h->j->doc, h->node->text,
+        copy = dom_create_text(dst_doc, h->node->text,
                                h->node->text_len);
+    else if (h->node->type == DOM_COMMENT)
+        copy = dom_create_comment(dst_doc, h->node->text,
+                                  h->node->text_len);
     else if (deep)
-        copy = clone_subtree(h->j, h->node, 0);
+        copy = clone_subtree_doc(h->j, dst_doc, h->node, 0);
+    else if (h->node->type == DOM_FRAGMENT)
+        copy = dom_create_fragment(dst_doc);
     else if (h->node->type == DOM_ELEMENT) {
         unsigned int i;
 
-        copy = dom_create_element(h->j->doc, h->node->tag, -1);
+        copy = dom_create_element(dst_doc, h->node->tag, -1);
         if (copy) {
             if (!dom_set_namespace(copy, h->node->namespace_uri, -1))
                 copy = 0;
@@ -3234,14 +3799,21 @@ static int node_matches(js_ctx *c, js_value t,
                         int ac, js_value *av, js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct css_stylesheet *ss;
     const char *selector;
+    int matched;
 
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &selector) != JS_OK)
         return JS_THROW;
-    *r = js_bool(selector_match(h->node, selector));
+    if (parse_dom_selector(c, selector, &ss) != JS_OK)
+        return JS_THROW;
+    dataset_sync_all(h->j);
+    matched = selector_matches_ss(ss, h->node);
+    css_free(ss);
+    *r = js_bool(matched);
     return JS_OK;
 }
 
@@ -3249,6 +3821,7 @@ static int node_closest(js_ctx *c, js_value t,
                         int ac, js_value *av, js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct css_stylesheet *ss;
     struct dom_node *node;
     const char *selector;
 
@@ -3257,9 +3830,13 @@ static int node_closest(js_ctx *c, js_value t,
                               "illegal Element receiver");
     if (string_arg(c, ac, av, 0, &selector) != JS_OK)
         return JS_THROW;
+    if (parse_dom_selector(c, selector, &ss) != JS_OK)
+        return JS_THROW;
+    dataset_sync_all(h->j);
     for (node = h->node; node; node = dom_parent_element(node))
-        if (selector_match(node, selector))
+        if (selector_matches_ss(ss, node))
             break;
+    css_free(ss);
     *r = wrap_node(h->j, node);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
@@ -3268,10 +3845,16 @@ static int node_query(js_ctx *c, js_value t, int ac, js_value *av,
                       js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
+    struct dom_node *match = 0;
     const char *sel;
-    if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
-    if (string_arg(c, ac, av, 0, &sel) != JS_OK) return JS_THROW;
-    *r = wrap_node(h->j, query_first(h->node, sel));
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
+    if (string_arg(c, ac, av, 0, &sel) != JS_OK)
+        return JS_THROW;
+    if (query_first(c, h->j, h->node, sel, &match) != JS_OK)
+        return JS_THROW;
+    *r = wrap_node(h->j, match);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
@@ -3314,6 +3897,59 @@ static char *dataset_key(const char *attribute)
     return key;
 }
 
+static char *dataset_attr_name(const char *key)
+{
+    unsigned long len, out_len = 5, i;
+    char *out;
+
+    if (!key || !*key)
+        return 0;
+    len = strlen(key);
+    for (i = 0; i < len; i++) {
+        if (key[i] == '-' && key[i + 1] >= 'a' && key[i + 1] <= 'z')
+            return 0;
+        out_len += (key[i] >= 'A' && key[i] <= 'Z') ? 2u : 1u;
+    }
+    out = (char *)malloc(out_len + 1);
+    if (!out)
+        return 0;
+    memcpy(out, "data-", 5);
+    out_len = 5;
+    for (i = 0; i < len; i++) {
+        if (key[i] >= 'A' && key[i] <= 'Z') {
+            out[out_len++] = '-';
+            out[out_len++] = (char)(key[i] + ('a' - 'A'));
+        } else {
+            out[out_len++] = key[i];
+        }
+    }
+    out[out_len] = 0;
+    return out;
+}
+
+static void dataset_track_node(struct jsdom *j, struct dom_node *node)
+{
+    unsigned int i, ncap;
+    struct dom_node **narr;
+
+    if (!j || !node)
+        return;
+    for (i = 0; i < j->dataset_node_count; i++) {
+        if (j->dataset_nodes[i] == node)
+            return;
+    }
+    if (j->dataset_node_count >= j->dataset_node_cap) {
+        ncap = j->dataset_node_cap ? j->dataset_node_cap * 2 : 16;
+        narr = (struct dom_node **)realloc(j->dataset_nodes,
+                                           ncap * sizeof(*narr));
+        if (!narr)
+            return;
+        j->dataset_nodes = narr;
+        j->dataset_node_cap = ncap;
+    }
+    j->dataset_nodes[j->dataset_node_count++] = node;
+}
+
 static int dataset_property_get(js_ctx *c, js_value t,
                                 int ac, js_value *av, js_value *r)
 {
@@ -3347,7 +3983,7 @@ static int dataset_property_set(js_ctx *c, js_value t,
     if (mutation_attribute(property->j, property->node,
                            (const char *)property->data, old) != JS_OK)
         return JS_THROW;
-    property->j->dirty = 1;
+    mark_dom_dirty(property->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -3366,17 +4002,206 @@ static int bind_native_to(js_ctx *c, js_native native,
                    1, &receiver, bound);
 }
 
-static int dataset_refresh(js_ctx *c, struct hostref *element,
-                           js_object *dataset)
+static int dataset_bind_key(js_ctx *c, struct hostref *element,
+                            js_object *dataset, js_object *bound,
+                            const char *key, const char *attr_name)
+{
+    char *attribute_copy;
+    js_object *holder;
+    js_value holder_value, getter, setter;
+
+    attribute_copy = dup_z(attr_name);
+    if (!attribute_copy)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    holder = new_host_data(element->j, element->node,
+                           HOST_DATASET_PROPERTY, attribute_copy, 0);
+    if (!holder) {
+        free(attribute_copy);
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    }
+    holder_value = js_object_value(holder);
+    if (bind_native_to(c, dataset_property_get, key, 0,
+                       holder_value, &getter) != JS_OK ||
+        bind_native_to(c, dataset_property_set, key, 1,
+                       holder_value, &setter) != JS_OK ||
+        js_define_accessor_value(c, dataset, key,
+                                 getter, setter, 1) != JS_OK)
+        return JS_THROW;
+    if (bound &&
+        js_define_enum(c, bound, key, js_bool(1)) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static int object_own_keys(js_ctx *c, js_value target, js_value *out_arr)
+{
+    js_value obj_ctor, keys_fn;
+
+    if (js_get(c, js_global(c), "Object", &obj_ctor) != JS_OK ||
+        js_get(c, obj_ctor, "keys", &keys_fn) != JS_OK ||
+        js_call(c, keys_fn, obj_ctor, 1, &target, out_arr) != JS_OK ||
+        !js_is_object(*out_arr))
+        return 0;
+    return 1;
+}
+
+static void dataset_on_attr_removed(struct jsdom *j, struct dom_node *node,
+                                    const char *attr_name)
+{
+    js_ctx *c;
+    js_value el_val, dataset, bound_val;
+    char *key;
+
+    if (!j || !node || !node->user || !attr_name ||
+        strncmp(attr_name, "data-", 5) != 0)
+        return;
+    key = dataset_key(attr_name);
+    if (!key)
+        return;
+    c = j->ctx;
+    el_val = js_object_value((js_object *)node->user);
+    if (js_get(c, el_val, "__dataset", &dataset) == JS_OK &&
+        js_is_object(dataset)) {
+        (void)js_delete(c, dataset, key);
+        if (js_get(c, dataset, "__bound", &bound_val) == JS_OK &&
+            js_is_object(bound_val))
+            (void)js_delete(c, bound_val, key);
+    }
+    free(key);
+}
+
+static void dataset_sync_element(struct jsdom *j, struct dom_node *node)
+{
+    js_ctx *c;
+    js_value el_val, dataset, bound_val, keys_arr;
+    struct hostref *el_host;
+    unsigned long len, i;
+
+    if (!j || !node || !node->user || node->type != DOM_ELEMENT)
+        return;
+    c = j->ctx;
+    el_val = js_object_value((js_object *)node->user);
+    el_host = host(el_val, HOST_NODE);
+    if (!el_host)
+        return;
+    if (js_get(c, el_val, "__dataset", &dataset) != JS_OK ||
+        !js_is_object(dataset))
+        return;
+    if (js_get(c, dataset, "__bound", &bound_val) != JS_OK ||
+        !js_is_object(bound_val))
+        return;
+    if (object_own_keys(c, bound_val, &keys_arr)) {
+        len = js_array_length(keys_arr.u.obj);
+        for (i = 0; i < len; i++) {
+            js_value kval;
+            const char *key, *old_attr;
+            char *attr_name;
+
+            if (js_array_get(c, keys_arr.u.obj, i, &kval) != JS_OK)
+                continue;
+            key = js_to_cstring(c, kval);
+            if (!key || js_has_own(c, dataset, key))
+                continue;
+            attr_name = dataset_attr_name(key);
+            if (attr_name) {
+                old_attr = dom_get_attr(node, attr_name);
+                if (old_attr) {
+                    char *old_copy = dup_z(old_attr);
+                    if (dom_remove_attr(node, attr_name)) {
+                        (void)mutation_attribute(j, node, attr_name,
+                                                 old_copy);
+                        mark_dom_dirty(j);
+                    }
+                    free(old_copy);
+                }
+                free(attr_name);
+            }
+            (void)js_delete(c, bound_val, key);
+        }
+    }
+    if (object_own_keys(c, dataset, &keys_arr)) {
+        len = js_array_length(keys_arr.u.obj);
+        for (i = 0; i < len; i++) {
+            js_value kval, vval, str_val;
+            const char *key, *sval, *old_attr;
+            char *attr_name;
+
+            if (js_array_get(c, keys_arr.u.obj, i, &kval) != JS_OK)
+                continue;
+            key = js_to_cstring(c, kval);
+            if (!key || js_has_own(c, bound_val, key))
+                continue;
+            attr_name = dataset_attr_name(key);
+            if (!attr_name)
+                continue;
+            if (js_get(c, dataset, key, &vval) != JS_OK ||
+                js_to_string(c, vval, &str_val) != JS_OK) {
+                free(attr_name);
+                continue;
+            }
+            sval = js_to_cstring(c, str_val);
+            if (!sval)
+                sval = "";
+            old_attr = dom_get_attr(node, attr_name);
+            if (dom_set_attr(node, attr_name, sval)) {
+                (void)mutation_attribute(j, node, attr_name, old_attr);
+                mark_dom_dirty(j);
+                (void)js_delete(c, dataset, key);
+                (void)dataset_bind_key(c, el_host, dataset.u.obj,
+                                       bound_val.u.obj, key, attr_name);
+            }
+            free(attr_name);
+        }
+    }
+}
+
+static void dataset_sync_all(struct jsdom *j)
 {
     unsigned int i;
 
+    if (!j)
+        return;
+    for (i = 0; i < j->dataset_node_count; i++)
+        dataset_sync_element(j, j->dataset_nodes[i]);
+}
+
+static int dataset_refresh(js_ctx *c, struct hostref *element,
+                           js_object *dataset)
+{
+    js_value bound_val = js_undefined(), keys_arr;
+    js_object *bound_obj = 0;
+    unsigned int i;
+
+    dataset_sync_element(element->j, element->node);
+    if (js_get(c, js_object_value(dataset), "__bound", &bound_val) != JS_OK)
+        return JS_THROW;
+    if (js_is_object(bound_val)) {
+        bound_obj = bound_val.u.obj;
+        if (object_own_keys(c, bound_val, &keys_arr)) {
+            unsigned long len = js_array_length(keys_arr.u.obj), k;
+
+            for (k = 0; k < len; k++) {
+                js_value kval;
+                const char *key;
+                char *attr_name;
+
+                if (js_array_get(c, keys_arr.u.obj, k, &kval) != JS_OK)
+                    continue;
+                key = js_to_cstring(c, kval);
+                if (!key)
+                    continue;
+                attr_name = dataset_attr_name(key);
+                if (!attr_name || !dom_get_attr(element->node, attr_name)) {
+                    (void)js_delete(c, js_object_value(dataset), key);
+                    (void)js_delete(c, bound_val, key);
+                }
+                free(attr_name);
+            }
+        }
+    }
     for (i = 0; i < dom_attr_count(element->node); i++) {
         const struct dom_attr *attribute = dom_attr_at(element->node, i);
         char *key = dataset_key(attribute ? attribute->name : 0);
-        char *attribute_copy;
-        js_object *holder;
-        js_value holder_value, getter, setter;
 
         if (!key)
             continue;
@@ -3384,25 +4209,8 @@ static int dataset_refresh(js_ctx *c, struct hostref *element,
             free(key);
             continue;
         }
-        attribute_copy = dup_z(attribute->name);
-        if (!attribute_copy) {
-            free(key);
-            return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-        }
-        holder = new_host_data(element->j, element->node,
-                               HOST_DATASET_PROPERTY, attribute_copy, 0);
-        if (!holder) {
-            free(attribute_copy);
-            free(key);
-            return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-        }
-        holder_value = js_object_value(holder);
-        if (bind_native_to(c, dataset_property_get, key, 0,
-                           holder_value, &getter) != JS_OK ||
-            bind_native_to(c, dataset_property_set, key, 1,
-                           holder_value, &setter) != JS_OK ||
-            js_define_accessor_value(c, dataset, key,
-                                     getter, setter, 1) != JS_OK) {
+        if (dataset_bind_key(c, element, dataset, bound_obj,
+                             key, attribute->name) != JS_OK) {
             free(key);
             return JS_THROW;
         }
@@ -3426,11 +4234,15 @@ static int node_dataset_get(js_ctx *c, js_value t,
         return JS_THROW;
     if (dataset.type == JS_UNDEFINED) {
         js_object *object = js_new_object(c);
-        if (!object)
+        js_object *bound = js_new_object(c);
+
+        if (!object || !bound)
             return JS_THROW;
         dataset = js_object_value(object);
-        if (js_define(c, t.u.obj, "__dataset", dataset) != JS_OK)
+        if (js_define(c, object, "__bound", js_object_value(bound)) != JS_OK ||
+            js_define(c, t.u.obj, "__dataset", dataset) != JS_OK)
             return JS_THROW;
+        dataset_track_node(element->j, element->node);
     }
     if (dataset_refresh(c, element, dataset.u.obj) != JS_OK)
         return JS_THROW;
@@ -3451,6 +4263,70 @@ static int token_present(const char *list, const char *tok)
             return 1;
     }
     return 0;
+}
+
+static int classlist_sync(js_ctx *c, struct dom_node *node,
+                          js_object *list_obj)
+{
+    const char *value;
+    js_value synced_val;
+    unsigned int old_len = 0, count = 0, i;
+    char key[16];
+
+    if (!c || !node || !list_obj)
+        return JS_OK;
+    if (js_get(c, js_object_value(list_obj), "__syncedLen",
+               &synced_val) == JS_OK &&
+        js_is_number(synced_val) && synced_val.u.num > 0)
+        old_len = (unsigned int)synced_val.u.num;
+    value = dom_get_attr(node, "class");
+    while (value && *value) {
+        const char *start;
+        js_value tok_str;
+
+        while (*value == ' ' || *value == '\t' ||
+               *value == '\r' || *value == '\n')
+            value++;
+        if (!*value)
+            break;
+        start = value;
+        while (*value && *value != ' ' && *value != '\t' &&
+               *value != '\r' && *value != '\n')
+            value++;
+        snprintf(key, sizeof(key), "%u", count);
+        tok_str = js_mkstring(c, start, (unsigned long)(value - start));
+        if (js_fatal(c))
+            return JS_THROW;
+        if (count < old_len) {
+            if (js_set(c, js_object_value(list_obj), key, tok_str) != JS_OK)
+                return JS_THROW;
+        } else {
+            if (js_define_enum(c, list_obj, key, tok_str) != JS_OK)
+                return JS_THROW;
+        }
+        count++;
+    }
+    for (i = count; i < old_len; i++) {
+        snprintf(key, sizeof(key), "%u", i);
+        (void)js_delete(c, js_object_value(list_obj), key);
+    }
+    if (js_set(c, js_object_value(list_obj), "__syncedLen",
+               js_number((double)count)) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static void classlist_sync_node(struct jsdom *j, struct dom_node *node)
+{
+    js_value list;
+
+    if (!j || !node || !node->user)
+        return;
+    if (js_get(j->ctx, js_object_value((js_object *)node->user),
+               "__classList", &list) != JS_OK)
+        return;
+    if (host(list, HOST_CLASSLIST))
+        (void)classlist_sync(j->ctx, node, list.u.obj);
 }
 
 static int class_change(struct hostref *h, const char *tok, int mode, int *now)
@@ -3504,7 +4380,8 @@ static int class_change(struct hostref *h, const char *tok, int mode, int *now)
     free(out);
     if (mutation_attribute(h->j, h->node, "class", old_attr) != JS_OK)
         return 0;
-    h->j->dirty = 1;
+    classlist_sync_node(h->j, h->node);
+    mark_dom_dirty(h->j);
     if (now) *now = mode == 1;
     return 1;
 }
@@ -3606,7 +4483,8 @@ static int class_value_set(js_ctx *c, js_value t,
                               "class value is too large");
     if (mutation_attribute(h->j, h->node, "class", old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    classlist_sync_node(h->j, h->node);
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -3694,8 +4572,11 @@ static int class_replace(js_ctx *c, js_value t,
             js_throw_error(c, JS_ERR_TYPE,
                            "illegal DOMTokenList receiver");
     if (!*old_token || !*new_token ||
+        strlen(old_token) > 128 || strlen(new_token) > 128 ||
         strchr(old_token, ' ') || strchr(new_token, ' ') ||
-        strchr(old_token, '\t') || strchr(new_token, '\t'))
+        strchr(old_token, '\t') || strchr(new_token, '\t') ||
+        strchr(old_token, '\r') || strchr(new_token, '\r') ||
+        strchr(old_token, '\n') || strchr(new_token, '\n'))
         return js_throw_error(c, JS_ERR_ERROR, "invalid class token");
     value = dom_get_attr(h->node, "class");
     if (!value || !token_present(value, old_token)) {
@@ -3722,13 +4603,51 @@ static int node_classlist_get(js_ctx *c, js_value t, int ac, js_value *av,
                               js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
-    js_object *o;
-    (void)c; (void)ac; (void)av;
-    if (!h) { *r = js_undefined(); return JS_OK; }
-    o = new_host(h->j, h->node, HOST_CLASSLIST, h->j->class_proto);
-    if (!o) return JS_THROW;
-    *r = js_object_value(o);
+    js_value list;
+    (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (js_get(c, t, "__classList", &list) != JS_OK)
+        return JS_THROW;
+    if (list.type == JS_UNDEFINED) {
+        js_object *o = new_host(h->j, h->node, HOST_CLASSLIST, h->j->class_proto);
+
+        if (!o)
+            return JS_THROW;
+        if (js_define(c, o, "__syncedLen", js_number(0)) != JS_OK)
+            return JS_THROW;
+        list = js_object_value(o);
+        if (js_define(c, t.u.obj, "__classList", list) != JS_OK)
+            return JS_THROW;
+    }
+    if (classlist_sync(c, h->node, list.u.obj) != JS_OK)
+        return JS_THROW;
+    *r = list;
     return JS_OK;
+}
+
+static int style_value_arg(js_ctx *c, int ac, js_value *av, int idx,
+                           const char **out)
+{
+    if (idx >= ac || js_is_null(av[idx])) {
+        *out = "";
+        return JS_OK;
+    }
+    return string_arg(c, ac, av, idx, out);
+}
+
+static int style_prop_name_eq(const char *a, unsigned long an, const char *prop)
+{
+    unsigned long pn = strlen(prop);
+
+    if (an != pn)
+        return 0;
+    if (pn >= 2 && prop[0] == '-' && prop[1] == '-')
+        return memcmp(a, prop, pn) == 0;
+    return ci_eq_n(a, an, prop, pn);
 }
 
 static int style_css_get(js_ctx *c, js_value t, int ac, js_value *av,
@@ -3749,14 +4668,14 @@ static int style_css_set(js_ctx *c, js_value t, int ac, js_value *av,
     struct hostref *h = host(t, HOST_STYLE);
     const char *v, *old;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
-    if (string_arg(c, ac, av, 0, &v) != JS_OK) return JS_THROW;
+    if (style_value_arg(c, ac, av, 0, &v) != JS_OK) return JS_THROW;
     old = dom_get_attr(h->node, "style");
     if (strlen(v) >= JSDOM_STYLE_MAX ||
         !dom_set_attr(h->node, "style", v))
         return js_throw_error(c, JS_ERR_ERROR, "style is too large");
     if (mutation_attribute(h->j, h->node, "style", old) != JS_OK)
         return JS_THROW;
-    h->j->dirty = 1;
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -3771,6 +4690,7 @@ static int style_next_declaration(const char **cursor,
     const char *p = *cursor;
     const char *name_start, *name_end, *value_start, *value_end;
     const char *word_end, *word_start, *bang;
+    int quote, paren;
 
 again:
     while (*p == ' ' || *p == '\t' || *p == '\r' ||
@@ -3803,8 +4723,30 @@ again:
     while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
         p++;
     value_start = p;
-    while (*p && *p != ';')
+    quote = 0;
+    paren = 0;
+    while (*p) {
+        char ch = *p;
+        if (quote) {
+            if (ch == '\\' && p[1]) {
+                p += 2;
+                continue;
+            }
+            if (ch == quote)
+                quote = 0;
+            p++;
+            continue;
+        }
+        if (ch == '"' || ch == '\'')
+            quote = ch;
+        else if (ch == '(')
+            paren++;
+        else if (ch == ')' && paren > 0)
+            paren--;
+        else if (ch == ';' && paren == 0)
+            break;
         p++;
+    }
     value_end = p;
     while (value_end > value_start &&
            (value_end[-1] == ' ' || value_end[-1] == '\t' ||
@@ -3856,7 +4798,7 @@ static char *style_property_copy(const char *css, const char *property,
         *priority = 0;
     while (style_next_declaration(&cursor, &name, &name_length,
                                   &value, &value_length, &important)) {
-        if (!ci_eq_n(name, name_length, property, strlen(property)))
+        if (!style_prop_name_eq(name, name_length, property))
             continue;
         free(found);
         found = dup_n(value, value_length);
@@ -3894,7 +4836,7 @@ static int style_rewrite_property(struct hostref *h, const char *property,
     while (style_next_declaration(&cursor, &name, &name_length,
                                   &value, &value_length,
                                   &old_important)) {
-        if (ci_eq_n(name, name_length, property, strlen(property)))
+        if (style_prop_name_eq(name, name_length, property))
             continue;
         if (!style_append_bytes(output, &used, name, name_length) ||
             !style_append_bytes(output, &used, ":", 1) ||
@@ -3925,9 +4867,12 @@ static int style_rewrite_property(struct hostref *h, const char *property,
     free(output);
     if (mutation_attribute(h->j, h->node, "style", css) != JS_OK)
         return 0;
-    h->j->dirty = 1;
+    mark_dom_dirty(h->j);
     return 1;
 }
+
+static int computed_style_prop_get(js_ctx *c, js_value t, const char *prop,
+                                   js_value *r);
 
 static int style_prop_set(js_ctx *c, js_value t, int ac, js_value *av,
                           js_value *r, const char *prop)
@@ -3935,8 +4880,13 @@ static int style_prop_set(js_ctx *c, js_value t, int ac, js_value *av,
     struct hostref *h = host(t, HOST_STYLE);
     const char *v;
 
-    if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
-    if (string_arg(c, ac, av, 0, &v) != JS_OK) return JS_THROW;
+    if (!h) {
+        if (host(t, HOST_COMPUTED_STYLE))
+            return throw_dom_exception(c, "NoModificationAllowedError",
+                                       "computed style is read-only");
+        return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
+    }
+    if (style_value_arg(c, ac, av, 0, &v) != JS_OK) return JS_THROW;
     if (!style_rewrite_property(h, prop, v, 0))
         return js_throw_error(c, JS_ERR_ERROR, "cannot set style");
     *r = js_undefined();
@@ -3949,7 +4899,11 @@ static int style_prop_get(js_ctx *c, js_value t, const char *prop, js_value *r)
     const char *css;
     char *value;
 
-    if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
+    if (!h) {
+        if (host(t, HOST_COMPUTED_STYLE))
+            return computed_style_prop_get(c, t, prop, r);
+        return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
+    }
     css = dom_get_attr(h->node, "style");
     value = style_property_copy(css, prop, 0);
     *r = js_mkcstring(c, value ? value : "");
@@ -3976,8 +4930,9 @@ static int style_set_property(js_ctx *c, js_value t,
     if (!h)
         return js_throw_error(c, JS_ERR_TYPE, "illegal style receiver");
     if (string_arg(c, ac, av, 0, &property) != JS_OK ||
-        string_arg(c, ac, av, 1, &value) != JS_OK ||
-        (ac > 2 && string_arg(c, ac, av, 2, &priority) != JS_OK))
+        style_value_arg(c, ac, av, 1, &value) != JS_OK ||
+        (ac > 2 && !js_is_null(av[2]) &&
+         string_arg(c, ac, av, 2, &priority) != JS_OK))
         return JS_THROW;
     if (!*property || strlen(property) > 128 ||
         strchr(property, ':') || strchr(property, ';'))
@@ -4086,36 +5041,178 @@ static int style_item(js_ctx *c, js_value t,
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
-#define STYLE_ACCESSORS(stem, prop)                                          \
-static int stem##_get(js_ctx *c, js_value t, int ac, js_value *av,           \
-                      js_value *r)                                            \
+#define JSDOM_CSS_PROPS(X) \
+    X(display,               "display",               "display") \
+    X(position,              "position",              "position") \
+    X(css_float,             "cssFloat",              "float") \
+    X(float_prop,            "float",                 "float") \
+    X(clear,                 "clear",                 "clear") \
+    X(box_sizing,            "boxSizing",             "box-sizing") \
+    X(width,                 "width",                 "width") \
+    X(height,                "height",                "height") \
+    X(min_width,             "minWidth",              "min-width") \
+    X(max_width,             "maxWidth",              "max-width") \
+    X(min_height,            "minHeight",             "min-height") \
+    X(max_height,            "maxHeight",             "max-height") \
+    X(top,                   "top",                   "top") \
+    X(right,                 "right",                 "right") \
+    X(bottom,                "bottom",                "bottom") \
+    X(left,                  "left",                  "left") \
+    X(margin,                "margin",                "margin") \
+    X(margin_top,            "marginTop",             "margin-top") \
+    X(margin_right,          "marginRight",           "margin-right") \
+    X(margin_bottom,         "marginBottom",          "margin-bottom") \
+    X(margin_left,           "marginLeft",            "margin-left") \
+    X(padding,               "padding",               "padding") \
+    X(padding_top,           "paddingTop",            "padding-top") \
+    X(padding_right,         "paddingRight",          "padding-right") \
+    X(padding_bottom,        "paddingBottom",         "padding-bottom") \
+    X(padding_left,          "paddingLeft",           "padding-left") \
+    X(border,                "border",                "border") \
+    X(border_width,          "borderWidth",           "border-width") \
+    X(border_style,          "borderStyle",           "border-style") \
+    X(border_color,          "borderColor",           "border-color") \
+    X(border_top,            "borderTop",             "border-top") \
+    X(border_right,          "borderRight",           "border-right") \
+    X(border_bottom,         "borderBottom",          "border-bottom") \
+    X(border_left,           "borderLeft",            "border-left") \
+    X(border_top_width,      "borderTopWidth",        "border-top-width") \
+    X(border_right_width,    "borderRightWidth",      "border-right-width") \
+    X(border_bottom_width,   "borderBottomWidth",     "border-bottom-width") \
+    X(border_left_width,     "borderLeftWidth",       "border-left-width") \
+    X(border_top_style,      "borderTopStyle",        "border-top-style") \
+    X(border_right_style,    "borderRightStyle",      "border-right-style") \
+    X(border_bottom_style,   "borderBottomStyle",     "border-bottom-style") \
+    X(border_left_style,     "borderLeftStyle",       "border-left-style") \
+    X(border_top_color,      "borderTopColor",        "border-top-color") \
+    X(border_right_color,    "borderRightColor",      "border-right-color") \
+    X(border_bottom_color,   "borderBottomColor",     "border-bottom-color") \
+    X(border_left_color,     "borderLeftColor",       "border-left-color") \
+    X(border_radius,         "borderRadius",          "border-radius") \
+    X(border_tl_radius,      "borderTopLeftRadius",   "border-top-left-radius") \
+    X(border_tr_radius,      "borderTopRightRadius",  "border-top-right-radius") \
+    X(border_br_radius,      "borderBottomRightRadius","border-bottom-right-radius") \
+    X(border_bl_radius,      "borderBottomLeftRadius","border-bottom-left-radius") \
+    X(font,                  "font",                  "font") \
+    X(font_family,           "fontFamily",            "font-family") \
+    X(font_size,             "fontSize",              "font-size") \
+    X(font_weight,           "fontWeight",            "font-weight") \
+    X(font_style,            "fontStyle",             "font-style") \
+    X(color,                 "color",                 "color") \
+    X(color_scheme,          "colorScheme",           "color-scheme") \
+    X(opacity,               "opacity",               "opacity") \
+    X(background,            "background",            "background") \
+    X(background_color,      "backgroundColor",       "background-color") \
+    X(background_image,      "backgroundImage",       "background-image") \
+    X(box_shadow,            "boxShadow",             "box-shadow") \
+    X(text_align,            "textAlign",             "text-align") \
+    X(text_decoration,       "textDecoration",        "text-decoration") \
+    X(text_indent,           "textIndent",            "text-indent") \
+    X(text_transform,        "textTransform",         "text-transform") \
+    X(text_overflow,         "textOverflow",          "text-overflow") \
+    X(letter_spacing,        "letterSpacing",         "letter-spacing") \
+    X(word_break,            "wordBreak",             "word-break") \
+    X(vertical_align,        "verticalAlign",         "vertical-align") \
+    X(line_height,           "lineHeight",            "line-height") \
+    X(list_style,            "listStyle",             "list-style") \
+    X(list_style_type,       "listStyleType",         "list-style-type") \
+    X(list_style_position,   "listStylePosition",     "list-style-position") \
+    X(white_space,           "whiteSpace",            "white-space") \
+    X(overflow,              "overflow",              "overflow") \
+    X(overflow_x,            "overflowX",             "overflow-x") \
+    X(overflow_y,            "overflowY",             "overflow-y") \
+    X(visibility,            "visibility",            "visibility") \
+    X(border_collapse,       "borderCollapse",        "border-collapse") \
+    X(border_spacing,        "borderSpacing",         "border-spacing") \
+    X(z_index,               "zIndex",                "z-index") \
+    X(flex,                  "flex",                  "flex") \
+    X(flex_flow,             "flexFlow",              "flex-flow") \
+    X(flex_direction,        "flexDirection",         "flex-direction") \
+    X(flex_wrap,             "flexWrap",              "flex-wrap") \
+    X(justify_content,       "justifyContent",        "justify-content") \
+    X(align_items,           "alignItems",            "align-items") \
+    X(align_content,         "alignContent",          "align-content") \
+    X(align_self,            "alignSelf",             "align-self") \
+    X(order,                 "order",                 "order") \
+    X(flex_grow,             "flexGrow",              "flex-grow") \
+    X(flex_shrink,           "flexShrink",            "flex-shrink") \
+    X(flex_basis,            "flexBasis",             "flex-basis") \
+    X(gap,                   "gap",                   "gap") \
+    X(row_gap,               "rowGap",                "row-gap") \
+    X(column_gap,            "columnGap",             "column-gap") \
+    X(grid_template_columns, "gridTemplateColumns",   "grid-template-columns") \
+    X(grid_template_rows,    "gridTemplateRows",      "grid-template-rows") \
+    X(grid_column,           "gridColumn",            "grid-column") \
+    X(grid_column_start,     "gridColumnStart",       "grid-column-start") \
+    X(grid_column_end,       "gridColumnEnd",         "grid-column-end") \
+    X(grid_row,              "gridRow",               "grid-row") \
+    X(grid_row_start,        "gridRowStart",          "grid-row-start") \
+    X(grid_row_end,          "gridRowEnd",            "grid-row-end") \
+    X(grid_area,             "gridArea",              "grid-area") \
+    X(transform,             "transform",             "transform") \
+    X(transform_origin,      "transformOrigin",       "transform-origin") \
+    X(transition,            "transition",            "transition") \
+    X(animation,             "animation",             "animation") \
+    X(pointer_events,        "pointerEvents",         "pointer-events") \
+    X(cursor,                "cursor",                "cursor") \
+    X(user_select,           "userSelect",            "user-select") \
+    X(outline,               "outline",               "outline") \
+    X(outline_width,         "outlineWidth",          "outline-width") \
+    X(outline_style,         "outlineStyle",          "outline-style") \
+    X(outline_color,         "outlineColor",          "outline-color") \
+    X(content,               "content",               "content") \
+    X(fill,                  "fill",                  "fill") \
+    X(stroke,                "stroke",                "stroke") \
+    X(stroke_width,          "strokeWidth",           "stroke-width")
+
+#define STYLE_ACCESSORS(id, camel, prop)                                     \
+static int style_##id##_get(js_ctx *c, js_value t, int ac, js_value *av,     \
+                            js_value *r)                                     \
 { (void)ac; (void)av; return style_prop_get(c, t, prop, r); }                \
-static int stem##_set(js_ctx *c, js_value t, int ac, js_value *av,           \
-                      js_value *r)                                            \
+static int style_##id##_set(js_ctx *c, js_value t, int ac, js_value *av,     \
+                            js_value *r)                                     \
 { return style_prop_set(c, t, ac, av, r, prop); }
 
-STYLE_ACCESSORS(style_display, "display")
-STYLE_ACCESSORS(style_color, "color")
-STYLE_ACCESSORS(style_bg, "background-color")
-STYLE_ACCESSORS(style_width, "width")
-STYLE_ACCESSORS(style_height, "height")
-STYLE_ACCESSORS(style_margin, "margin")
-STYLE_ACCESSORS(style_padding, "padding")
-STYLE_ACCESSORS(style_font_size, "font-size")
-STYLE_ACCESSORS(style_font_weight, "font-weight")
-STYLE_ACCESSORS(style_text_align, "text-align")
-STYLE_ACCESSORS(style_visibility, "visibility")
+JSDOM_CSS_PROPS(STYLE_ACCESSORS)
+
+static int register_css_decl_accessors(js_ctx *c, js_object *proto)
+{
+#define REG_STYLE_ACC(id, camel, prop)                                       \
+    if (js_define_accessor(c, proto, camel,                                  \
+                           style_##id##_get, style_##id##_set, 1) != JS_OK)  \
+        return 0;                                                            \
+    if (strcmp(camel, prop) != 0 && strcmp(camel, "cssFloat") != 0 &&        \
+        js_define_accessor(c, proto, prop,                                   \
+                           style_##id##_get, style_##id##_set, 1) != JS_OK)  \
+        return 0;
+    JSDOM_CSS_PROPS(REG_STYLE_ACC)
+#undef REG_STYLE_ACC
+    return 1;
+}
 
 static int node_style_get(js_ctx *c, js_value t, int ac, js_value *av,
                           js_value *r)
 {
     struct hostref *h = host(t, HOST_NODE);
-    js_object *o;
-    (void)c; (void)ac; (void)av;
-    if (!h) { *r = js_undefined(); return JS_OK; }
-    o = new_host(h->j, h->node, HOST_STYLE, h->j->style_proto);
-    if (!o) return JS_THROW;
-    *r = js_object_value(o);
+    js_value st;
+    (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (js_get(c, t, "__style", &st) != JS_OK)
+        return JS_THROW;
+    if (st.type == JS_UNDEFINED) {
+        js_object *o = new_host(h->j, h->node, HOST_STYLE, h->j->style_proto);
+
+        if (!o)
+            return JS_THROW;
+        st = js_object_value(o);
+        if (js_define(c, t.u.obj, "__style", st) != JS_OK)
+            return JS_THROW;
+    }
+    *r = st;
     return JS_OK;
 }
 
@@ -4220,6 +5317,8 @@ static int custom_event_constructor(js_ctx *c, js_value t,
     if (js_is_object(options) &&
         js_get(c, options, "detail", &detail) != JS_OK)
         return JS_THROW;
+    if (js_is_undefined(detail))
+        detail = js_null();
     type = js_string_bytes(type_value, 0);
     return event_make(j, j->custom_event_proto, type, options,
                       detail, 1, r);
@@ -6172,19 +7271,25 @@ static int range_create_contextual_fragment(js_ctx *c, js_value t,
 {
     struct hostref *h;
     struct range_state *state = range_state_of(t, &h);
-    struct dom_node *container, *fragment, *child;
+    struct dom_node *container, *fragment, *child, *ctx_node;
+    struct dom_document *dst_doc;
     const char *markup;
-    int dirty;
+    int dirty, ss_dirty;
 
     if (!state)
         return js_throw_error(c, JS_ERR_TYPE, "illegal Range receiver");
     if (string_arg(c, ac, av, 0, &markup) != JS_OK)
         return JS_THROW;
-    container = dom_create_element(h->j->doc, "div", 3);
-    fragment = dom_create_fragment(h->j->doc);
+    ctx_node = state->start_container;
+    dst_doc = (ctx_node && ctx_node->doc) ? ctx_node->doc : h->j->doc;
+    while (ctx_node && ctx_node->type != DOM_ELEMENT)
+        ctx_node = ctx_node->parent;
+    container = dom_create_element(dst_doc, "div", 3);
+    fragment = dom_create_fragment(dst_doc);
     dirty = h->j->dirty;
+    ss_dirty = h->j->style_sheet_dirty;
     if (!container || !fragment ||
-        !set_inner_html(h->j, container, markup))
+        !set_inner_html_ctx(h->j, container, ctx_node, markup))
         return js_throw_error(c, JS_ERR_ERROR,
                               "cannot parse contextual fragment");
     while ((child = container->first_child) != 0) {
@@ -6194,6 +7299,7 @@ static int range_create_contextual_fragment(js_ctx *c, js_value t,
                                   "cannot build contextual fragment");
     }
     h->j->dirty = dirty;
+    h->j->style_sheet_dirty = ss_dirty;
     *r = wrap_node(h->j, fragment);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
@@ -6857,17 +7963,20 @@ static int doc_by_id(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
     const char *id;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &id) != JS_OK) return JS_THROW;
-    *r = wrap_node(h->j, dom_get_element_by_id(h->j->doc, id));
+    *r = wrap_node(h->j, dom_get_element_by_id(doc_of(h), id));
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
 static int doc_query(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
 {
     struct hostref *h = host(t, HOST_DOCUMENT);
+    struct dom_node *match = 0;
     const char *sel;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &sel) != JS_OK) return JS_THROW;
-    *r = wrap_node(h->j, query_first(h->j->doc->root, sel));
+    if (query_first(c, h->j, doc_of(h)->root, sel, &match) != JS_OK)
+        return JS_THROW;
+    *r = wrap_node(h->j, match);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
@@ -6878,7 +7987,7 @@ static int doc_query_all(js_ctx *c, js_value t, int ac, js_value *av,
     const char *sel;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &sel) != JS_OK) return JS_THROW;
-    return query_all(c, h->j, h->j->doc->root, sel, r);
+    return query_all(c, h->j, doc_of(h)->root, sel, r);
 }
 
 static int doc_create_element(js_ctx *c, js_value t, int ac, js_value *av,
@@ -6889,7 +7998,7 @@ static int doc_create_element(js_ctx *c, js_value t, int ac, js_value *av,
     struct dom_node *n;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &name) != JS_OK) return JS_THROW;
-    n = dom_create_element(h->j->doc, name, (long)strlen(name));
+    n = dom_create_element(doc_of(h), name, (long)strlen(name));
     if (!n) return js_throw_error(c, JS_ERR_ERROR, "cannot create element");
     *r = wrap_node(h->j, n);
     return js_fatal(c) ? JS_THROW : JS_OK;
@@ -6923,7 +8032,7 @@ static int doc_create_element_ns(js_ctx *c, js_value t,
         (colon && !namespace_uri))
         return throw_dom_exception(c, "NamespaceError",
                                    "invalid qualified element name");
-    node = dom_create_element(h->j->doc, name, (long)strlen(name));
+    node = dom_create_element(doc_of(h), name, (long)strlen(name));
     if (!node || !dom_set_namespace(node, namespace_uri, -1))
         return js_throw_error(c, JS_ERR_ERROR,
                               "cannot create namespaced element");
@@ -6939,7 +8048,7 @@ static int doc_create_text(js_ctx *c, js_value t, int ac, js_value *av,
     struct dom_node *n;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &text) != JS_OK) return JS_THROW;
-    n = dom_create_text(h->j->doc, text, strlen(text));
+    n = dom_create_text(doc_of(h), text, strlen(text));
     if (!n) return js_throw_error(c, JS_ERR_ERROR, "cannot create text node");
     *r = wrap_node(h->j, n);
     return js_fatal(c) ? JS_THROW : JS_OK;
@@ -6997,7 +8106,7 @@ static int doc_create_comment(js_ctx *c, js_value t, int ac, js_value *av,
                               "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &text) != JS_OK)
         return JS_THROW;
-    node = dom_create_comment(h->j->doc, text, strlen(text));
+    node = dom_create_comment(doc_of(h), text, strlen(text));
     if (!node)
         return js_throw_error(c, JS_ERR_ERROR,
                               "cannot create comment");
@@ -7015,7 +8124,7 @@ static int doc_create_fragment(js_ctx *c, js_value t,
     if (!h)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal Document receiver");
-    node = dom_create_fragment(h->j->doc);
+    node = dom_create_fragment(doc_of(h));
     if (!node)
         return js_throw_error(c, JS_ERR_ERROR,
                               "cannot create document fragment");
@@ -7027,12 +8136,21 @@ static int doc_root_get(js_ctx *c, js_value t, int ac, js_value *av,
                         js_value *r, int which)
 {
     struct hostref *h = host(t, HOST_DOCUMENT);
+    struct dom_document *d;
     struct dom_node *n = 0;
     (void)ac; (void)av;
     if (h) {
-        if (which == 0) n = h->j->doc->html;
-        if (which == 1) n = h->j->doc->head;
-        if (which == 2) n = h->j->doc->body;
+        d = doc_of(h);
+        if (which == 0) {
+            n = d->html;
+            if (!n && d->root) {
+                for (n = d->root->first_child; n && n->type != DOM_ELEMENT;
+                     n = n->next_sibling)
+                    ;
+            }
+        }
+        if (which == 1) n = d->head;
+        if (which == 2) n = d->body;
     }
     *r = h ? wrap_node(h->j, n) : js_null();
     return js_fatal(c) ? JS_THROW : JS_OK;
@@ -7049,8 +8167,9 @@ static int doc_title_get(js_ctx *c, js_value t, int ac, js_value *av,
                          js_value *r)
 {
     struct hostref *h = host(t, HOST_DOCUMENT);
+    struct dom_document *d = doc_of(h);
     (void)ac; (void)av;
-    *r = js_mkcstring(c, h && h->j->doc->title ? h->j->doc->title : "");
+    *r = js_mkcstring(c, h && d && d->title ? d->title : "");
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
@@ -7058,20 +8177,26 @@ static int doc_title_set(js_ctx *c, js_value t, int ac, js_value *av,
                          js_value *r)
 {
     struct hostref *h = host(t, HOST_DOCUMENT);
+    struct dom_document *d;
     struct dom_node *title;
     const char *v;
     if (!h) return js_throw_error(c, JS_ERR_TYPE, "illegal Document receiver");
     if (string_arg(c, ac, av, 0, &v) != JS_OK) return JS_THROW;
-    title = dom_find_tag(h->j->doc->head, "title");
+    d = doc_of(h);
+    if (!d->head) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    title = dom_find_tag(d->head, "title");
     if (!title) {
-        title = dom_create_element(h->j->doc, "title", 5);
-        if (!title || !dom_append_child(h->j->doc->head, title))
+        title = dom_create_element(d, "title", 5);
+        if (!title || !dom_append_child(d->head, title))
             return js_throw_error(c, JS_ERR_ERROR, "cannot create title");
     }
     if (!set_text(h->j, title, v))
         return js_throw_error(c, JS_ERR_ERROR, "cannot set title");
-    h->j->doc->title = title->first_child ? title->first_child->text : "";
-    h->j->dirty = 1;
+    d->title = title->first_child ? title->first_child->text : "";
+    mark_dom_dirty(h->j);
     *r = js_undefined();
     return JS_OK;
 }
@@ -7113,8 +8238,12 @@ static int doc_charset_get(js_ctx *c, js_value t, int ac, js_value *av,
 static int doc_content_type_get(js_ctx *c, js_value t, int ac, js_value *av,
                                 js_value *r)
 {
-    (void)t; (void)ac; (void)av;
-    *r = js_mkcstring(c, "text/html");
+    struct hostref *h = host(t, HOST_DOCUMENT);
+    const char *ct = "text/html";
+    (void)ac; (void)av;
+    if (h && h->data && ((const struct doc_ref *)h->data)->content_type[0])
+        ct = ((const struct doc_ref *)h->data)->content_type;
+    *r = js_mkcstring(c, ct);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
@@ -8603,15 +9732,189 @@ static const char *const clear_names[] = {
 static const char *const align_names[] = {
     CSS_TEXTALIGN_LIST(CSS_NAME_ENTRY)
 };
+static const char *const valign_names[] = {
+    CSS_VALIGN_LIST(CSS_NAME_ENTRY)
+};
+static const char *const whitespace_names[] = {
+    CSS_WHITESPACE_LIST(CSS_NAME_ENTRY)
+};
+static const char *const overflow_names[] = {
+    CSS_OVERFLOW_LIST(CSS_NAME_ENTRY)
+};
 static const char *const visibility_names[] = {
     CSS_VISIBILITY_LIST(CSS_NAME_ENTRY)
 };
+static const char *const fontstyle_names[] = {
+    CSS_FONTSTYLE_LIST(CSS_NAME_ENTRY)
+};
+static const char *const fontfamily_names[] = {
+    CSS_FONTFAMILY_LIST(CSS_NAME_ENTRY)
+};
+static const char *const borderstyle_names[] = {
+    CSS_BORDERSTYLE_LIST(CSS_NAME_ENTRY)
+};
+static const char *const liststyle_names[] = {
+    CSS_LISTSTYLE_LIST(CSS_NAME_ENTRY)
+};
+static const char *const listpos_names[] = {
+    CSS_LISTPOS_LIST(CSS_NAME_ENTRY)
+};
+static const char *const bordercollapse_names[] = {
+    CSS_BORDERCOLLAPSE_LIST(CSS_NAME_ENTRY)
+};
+static const char *const texttransform_names[] = {
+    CSS_TEXTTRANSFORM_LIST(CSS_NAME_ENTRY)
+};
+static const char *const boxsizing_names[] = {
+    CSS_BOXSIZING_LIST(CSS_NAME_ENTRY)
+};
+static const char *const flexdir_names[] = {
+    CSS_FLEXDIR_LIST(CSS_NAME_ENTRY)
+};
+static const char *const flexwrap_names[] = {
+    CSS_FLEXWRAP_LIST(CSS_NAME_ENTRY)
+};
+static const char *const justify_names[] = {
+    CSS_JUSTIFY_LIST(CSS_NAME_ENTRY)
+};
+static const char *const alignitems_names[] = {
+    CSS_ALIGN_LIST(CSS_NAME_ENTRY)
+};
+static const char *const colorscheme_names[] = {
+    CSS_COLORSCHEME_LIST(CSS_NAME_ENTRY)
+};
+static const char *const fontsizekw_names[] = {
+    CSS_FONTSIZEKW_LIST(CSS_NAME_ENTRY)
+};
+static const char *const fontweightkw_names[] = {
+    CSS_FONTWEIGHTKW_LIST(CSS_NAME_ENTRY)
+};
 #undef CSS_NAME_ENTRY
 
-static int computed_put(js_ctx *c, js_value obj, const char *name,
-                        const char *value)
+static uint64_t style_tags_hash(const struct dom_document *doc)
 {
-    return js_set(c, obj, name, js_mkcstring(c, value));
+    uint64_t h = 14695981039346656037ULL;
+    const struct dom_node *n, *ch;
+    const char *ty;
+    unsigned long k;
+
+    if (!doc || !doc->root)
+        return h;
+    for (n = doc->root; n; n = dom_next(n)) {
+        if (n->type != DOM_ELEMENT || n->tag_id != HTAG_STYLE)
+            continue;
+        ty = dom_get_attr(n, "type");
+        if (ty && *ty && !ci_eq_n(ty, strlen(ty), "text/css", 8))
+            continue;
+        h = (h ^ 0xFFu) * 1099511628211ULL;
+        for (ch = n->first_child; ch; ch = ch->next_sibling) {
+            if (ch->type == DOM_TEXT && ch->text && ch->text_len) {
+                for (k = 0; k < ch->text_len; k++)
+                    h = (h ^ (unsigned char)ch->text[k]) * 1099511628211ULL;
+            }
+        }
+    }
+    return h;
+}
+
+static struct css_stylesheet *ensure_author_stylesheet(struct jsdom *j)
+{
+    struct dom_node *n;
+    unsigned long cap = 0, used = 0;
+    char *buf;
+    struct css_media media;
+
+    if (!j || !j->doc || !j->doc->root)
+        return 0;
+    if (j->external_sheet &&
+        style_tags_hash(j->doc) == j->initial_style_hash)
+        return 0;
+    if (!j->style_sheet_dirty)
+        return j->author_sheet;
+    css_free(j->author_sheet);
+    j->author_sheet = 0;
+    j->style_sheet_dirty = 0;
+    for (n = j->doc->root; n; n = dom_next(n)) {
+        const char *ty;
+        struct dom_node *ch;
+
+        if (n->type != DOM_ELEMENT || n->tag_id != HTAG_STYLE)
+            continue;
+        ty = dom_get_attr(n, "type");
+        if (ty && *ty && !ci_eq_n(ty, strlen(ty), "text/css", 8))
+            continue;
+        for (ch = n->first_child; ch; ch = ch->next_sibling) {
+            if (ch->type == DOM_TEXT && ch->text && ch->text_len)
+                cap += ch->text_len + 1;
+        }
+        cap += 1;
+    }
+    if (!cap || cap > CSS_MAX_SOURCE)
+        return 0;
+    buf = (char *)malloc(cap + 1);
+    if (!buf)
+        return 0;
+    for (n = j->doc->root; n; n = dom_next(n)) {
+        const char *ty;
+        struct dom_node *ch;
+
+        if (n->type != DOM_ELEMENT || n->tag_id != HTAG_STYLE)
+            continue;
+        ty = dom_get_attr(n, "type");
+        if (ty && *ty && !ci_eq_n(ty, strlen(ty), "text/css", 8))
+            continue;
+        for (ch = n->first_child; ch; ch = ch->next_sibling) {
+            if (ch->type == DOM_TEXT && ch->text && ch->text_len &&
+                used + ch->text_len + 1 <= cap) {
+                memcpy(buf + used, ch->text, ch->text_len);
+                used += ch->text_len;
+            }
+        }
+        if (used < cap)
+            buf[used++] = '\n';
+    }
+    buf[used] = 0;
+    memset(&media, 0, sizeof(media));
+    media.width = (int32_t)(j->viewport_width ? j->viewport_width : 900);
+    media.height = (int32_t)(j->viewport_height ? j->viewport_height : 620);
+    media.dpi = 96;
+    media.screen = 1;
+    media.scripting = 1;
+    if (used)
+        j->author_sheet = css_parse(buf, used, CSS_ORIGIN_AUTHOR, &media);
+    free(buf);
+    return j->author_sheet;
+}
+
+static void computed_fmt_thousandths(char *out, unsigned long outsz,
+                                     int32_t v, const char *unit)
+{
+    int neg = 0;
+    uint32_t av, whole, frac;
+
+    if (!outsz)
+        return;
+    if (v < 0) {
+        neg = 1;
+        av = (uint32_t)(-(int64_t)v);
+    } else {
+        av = (uint32_t)v;
+    }
+    whole = av / 1000u;
+    frac = av % 1000u;
+    if (!frac) {
+        snprintf(out, outsz, "%s%u%s", neg ? "-" : "",
+                 (unsigned)whole, unit);
+    } else {
+        char fbuf[8];
+        int flen = 3;
+
+        snprintf(fbuf, sizeof(fbuf), "%03u", (unsigned)frac);
+        while (flen > 1 && fbuf[flen - 1] == '0')
+            fbuf[--flen] = 0;
+        snprintf(out, outsz, "%s%u.%s%s", neg ? "-" : "",
+                 (unsigned)whole, fbuf, unit);
+    }
 }
 
 static void computed_len(char *out, unsigned long outsz, struct css_len v)
@@ -8619,11 +9922,9 @@ static void computed_len(char *out, unsigned long outsz, struct css_len v)
     if (v.type == CSS_LEN_PX)
         snprintf(out, outsz, "%dpx", v.v);
     else if (v.type == CSS_LEN_PCT)
-        snprintf(out, outsz, "%d.%03d%%", v.v / 1000,
-                 v.v < 0 ? -(v.v % 1000) : v.v % 1000);
+        computed_fmt_thousandths(out, outsz, v.v, "%");
     else if (v.type == CSS_LEN_NUMBER)
-        snprintf(out, outsz, "%d.%03d", v.v / 1000,
-                 v.v < 0 ? -(v.v % 1000) : v.v % 1000);
+        computed_fmt_thousandths(out, outsz, v.v, "");
     else if (v.type == CSS_LEN_NONE)
         snprintf(out, outsz, "none");
     else if (v.type == CSS_LEN_NORMAL)
@@ -8632,66 +9933,898 @@ static void computed_len(char *out, unsigned long outsz, struct css_len v)
         snprintf(out, outsz, "auto");
 }
 
+static void computed_fmt_color(char *out, unsigned long outsz, uint32_t col)
+{
+    uint32_t a = CSS_COLOR_A(col);
+    uint32_t r = CSS_COLOR_R(col);
+    uint32_t g = CSS_COLOR_G(col);
+    uint32_t b = CSS_COLOR_B(col);
+
+    if (a == 0) {
+        snprintf(out, outsz, "rgba(0, 0, 0, 0)");
+    } else if (a == 255) {
+        snprintf(out, outsz, "rgb(%u, %u, %u)",
+                 (unsigned)r, (unsigned)g, (unsigned)b);
+    } else {
+        char abuf[16];
+        uint32_t ath = (a * 1000u + 127u) / 255u;
+
+        computed_fmt_thousandths(abuf, sizeof(abuf), (int32_t)ath, "");
+        snprintf(out, outsz, "rgba(%u, %u, %u, %s)",
+                 (unsigned)r, (unsigned)g, (unsigned)b, abuf);
+    }
+}
+
+static const char *computed_kw_str(uint16_t prop_id, int16_t kw)
+{
+    const char *const *tab = 0;
+    unsigned n = 0;
+    unsigned idx = (unsigned)kw;
+
+    switch (prop_id) {
+    case CSS_PROP_DISPLAY:        tab = display_names; n = sizeof(display_names) / sizeof(display_names[0]); break;
+    case CSS_PROP_POSITION:       tab = position_names; n = sizeof(position_names) / sizeof(position_names[0]); break;
+    case CSS_PROP_FLOAT:          tab = float_names; n = sizeof(float_names) / sizeof(float_names[0]); break;
+    case CSS_PROP_CLEAR:          tab = clear_names; n = sizeof(clear_names) / sizeof(clear_names[0]); break;
+    case CSS_PROP_TEXT_ALIGN:     tab = align_names; n = sizeof(align_names) / sizeof(align_names[0]); break;
+    case CSS_PROP_VERTICAL_ALIGN: tab = valign_names; n = sizeof(valign_names) / sizeof(valign_names[0]); break;
+    case CSS_PROP_WHITE_SPACE:    tab = whitespace_names; n = sizeof(whitespace_names) / sizeof(whitespace_names[0]); break;
+    case CSS_PROP_OVERFLOW:       tab = overflow_names; n = sizeof(overflow_names) / sizeof(overflow_names[0]); break;
+    case CSS_PROP_VISIBILITY:     tab = visibility_names; n = sizeof(visibility_names) / sizeof(visibility_names[0]); break;
+    case CSS_PROP_FONT_STYLE:     tab = fontstyle_names; n = sizeof(fontstyle_names) / sizeof(fontstyle_names[0]); break;
+    case CSS_PROP_FONT_FAMILY:    tab = fontfamily_names; n = sizeof(fontfamily_names) / sizeof(fontfamily_names[0]); break;
+    case CSS_PROP_BORDER_TOP_STYLE:
+    case CSS_PROP_BORDER_RIGHT_STYLE:
+    case CSS_PROP_BORDER_BOTTOM_STYLE:
+    case CSS_PROP_BORDER_LEFT_STYLE:
+        tab = borderstyle_names; n = sizeof(borderstyle_names) / sizeof(borderstyle_names[0]); break;
+    case CSS_PROP_LIST_STYLE_TYPE: tab = liststyle_names; n = sizeof(liststyle_names) / sizeof(liststyle_names[0]); break;
+    case CSS_PROP_LIST_STYLE_POSITION: tab = listpos_names; n = sizeof(listpos_names) / sizeof(listpos_names[0]); break;
+    case CSS_PROP_BORDER_COLLAPSE: tab = bordercollapse_names; n = sizeof(bordercollapse_names) / sizeof(bordercollapse_names[0]); break;
+    case CSS_PROP_TEXT_TRANSFORM: tab = texttransform_names; n = sizeof(texttransform_names) / sizeof(texttransform_names[0]); break;
+    case CSS_PROP_BOX_SIZING:     tab = boxsizing_names; n = sizeof(boxsizing_names) / sizeof(boxsizing_names[0]); break;
+    case CSS_PROP_FLEX_DIRECTION: tab = flexdir_names; n = sizeof(flexdir_names) / sizeof(flexdir_names[0]); break;
+    case CSS_PROP_FLEX_WRAP:      tab = flexwrap_names; n = sizeof(flexwrap_names) / sizeof(flexwrap_names[0]); break;
+    case CSS_PROP_JUSTIFY_CONTENT: tab = justify_names; n = sizeof(justify_names) / sizeof(justify_names[0]); break;
+    case CSS_PROP_ALIGN_ITEMS:    tab = alignitems_names; n = sizeof(alignitems_names) / sizeof(alignitems_names[0]); break;
+    case CSS_PROP_COLOR_SCHEME:   tab = colorscheme_names; n = sizeof(colorscheme_names) / sizeof(colorscheme_names[0]); break;
+    case CSS_PROP_FONT_SIZE:      tab = fontsizekw_names; n = sizeof(fontsizekw_names) / sizeof(fontsizekw_names[0]); break;
+    case CSS_PROP_FONT_WEIGHT:    tab = fontweightkw_names; n = sizeof(fontweightkw_names) / sizeof(fontweightkw_names[0]); break;
+    default: break;
+    }
+    if (tab && idx < n && tab[idx][0] != '\1')
+        return tab[idx];
+    return "";
+}
+
+static const char *computed_ua_display(const struct dom_node *node)
+{
+    static const char *const none_tags[] = {
+        "head", "style", "script", "link", "meta", "title", "base",
+        "template", "datalist", "noscript", "param", "source", "track", 0
+    };
+    static const char *const inline_tags[] = {
+        "span", "a", "em", "strong", "b", "i", "u", "s", "small", "big",
+        "code", "kbd", "samp", "var", "cite", "q", "abbr", "dfn", "sub",
+        "sup", "time", "mark", "bdi", "bdo", "br", "wbr", "label", "img",
+        "input", "button", "select", "textarea", "canvas", "svg", "audio",
+        "video", "iframe", 0
+    };
+    const char *tag;
+    int i;
+
+    if (!node || !node->tag)
+        return "block";
+    tag = node->tag;
+    if (node->namespace_id == DOM_NS_SVG && strcmp(tag, "svg") != 0)
+        return "inline";
+    for (i = 0; none_tags[i]; i++)
+        if (!strcmp(tag, none_tags[i]))
+            return "none";
+    if (!strcmp(tag, "li")) return "list-item";
+    if (!strcmp(tag, "table")) return "table";
+    if (!strcmp(tag, "tr")) return "table-row";
+    if (!strcmp(tag, "td") || !strcmp(tag, "th")) return "table-cell";
+    if (!strcmp(tag, "tbody")) return "table-row-group";
+    if (!strcmp(tag, "thead")) return "table-header-group";
+    if (!strcmp(tag, "tfoot")) return "table-footer-group";
+    for (i = 0; inline_tags[i]; i++)
+        if (!strcmp(tag, inline_tags[i]))
+            return "inline";
+    return "block";
+}
+
+struct computed_cascade_match {
+    uint16_t prop_id;
+    const char *custom_name;
+    int has_winner;
+    int best_important;
+    uint8_t best_origin;
+    uint32_t best_spec;
+    uint32_t best_order;
+    struct css_value val;
+    const char *custom_val;
+};
+
+static int computed_beats(const struct computed_cascade_match *m,
+                          int imp, uint8_t origin,
+                          uint32_t spec, uint32_t order)
+{
+    if (!m->has_winner)
+        return 1;
+    if (imp != m->best_important)
+        return imp > m->best_important;
+    if (origin != m->best_origin)
+        return origin > m->best_origin;
+    if (spec != m->best_spec)
+        return spec > m->best_spec;
+    return order >= m->best_order;
+}
+
+static void computed_apply_rule(struct computed_cascade_match *m,
+                                const struct css_rule *r, uint8_t origin)
+{
+    int i;
+
+    if (!m || !r)
+        return;
+    if (m->custom_name) {
+        for (i = 0; i < r->ncustom; i++) {
+            const struct css_custom_decl *cd = &r->customs[i];
+            if (cd->name && !strcmp(cd->name, m->custom_name) &&
+                computed_beats(m, cd->important, origin,
+                               r->sel.specificity, r->order)) {
+                m->has_winner = 1;
+                m->best_important = cd->important;
+                m->best_origin = origin;
+                m->best_spec = r->sel.specificity;
+                m->best_order = r->order;
+                m->custom_val = cd->value ? cd->value : "";
+            }
+        }
+        return;
+    }
+    for (i = 0; i < r->ndecl; i++) {
+        const struct css_decl *d = &r->decls[i];
+        if (d->prop == m->prop_id &&
+            computed_beats(m, d->important, origin,
+                           r->sel.specificity, r->order)) {
+            m->has_winner = 1;
+            m->best_important = d->important;
+            m->best_origin = origin;
+            m->best_spec = r->sel.specificity;
+            m->best_order = r->order;
+            m->val = d->val;
+        }
+    }
+}
+
+static void computed_rule_cb(void *ctx, const struct css_rule *r)
+{
+    computed_apply_rule((struct computed_cascade_match *)ctx, r,
+                        CSS_ORIGIN_AUTHOR);
+}
+
+static void computed_resolve_prop(struct jsdom *j, struct dom_node *node,
+                                  const char *prop, char *out,
+                                  unsigned long outsz, int depth);
+
+static void computed_expand_var(struct jsdom *j, struct dom_node *node,
+                                const char *expr, char *out,
+                                unsigned long outsz, int depth)
+{
+    const char *p, *comma = 0;
+    char vname[128], fb[256];
+    unsigned long nlen;
+    int paren = 0;
+
+    if (!expr || depth > 8) {
+        snprintf(out, outsz, "%s", expr ? expr : "");
+        return;
+    }
+    while (*expr == ' ' || *expr == '\t') expr++;
+    if (strncmp(expr, "var(", 4) != 0) {
+        snprintf(out, outsz, "%s", expr);
+        return;
+    }
+    p = expr + 4;
+    while (*p == ' ' || *p == '\t') p++;
+    for (nlen = 0; p[nlen] && p[nlen] != ',' && p[nlen] != ')' &&
+                   p[nlen] != ' ' && p[nlen] != '\t' &&
+                   nlen < sizeof(vname) - 1; nlen++)
+        vname[nlen] = p[nlen];
+    vname[nlen] = 0;
+    if (strncmp(vname, "--", 2) == 0) {
+        out[0] = 0;
+        computed_resolve_prop(j, node, vname, out, outsz, depth + 1);
+        if (out[0])
+            return;
+    }
+    while (p[nlen] && (p[nlen] == ' ' || p[nlen] == '\t'))
+        nlen++;
+    if (p[nlen] == ',') {
+        const char *fstart = p + nlen + 1;
+        const char *fend;
+
+        while (*fstart == ' ' || *fstart == '\t') fstart++;
+        fend = fstart;
+        while (*fend) {
+            if (*fend == '(') paren++;
+            else if (*fend == ')') {
+                if (paren == 0) break;
+                paren--;
+            }
+            fend++;
+        }
+        while (fend > fstart && (fend[-1] == ' ' || fend[-1] == '\t'))
+            fend--;
+        nlen = (unsigned long)(fend - fstart);
+        if (nlen >= sizeof(fb)) nlen = sizeof(fb) - 1;
+        memcpy(fb, fstart, nlen);
+        fb[nlen] = 0;
+        (void)comma;
+        if (strncmp(fb, "var(", 4) == 0)
+            computed_expand_var(j, node, fb, out, outsz, depth + 1);
+        else
+            snprintf(out, outsz, "%s", fb);
+        return;
+    }
+    out[0] = 0;
+}
+
+static void computed_fmt_css_value(struct jsdom *j, struct dom_node *node,
+                                   uint16_t prop_id, const char *prop,
+                                   const struct css_value *v,
+                                   char *out, unsigned long outsz, int depth)
+{
+    static const char *const units[] = {
+        "", "px", "em", "rem", "ex", "ch", "pt", "pc", "cm", "mm", "in",
+        "vw", "vh"
+    };
+    const char *u;
+
+    if (!v || !outsz)
+        return;
+    switch (v->type) {
+    case CSS_VAL_KEYWORD:
+        if (prop_id == CSS_PROP_FONT_WEIGHT) {
+            if (v->kw == CSS_FONTWEIGHTKW_BOLD)
+                snprintf(out, outsz, "700");
+            else if (v->kw == CSS_FONTWEIGHTKW_NORMAL)
+                snprintf(out, outsz, "400");
+            else
+                snprintf(out, outsz, "%s",
+                         computed_kw_str(prop_id, v->kw));
+        } else {
+            const char *kw = computed_kw_str(prop_id, v->kw);
+            if ((prop_id == CSS_PROP_COLOR ||
+                 prop_id == CSS_PROP_BACKGROUND_COLOR) &&
+                (!kw || !*kw))
+                snprintf(out, outsz, "%s",
+                         prop_id == CSS_PROP_COLOR ? "rgb(0, 0, 0)" :
+                         "rgba(0, 0, 0, 0)");
+            else
+                snprintf(out, outsz, "%s", kw);
+        }
+        break;
+    case CSS_VAL_COLOR:
+        computed_fmt_color(out, outsz, v->color);
+        break;
+    case CSS_VAL_LENGTH:
+        if (v->unit == CSS_UNIT_REM) {
+            computed_fmt_thousandths(out, outsz, v->num * 16, "px");
+        } else {
+            u = v->unit < sizeof(units) / sizeof(units[0]) ? units[v->unit] : "px";
+            computed_fmt_thousandths(out, outsz, v->num, u);
+        }
+        break;
+    case CSS_VAL_NUMBER:
+        computed_fmt_thousandths(out, outsz, v->num, "");
+        break;
+    case CSS_VAL_PERCENT:
+        computed_fmt_thousandths(out, outsz, v->num, "%");
+        break;
+    case CSS_VAL_AUTO:
+        snprintf(out, outsz, "auto");
+        break;
+    case CSS_VAL_BITS:
+        if (!v->kw) {
+            snprintf(out, outsz, "none");
+        } else {
+            out[0] = 0;
+            if (v->kw & CSS_DECOR_UNDERLINE) strcat(out, "underline");
+            if (v->kw & CSS_DECOR_OVERLINE) {
+                if (out[0]) strcat(out, " ");
+                strcat(out, "overline");
+            }
+            if (v->kw & CSS_DECOR_LINETHRU) {
+                if (out[0]) strcat(out, " ");
+                strcat(out, "line-through");
+            }
+            if (v->kw & CSS_DECOR_BLINK) {
+                if (out[0]) strcat(out, " ");
+                strcat(out, "blink");
+            }
+        }
+        break;
+    case CSS_VAL_RAW_EXPR:
+        if (v->str && strncmp(v->str, "var(", 4) == 0) {
+            char resolved[256];
+            uint32_t col;
+
+            computed_expand_var(j, node, v->str, resolved, sizeof(resolved),
+                                depth);
+            if ((prop_id == CSS_PROP_COLOR ||
+                 prop_id == CSS_PROP_BACKGROUND_COLOR ||
+                 prop_id == CSS_PROP_BORDER_TOP_COLOR ||
+                 prop_id == CSS_PROP_BORDER_RIGHT_COLOR ||
+                 prop_id == CSS_PROP_BORDER_BOTTOM_COLOR ||
+                 prop_id == CSS_PROP_BORDER_LEFT_COLOR) &&
+                resolved[0] && css_parse_color_string(resolved, &col)) {
+                computed_fmt_color(out, outsz, col);
+            } else {
+                snprintf(out, outsz, "%s", resolved);
+            }
+        } else {
+            snprintf(out, outsz, "%s", v->str ? v->str : "");
+        }
+        break;
+    case CSS_VAL_URL:
+        if (v->str && strncmp(v->str, "url(", 4) == 0)
+            snprintf(out, outsz, "%s", v->str);
+        else
+            snprintf(out, outsz, "url(\"%s\")", v->str ? v->str : "");
+        break;
+    case CSS_VAL_STRING:
+    case CSS_VAL_IDENT:
+        snprintf(out, outsz, "%s", v->str ? v->str : "");
+        break;
+    default:
+        (void)prop;
+        out[0] = 0;
+        break;
+    }
+}
+
+static int computed_from_node_style(struct dom_node *node, uint16_t prop_id,
+                                    char *out, unsigned long outsz)
+{
+    const struct computed_style *s =
+        node ? (const struct computed_style *)node->style : 0;
+
+    if (!s || !outsz)
+        return 0;
+    switch (prop_id) {
+    case CSS_PROP_DISPLAY:
+        if (s->display < sizeof(display_names) / sizeof(display_names[0])) {
+            snprintf(out, outsz, "%s", display_names[s->display]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_POSITION:
+        if (s->position < sizeof(position_names) / sizeof(position_names[0])) {
+            snprintf(out, outsz, "%s", position_names[s->position]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_FLOAT:
+        if (s->css_float < sizeof(float_names) / sizeof(float_names[0])) {
+            snprintf(out, outsz, "%s", float_names[s->css_float]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_CLEAR:
+        if (s->clear < sizeof(clear_names) / sizeof(clear_names[0])) {
+            snprintf(out, outsz, "%s", clear_names[s->clear]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_TEXT_ALIGN:
+        if (s->text_align < sizeof(align_names) / sizeof(align_names[0])) {
+            snprintf(out, outsz, "%s", align_names[s->text_align]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_VISIBILITY:
+        if (s->visibility < sizeof(visibility_names) / sizeof(visibility_names[0])) {
+            snprintf(out, outsz, "%s", visibility_names[s->visibility]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_FONT_STYLE:
+        if (s->font_style < sizeof(fontstyle_names) / sizeof(fontstyle_names[0])) {
+            snprintf(out, outsz, "%s", fontstyle_names[s->font_style]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_FONT_FAMILY:
+        if (s->font_family_name && s->font_family_name[0]) {
+            snprintf(out, outsz, "%s", s->font_family_name);
+            return 1;
+        }
+        if (s->font_family < sizeof(fontfamily_names) / sizeof(fontfamily_names[0])) {
+            snprintf(out, outsz, "%s", fontfamily_names[s->font_family]);
+            return 1;
+        }
+        break;
+    case CSS_PROP_COLOR:
+        computed_fmt_color(out, outsz, s->color);
+        return 1;
+    case CSS_PROP_BACKGROUND_COLOR:
+        computed_fmt_color(out, outsz, s->background_color);
+        return 1;
+    case CSS_PROP_OPACITY:
+        computed_fmt_thousandths(out, outsz, (int32_t)s->opacity, "");
+        return 1;
+    case CSS_PROP_FONT_SIZE:
+        snprintf(out, outsz, "%dpx", s->font_size);
+        return 1;
+    case CSS_PROP_FONT_WEIGHT:
+        snprintf(out, outsz, "%u", (unsigned)s->font_weight);
+        return 1;
+    case CSS_PROP_WIDTH:
+        if (s->width.type != CSS_LEN_AUTO) {
+            computed_len(out, outsz, s->width);
+            return 1;
+        }
+        break;
+    case CSS_PROP_HEIGHT:
+        if (s->height.type != CSS_LEN_AUTO) {
+            computed_len(out, outsz, s->height);
+            return 1;
+        }
+        break;
+    case CSS_PROP_LINE_HEIGHT:
+        computed_len(out, outsz, s->line_height);
+        return 1;
+    case CSS_PROP_Z_INDEX:
+        if (s->z_auto)
+            snprintf(out, outsz, "auto");
+        else
+            snprintf(out, outsz, "%d", s->z_index);
+        return 1;
+    case CSS_PROP_BORDER_TL_RADIUS:
+    case CSS_PROP_BORDER_TR_RADIUS:
+    case CSS_PROP_BORDER_BR_RADIUS:
+    case CSS_PROP_BORDER_BL_RADIUS:
+        snprintf(out, outsz, "%dpx",
+                 s->border_radius[prop_id - CSS_PROP_BORDER_TL_RADIUS]);
+        return 1;
+    case CSS_PROP_MARGIN_TOP:
+    case CSS_PROP_MARGIN_RIGHT:
+    case CSS_PROP_MARGIN_BOTTOM:
+    case CSS_PROP_MARGIN_LEFT:
+        computed_len(out, outsz, s->margin[prop_id - CSS_PROP_MARGIN_TOP]);
+        return 1;
+    case CSS_PROP_PADDING_TOP:
+    case CSS_PROP_PADDING_RIGHT:
+    case CSS_PROP_PADDING_BOTTOM:
+    case CSS_PROP_PADDING_LEFT:
+        computed_len(out, outsz, s->padding[prop_id - CSS_PROP_PADDING_TOP]);
+        return 1;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static void computed_initial_value(struct jsdom *j, struct dom_node *node,
+                                   uint16_t prop_id, const char *prop,
+                                   char *out, unsigned long outsz)
+{
+    if (!outsz)
+        return;
+    out[0] = 0;
+    if (prop && prop[0] == '-' && prop[1] == '-')
+        return;
+    switch (prop_id) {
+    case CSS_PROP_DISPLAY:
+        snprintf(out, outsz, "%s", computed_ua_display(node));
+        return;
+    case CSS_PROP_POSITION:
+        snprintf(out, outsz, "static");
+        return;
+    case CSS_PROP_FLOAT:
+    case CSS_PROP_CLEAR:
+    case CSS_PROP_TEXT_DECORATION:
+    case CSS_PROP_TEXT_TRANSFORM:
+    case CSS_PROP_LIST_STYLE_TYPE:
+    case CSS_PROP_BORDER_TOP_STYLE:
+    case CSS_PROP_BORDER_RIGHT_STYLE:
+    case CSS_PROP_BORDER_BOTTOM_STYLE:
+    case CSS_PROP_BORDER_LEFT_STYLE:
+    case CSS_PROP_MAX_WIDTH:
+    case CSS_PROP_MAX_HEIGHT:
+    case CSS_PROP_BOX_SHADOW:
+    case CSS_PROP_BACKGROUND_IMAGE:
+        snprintf(out, outsz, "none");
+        return;
+    case CSS_PROP_VISIBILITY:
+        snprintf(out, outsz, "visible");
+        return;
+    case CSS_PROP_OVERFLOW:
+        snprintf(out, outsz, "visible");
+        return;
+    case CSS_PROP_COLOR:
+        snprintf(out, outsz, "rgb(0, 0, 0)");
+        return;
+    case CSS_PROP_BACKGROUND_COLOR:
+        snprintf(out, outsz, "rgba(0, 0, 0, 0)");
+        return;
+    case CSS_PROP_OPACITY:
+    case CSS_PROP_FLEX_SHRINK:
+        snprintf(out, outsz, "1");
+        return;
+    case CSS_PROP_FLEX_GROW:
+        snprintf(out, outsz, "0");
+        return;
+    case CSS_PROP_FONT_SIZE:
+        snprintf(out, outsz, "16px");
+        return;
+    case CSS_PROP_FONT_WEIGHT:
+        if (node && node->tag &&
+            (!strcmp(node->tag, "b") || !strcmp(node->tag, "strong") ||
+             !strcmp(node->tag, "h1") || !strcmp(node->tag, "h2") ||
+             !strcmp(node->tag, "h3") || !strcmp(node->tag, "h4") ||
+             !strcmp(node->tag, "h5") || !strcmp(node->tag, "h6") ||
+             !strcmp(node->tag, "th")))
+            snprintf(out, outsz, "700");
+        else
+            snprintf(out, outsz, "400");
+        return;
+    case CSS_PROP_FONT_STYLE:
+        if (node && node->tag &&
+            (!strcmp(node->tag, "em") || !strcmp(node->tag, "i") ||
+             !strcmp(node->tag, "cite")))
+            snprintf(out, outsz, "italic");
+        else
+            snprintf(out, outsz, "normal");
+        return;
+    case CSS_PROP_FONT_FAMILY:
+        snprintf(out, outsz, "sans-serif");
+        return;
+    case CSS_PROP_TEXT_ALIGN:
+        snprintf(out, outsz, "start");
+        return;
+    case CSS_PROP_LINE_HEIGHT:
+    case CSS_PROP_WHITE_SPACE:
+    case CSS_PROP_JUSTIFY_CONTENT:
+    case CSS_PROP_ALIGN_ITEMS:
+    case CSS_PROP_GAP:
+    case CSS_PROP_ROW_GAP:
+    case CSS_PROP_COLUMN_GAP:
+    case CSS_PROP_COLOR_SCHEME:
+        snprintf(out, outsz, "normal");
+        return;
+    case CSS_PROP_BOX_SIZING:
+        snprintf(out, outsz, "content-box");
+        return;
+    case CSS_PROP_FLEX_DIRECTION:
+        snprintf(out, outsz, "row");
+        return;
+    case CSS_PROP_FLEX_WRAP:
+        snprintf(out, outsz, "nowrap");
+        return;
+    case CSS_PROP_BORDER_COLLAPSE:
+        snprintf(out, outsz, "separate");
+        return;
+    case CSS_PROP_LIST_STYLE_POSITION:
+        snprintf(out, outsz, "outside");
+        return;
+    case CSS_PROP_VERTICAL_ALIGN:
+        snprintf(out, outsz, "baseline");
+        return;
+    case CSS_PROP_MARGIN_TOP:
+    case CSS_PROP_MARGIN_RIGHT:
+    case CSS_PROP_MARGIN_BOTTOM:
+    case CSS_PROP_MARGIN_LEFT:
+    case CSS_PROP_PADDING_TOP:
+    case CSS_PROP_PADDING_RIGHT:
+    case CSS_PROP_PADDING_BOTTOM:
+    case CSS_PROP_PADDING_LEFT:
+    case CSS_PROP_BORDER_TOP_WIDTH:
+    case CSS_PROP_BORDER_RIGHT_WIDTH:
+    case CSS_PROP_BORDER_BOTTOM_WIDTH:
+    case CSS_PROP_BORDER_LEFT_WIDTH:
+    case CSS_PROP_BORDER_TL_RADIUS:
+    case CSS_PROP_BORDER_TR_RADIUS:
+    case CSS_PROP_BORDER_BR_RADIUS:
+    case CSS_PROP_BORDER_BL_RADIUS:
+    case CSS_PROP_MIN_WIDTH:
+    case CSS_PROP_MIN_HEIGHT:
+    case CSS_PROP_TEXT_INDENT:
+    case CSS_PROP_BORDER_SPACING:
+        snprintf(out, outsz, "0px");
+        return;
+    case CSS_PROP_WIDTH:
+    case CSS_PROP_HEIGHT:
+        if (j && j->get_box_rect && node) {
+            float bx = 0, by = 0, bw = 0, bh = 0;
+            if (j->get_box_rect(j->print_user, node, &bx, &by, &bw, &bh)) {
+                snprintf(out, outsz, "%dpx",
+                         (int)(prop_id == CSS_PROP_WIDTH ? bw : bh));
+                return;
+            }
+        }
+        snprintf(out, outsz, "auto");
+        return;
+    case CSS_PROP_TOP:
+    case CSS_PROP_RIGHT:
+    case CSS_PROP_BOTTOM:
+    case CSS_PROP_LEFT:
+    case CSS_PROP_Z_INDEX:
+    case CSS_PROP_FLEX_BASIS:
+    case CSS_PROP_GRID_COL_START:
+    case CSS_PROP_GRID_COL_END:
+    case CSS_PROP_GRID_ROW_START:
+    case CSS_PROP_GRID_ROW_END:
+        snprintf(out, outsz, "auto");
+        return;
+    default:
+        break;
+    }
+    if (prop) {
+        if (!strcmp(prop, "border-radius") || !strcmp(prop, "margin") ||
+            !strcmp(prop, "padding"))
+            snprintf(out, outsz, "0px");
+        else if (!strcmp(prop, "pointer-events"))
+            snprintf(out, outsz, "auto");
+        else if (!strcmp(prop, "overflow-x") || !strcmp(prop, "overflow-y"))
+            snprintf(out, outsz, "visible");
+        else if (!strcmp(prop, "transform"))
+            snprintf(out, outsz, "none");
+        else if (!strcmp(prop, "cursor"))
+            snprintf(out, outsz, "auto");
+    }
+}
+
+static void computed_resolve_prop(struct jsdom *j, struct dom_node *node,
+                                  const char *prop, char *out,
+                                  unsigned long outsz, int depth)
+{
+    struct css_stylesheet *author, *inline_ss;
+    struct computed_cascade_match m;
+    const char *inline_css;
+    struct dom_node *parent;
+    int is_custom;
+    uint16_t prop_id;
+
+    if (!outsz)
+        return;
+    out[0] = 0;
+    if (!j || !node || node->type != DOM_ELEMENT || !prop || !*prop ||
+        depth > 64)
+        return;
+    is_custom = (prop[0] == '-' && prop[1] == '-');
+    if (!is_custom) {
+        if (!strcmp(prop, "margin") || !strcmp(prop, "padding") ||
+            !strcmp(prop, "border-radius")) {
+            char a[48], b[48], cv[48], d[48];
+            const char *p0 = !strcmp(prop, "margin") ? "margin-top" :
+                             !strcmp(prop, "padding") ? "padding-top" :
+                             "border-top-left-radius";
+            const char *p1 = !strcmp(prop, "margin") ? "margin-right" :
+                             !strcmp(prop, "padding") ? "padding-right" :
+                             "border-top-right-radius";
+            const char *p2 = !strcmp(prop, "margin") ? "margin-bottom" :
+                             !strcmp(prop, "padding") ? "padding-bottom" :
+                             "border-bottom-right-radius";
+            const char *p3 = !strcmp(prop, "margin") ? "margin-left" :
+                             !strcmp(prop, "padding") ? "padding-left" :
+                             "border-bottom-left-radius";
+
+            computed_resolve_prop(j, node, p0, a, sizeof(a), depth + 1);
+            computed_resolve_prop(j, node, p1, b, sizeof(b), depth + 1);
+            computed_resolve_prop(j, node, p2, cv, sizeof(cv), depth + 1);
+            computed_resolve_prop(j, node, p3, d, sizeof(d), depth + 1);
+            if (!strcmp(a, b) && !strcmp(a, cv) && !strcmp(a, d))
+                snprintf(out, outsz, "%s", a);
+            else if (!strcmp(a, cv) && !strcmp(b, d))
+                snprintf(out, outsz, "%s %s", a, b);
+            else
+                snprintf(out, outsz, "%s %s %s %s", a, b, cv, d);
+            return;
+        }
+        if (!strcmp(prop, "border-width") || !strcmp(prop, "border-style") ||
+            !strcmp(prop, "border-color")) {
+            char a[64], b[64], cv[64], d[64];
+            const char *suf = prop + 6;
+            char p0[32], p1[32], p2[32], p3[32];
+
+            snprintf(p0, sizeof(p0), "border-top%s", suf);
+            snprintf(p1, sizeof(p1), "border-right%s", suf);
+            snprintf(p2, sizeof(p2), "border-bottom%s", suf);
+            snprintf(p3, sizeof(p3), "border-left%s", suf);
+            computed_resolve_prop(j, node, p0, a, sizeof(a), depth + 1);
+            computed_resolve_prop(j, node, p1, b, sizeof(b), depth + 1);
+            computed_resolve_prop(j, node, p2, cv, sizeof(cv), depth + 1);
+            computed_resolve_prop(j, node, p3, d, sizeof(d), depth + 1);
+            if (!strcmp(a, b) && !strcmp(a, cv) && !strcmp(a, d))
+                snprintf(out, outsz, "%s", a);
+            else
+                snprintf(out, outsz, "%s %s %s %s", a, b, cv, d);
+            return;
+        }
+    }
+    prop_id = is_custom ? CSS_PROP_NONE : (uint16_t)css_property_id(prop);
+    memset(&m, 0, sizeof(m));
+    m.prop_id = prop_id;
+    m.custom_name = is_custom ? prop : 0;
+
+    if (j->external_sheet && (is_custom || prop_id != CSS_PROP_NONE))
+        css_match(j->external_sheet, node, &jsdom_css_ops, computed_rule_cb, &m);
+    author = ensure_author_stylesheet(j);
+    if (author && (is_custom || prop_id != CSS_PROP_NONE))
+        css_match(author, node, &jsdom_css_ops, computed_rule_cb, &m);
+    inline_css = dom_get_attr(node, "style");
+    if (inline_css && *inline_css && (is_custom || prop_id != CSS_PROP_NONE)) {
+        inline_ss = css_parse_style_attr(inline_css);
+        if (inline_ss) {
+            int i, rc = css_rule_count(inline_ss);
+            for (i = 0; i < rc; i++)
+                computed_apply_rule(&m, css_rule_at(inline_ss, i),
+                                    CSS_ORIGIN_INLINE);
+            css_free(inline_ss);
+        }
+    }
+    if (!m.has_winner && !is_custom && prop_id == CSS_PROP_NONE &&
+        inline_css && *inline_css) {
+        char *raw = style_property_copy(inline_css, prop, 0);
+        if (raw) {
+            snprintf(out, outsz, "%s", raw);
+            free(raw);
+            return;
+        }
+    }
+    if (m.has_winner) {
+        if (is_custom) {
+            if (m.custom_val && strncmp(m.custom_val, "var(", 4) == 0)
+                computed_expand_var(j, node, m.custom_val, out, outsz, depth);
+            else
+                snprintf(out, outsz, "%s", m.custom_val ? m.custom_val : "");
+            return;
+        }
+        if (m.val.type == CSS_VAL_INHERIT ||
+            (m.val.type == CSS_VAL_UNSET && css_property_inherited(prop_id))) {
+            parent = dom_parent_element(node);
+            if (parent)
+                computed_resolve_prop(j, parent, prop, out, outsz, depth + 1);
+            if (!out[0])
+                computed_initial_value(j, node, prop_id, prop, out, outsz);
+            return;
+        }
+        if (m.val.type == CSS_VAL_INITIAL || m.val.type == CSS_VAL_UNSET) {
+            computed_initial_value(j, node, prop_id, prop, out, outsz);
+            return;
+        }
+        computed_fmt_css_value(j, node, prop_id, prop, &m.val,
+                               out, outsz, depth);
+        if (out[0])
+            return;
+    }
+    if (computed_from_node_style(node, prop_id, out, outsz))
+        return;
+    if (is_custom ||
+        (prop_id != CSS_PROP_NONE && css_property_inherited(prop_id))) {
+        parent = dom_parent_element(node);
+        if (parent) {
+            computed_resolve_prop(j, parent, prop, out, outsz, depth + 1);
+            if (out[0])
+                return;
+        }
+    }
+    computed_initial_value(j, node, prop_id, prop, out, outsz);
+}
+
+static int computed_style_prop_get(js_ctx *c, js_value t, const char *prop,
+                                   js_value *r)
+{
+    struct hostref *h = host(t, HOST_COMPUTED_STYLE);
+    char buf[256];
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CSSStyleDeclaration receiver");
+    dataset_sync_all(h->j);
+    computed_resolve_prop(h->j, h->node, prop, buf, sizeof(buf), 0);
+    *r = js_mkcstring(c, buf);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int computed_style_get_property_value(js_ctx *c, js_value t,
+                                             int ac, js_value *av, js_value *r)
+{
+    const char *prop;
+
+    if (string_arg(c, ac, av, 0, &prop) != JS_OK)
+        return JS_THROW;
+    return computed_style_prop_get(c, t, prop, r);
+}
+
+static int computed_style_get_property_priority(js_ctx *c, js_value t,
+                                                int ac, js_value *av,
+                                                js_value *r)
+{
+    struct hostref *h = host(t, HOST_COMPUTED_STYLE);
+    const char *prop;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CSSStyleDeclaration receiver");
+    if (string_arg(c, ac, av, 0, &prop) != JS_OK)
+        return JS_THROW;
+    *r = js_mkcstring(c, "");
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int computed_style_readonly(js_ctx *c, js_value t,
+                                   int ac, js_value *av, js_value *r)
+{
+    (void)t; (void)ac; (void)av; (void)r;
+    return throw_dom_exception(c, "NoModificationAllowedError",
+                               "computed style is read-only");
+}
+
+static int computed_style_css_get(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_COMPUTED_STYLE);
+    (void)ac; (void)av;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CSSStyleDeclaration receiver");
+    *r = js_mkcstring(c, "");
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int computed_style_length_get(js_ctx *c, js_value t,
+                                     int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_COMPUTED_STYLE);
+    (void)c; (void)ac; (void)av;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CSSStyleDeclaration receiver");
+    *r = js_number((double)(CSS_PROP_COUNT - 1));
+    return JS_OK;
+}
+
+static int computed_style_item(js_ctx *c, js_value t,
+                               int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_COMPUTED_STYLE);
+    double idx;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CSSStyleDeclaration receiver");
+    if (js_to_integer(c, ac ? av[0] : js_undefined(), &idx) != JS_OK)
+        return JS_THROW;
+    if (idx < 0 || idx >= (double)(CSS_PROP_COUNT - 1)) {
+        *r = js_mkcstring(c, "");
+        return js_fatal(c) ? JS_THROW : JS_OK;
+    }
+    *r = js_mkcstring(c, css_property_name((int)idx + 1));
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
 static int global_computed_style(js_ctx *c, js_value t, int ac,
                                  js_value *av, js_value *r)
 {
     struct hostref *h = ac ? host(av[0], HOST_NODE) : 0;
-    const struct computed_style *s;
     js_object *o;
-    js_value ov;
-    char buf[64];
     (void)t;
 
     if (!h || h->node->type != DOM_ELEMENT)
         return js_throw_error(c, JS_ERR_TYPE,
                               "getComputedStyle requires an Element");
-    o = js_new_object(c);
+    o = new_host(h->j, h->node, HOST_COMPUTED_STYLE,
+                 h->j->computed_style_proto);
     if (!o)
         return JS_THROW;
-    ov = js_object_value(o);
-    s = (const struct computed_style *)h->node->style;
-    if (!s) {
-        *r = ov;
-        return JS_OK;
-    }
-#define ENUM_PUT(prop, value, names) do {                                    \
-    unsigned _v = (unsigned)(value);                                         \
-    if (_v < sizeof(names) / sizeof((names)[0]) &&                            \
-        computed_put(c, ov, prop, (names)[_v]) != JS_OK) return JS_THROW;     \
-} while (0)
-    ENUM_PUT("display", s->display, display_names);
-    ENUM_PUT("position", s->position, position_names);
-    ENUM_PUT("float", s->css_float, float_names);
-    ENUM_PUT("clear", s->clear, clear_names);
-    ENUM_PUT("textAlign", s->text_align, align_names);
-    ENUM_PUT("visibility", s->visibility, visibility_names);
-#undef ENUM_PUT
-    snprintf(buf, sizeof(buf), "rgb(%u, %u, %u)",
-             CSS_COLOR_R(s->color), CSS_COLOR_G(s->color),
-             CSS_COLOR_B(s->color));
-    if (computed_put(c, ov, "color", buf) != JS_OK) return JS_THROW;
-    if (!CSS_COLOR_A(s->background_color)) {
-        snprintf(buf, sizeof(buf), "transparent");
-    } else {
-        snprintf(buf, sizeof(buf), "rgba(%u, %u, %u, %u)",
-                 CSS_COLOR_R(s->background_color),
-                 CSS_COLOR_G(s->background_color),
-                 CSS_COLOR_B(s->background_color),
-                 CSS_COLOR_A(s->background_color));
-    }
-    if (computed_put(c, ov, "backgroundColor", buf) != JS_OK)
-        return JS_THROW;
-    snprintf(buf, sizeof(buf), "%dpx", s->font_size);
-    if (computed_put(c, ov, "fontSize", buf) != JS_OK) return JS_THROW;
-    snprintf(buf, sizeof(buf), "%u", (unsigned)s->font_weight);
-    if (computed_put(c, ov, "fontWeight", buf) != JS_OK) return JS_THROW;
-    computed_len(buf, sizeof(buf), s->width);
-    if (computed_put(c, ov, "width", buf) != JS_OK) return JS_THROW;
-    computed_len(buf, sizeof(buf), s->height);
-    if (computed_put(c, ov, "height", buf) != JS_OK) return JS_THROW;
-    computed_len(buf, sizeof(buf), s->line_height);
-    if (computed_put(c, ov, "lineHeight", buf) != JS_OK) return JS_THROW;
-    *r = ov;
+    *r = js_object_value(o);
     return JS_OK;
 }
 
@@ -13831,6 +15964,2902 @@ static int dom_exception_to_string(js_ctx *c, js_value t,
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
+/* ------------------------------------------------------------------ */
+/* Self-contained math, color & bitmap helpers (freestanding safe)    */
+
+#define JSDOM_PI                3.14159265358979323846
+#define JSDOM_PI2               6.28318530717958647693
+
+static int jsd_isnan(double x) { return x != x; }
+static int jsd_isfinite(double x) { return !jsd_isnan(x) && !jsd_isnan(x - x); }
+static double jsd_fabs(double x) { return x < 0.0 ? -x : x; }
+
+static double jsd_floor(double x)
+{
+    long long i;
+
+    if (!jsd_isfinite(x) || jsd_fabs(x) >= 4503599627370496.0)
+        return x;
+    i = (long long)x;
+    if (x < (double)i)
+        i--;
+    return (double)i;
+}
+
+static double jsd_ceil(double x)
+{
+    return -jsd_floor(-x);
+}
+
+static double jsd_sqrt(double x)
+{
+    double y;
+    int scale = 0, i;
+
+    if (x <= 0.0 || !jsd_isfinite(x))
+        return x == 0.0 ? 0.0 : 0.0;
+    while (x >= 2.0) { x *= 0.25; scale++; }
+    while (x < 0.5) { x *= 4.0; scale--; }
+    y = 0.5 * (1.0 + x);
+    for (i = 0; i < 6; i++)
+        y = 0.5 * (y + x / y);
+    while (scale > 0) { y *= 2.0; scale--; }
+    while (scale < 0) { y *= 0.5; scale++; }
+    return y;
+}
+
+static double jsd_sin(double x)
+{
+    double k, x2, num, res, sign = 1.0;
+
+    if (!jsd_isfinite(x))
+        return 0.0;
+    k = jsd_floor((x + JSDOM_PI) / JSDOM_PI2);
+    x -= k * JSDOM_PI2;
+    if (x < 0.0) { x = -x; sign = -1.0; }
+    if (x > JSDOM_PI * 0.5)
+        x = JSDOM_PI - x;
+    if (x > JSDOM_PI * 0.25) {
+        double c = JSDOM_PI * 0.5 - x;
+        double c2 = c * c;
+        res = 1.0 - c2 * (0.5 - c2 * (1.0 / 24.0 - c2 * (1.0 / 720.0 - c2 / 40320.0)));
+        return sign * res;
+    }
+    x2 = x * x;
+    num = x * x2;
+    res = x - num / 6.0;
+    num *= x2; res += num / 120.0;
+    num *= x2; res -= num / 5040.0;
+    num *= x2; res += num / 362880.0;
+    num *= x2; res -= num / 39916800.0;
+    return sign * res;
+}
+
+static double jsd_cos(double x)
+{
+    return jsd_sin(x + JSDOM_PI * 0.5);
+}
+
+static int jsd_parse_double(const char *s, double *out, const char **endp)
+{
+    int neg = 0, digits = 0;
+    double v = 0.0, frac = 0.1;
+
+    if (!s)
+        return 0;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    if (*s == '+' || *s == '-') {
+        neg = (*s == '-');
+        s++;
+    }
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10.0 + (double)(*s - '0');
+        s++;
+        digits = 1;
+    }
+    if (*s == '.') {
+        s++;
+        while (*s >= '0' && *s <= '9') {
+            v += (double)(*s - '0') * frac;
+            frac *= 0.1;
+            s++;
+            digits = 1;
+        }
+    }
+    if (!digits)
+        return 0;
+    if (neg) v = -v;
+    *out = v;
+    if (endp) *endp = s;
+    return 1;
+}
+
+static int jsd_clamp_u8(double x)
+{
+    if (x <= 0.0) return 0;
+    if (x >= 255.0) return 255;
+    return (int)(x + 0.5);
+}
+
+static int jsdom_parse_color(const char *s, uint32_t *out)
+{
+    char buf[128];
+    unsigned long len, start = 0, end;
+    const char *p;
+    double c[4];
+    int pct[4];
+    int n = 0;
+
+    if (!s || !out)
+        return 0;
+    while (s[start] && (unsigned char)s[start] <= ' ')
+        start++;
+    len = strlen(s + start);
+    while (len > 0 && (unsigned char)s[start + len - 1] <= ' ')
+        len--;
+    if (!len || len >= sizeof(buf))
+        return 0;
+    memcpy(buf, s + start, len);
+    buf[len] = 0;
+    if (css_parse_color_string(buf, out))
+        return 1;
+    (void)end;
+    if (ci_eq_n(buf, 4, "rgb(", 4) || ci_eq_n(buf, 5, "rgba(", 5)) {
+        p = strchr(buf, '(') + 1;
+        while (*p && n < 4) {
+            const char *np;
+
+            while (*p == ' ' || *p == '\t' || *p == ',' || *p == '/')
+                p++;
+            if (*p == ')')
+                break;
+            if (!jsd_parse_double(p, &c[n], &np))
+                return 0;
+            pct[n] = (*np == '%');
+            if (pct[n]) np++;
+            p = np;
+            n++;
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ')' || (n != 3 && n != 4))
+            return 0;
+        {
+            uint32_t r = (uint32_t)jsd_clamp_u8(pct[0] ? c[0] * 2.55 : c[0]);
+            uint32_t g = (uint32_t)jsd_clamp_u8(pct[1] ? c[1] * 2.55 : c[1]);
+            uint32_t b = (uint32_t)jsd_clamp_u8(pct[2] ? c[2] * 2.55 : c[2]);
+            uint32_t a = n == 4
+                ? (uint32_t)jsd_clamp_u8(pct[3] ? c[3] * 2.55 : c[3] * 255.0)
+                : 255u;
+
+            *out = (a << 24) | (r << 16) | (g << 8) | b;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void canvas_fmt_color(uint32_t col, char *out, unsigned long outsz)
+{
+    uint32_t a = CSS_COLOR_A(col);
+    uint32_t r = CSS_COLOR_R(col);
+    uint32_t g = CSS_COLOR_G(col);
+    uint32_t b = CSS_COLOR_B(col);
+
+    if (a == 255) {
+        snprintf(out, outsz, "#%02x%02x%02x",
+                 (unsigned)r, (unsigned)g, (unsigned)b);
+    } else {
+        char abuf[16];
+        uint32_t ath = (a * 1000u + 127u) / 255u;
+
+        computed_fmt_thousandths(abuf, sizeof(abuf), (int32_t)ath, "");
+        snprintf(out, outsz, "rgba(%u, %u, %u, %s)",
+                 (unsigned)r, (unsigned)g, (unsigned)b, abuf);
+    }
+}
+
+/* 5x7 ASCII glyph table (' ' .. '~', LSB = top row, 5 columns per char) */
+static const uint8_t jsdom_font5x7[95][5] = {
+    {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5f,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
+    {0x14,0x7f,0x14,0x7f,0x14},{0x24,0x2a,0x7f,0x2a,0x12},{0x23,0x13,0x08,0x64,0x62},
+    {0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},{0x00,0x1c,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1c,0x00},{0x14,0x08,0x3e,0x08,0x14},{0x08,0x08,0x3e,0x08,0x08},
+    {0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},
+    {0x20,0x10,0x08,0x04,0x02},{0x3e,0x51,0x49,0x45,0x3e},{0x00,0x42,0x7f,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4b,0x31},{0x18,0x14,0x12,0x7f,0x10},
+    {0x27,0x45,0x45,0x45,0x39},{0x3c,0x4a,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1e},{0x00,0x36,0x36,0x00,0x00},
+    {0x00,0x56,0x36,0x00,0x00},{0x08,0x14,0x22,0x41,0x00},{0x14,0x14,0x14,0x14,0x14},
+    {0x00,0x41,0x22,0x14,0x08},{0x02,0x01,0x51,0x09,0x06},{0x32,0x49,0x79,0x41,0x3e},
+    {0x7e,0x11,0x11,0x11,0x7e},{0x7f,0x49,0x49,0x49,0x36},{0x3e,0x41,0x41,0x41,0x22},
+    {0x7f,0x41,0x41,0x22,0x1c},{0x7f,0x49,0x49,0x49,0x41},{0x7f,0x09,0x09,0x09,0x01},
+    {0x3e,0x41,0x49,0x49,0x7a},{0x7f,0x08,0x08,0x08,0x7f},{0x00,0x41,0x7f,0x41,0x00},
+    {0x20,0x40,0x41,0x3f,0x01},{0x7f,0x08,0x14,0x22,0x41},{0x7f,0x40,0x40,0x40,0x40},
+    {0x7f,0x02,0x0c,0x02,0x7f},{0x7f,0x04,0x08,0x10,0x7f},{0x3e,0x41,0x41,0x41,0x3e},
+    {0x7f,0x09,0x09,0x09,0x06},{0x3e,0x41,0x51,0x21,0x5e},{0x7f,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7f,0x01,0x01},{0x3f,0x40,0x40,0x40,0x3f},
+    {0x1f,0x20,0x40,0x20,0x1f},{0x3f,0x40,0x38,0x40,0x3f},{0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7f,0x41,0x41,0x00},
+    {0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7f,0x00},{0x04,0x02,0x01,0x02,0x04},
+    {0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},
+    {0x7f,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7f},
+    {0x38,0x54,0x54,0x54,0x18},{0x08,0x7e,0x09,0x01,0x02},{0x0c,0x52,0x52,0x52,0x3e},
+    {0x7f,0x08,0x04,0x04,0x78},{0x00,0x44,0x7d,0x40,0x00},{0x20,0x40,0x44,0x3d,0x00},
+    {0x7f,0x10,0x28,0x44,0x00},{0x00,0x41,0x7f,0x40,0x00},{0x7c,0x04,0x18,0x04,0x78},
+    {0x7c,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},{0x7c,0x14,0x14,0x14,0x08},
+    {0x08,0x14,0x14,0x18,0x7c},{0x7c,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+    {0x04,0x3f,0x44,0x40,0x20},{0x3c,0x40,0x40,0x20,0x7c},{0x1c,0x20,0x40,0x20,0x1c},
+    {0x3c,0x40,0x30,0x40,0x3c},{0x44,0x28,0x10,0x28,0x44},{0x0c,0x50,0x50,0x50,0x3c},
+    {0x44,0x64,0x54,0x4c,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7f,0x00,0x00},
+    {0x00,0x41,0x36,0x08,0x00},{0x08,0x04,0x08,0x10,0x08}
+};
+
+/* ------------------------------------------------------------------ */
+/* HTMLTemplateElement                                                */
+
+static int template_content_get(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    struct dom_node *frag;
+    (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT ||
+        h->node->tag_id != HTAG_TEMPLATE ||
+        h->node->namespace_id != DOM_NS_HTML)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal HTMLTemplateElement receiver");
+    frag = template_content_node(h->j, h->node);
+    if (!frag)
+        return js_throw_error(c, JS_ERR_ERROR,
+                              "cannot access template content");
+    *r = wrap_node(h->j, frag);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Canvas 2D Backing Store, Rasterizer, ImageData & PNG Export        */
+
+static unsigned int canvas_parse_dim_attr(const char *s, unsigned int def)
+{
+    unsigned long v = 0;
+    int digits = 0;
+
+    if (!s || !*s)
+        return def;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')
+        s++;
+    if (*s == '+')
+        s++;
+    while (*s >= '0' && *s <= '9') {
+        digits = 1;
+        if (v <= JSDOM_CANVAS_MAX_DIM)
+            v = v * 10ul + (unsigned long)(*s - '0');
+        s++;
+    }
+    if (!digits)
+        return def;
+    if (v > JSDOM_CANVAS_MAX_DIM)
+        v = JSDOM_CANVAS_MAX_DIM;
+    return (unsigned int)v;
+}
+
+static void canvas_2d_reset_state(struct canvas_2d_state *st)
+{
+    if (!st)
+        return;
+    st->sp = 0;
+    st->path_n = 0;
+    st->cur.m[0] = 1.0; st->cur.m[1] = 0.0;
+    st->cur.m[2] = 0.0; st->cur.m[3] = 1.0;
+    st->cur.m[4] = 0.0; st->cur.m[5] = 0.0;
+    st->cur.fill_color = 0xFF000000u;
+    st->cur.stroke_color = 0xFF000000u;
+    strcpy(st->cur.fill_str, "#000000");
+    strcpy(st->cur.stroke_str, "#000000");
+    st->cur.line_width = 1.0;
+    st->cur.global_alpha = 1.0;
+    strcpy(st->cur.font, "10px sans-serif");
+    st->cur.font_px = 10.0;
+    st->cur.text_align = 0;
+    st->cur.text_baseline = 0;
+}
+
+static struct dom_canvas *canvas_ensure_buffer(struct jsdom *j,
+                                               struct dom_node *node,
+                                               int force_resize,
+                                               unsigned int req_w,
+                                               unsigned int req_h)
+{
+    unsigned int w, h;
+    struct dom_canvas *cv;
+
+    if (!node || node->type != DOM_ELEMENT || node->tag_id != HTAG_CANVAS)
+        return 0;
+    if (!force_resize && node->canvas)
+        return node->canvas;
+    if (!force_resize) {
+        w = canvas_parse_dim_attr(dom_get_attr(node, "width"), 300u);
+        h = canvas_parse_dim_attr(dom_get_attr(node, "height"), 150u);
+    } else {
+        w = req_w;
+        h = req_h;
+    }
+    if (w > JSDOM_CANVAS_MAX_DIM) w = JSDOM_CANVAS_MAX_DIM;
+    if (h > JSDOM_CANVAS_MAX_DIM) h = JSDOM_CANVAS_MAX_DIM;
+    if (w > 0 && h > JSDOM_CANVAS_MAX_PIXELS / w)
+        h = JSDOM_CANVAS_MAX_PIXELS / w;
+    cv = node->canvas;
+    if (!cv) {
+        cv = (struct dom_canvas *)calloc(1, sizeof(*cv));
+        if (!cv)
+            return 0;
+        node->canvas = cv;
+    } else {
+        free(cv->px);
+        free(cv->alpha);
+        cv->px = 0;
+        cv->alpha = 0;
+    }
+    cv->w = w;
+    cv->h = h;
+    if (w > 0 && h > 0) {
+        unsigned long total = (unsigned long)w * (unsigned long)h;
+
+        cv->px = (uint32_t *)calloc(total, sizeof(uint32_t));
+        cv->alpha = (uint8_t *)calloc(total, 1);
+        if (!cv->px || !cv->alpha) {
+            free(cv->px);
+            free(cv->alpha);
+            cv->px = 0;
+            cv->alpha = 0;
+            cv->w = 0;
+            cv->h = 0;
+            return 0;
+        }
+    }
+    if (force_resize && node->user && j) {
+        js_value ctx2d = js_undefined();
+
+        if (js_get(j->ctx, js_object_value((js_object *)node->user),
+                   "__ctx2d", &ctx2d) == JS_OK &&
+            js_is_object(ctx2d)) {
+            struct hostref *ch = host(ctx2d, HOST_CANVAS_2D);
+
+            if (ch && ch->data)
+                canvas_2d_reset_state((struct canvas_2d_state *)ch->data);
+        }
+    }
+    mark_dom_dirty(j);
+    return cv;
+}
+
+static void canvas_sync_attr_resize(struct jsdom *j, struct dom_node *node)
+{
+    unsigned int w, h;
+
+    if (!node || node->tag_id != HTAG_CANVAS || !node->canvas)
+        return;
+    w = canvas_parse_dim_attr(dom_get_attr(node, "width"), 300u);
+    h = canvas_parse_dim_attr(dom_get_attr(node, "height"), 150u);
+    (void)canvas_ensure_buffer(j, node, 1, w, h);
+}
+
+static unsigned int canvas_current_dim(struct dom_node *node, int is_height)
+{
+    if (node && node->canvas)
+        return is_height ? node->canvas->h : node->canvas->w;
+    return canvas_parse_dim_attr(
+        dom_get_attr(node, is_height ? "height" : "width"),
+        is_height ? 150u : 300u);
+}
+
+static int canvas_width_get(js_ctx *c, js_value t,
+                            int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    (void)c; (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT || h->node->tag_id != HTAG_CANVAS) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    *r = js_number((double)canvas_current_dim(h->node, 0));
+    return JS_OK;
+}
+
+static int canvas_height_get(js_ctx *c, js_value t,
+                             int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    (void)c; (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT || h->node->tag_id != HTAG_CANVAS) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    *r = js_number((double)canvas_current_dim(h->node, 1));
+    return JS_OK;
+}
+
+static int canvas_dim_set(js_ctx *c, js_value t, int ac, js_value *av,
+                          js_value *r, int is_height)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    double dv;
+    unsigned int val, other, new_w, new_h;
+    const char *attr_name = is_height ? "height" : "width";
+    const char *old;
+    char buf[24];
+
+    if (!h || h->node->type != DOM_ELEMENT || h->node->tag_id != HTAG_CANVAS)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal HTMLCanvasElement receiver");
+    if (js_to_number(c, ac ? av[0] : js_undefined(), &dv) != JS_OK)
+        return JS_THROW;
+    if (!jsd_isfinite(dv) || dv < 0.0)
+        val = is_height ? 150u : 300u;
+    else if (dv > (double)JSDOM_CANVAS_MAX_DIM)
+        val = JSDOM_CANVAS_MAX_DIM;
+    else
+        val = (unsigned int)dv;
+    other = canvas_current_dim(h->node, !is_height);
+    new_w = is_height ? other : val;
+    new_h = is_height ? val : other;
+    snprintf(buf, sizeof(buf), "%u", val);
+    old = dom_get_attr(h->node, attr_name);
+    if (!dom_set_attr(h->node, attr_name, buf))
+        return js_throw_error(c, JS_ERR_ERROR, "cannot set canvas dimension");
+    if (mutation_attribute(h->j, h->node, attr_name, old) != JS_OK)
+        return JS_THROW;
+    if (!canvas_ensure_buffer(h->j, h->node, 1, new_w, new_h))
+        return js_throw_error(c, JS_ERR_ERROR, "canvas allocation failed");
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int canvas_width_set(js_ctx *c, js_value t,
+                            int ac, js_value *av, js_value *r)
+{
+    return canvas_dim_set(c, t, ac, av, r, 0);
+}
+
+static int canvas_height_set(js_ctx *c, js_value t,
+                             int ac, js_value *av, js_value *r)
+{
+    return canvas_dim_set(c, t, ac, av, r, 1);
+}
+
+static int canvas_get_context(js_ctx *c, js_value t,
+                              int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    const char *kind;
+    js_value ctx_val = js_undefined();
+    struct canvas_2d_state *st;
+    js_object *obj;
+
+    if (!h || h->node->type != DOM_ELEMENT || h->node->tag_id != HTAG_CANVAS)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal HTMLCanvasElement receiver");
+    if (string_arg(c, ac, av, 0, &kind) != JS_OK)
+        return JS_THROW;
+    if (strcmp(kind, "2d") != 0) {
+        *r = js_null();
+        return JS_OK;
+    }
+    if (!canvas_ensure_buffer(h->j, h->node, 0, 0, 0))
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    if (js_get(c, t, "__ctx2d", &ctx_val) != JS_OK)
+        return JS_THROW;
+    if (host(ctx_val, HOST_CANVAS_2D)) {
+        *r = ctx_val;
+        return JS_OK;
+    }
+    st = (struct canvas_2d_state *)calloc(1, sizeof(*st));
+    if (!st)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    canvas_2d_reset_state(st);
+    st->canvas_obj = t;
+    obj = new_host_data(h->j, h->node, HOST_CANVAS_2D, st, h->j->canvas_2d_proto);
+    if (!obj) {
+        free(st);
+        return JS_THROW;
+    }
+    ctx_val = js_object_value(obj);
+    if (js_define(c, obj, "__canvas", t) != JS_OK ||
+        js_define(c, t.u.obj, "__ctx2d", ctx_val) != JS_OK)
+        return JS_THROW;
+    *r = ctx_val;
+    return JS_OK;
+}
+
+static uint32_t png_crc32_update(uint32_t crc, const uint8_t *buf, unsigned long len)
+{
+    unsigned long i;
+    int k;
+
+    crc = ~crc;
+    for (i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (k = 0; k < 8; k++)
+            crc = (crc >> 1) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
+    }
+    return ~crc;
+}
+
+static void png_put_be32(uint8_t *dst, uint32_t v)
+{
+    dst[0] = (uint8_t)((v >> 24) & 0xFFu);
+    dst[1] = (uint8_t)((v >> 16) & 0xFFu);
+    dst[2] = (uint8_t)((v >> 8) & 0xFFu);
+    dst[3] = (uint8_t)(v & 0xFFu);
+}
+
+static void png_write_chunk(uint8_t *out, unsigned long *used,
+                            const char tag[4], const uint8_t *data, uint32_t len)
+{
+    uint32_t crc;
+
+    png_put_be32(out + *used, len);
+    memcpy(out + *used + 4, tag, 4);
+    if (len && data)
+        memcpy(out + *used + 8, data, len);
+    crc = png_crc32_update(0u, out + *used + 4, 4ul + len);
+    png_put_be32(out + *used + 8 + len, crc);
+    *used += 12ul + len;
+}
+
+static char *jsd_base64_encode(const uint8_t *src, unsigned long len,
+                               unsigned long *out_len)
+{
+    static const char tab[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *out;
+    unsigned long i, used = 0, need;
+
+    need = ((len + 2ul) / 3ul) * 4ul;
+    out = (char *)malloc(need + 1);
+    if (!out)
+        return 0;
+    for (i = 0; i < len; i += 3ul) {
+        uint32_t a = src[i];
+        uint32_t b = (i + 1 < len) ? src[i + 1] : 0u;
+        uint32_t c = (i + 2 < len) ? src[i + 2] : 0u;
+
+        out[used++] = tab[(a >> 2) & 0x3Fu];
+        out[used++] = tab[((a & 0x03u) << 4) | (b >> 4)];
+        out[used++] = (i + 1 < len) ? tab[((b & 0x0Fu) << 2) | (c >> 6)] : '=';
+        out[used++] = (i + 2 < len) ? tab[c & 0x3Fu] : '=';
+    }
+    out[used] = 0;
+    if (out_len)
+        *out_len = used;
+    return out;
+}
+
+static int canvas_to_data_url(js_ctx *c, js_value t,
+                              int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    struct dom_canvas *cv;
+    unsigned long w, hpx, raw_len, nblocks, zlen, png_cap, png_len = 0;
+    unsigned long pos = 0, b64_len = 0, y, x;
+    uint8_t *raw, *png, *zbuf;
+    uint8_t ihdr[13];
+    uint32_t s1 = 1u, s2 = 0u;
+    char *b64, *url;
+
+    (void)ac; (void)av;
+    if (!h || h->node->type != DOM_ELEMENT || h->node->tag_id != HTAG_CANVAS)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal HTMLCanvasElement receiver");
+    cv = canvas_ensure_buffer(h->j, h->node, 0, 0, 0);
+    if (!cv)
+        return js_throw_error(c, JS_ERR_ERROR, "canvas allocation failed");
+    if (cv->w == 0 || cv->h == 0) {
+        *r = js_mkcstring(c, "data:,");
+        return js_fatal(c) ? JS_THROW : JS_OK;
+    }
+    w = cv->w;
+    hpx = cv->h;
+    raw_len = (1ul + w * 4ul) * hpx;
+    raw = (uint8_t *)malloc(raw_len);
+    if (!raw)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    for (y = 0; y < hpx; y++) {
+        raw[pos++] = 0u;
+        for (x = 0; x < w; x++) {
+            unsigned long idx = y * w + x;
+            uint32_t px = cv->px[idx];
+            uint8_t al = cv->alpha[idx];
+
+            raw[pos++] = (uint8_t)((px >> 16) & 0xFFu);
+            raw[pos++] = (uint8_t)((px >> 8) & 0xFFu);
+            raw[pos++] = (uint8_t)(px & 0xFFu);
+            raw[pos++] = al;
+        }
+    }
+    for (pos = 0; pos < raw_len; pos++) {
+        s1 = (s1 + raw[pos]) % 65521u;
+        s2 = (s2 + s1) % 65521u;
+    }
+    nblocks = (raw_len + 65534ul) / 65535ul;
+    zlen = 2ul + nblocks * 5ul + raw_len + 4ul;
+    png_cap = 8ul + 25ul + (12ul + zlen) + 12ul;
+    zbuf = (uint8_t *)malloc(zlen);
+    png = (uint8_t *)malloc(png_cap);
+    if (!zbuf || !png) {
+        free(zbuf); free(png); free(raw);
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    }
+    pos = 0;
+    zbuf[pos++] = 0x78u;
+    zbuf[pos++] = 0x01u;
+    {
+        unsigned long rem = raw_len, off = 0;
+        while (rem > 0) {
+            unsigned long blk = rem > 65535ul ? 65535ul : rem;
+            uint16_t len16 = (uint16_t)blk;
+            uint16_t nlen16 = (uint16_t)(~len16);
+
+            zbuf[pos++] = (rem == blk) ? 0x01u : 0x00u;
+            zbuf[pos++] = (uint8_t)(len16 & 0xFFu);
+            zbuf[pos++] = (uint8_t)(len16 >> 8);
+            zbuf[pos++] = (uint8_t)(nlen16 & 0xFFu);
+            zbuf[pos++] = (uint8_t)(nlen16 >> 8);
+            memcpy(zbuf + pos, raw + off, blk);
+            pos += blk;
+            off += blk;
+            rem -= blk;
+        }
+    }
+    png_put_be32(zbuf + pos, (s2 << 16) | s1);
+    free(raw);
+
+    png[0] = 0x89u; png[1] = 0x50u; png[2] = 0x4Eu; png[3] = 0x47u;
+    png[4] = 0x0Du; png[5] = 0x0Au; png[6] = 0x1Au; png[7] = 0x0Au;
+    png_len = 8ul;
+    png_put_be32(ihdr, (uint32_t)w);
+    png_put_be32(ihdr + 4, (uint32_t)hpx);
+    ihdr[8] = 8u; ihdr[9] = 6u; ihdr[10] = 0u; ihdr[11] = 0u; ihdr[12] = 0u;
+    png_write_chunk(png, &png_len, "IHDR", ihdr, 13u);
+    png_write_chunk(png, &png_len, "IDAT", zbuf, (uint32_t)zlen);
+    png_write_chunk(png, &png_len, "IEND", 0, 0u);
+    free(zbuf);
+
+    b64 = jsd_base64_encode(png, png_len, &b64_len);
+    free(png);
+    if (!b64)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    url = (char *)malloc(22ul + b64_len + 1ul);
+    if (!url) {
+        free(b64);
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    }
+    memcpy(url, "data:image/png;base64,", 22ul);
+    memcpy(url + 22ul, b64, b64_len + 1ul);
+    free(b64);
+    *r = js_mkstring(c, url, 22ul + b64_len);
+    free(url);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static struct canvas_2d_state *ctx2d_of(js_value t, struct hostref **out_h,
+                                        struct dom_canvas **out_cv)
+{
+    struct hostref *h = host(t, HOST_CANVAS_2D);
+
+    if (!h || !h->data)
+        return 0;
+    if (out_h) *out_h = h;
+    if (out_cv) *out_cv = canvas_ensure_buffer(h->j, h->node, 0, 0, 0);
+    return (struct canvas_2d_state *)h->data;
+}
+
+static void canvas_xform(const struct canvas_2d_saved *cur,
+                         double x, double y, double *ox, double *oy)
+{
+    *ox = cur->m[0] * x + cur->m[2] * y + cur->m[4];
+    *oy = cur->m[1] * x + cur->m[3] * y + cur->m[5];
+}
+
+static uint8_t canvas_effective_alpha(uint32_t col, double global_alpha)
+{
+    double a = ((double)CSS_COLOR_A(col) / 255.0) * global_alpha;
+    return (uint8_t)jsd_clamp_u8(a * 255.0);
+}
+
+static void canvas_blend_px(struct dom_canvas *cv, int x, int y,
+                            uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa)
+{
+    unsigned long idx;
+    uint32_t da, inv_da, out_a, rr, gg, bb, dp;
+
+    if (!cv || !cv->px || !cv->alpha || sa == 0)
+        return;
+    if (x < 0 || y < 0 || x >= cv->w || y >= cv->h)
+        return;
+    idx = (unsigned long)y * (unsigned long)cv->w + (unsigned long)x;
+    if (sa == 255) {
+        cv->px[idx] = ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | (uint32_t)sb;
+        cv->alpha[idx] = 255;
+        return;
+    }
+    da = cv->alpha[idx];
+    if (da == 0) {
+        cv->px[idx] = ((uint32_t)sr << 16) | ((uint32_t)sg << 8) | (uint32_t)sb;
+        cv->alpha[idx] = sa;
+        return;
+    }
+    dp = cv->px[idx];
+    inv_da = 255u - sa;
+    out_a = (uint32_t)sa + (da * inv_da + 127u) / 255u;
+    if (out_a == 0) {
+        cv->px[idx] = 0;
+        cv->alpha[idx] = 0;
+        return;
+    }
+    {
+        uint32_t dr = (dp >> 16) & 0xFFu;
+        uint32_t dg = (dp >> 8) & 0xFFu;
+        uint32_t db = dp & 0xFFu;
+        uint32_t sw = (uint32_t)sa * 255u;
+        uint32_t dw = da * inv_da;
+        uint32_t denom = out_a * 255u;
+
+        rr = (sr * sw + dr * dw + denom / 2u) / denom;
+        gg = (sg * sw + dg * dw + denom / 2u) / denom;
+        bb = (sb * sw + db * dw + denom / 2u) / denom;
+        if (rr > 255u) rr = 255u;
+        if (gg > 255u) gg = 255u;
+        if (bb > 255u) bb = 255u;
+        cv->px[idx] = (rr << 16) | (gg << 8) | bb;
+        cv->alpha[idx] = (uint8_t)out_a;
+    }
+}
+
+static void canvas_clear_px(struct dom_canvas *cv, int x, int y)
+{
+    unsigned long idx;
+
+    if (!cv || !cv->px || !cv->alpha)
+        return;
+    if (x < 0 || y < 0 || x >= cv->w || y >= cv->h)
+        return;
+    idx = (unsigned long)y * (unsigned long)cv->w + (unsigned long)x;
+    cv->px[idx] = 0;
+    cv->alpha[idx] = 0;
+}
+
+static int canvas_rasterize_poly(struct dom_canvas *cv,
+                                 const struct canvas_pt *pts, unsigned int npts,
+                                 uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa,
+                                 int is_clear)
+{
+    double miny = 1e9, maxy = -1e9;
+    unsigned int i, sp_start = 0, edge_count = 0;
+    int y0, y1, py;
+    struct { double x0, y0, x1, y1; } *edges;
+    double xs[512];
+
+    if (!cv || !cv->w || !cv->h || npts < 3 || (!is_clear && sa == 0))
+        return 0;
+    edges = malloc(sizeof(*edges) * npts);
+    if (!edges)
+        return 0;
+    for (i = 0; i < npts; i++) {
+        if (pts[i].y < miny) miny = pts[i].y;
+        if (pts[i].y > maxy) maxy = pts[i].y;
+        if (pts[i].kind == 0) {
+            sp_start = i;
+        } else {
+            edges[edge_count].x0 = pts[i - 1].x;
+            edges[edge_count].y0 = pts[i - 1].y;
+            edges[edge_count].x1 = pts[i].x;
+            edges[edge_count].y1 = pts[i].y;
+            edge_count++;
+        }
+        if (i + 1 == npts || pts[i + 1].kind == 0) {
+            if (i > sp_start) {
+                edges[edge_count].x0 = pts[i].x;
+                edges[edge_count].y0 = pts[i].y;
+                edges[edge_count].x1 = pts[sp_start].x;
+                edges[edge_count].y1 = pts[sp_start].y;
+                edge_count++;
+            }
+        }
+    }
+    if (!edge_count) {
+        free(edges);
+        return 0;
+    }
+    y0 = (int)jsd_floor(miny);
+    y1 = (int)jsd_ceil(maxy);
+    if (y0 < 0) y0 = 0;
+    if (y1 >= (int)cv->h) y1 = (int)cv->h - 1;
+    for (py = y0; py <= y1; py++) {
+        double sy = (double)py + 0.5;
+        int nx = 0, k, px;
+
+        for (i = 0; i < edge_count; i++) {
+            double ey0 = edges[i].y0, ey1 = edges[i].y1;
+            if ((ey0 <= sy && ey1 > sy) || (ey1 <= sy && ey0 > sy)) {
+                double t = (sy - ey0) / (ey1 - ey0);
+                double ix = edges[i].x0 + t * (edges[i].x1 - edges[i].x0);
+
+                if (nx < (int)(sizeof(xs) / sizeof(xs[0])))
+                    xs[nx++] = ix;
+            }
+        }
+        for (k = 1; k < nx; k++) {
+            double key = xs[k];
+            int m = k - 1;
+            while (m >= 0 && xs[m] > key) {
+                xs[m + 1] = xs[m];
+                m--;
+            }
+            xs[m + 1] = key;
+        }
+        for (k = 0; k + 1 < nx; k += 2) {
+            int x0 = (int)jsd_ceil(xs[k] - 0.5);
+            int x1 = (int)jsd_floor(xs[k + 1] - 0.5);
+
+            if (x0 < 0) x0 = 0;
+            if (x1 >= (int)cv->w) x1 = (int)cv->w - 1;
+            for (px = x0; px <= x1; px++) {
+                if (is_clear) canvas_clear_px(cv, px, py);
+                else canvas_blend_px(cv, px, py, sr, sg, sb, sa);
+            }
+        }
+    }
+    free(edges);
+    return 1;
+}
+
+static void canvas_draw_segment(struct dom_canvas *cv,
+                                double x0, double y0, double x1, double y1,
+                                double lw, uint8_t sr, uint8_t sg, uint8_t sb,
+                                uint8_t sa)
+{
+    double half_w, dx, dy, len2, r2;
+    int ix0, iy0, ix1, iy1, px, py;
+
+    if (!cv || !cv->w || !cv->h || sa == 0)
+        return;
+    if (lw <= 1.2) {
+        int bx0 = (int)jsd_floor(x0), by0 = (int)jsd_floor(y0);
+        int bx1 = (int)jsd_floor(x1), by1 = (int)jsd_floor(y1);
+        int sx = bx0 < bx1 ? 1 : -1;
+        int sy = by0 < by1 ? 1 : -1;
+        int adx = bx1 >= bx0 ? bx1 - bx0 : bx0 - bx1;
+        int ady = by1 >= by0 ? by1 - by0 : by0 - by1;
+        int err = adx - ady, steps = 0;
+
+        while (steps++ < 16384) {
+            canvas_blend_px(cv, bx0, by0, sr, sg, sb, sa);
+            if (bx0 == bx1 && by0 == by1)
+                break;
+            {
+                int e2 = 2 * err;
+                if (e2 > -ady) { err -= ady; bx0 += sx; }
+                if (e2 < adx) { err += adx; by0 += sy; }
+            }
+        }
+        return;
+    }
+    half_w = lw * 0.5;
+    r2 = half_w * half_w;
+    dx = x1 - x0;
+    dy = y1 - y0;
+    len2 = dx * dx + dy * dy;
+    ix0 = (int)jsd_floor((x0 < x1 ? x0 : x1) - half_w - 1.0);
+    ix1 = (int)jsd_ceil((x0 > x1 ? x0 : x1) + half_w + 1.0);
+    iy0 = (int)jsd_floor((y0 < y1 ? y0 : y1) - half_w - 1.0);
+    iy1 = (int)jsd_ceil((y0 > y1 ? y0 : y1) + half_w + 1.0);
+    if (ix0 < 0) ix0 = 0;
+    if (iy0 < 0) iy0 = 0;
+    if (ix1 >= (int)cv->w) ix1 = (int)cv->w - 1;
+    if (iy1 >= (int)cv->h) iy1 = (int)cv->h - 1;
+    for (py = iy0; py <= iy1; py++) {
+        for (px = ix0; px <= ix1; px++) {
+            double cx = (double)px + 0.5, cy = (double)py + 0.5;
+            double t = len2 > 1e-12 ? ((cx - x0) * dx + (cy - y0) * dy) / len2 : 0.0;
+            double projx, projy, d2;
+
+            if (t < 0.0) t = 0.0;
+            if (t > 1.0) t = 1.0;
+            projx = x0 + t * dx;
+            projy = y0 + t * dy;
+            d2 = (cx - projx) * (cx - projx) + (cy - projy) * (cy - projy);
+            if (d2 <= r2)
+                canvas_blend_px(cv, px, py, sr, sg, sb, sa);
+        }
+    }
+}
+
+static int canvas_pt_add(struct canvas_2d_state *st,
+                         double x, double y, unsigned char kind)
+{
+    if (!st || st->path_n >= 16384u)
+        return 0;
+    if (st->path_n >= st->path_cap) {
+        unsigned int ncap = st->path_cap ? st->path_cap * 2u : 64u;
+        struct canvas_pt *narr;
+
+        if (ncap > 16384u) ncap = 16384u;
+        narr = (struct canvas_pt *)realloc(st->path, ncap * sizeof(*narr));
+        if (!narr)
+            return 0;
+        st->path = narr;
+        st->path_cap = ncap;
+    }
+    st->path[st->path_n].x = x;
+    st->path[st->path_n].y = y;
+    st->path[st->path_n].kind = kind;
+    st->path_n++;
+    return 1;
+}
+
+static int ctx2d_num_arg(js_ctx *c, int ac, js_value *av, int idx, double *out)
+{
+    double v;
+
+    if (idx >= ac)
+        return 0;
+    if (js_to_number(c, av[idx], &v) != JS_OK)
+        return -1;
+    if (!jsd_isfinite(v))
+        return 0;
+    *out = v;
+    return 1;
+}
+
+static int ctx2d_canvas_get(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{
+    (void)ac; (void)av;
+    if (!ctx2d_of(t, 0, 0))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    if (js_get(c, t, "__canvas", r) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static int ctx2d_save(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    if (st->sp < JSDOM_CANVAS_STACK_MAX)
+        st->stack[st->sp++] = st->cur;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_restore(js_ctx *c, js_value t, int ac, js_value *av,
+                         js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    if (st->sp > 0)
+        st->cur = st->stack[--st->sp];
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static void ctx2d_mul_matrix(struct canvas_2d_saved *cur,
+                             double a2, double b2, double c2,
+                             double d2, double e2, double f2)
+{
+    double a1 = cur->m[0], b1 = cur->m[1], c1 = cur->m[2];
+    double d1 = cur->m[3], e1 = cur->m[4], f1 = cur->m[5];
+
+    cur->m[0] = a1 * a2 + c1 * b2;
+    cur->m[1] = b1 * a2 + d1 * b2;
+    cur->m[2] = a1 * c2 + c1 * d2;
+    cur->m[3] = b1 * c2 + d1 * d2;
+    cur->m[4] = a1 * e2 + c1 * f2 + e1;
+    cur->m[5] = b1 * e2 + d1 * f2 + f1;
+}
+
+static int ctx2d_translate(js_ctx *c, js_value t, int ac, js_value *av,
+                           js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double x, y;
+    int rx, ry;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    rx = ctx2d_num_arg(c, ac, av, 0, &x);
+    ry = ctx2d_num_arg(c, ac, av, 1, &y);
+    if (rx < 0 || ry < 0) return JS_THROW;
+    if (rx == 1 && ry == 1)
+        ctx2d_mul_matrix(&st->cur, 1.0, 0.0, 0.0, 1.0, x, y);
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_scale(js_ctx *c, js_value t, int ac, js_value *av,
+                       js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double sx, sy;
+    int rx, ry;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    rx = ctx2d_num_arg(c, ac, av, 0, &sx);
+    ry = ctx2d_num_arg(c, ac, av, 1, &sy);
+    if (rx < 0 || ry < 0) return JS_THROW;
+    if (rx == 1 && ry == 1)
+        ctx2d_mul_matrix(&st->cur, sx, 0.0, 0.0, sy, 0.0, 0.0);
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_rotate(js_ctx *c, js_value t, int ac, js_value *av,
+                        js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double ang;
+    int ra;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    ra = ctx2d_num_arg(c, ac, av, 0, &ang);
+    if (ra < 0) return JS_THROW;
+    if (ra == 1) {
+        double co = jsd_cos(ang), si = jsd_sin(ang);
+        ctx2d_mul_matrix(&st->cur, co, si, -si, co, 0.0, 0.0);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_transform(js_ctx *c, js_value t, int ac, js_value *av,
+                           js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double m[6];
+    int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    for (i = 0; i < 6; i++) {
+        int rc = ctx2d_num_arg(c, ac, av, i, &m[i]);
+        if (rc < 0) return JS_THROW;
+        if (rc == 0) { *r = js_undefined(); return JS_OK; }
+    }
+    ctx2d_mul_matrix(&st->cur, m[0], m[1], m[2], m[3], m[4], m[5]);
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_set_transform(js_ctx *c, js_value t, int ac, js_value *av,
+                               js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double m[6];
+    int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasRenderingContext2D receiver");
+    if (ac == 0) {
+        st->cur.m[0] = 1.0; st->cur.m[1] = 0.0;
+        st->cur.m[2] = 0.0; st->cur.m[3] = 1.0;
+        st->cur.m[4] = 0.0; st->cur.m[5] = 0.0;
+        *r = js_undefined();
+        return JS_OK;
+    }
+    for (i = 0; i < 6; i++) {
+        int rc = ctx2d_num_arg(c, ac, av, i, &m[i]);
+        if (rc < 0) return JS_THROW;
+        if (rc == 0) { *r = js_undefined(); return JS_OK; }
+    }
+    for (i = 0; i < 6; i++)
+        st->cur.m[i] = m[i];
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_reset_transform(js_ctx *c, js_value t, int ac, js_value *av,
+                                 js_value *r)
+{
+    (void)ac;
+    return ctx2d_set_transform(c, t, 0, av, r);
+}
+
+static int ctx2d_fill_style_get(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_mkcstring(c, st->cur.fill_str);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int ctx2d_fill_style_set(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *s;
+    uint32_t col;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (jsdom_parse_color(s, &col)) {
+        st->cur.fill_color = col;
+        canvas_fmt_color(col, st->cur.fill_str, sizeof(st->cur.fill_str));
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_stroke_style_get(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_mkcstring(c, st->cur.stroke_str);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int ctx2d_stroke_style_set(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *s;
+    uint32_t col;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (jsdom_parse_color(s, &col)) {
+        st->cur.stroke_color = col;
+        canvas_fmt_color(col, st->cur.stroke_str, sizeof(st->cur.stroke_str));
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_line_width_get(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_number(st->cur.line_width);
+    return JS_OK;
+}
+
+static int ctx2d_line_width_set(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double v;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac > 0) {
+        if (js_to_number(c, av[0], &v) != JS_OK) return JS_THROW;
+        if (jsd_isfinite(v) && v > 0.0)
+            st->cur.line_width = v;
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_global_alpha_get(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_number(st->cur.global_alpha);
+    return JS_OK;
+}
+
+static int ctx2d_global_alpha_set(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double v;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac > 0) {
+        if (js_to_number(c, av[0], &v) != JS_OK) return JS_THROW;
+        if (jsd_isfinite(v) && v >= 0.0 && v <= 1.0)
+            st->cur.global_alpha = v;
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_font_get(js_ctx *c, js_value t,
+                          int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_mkcstring(c, st->cur.font);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int ctx2d_font_set(js_ctx *c, js_value t,
+                          int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *s, *p;
+    double sz = 10.0;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (*s && strlen(s) < sizeof(st->cur.font)) {
+        for (p = s; *p; p++) {
+            const char *end;
+            double v;
+            if ((*p >= '0' && *p <= '9') &&
+                jsd_parse_double(p, &v, &end) && v > 0.0) {
+                if (ci_eq_n(end, 2, "px", 2)) { sz = v; break; }
+                if (ci_eq_n(end, 2, "pt", 2)) { sz = v * 4.0 / 3.0; break; }
+            }
+        }
+        snprintf(st->cur.font, sizeof(st->cur.font), "%s", s);
+        st->cur.font_px = sz;
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_text_align_get(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *v;
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    v = st->cur.text_align == 1 ? "center" :
+        st->cur.text_align == 2 ? "right" : "left";
+    *r = js_mkcstring(c, v);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int ctx2d_text_align_set(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *s;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (!strcmp(s, "left") || !strcmp(s, "start")) st->cur.text_align = 0;
+    else if (!strcmp(s, "center")) st->cur.text_align = 1;
+    else if (!strcmp(s, "right") || !strcmp(s, "end")) st->cur.text_align = 2;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_text_baseline_get(js_ctx *c, js_value t,
+                                   int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    static const char *const names[] = {
+        "alphabetic", "top", "middle", "bottom"
+    };
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    *r = js_mkcstring(c, names[st->cur.text_baseline < 4 ? st->cur.text_baseline : 0]);
+    return js_fatal(c) ? JS_THROW : JS_OK;
+}
+
+static int ctx2d_text_baseline_set(js_ctx *c, js_value t,
+                                   int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *s;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (!strcmp(s, "alphabetic") || !strcmp(s, "ideographic"))
+        st->cur.text_baseline = 0;
+    else if (!strcmp(s, "top") || !strcmp(s, "hanging"))
+        st->cur.text_baseline = 1;
+    else if (!strcmp(s, "middle"))
+        st->cur.text_baseline = 2;
+    else if (!strcmp(s, "bottom"))
+        st->cur.text_baseline = 3;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static void ctx2d_fill_transformed_rect(struct dom_canvas *cv,
+                                        const struct canvas_2d_saved *cur,
+                                        double x, double y, double w, double h,
+                                        uint8_t sr, uint8_t sg, uint8_t sb,
+                                        uint8_t sa, int is_clear)
+{
+    struct canvas_pt pts[4];
+    double x0, y0, x1, y1;
+
+    if (!cv || !cv->w || !cv->h)
+        return;
+    if (w < 0.0) { x += w; w = -w; }
+    if (h < 0.0) { y += h; h = -h; }
+    if (w == 0.0 || h == 0.0)
+        return;
+    if (jsd_fabs(cur->m[1]) < 1e-9 && jsd_fabs(cur->m[2]) < 1e-9 &&
+        cur->m[0] >= 0.0 && cur->m[3] >= 0.0) {
+        int ix0, iy0, ix1, iy1, px, py;
+
+        x0 = cur->m[0] * x + cur->m[4];
+        y0 = cur->m[3] * y + cur->m[5];
+        x1 = cur->m[0] * (x + w) + cur->m[4];
+        y1 = cur->m[3] * (y + h) + cur->m[5];
+        ix0 = (int)jsd_ceil(x0 - 0.5);
+        iy0 = (int)jsd_ceil(y0 - 0.5);
+        ix1 = (int)jsd_floor(x1 - 0.5);
+        iy1 = (int)jsd_floor(y1 - 0.5);
+        if (ix0 < 0) ix0 = 0;
+        if (iy0 < 0) iy0 = 0;
+        if (ix1 >= (int)cv->w) ix1 = (int)cv->w - 1;
+        if (iy1 >= (int)cv->h) iy1 = (int)cv->h - 1;
+        for (py = iy0; py <= iy1; py++)
+            for (px = ix0; px <= ix1; px++) {
+                if (is_clear) canvas_clear_px(cv, px, py);
+                else canvas_blend_px(cv, px, py, sr, sg, sb, sa);
+            }
+        return;
+    }
+    canvas_xform(cur, x, y, &pts[0].x, &pts[0].y); pts[0].kind = 0;
+    canvas_xform(cur, x + w, y, &pts[1].x, &pts[1].y); pts[1].kind = 1;
+    canvas_xform(cur, x + w, y + h, &pts[2].x, &pts[2].y); pts[2].kind = 1;
+    canvas_xform(cur, x, y + h, &pts[3].x, &pts[3].y); pts[3].kind = 1;
+    canvas_rasterize_poly(cv, pts, 4, sr, sg, sb, sa, is_clear);
+}
+
+static int ctx2d_rect_op(js_ctx *c, js_value t, int ac, js_value *av,
+                         js_value *r, int mode)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    double x, y, w, hbox;
+    int i, ok = 1;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    {
+        double *dst[4] = { &x, &y, &w, &hbox };
+        for (i = 0; i < 4; i++) {
+            int rc = ctx2d_num_arg(c, ac, av, i, dst[i]);
+            if (rc < 0) return JS_THROW;
+            if (rc == 0) ok = 0;
+        }
+    }
+    if (!ok || !cv) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (mode == 0 || mode == 2) {
+        uint8_t sa = mode == 0
+            ? canvas_effective_alpha(st->cur.fill_color, st->cur.global_alpha)
+            : 255u;
+        ctx2d_fill_transformed_rect(cv, &st->cur, x, y, w, hbox,
+                                    (uint8_t)CSS_COLOR_R(st->cur.fill_color),
+                                    (uint8_t)CSS_COLOR_G(st->cur.fill_color),
+                                    (uint8_t)CSS_COLOR_B(st->cur.fill_color),
+                                    sa, mode == 2);
+    } else {
+        double p[4][2];
+        uint8_t sa = canvas_effective_alpha(st->cur.stroke_color,
+                                            st->cur.global_alpha);
+        uint8_t sr = (uint8_t)CSS_COLOR_R(st->cur.stroke_color);
+        uint8_t sg = (uint8_t)CSS_COLOR_G(st->cur.stroke_color);
+        uint8_t sb = (uint8_t)CSS_COLOR_B(st->cur.stroke_color);
+
+        canvas_xform(&st->cur, x, y, &p[0][0], &p[0][1]);
+        canvas_xform(&st->cur, x + w, y, &p[1][0], &p[1][1]);
+        canvas_xform(&st->cur, x + w, y + hbox, &p[2][0], &p[2][1]);
+        canvas_xform(&st->cur, x, y + hbox, &p[3][0], &p[3][1]);
+        for (i = 0; i < 4; i++)
+            canvas_draw_segment(cv, p[i][0], p[i][1],
+                                p[(i + 1) & 3][0], p[(i + 1) & 3][1],
+                                st->cur.line_width, sr, sg, sb, sa);
+    }
+    mark_dom_dirty(h->j);
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_fill_rect(js_ctx *c, js_value t, int ac, js_value *av,
+                           js_value *r)
+{ return ctx2d_rect_op(c, t, ac, av, r, 0); }
+static int ctx2d_stroke_rect(js_ctx *c, js_value t, int ac, js_value *av,
+                             js_value *r)
+{ return ctx2d_rect_op(c, t, ac, av, r, 1); }
+static int ctx2d_clear_rect(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{ return ctx2d_rect_op(c, t, ac, av, r, 2); }
+
+static int ctx2d_begin_path(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    (void)ac; (void)av;
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    st->path_n = 0;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_close_path(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    unsigned int sp_start;
+    (void)ac; (void)av;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (st->path_n > 1) {
+        sp_start = st->path_n - 1;
+        while (sp_start > 0 && st->path[sp_start].kind != 0)
+            sp_start--;
+        if (st->path_n - 1 > sp_start)
+            (void)canvas_pt_add(st, st->path[sp_start].x,
+                                st->path[sp_start].y, 2);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_move_to(js_ctx *c, js_value t, int ac, js_value *av,
+                         js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double x, y, dx, dy;
+    int rx, ry;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    rx = ctx2d_num_arg(c, ac, av, 0, &x);
+    ry = ctx2d_num_arg(c, ac, av, 1, &y);
+    if (rx < 0 || ry < 0) return JS_THROW;
+    if (rx == 1 && ry == 1) {
+        canvas_xform(&st->cur, x, y, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 0);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_line_to(js_ctx *c, js_value t, int ac, js_value *av,
+                         js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double x, y, dx, dy;
+    int rx, ry;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    rx = ctx2d_num_arg(c, ac, av, 0, &x);
+    ry = ctx2d_num_arg(c, ac, av, 1, &y);
+    if (rx < 0 || ry < 0) return JS_THROW;
+    if (rx == 1 && ry == 1) {
+        canvas_xform(&st->cur, x, y, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, st->path_n ? 1 : 0);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_rect(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double x, y, w, hbox, dx, dy;
+    int rx, ry, rw, rh;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    rx = ctx2d_num_arg(c, ac, av, 0, &x);
+    ry = ctx2d_num_arg(c, ac, av, 1, &y);
+    rw = ctx2d_num_arg(c, ac, av, 2, &w);
+    rh = ctx2d_num_arg(c, ac, av, 3, &hbox);
+    if (rx < 0 || ry < 0 || rw < 0 || rh < 0) return JS_THROW;
+    if (rx == 1 && ry == 1 && rw == 1 && rh == 1) {
+        canvas_xform(&st->cur, x, y, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 0);
+        canvas_xform(&st->cur, x + w, y, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 1);
+        canvas_xform(&st->cur, x + w, y + hbox, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 1);
+        canvas_xform(&st->cur, x, y + hbox, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 1);
+        canvas_xform(&st->cur, x, y, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, 2);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_arc(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double cx, cy, rad, a0, a1, sweep, scale;
+    int rx, ry, rr, r0, r1, ccw = 0, segs, i;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    rx = ctx2d_num_arg(c, ac, av, 0, &cx);
+    ry = ctx2d_num_arg(c, ac, av, 1, &cy);
+    rr = ctx2d_num_arg(c, ac, av, 2, &rad);
+    r0 = ctx2d_num_arg(c, ac, av, 3, &a0);
+    r1 = ctx2d_num_arg(c, ac, av, 4, &a1);
+    if (rx < 0 || ry < 0 || rr < 0 || r0 < 0 || r1 < 0) return JS_THROW;
+    if (rx != 1 || ry != 1 || rr != 1 || r0 != 1 || r1 != 1) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (rad < 0.0)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "arc radius must be non-negative");
+    if (ac > 5)
+        ccw = js_to_boolean(av[5]);
+    if (ccw) {
+        if (a0 - a1 >= JSDOM_PI2) {
+            sweep = -JSDOM_PI2;
+        } else {
+            sweep = a1 - a0;
+            while (sweep > 0.0) sweep -= JSDOM_PI2;
+            while (sweep <= -JSDOM_PI2) sweep += JSDOM_PI2;
+            if (sweep == 0.0 && a0 != a1) sweep = -JSDOM_PI2;
+        }
+    } else {
+        if (a1 - a0 >= JSDOM_PI2) {
+            sweep = JSDOM_PI2;
+        } else {
+            sweep = a1 - a0;
+            while (sweep < 0.0) sweep += JSDOM_PI2;
+            while (sweep > JSDOM_PI2) sweep -= JSDOM_PI2;
+            if (sweep == 0.0 && a0 != a1) sweep = JSDOM_PI2;
+        }
+    }
+    scale = jsd_sqrt(st->cur.m[0] * st->cur.m[0] + st->cur.m[1] * st->cur.m[1]);
+    segs = (int)(rad * scale * jsd_fabs(sweep) * 0.5) + 12;
+    if (segs < 16) segs = 16;
+    if (segs > 128) segs = 128;
+    for (i = 0; i <= segs; i++) {
+        double a = a0 + sweep * ((double)i / (double)segs);
+        double px = cx + rad * jsd_cos(a);
+        double py = cy + rad * jsd_sin(a);
+        double dx, dy;
+
+        canvas_xform(&st->cur, px, py, &dx, &dy);
+        (void)canvas_pt_add(st, dx, dy, st->path_n ? 1 : 0);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_quadratic_curve_to(js_ctx *c, js_value t,
+                                    int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double cpx, cpy, x, y, dcx, dcy, dx, dy, p0x, p0y;
+    int rc0, rc1, rc2, rc3, i;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    rc0 = ctx2d_num_arg(c, ac, av, 0, &cpx);
+    rc1 = ctx2d_num_arg(c, ac, av, 1, &cpy);
+    rc2 = ctx2d_num_arg(c, ac, av, 2, &x);
+    rc3 = ctx2d_num_arg(c, ac, av, 3, &y);
+    if (rc0 < 0 || rc1 < 0 || rc2 < 0 || rc3 < 0) return JS_THROW;
+    if (rc0 != 1 || rc1 != 1 || rc2 != 1 || rc3 != 1) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    canvas_xform(&st->cur, cpx, cpy, &dcx, &dcy);
+    canvas_xform(&st->cur, x, y, &dx, &dy);
+    if (!st->path_n)
+        (void)canvas_pt_add(st, dcx, dcy, 0);
+    p0x = st->path[st->path_n - 1].x;
+    p0y = st->path[st->path_n - 1].y;
+    for (i = 1; i <= 24; i++) {
+        double u = (double)i / 24.0, inv = 1.0 - u;
+        double bx = inv * inv * p0x + 2.0 * inv * u * dcx + u * u * dx;
+        double by = inv * inv * p0y + 2.0 * inv * u * dcy + u * u * dy;
+        (void)canvas_pt_add(st, bx, by, 1);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_bezier_curve_to(js_ctx *c, js_value t,
+                                 int ac, js_value *av, js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    double v[6], dc1x, dc1y, dc2x, dc2y, dx, dy, p0x, p0y;
+    int i;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    for (i = 0; i < 6; i++) {
+        int rc = ctx2d_num_arg(c, ac, av, i, &v[i]);
+        if (rc < 0) return JS_THROW;
+        if (rc == 0) { *r = js_undefined(); return JS_OK; }
+    }
+    canvas_xform(&st->cur, v[0], v[1], &dc1x, &dc1y);
+    canvas_xform(&st->cur, v[2], v[3], &dc2x, &dc2y);
+    canvas_xform(&st->cur, v[4], v[5], &dx, &dy);
+    if (!st->path_n)
+        (void)canvas_pt_add(st, dc1x, dc1y, 0);
+    p0x = st->path[st->path_n - 1].x;
+    p0y = st->path[st->path_n - 1].y;
+    for (i = 1; i <= 24; i++) {
+        double u = (double)i / 24.0, inv = 1.0 - u;
+        double a0 = inv * inv * inv, a1 = 3.0 * inv * inv * u;
+        double a2 = 3.0 * inv * u * u, a3 = u * u * u;
+        double bx = a0 * p0x + a1 * dc1x + a2 * dc2x + a3 * dx;
+        double by = a0 * p0y + a1 * dc1y + a2 * dc2y + a3 * dy;
+        (void)canvas_pt_add(st, bx, by, 1);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_fill(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    uint8_t sa;
+    (void)ac; (void)av;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (cv && st->path_n >= 3) {
+        sa = canvas_effective_alpha(st->cur.fill_color, st->cur.global_alpha);
+        if (canvas_rasterize_poly(cv, st->path, st->path_n,
+                                  (uint8_t)CSS_COLOR_R(st->cur.fill_color),
+                                  (uint8_t)CSS_COLOR_G(st->cur.fill_color),
+                                  (uint8_t)CSS_COLOR_B(st->cur.fill_color),
+                                  sa, 0))
+            mark_dom_dirty(h->j);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_stroke(js_ctx *c, js_value t, int ac, js_value *av,
+                        js_value *r)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    unsigned int i;
+    uint8_t sa, sr, sg, sb;
+    (void)ac; (void)av;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (cv && st->path_n >= 2) {
+        sa = canvas_effective_alpha(st->cur.stroke_color, st->cur.global_alpha);
+        sr = (uint8_t)CSS_COLOR_R(st->cur.stroke_color);
+        sg = (uint8_t)CSS_COLOR_G(st->cur.stroke_color);
+        sb = (uint8_t)CSS_COLOR_B(st->cur.stroke_color);
+        for (i = 1; i < st->path_n; i++) {
+            if (st->path[i].kind == 0)
+                continue;
+            canvas_draw_segment(cv, st->path[i - 1].x, st->path[i - 1].y,
+                                st->path[i].x, st->path[i].y,
+                                st->cur.line_width, sr, sg, sb, sa);
+        }
+        mark_dom_dirty(h->j);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_draw_text_op(js_ctx *c, js_value t, int ac, js_value *av,
+                              js_value *r, int is_stroke)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    const char *text;
+    double x, y, scale, total_w, ox, oy;
+    int rx, ry;
+    unsigned long len, ci;
+    uint32_t col;
+    uint8_t sa, sr, sg, sb;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac < 3 || string_arg(c, ac, av, 0, &text) != JS_OK)
+        return ac < 3 ? js_throw_error(c, JS_ERR_TYPE, "too few arguments")
+                      : JS_THROW;
+    rx = ctx2d_num_arg(c, ac, av, 1, &x);
+    ry = ctx2d_num_arg(c, ac, av, 2, &y);
+    if (rx < 0 || ry < 0) return JS_THROW;
+    if (!cv || rx != 1 || ry != 1 || !*text) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    len = strlen(text);
+    scale = st->cur.font_px / 7.0;
+    if (scale < 1.0) scale = 1.0;
+    total_w = (double)len * 6.0 * scale;
+    ox = x;
+    if (st->cur.text_align == 1) ox -= total_w * 0.5;
+    else if (st->cur.text_align == 2) ox -= total_w;
+    if (st->cur.text_baseline == 1) oy = y;
+    else if (st->cur.text_baseline == 2) oy = y - 3.5 * scale;
+    else if (st->cur.text_baseline == 3) oy = y - 7.0 * scale;
+    else oy = y - 6.0 * scale;
+
+    col = is_stroke ? st->cur.stroke_color : st->cur.fill_color;
+    sa = canvas_effective_alpha(col, st->cur.global_alpha);
+    sr = (uint8_t)CSS_COLOR_R(col);
+    sg = (uint8_t)CSS_COLOR_G(col);
+    sb = (uint8_t)CSS_COLOR_B(col);
+
+    for (ci = 0; ci < len; ci++) {
+        unsigned char ch = (unsigned char)text[ci];
+        int gx, gy;
+
+        if (ch < 0x20 || ch > 0x7E)
+            ch = '?';
+        for (gx = 0; gx < 5; gx++) {
+            uint8_t col_bits = jsdom_font5x7[ch - 0x20][gx];
+            for (gy = 0; gy < 7; gy++) {
+                if (!(col_bits & (1u << gy)))
+                    continue;
+                if (is_stroke) {
+                    int edge = (gx == 0 || gx == 4 || gy == 0 || gy == 6 ||
+                                !(jsdom_font5x7[ch - 0x20][gx - 1] & (1u << gy)) ||
+                                !(jsdom_font5x7[ch - 0x20][gx + 1] & (1u << gy)) ||
+                                !(col_bits & (1u << (gy - 1))) ||
+                                !(col_bits & (1u << (gy + 1))));
+                    if (!edge) continue;
+                }
+                ctx2d_fill_transformed_rect(
+                    cv, &st->cur,
+                    ox + ((double)ci * 6.0 + (double)gx) * scale,
+                    oy + (double)gy * scale,
+                    scale, scale, sr, sg, sb, sa, 0);
+            }
+        }
+    }
+    mark_dom_dirty(h->j);
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int ctx2d_fill_text(js_ctx *c, js_value t, int ac, js_value *av,
+                           js_value *r)
+{ return ctx2d_draw_text_op(c, t, ac, av, r, 0); }
+static int ctx2d_stroke_text(js_ctx *c, js_value t, int ac, js_value *av,
+                             js_value *r)
+{ return ctx2d_draw_text_op(c, t, ac, av, r, 1); }
+
+static int ctx2d_measure_text(js_ctx *c, js_value t, int ac, js_value *av,
+                              js_value *r)
+{
+    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    const char *text;
+    double scale;
+    js_object *m;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (string_arg(c, ac, av, 0, &text) != JS_OK) return JS_THROW;
+    scale = st->cur.font_px / 7.0;
+    if (scale < 1.0) scale = 1.0;
+    m = js_new_object(c);
+    if (!m ||
+        js_set(c, js_object_value(m), "width",
+               js_number((double)strlen(text) * 6.0 * scale)) != JS_OK)
+        return JS_THROW;
+    *r = js_object_value(m);
+    return JS_OK;
+}
+
+static int make_image_data_obj(js_ctx *c, struct jsdom *j,
+                               unsigned int w, unsigned int hpx,
+                               const uint8_t *src_rgba, js_value *out)
+{
+    js_object *obj;
+    js_value u8;
+    unsigned long byte_len;
+
+    if (w == 0 || hpx == 0 || w > JSDOM_CANVAS_MAX_DIM ||
+        hpx > JSDOM_CANVAS_MAX_DIM || w > JSDOM_CANVAS_MAX_PIXELS / hpx)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "invalid ImageData dimensions");
+    byte_len = (unsigned long)w * (unsigned long)hpx * 4ul;
+    u8 = js_uint8array_new(c, src_rgba, byte_len);
+    if (js_fatal(c) || js_is_undefined(u8))
+        return JS_THROW;
+    obj = new_host(j, 0, HOST_IMAGE_DATA, j->image_data_proto);
+    if (!obj)
+        return JS_THROW;
+    if (js_define_enum(c, obj, "width", js_number((double)w)) != JS_OK ||
+        js_define_enum(c, obj, "height", js_number((double)hpx)) != JS_OK ||
+        js_define_enum(c, obj, "data", u8) != JS_OK)
+        return JS_THROW;
+    *out = js_object_value(obj);
+    return JS_OK;
+}
+
+static int ctx2d_create_image_data(js_ctx *c, js_value t,
+                                   int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, 0);
+    double w, hbox;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac >= 1 && js_is_object(av[0])) {
+        js_value vw, vh;
+
+        if (js_get(c, av[0], "width", &vw) != JS_OK ||
+            js_get(c, av[0], "height", &vh) != JS_OK ||
+            js_to_number(c, vw, &w) != JS_OK ||
+            js_to_number(c, vh, &hbox) != JS_OK)
+            return JS_THROW;
+    } else {
+        if (ac < 2 || js_to_number(c, av[0], &w) != JS_OK ||
+            js_to_number(c, av[1], &hbox) != JS_OK)
+            return ac < 2
+                ? js_throw_error(c, JS_ERR_TYPE,
+                                 "createImageData requires dimensions")
+                : JS_THROW;
+    }
+    if (!jsd_isfinite(w) || !jsd_isfinite(hbox) || w < 1.0 || hbox < 1.0)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "invalid ImageData dimensions");
+    return make_image_data_obj(c, h->j, (unsigned int)w, (unsigned int)hbox, 0, r);
+}
+
+static int ctx2d_get_image_data(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    double dsx, dsy, dsw, dsh;
+    int sx, sy, sw, sh, iy, ix;
+    uint8_t *buf;
+    int rc;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac < 4)
+        return js_throw_error(c, JS_ERR_TYPE, "getImageData requires 4 args");
+    if (js_to_number(c, av[0], &dsx) != JS_OK ||
+        js_to_number(c, av[1], &dsy) != JS_OK ||
+        js_to_number(c, av[2], &dsw) != JS_OK ||
+        js_to_number(c, av[3], &dsh) != JS_OK)
+        return JS_THROW;
+    if (!jsd_isfinite(dsw) || !jsd_isfinite(dsh) || dsw == 0.0 || dsh == 0.0)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "getImageData width/height must be non-zero");
+    if (dsw < 0.0) { dsx += dsw; dsw = -dsw; }
+    if (dsh < 0.0) { dsy += dsh; dsh = -dsh; }
+    sx = (int)jsd_floor(dsx);
+    sy = (int)jsd_floor(dsy);
+    sw = (int)dsw;
+    sh = (int)dsh;
+    if (sw <= 0 || sh <= 0 || (unsigned int)sw > JSDOM_CANVAS_MAX_DIM ||
+        (unsigned int)sh > JSDOM_CANVAS_MAX_DIM ||
+        (unsigned int)sw > JSDOM_CANVAS_MAX_PIXELS / (unsigned int)sh)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "getImageData dimensions out of range");
+    buf = (uint8_t *)calloc((unsigned long)sw * (unsigned long)sh, 4ul);
+    if (!buf)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    if (cv && cv->px && cv->alpha) {
+        for (iy = 0; iy < sh; iy++) {
+            int cy = sy + iy;
+            if (cy < 0 || cy >= cv->h)
+                continue;
+            for (ix = 0; ix < sw; ix++) {
+                int cx = sx + ix;
+                unsigned long si, di;
+
+                if (cx < 0 || cx >= cv->w)
+                    continue;
+                si = (unsigned long)cy * (unsigned long)cv->w + (unsigned long)cx;
+                di = ((unsigned long)iy * (unsigned long)sw + (unsigned long)ix) * 4ul;
+                buf[di]     = (uint8_t)((cv->px[si] >> 16) & 0xFFu);
+                buf[di + 1] = (uint8_t)((cv->px[si] >> 8) & 0xFFu);
+                buf[di + 2] = (uint8_t)(cv->px[si] & 0xFFu);
+                buf[di + 3] = cv->alpha[si];
+            }
+        }
+    }
+    rc = make_image_data_obj(c, h->j, (unsigned int)sw, (unsigned int)sh, buf, r);
+    free(buf);
+    return rc;
+}
+
+static int ctx2d_put_image_data(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct dom_canvas *cv = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    js_value vw, vh, vdata;
+    double dw, dh, ddx, ddy;
+    const uint8_t *src;
+    unsigned long dlen = 0, need;
+    int iw, ih, dx, dy, ix, iy;
+
+    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac < 3 || !js_is_object(av[0]))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "putImageData requires ImageData and dx, dy");
+    if (js_get(c, av[0], "width", &vw) != JS_OK ||
+        js_get(c, av[0], "height", &vh) != JS_OK ||
+        js_get(c, av[0], "data", &vdata) != JS_OK ||
+        js_to_number(c, vw, &dw) != JS_OK ||
+        js_to_number(c, vh, &dh) != JS_OK ||
+        js_to_number(c, av[1], &ddx) != JS_OK ||
+        js_to_number(c, av[2], &ddy) != JS_OK)
+        return JS_THROW;
+    src = (const uint8_t *)js_uint8array_data(vdata, &dlen);
+    iw = (int)dw;
+    ih = (int)dh;
+    if (!src || iw <= 0 || ih <= 0)
+        return js_throw_error(c, JS_ERR_TYPE, "invalid ImageData");
+    need = (unsigned long)iw * (unsigned long)ih * 4ul;
+    if (dlen < need)
+        return js_throw_error(c, JS_ERR_RANGE, "ImageData buffer too small");
+    if (cv && cv->px && cv->alpha) {
+        dx = (int)jsd_floor(ddx);
+        dy = (int)jsd_floor(ddy);
+        for (iy = 0; iy < ih; iy++) {
+            int cy = dy + iy;
+            if (cy < 0 || cy >= cv->h)
+                continue;
+            for (ix = 0; ix < iw; ix++) {
+                int cx = dx + ix;
+                unsigned long si, di;
+
+                if (cx < 0 || cx >= cv->w)
+                    continue;
+                si = ((unsigned long)iy * (unsigned long)iw + (unsigned long)ix) * 4ul;
+                di = (unsigned long)cy * (unsigned long)cv->w + (unsigned long)cx;
+                cv->px[di] = ((uint32_t)src[si] << 16) |
+                             ((uint32_t)src[si + 1] << 8) |
+                             (uint32_t)src[si + 2];
+                cv->alpha[di] = src[si + 3];
+            }
+        }
+        mark_dom_dirty(h->j);
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* DOMParser (text/html, image/svg+xml, text/xml)                     */
+
+static void xml_decode_entities(const char *src, unsigned long len,
+                                char *out, unsigned long outsz)
+{
+    unsigned long i = 0, used = 0;
+
+    while (i < len && used + 1 < outsz) {
+        if (src[i] == '&') {
+            unsigned long j = i + 1;
+            while (j < len && src[j] != ';' && j - i < 32 &&
+                   src[j] != '<' && src[j] != '&')
+                j++;
+            if (j < len && src[j] == ';') {
+                unsigned long elen = j - (i + 1);
+                char ebuf[36];
+                unsigned long cp = 0;
+                int ok = 0;
+
+                if (elen > 0 && elen < sizeof(ebuf)) {
+                    memcpy(ebuf, src + i + 1, elen);
+                    ebuf[elen] = 0;
+                    if (!strcmp(ebuf, "apos")) { cp = '\''; ok = 1; }
+                    else if (ebuf[0] == '#') {
+                        const char *np = ebuf + 1;
+                        int base = 10;
+                        if (np[0] == 'x' || np[0] == 'X') { base = 16; np++; }
+                        while (*np) {
+                            unsigned d;
+                            if (*np >= '0' && *np <= '9') d = (unsigned)(*np - '0');
+                            else if (base == 16 && *np >= 'a' && *np <= 'f') d = (unsigned)(*np - 'a' + 10);
+                            else if (base == 16 && *np >= 'A' && *np <= 'F') d = (unsigned)(*np - 'A' + 10);
+                            else { ok = 0; break; }
+                            cp = cp * (unsigned long)base + d;
+                            ok = 1;
+                            np++;
+                        }
+                    } else if (html_entity_lookup(ebuf, (long)elen, &cp)) {
+                        ok = 1;
+                    }
+                    if (ok && cp > 0 && cp <= 0x10FFFFul) {
+                        char u8[6];
+                        int nbytes = dom_utf8_encode(cp, u8);
+                        if (nbytes > 0 && used + (unsigned long)nbytes + 1 < outsz) {
+                            memcpy(out + used, u8, (unsigned long)nbytes);
+                            used += (unsigned long)nbytes;
+                        }
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out[used++] = src[i++];
+    }
+    out[used] = 0;
+}
+
+static struct dom_document *jsdom_parse_xml_document(const char *src,
+                                                     unsigned long len,
+                                                     const char *default_ns)
+{
+    struct dom_document *d = dom_document_new();
+    struct dom_node *stack[64];
+    const char *ns_stack[64];
+    int sp = 0;
+    unsigned long i = 0;
+
+    if (!d)
+        return 0;
+    stack[0] = d->root;
+    ns_stack[0] = default_ns;
+    while (i < len) {
+        if (src[i] == '<') {
+            if (i + 4 <= len && !memcmp(src + i, "<!--", 4)) {
+                unsigned long start = i + 4, end = start;
+                struct dom_node *cm;
+
+                while (end + 3 <= len && memcmp(src + end, "-->", 3) != 0)
+                    end++;
+                cm = dom_create_comment(d, src + start, end - start);
+                if (cm) (void)dom_append_child(stack[sp], cm);
+                i = (end + 3 <= len) ? end + 3 : len;
+                continue;
+            }
+            if (i + 9 <= len && !memcmp(src + i, "<![CDATA[", 9)) {
+                unsigned long start = i + 9, end = start;
+                struct dom_node *tx;
+
+                while (end + 3 <= len && memcmp(src + end, "]]>", 3) != 0)
+                    end++;
+                tx = dom_create_text(d, src + start, end - start);
+                if (tx) (void)dom_append_child(stack[sp], tx);
+                i = (end + 3 <= len) ? end + 3 : len;
+                continue;
+            }
+            if (i + 2 <= len && (src[i + 1] == '?' || src[i + 1] == '!')) {
+                i += 2;
+                while (i < len && src[i] != '>') i++;
+                if (i < len) i++;
+                continue;
+            }
+            if (i + 2 <= len && src[i + 1] == '/') {
+                unsigned long tstart = i + 2, tend;
+                int k;
+
+                while (tstart < len && (src[tstart] == ' ' || src[tstart] == '\t'))
+                    tstart++;
+                tend = tstart;
+                while (tend < len && src[tend] != '>' &&
+                       (unsigned char)src[tend] > ' ')
+                    tend++;
+                while (i < len && src[i] != '>') i++;
+                if (i < len) i++;
+                for (k = sp; k >= 1; k--) {
+                    if (stack[k]->tag &&
+                        ci_eq_n(stack[k]->tag, strlen(stack[k]->tag),
+                                src + tstart, tend - tstart)) {
+                        sp = k - 1;
+                        break;
+                    }
+                }
+                continue;
+            }
+            {
+                unsigned long tstart = i + 1, tend = tstart;
+                char tagbuf[129], decbuf[2048];
+                struct dom_node *el;
+                const char *cur_ns = ns_stack[sp];
+                int self_close = 0;
+
+                while (tend < len && (unsigned char)src[tend] > ' ' &&
+                       src[tend] != '>' && src[tend] != '/')
+                    tend++;
+                if (tend == tstart) {
+                    i++;
+                    continue;
+                }
+                {
+                    unsigned long tl = tend - tstart;
+                    if (tl >= sizeof(tagbuf)) tl = sizeof(tagbuf) - 1;
+                    memcpy(tagbuf, src + tstart, tl);
+                    tagbuf[tl] = 0;
+                    el = dom_create_element(d, tagbuf, (long)tl);
+                    if (el)
+                        (void)dom_set_namespace(el, cur_ns, -1);
+                }
+                i = tend;
+                while (i < len && src[i] != '>') {
+                    unsigned long astart, aend, vstart, vend;
+                    char aname[129];
+
+                    while (i < len && (unsigned char)src[i] <= ' ') i++;
+                    if (i < len && src[i] == '/') {
+                        self_close = 1;
+                        i++;
+                        while (i < len && (unsigned char)src[i] <= ' ') i++;
+                        break;
+                    }
+                    if (i >= len || src[i] == '>')
+                        break;
+                    astart = i;
+                    while (i < len && (unsigned char)src[i] > ' ' &&
+                           src[i] != '=' && src[i] != '>' && src[i] != '/')
+                        i++;
+                    aend = i;
+                    while (i < len && (unsigned char)src[i] <= ' ') i++;
+                    vstart = vend = i;
+                    if (i < len && src[i] == '=') {
+                        i++;
+                        while (i < len && (unsigned char)src[i] <= ' ') i++;
+                        if (i < len && (src[i] == '"' || src[i] == '\'')) {
+                            char q = src[i++];
+                            vstart = i;
+                            while (i < len && src[i] != q) i++;
+                            vend = i;
+                            if (i < len) i++;
+                        } else {
+                            vstart = i;
+                            while (i < len && (unsigned char)src[i] > ' ' &&
+                                   src[i] != '>')
+                                i++;
+                            vend = i;
+                        }
+                    }
+                    if (el && aend > astart && aend - astart < sizeof(aname)) {
+                        memcpy(aname, src + astart, aend - astart);
+                        aname[aend - astart] = 0;
+                        xml_decode_entities(src + vstart, vend - vstart,
+                                            decbuf, sizeof(decbuf));
+                        if (!strcmp(aname, "xmlns")) {
+                            (void)dom_set_namespace(el, decbuf[0] ? decbuf : 0, -1);
+                            cur_ns = el->namespace_uri;
+                        }
+                        (void)dom_set_attr(el, aname, decbuf);
+                    }
+                }
+                if (i < len && src[i] == '>')
+                    i++;
+                if (el) {
+                    (void)dom_append_child(stack[sp], el);
+                    if (!self_close && sp + 1 < 64) {
+                        sp++;
+                        stack[sp] = el;
+                        ns_stack[sp] = cur_ns;
+                    }
+                }
+                continue;
+            }
+        }
+        {
+            unsigned long tstart = i;
+            char *tbuf;
+            struct dom_node *tn;
+
+            while (i < len && src[i] != '<') i++;
+            tbuf = (char *)malloc((i - tstart) + 1);
+            if (tbuf) {
+                xml_decode_entities(src + tstart, i - tstart,
+                                    tbuf, (i - tstart) + 1);
+                tn = dom_create_text(d, tbuf, strlen(tbuf));
+                if (tn) (void)dom_append_child(stack[sp], tn);
+                free(tbuf);
+            }
+        }
+    }
+    return d;
+}
+
+static int track_parsed_document(struct jsdom *j, struct dom_document *d)
+{
+    unsigned int ncap;
+    struct dom_document **narr;
+
+    if (!j || !d)
+        return 0;
+    if (j->parsed_doc_count >= j->parsed_doc_cap) {
+        ncap = j->parsed_doc_cap ? j->parsed_doc_cap * 2u : 8u;
+        narr = (struct dom_document **)realloc(j->parsed_docs,
+                                               ncap * sizeof(*narr));
+        if (!narr)
+            return 0;
+        j->parsed_docs = narr;
+        j->parsed_doc_cap = ncap;
+    }
+    j->parsed_docs[j->parsed_doc_count++] = d;
+    return 1;
+}
+
+static int dom_parser_constructor(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    js_object *obj;
+    (void)t; (void)ac; (void)av;
+
+    if (!j || !js_is_constructing(c))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "DOMParser must be constructed with new");
+    obj = new_host(j, 0, HOST_DOM_PARSER, j->dom_parser_proto);
+    if (!obj)
+        return JS_THROW;
+    *r = js_object_value(obj);
+    return JS_OK;
+}
+
+static int dom_parser_parse_from_string(js_ctx *c, js_value t,
+                                        int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_DOM_PARSER);
+    const char *markup, *mime;
+    struct dom_document *doc2 = 0;
+    struct doc_ref *ref;
+    js_object *proto, *docobj;
+
+    if (!h)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal DOMParser receiver");
+    if (ac < 2 || string_arg(c, ac, av, 0, &markup) != JS_OK ||
+        string_arg(c, ac, av, 1, &mime) != JS_OK)
+        return ac < 2
+            ? js_throw_error(c, JS_ERR_TYPE,
+                             "parseFromString requires string and type")
+            : JS_THROW;
+    if (!strcmp(mime, "text/html")) {
+        doc2 = html_parse_document(markup, strlen(markup));
+        proto = h->j->html_document_proto;
+    } else if (!strcmp(mime, "image/svg+xml")) {
+        doc2 = jsdom_parse_xml_document(markup, strlen(markup),
+                                        DOM_NS_SVG_URI);
+        proto = h->j->doc_proto;
+    } else if (!strcmp(mime, "text/xml") ||
+               !strcmp(mime, "application/xml")) {
+        doc2 = jsdom_parse_xml_document(markup, strlen(markup), 0);
+        proto = h->j->doc_proto;
+    } else if (!strcmp(mime, "application/xhtml+xml")) {
+        doc2 = jsdom_parse_xml_document(markup, strlen(markup),
+                                        DOM_NS_HTML_URI);
+        proto = h->j->doc_proto;
+    } else {
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "unsupported DOMParser MIME type");
+    }
+    if (!doc2)
+        return js_throw_error(c, JS_ERR_ERROR, "cannot parse document");
+    if (!track_parsed_document(h->j, doc2)) {
+        dom_document_free(doc2);
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    }
+    ref = (struct doc_ref *)calloc(1, sizeof(*ref));
+    if (!ref)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    ref->doc = doc2;
+    snprintf(ref->content_type, sizeof(ref->content_type), "%s", mime);
+    docobj = new_host_data(h->j, 0, HOST_DOCUMENT, ref, proto);
+    if (!docobj) {
+        free(ref);
+        return JS_THROW;
+    }
+    *r = js_object_value(docobj);
+    return JS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Geometry, Viewport, Scroll, Observers & Clipboard                  */
+
+static int node_is_in_main_dom(const struct jsdom *j,
+                               const struct dom_node *node)
+{
+    const struct dom_node *cur = node;
+
+    if (!j || !j->doc || !j->doc->root)
+        return 0;
+    while (cur && cur != j->doc->root)
+        cur = cur->parent;
+    return cur == j->doc->root;
+}
+
+static int node_box_rect(struct jsdom *j, struct dom_node *node,
+                         float *ox, float *oy, float *ow, float *oh)
+{
+    const char *ws, *hs;
+
+    *ox = 0.0f; *oy = 0.0f; *ow = 0.0f; *oh = 0.0f;
+    if (!j || !node || node->type != DOM_ELEMENT)
+        return 0;
+    if (j->get_box_rect && j->get_box_rect(j->print_user, node, ox, oy, ow, oh))
+        return 1;
+    if (node->tag_id == HTAG_CANVAS && node->canvas) {
+        *ow = (float)node->canvas->w;
+        *oh = (float)node->canvas->h;
+        return 1;
+    }
+    ws = dom_get_attr(node, "width");
+    hs = dom_get_attr(node, "height");
+    if (ws || hs) {
+        double dw = 0.0, dh = 0.0;
+        if (ws && jsd_parse_double(ws, &dw, 0) && dw > 0.0) *ow = (float)dw;
+        if (hs && jsd_parse_double(hs, &dh, 0) && dh > 0.0) *oh = (float)dh;
+        return (*ow > 0.0f || *oh > 0.0f);
+    }
+    {
+        char wbuf[64], hbuf[64];
+        double dw = 0.0, dh = 0.0;
+        const char *we, *he;
+
+        computed_resolve_prop(j, node, "width", wbuf, sizeof(wbuf), 0);
+        computed_resolve_prop(j, node, "height", hbuf, sizeof(hbuf), 0);
+        if (jsd_parse_double(wbuf, &dw, &we) && !strcmp(we, "px") && dw > 0.0)
+            *ow = (float)dw;
+        if (jsd_parse_double(hbuf, &dh, &he) && !strcmp(he, "px") && dh > 0.0)
+            *oh = (float)dh;
+    }
+    return 0;
+}
+
+static int make_dom_rect(js_ctx *c, double x, double y, double w, double h,
+                         js_value *out)
+{
+    js_object *rect = js_new_object(c);
+    js_value rv;
+
+    if (!rect)
+        return JS_THROW;
+    rv = js_object_value(rect);
+    if (js_set(c, rv, "x", js_number(x)) != JS_OK ||
+        js_set(c, rv, "y", js_number(y)) != JS_OK ||
+        js_set(c, rv, "width", js_number(w)) != JS_OK ||
+        js_set(c, rv, "height", js_number(h)) != JS_OK ||
+        js_set(c, rv, "top", js_number(y)) != JS_OK ||
+        js_set(c, rv, "left", js_number(x)) != JS_OK ||
+        js_set(c, rv, "right", js_number(x + w)) != JS_OK ||
+        js_set(c, rv, "bottom", js_number(y + h)) != JS_OK)
+        return JS_THROW;
+    *out = rv;
+    return JS_OK;
+}
+
+static int node_get_bounding_client_rect(js_ctx *c, js_value t,
+                                         int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    float x, y, w, hb;
+    (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal Element receiver");
+    (void)node_box_rect(h->j, h->node, &x, &y, &w, &hb);
+    return make_dom_rect(c, (double)x, (double)y, (double)w, (double)hb, r);
+}
+
+static int node_metric_get(js_ctx *c, js_value t, int ac, js_value *av,
+                           js_value *r, int which)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    float x = 0, y = 0, w = 0, hb = 0;
+    double val = 0.0;
+    (void)c; (void)ac; (void)av;
+
+    if (!h || h->node->type != DOM_ELEMENT) {
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (h->node == h->j->doc->html && (which == 0 || which == 1)) {
+        *r = js_number(which == 0 ? (double)h->j->viewport_width
+                                  : (double)h->j->viewport_height);
+        return JS_OK;
+    }
+    (void)node_box_rect(h->j, h->node, &x, &y, &w, &hb);
+    if (which == 0 || which == 2) val = (double)(int)(w + 0.5f);
+    else if (which == 1 || which == 3) val = (double)(int)(hb + 0.5f);
+    else if (which == 4) val = (double)(int)(x + 0.5f);
+    else if (which == 5) val = (double)(int)(y + 0.5f);
+    *r = js_number(val);
+    return JS_OK;
+}
+
+#define NODE_METRIC_GETTER(fn, which)                                        \
+static int fn(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)      \
+{ return node_metric_get(c, t, ac, av, r, which); }
+NODE_METRIC_GETTER(node_client_width_get, 0)
+NODE_METRIC_GETTER(node_client_height_get, 1)
+NODE_METRIC_GETTER(node_offset_width_get, 2)
+NODE_METRIC_GETTER(node_offset_height_get, 3)
+NODE_METRIC_GETTER(node_offset_left_get, 4)
+NODE_METRIC_GETTER(node_offset_top_get, 5)
+#undef NODE_METRIC_GETTER
+
+static int node_scroll_pos_get(js_ctx *c, js_value t, int ac, js_value *av,
+                               js_value *r)
+{
+    struct hostref *h = host(t, HOST_NODE);
+    (void)c; (void)ac; (void)av;
+    *r = h ? js_number(0) : js_undefined();
+    return JS_OK;
+}
+
+static int node_scroll_pos_set(js_ctx *c, js_value t, int ac, js_value *av,
+                               js_value *r)
+{
+    (void)c; (void)t; (void)ac; (void)av;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int window_scroll_x_get(js_ctx *c, js_value t, int ac, js_value *av,
+                               js_value *r)
+{
+    struct jsdom *j = binding(c);
+    (void)t; (void)ac; (void)av;
+    *r = js_number(j ? j->scroll_x : 0.0);
+    return JS_OK;
+}
+
+static int window_scroll_y_get(js_ctx *c, js_value t, int ac, js_value *av,
+                               js_value *r)
+{
+    struct jsdom *j = binding(c);
+    (void)t; (void)ac; (void)av;
+    *r = js_number(j ? j->scroll_y : 0.0);
+    return JS_OK;
+}
+
+static int window_inner_w_get(js_ctx *c, js_value t, int ac, js_value *av,
+                              js_value *r)
+{
+    struct jsdom *j = binding(c);
+    (void)t; (void)ac; (void)av;
+    *r = js_number(j ? (double)j->viewport_width : 0.0);
+    return JS_OK;
+}
+
+static int window_inner_h_get(js_ctx *c, js_value t, int ac, js_value *av,
+                              js_value *r)
+{
+    struct jsdom *j = binding(c);
+    (void)t; (void)ac; (void)av;
+    *r = js_number(j ? (double)j->viewport_height : 0.0);
+    return JS_OK;
+}
+
+static int parse_scroll_args(js_ctx *c, int ac, js_value *av,
+                             double def_x, double def_y,
+                             double *ox, double *oy)
+{
+    double x = def_x, y = def_y;
+
+    if (ac == 1 && js_is_object(av[0])) {
+        js_value lx, ly;
+        double d;
+
+        if (js_get(c, av[0], "left", &lx) != JS_OK ||
+            js_get(c, av[0], "top", &ly) != JS_OK)
+            return JS_THROW;
+        if (!js_is_undefined(lx)) {
+            if (js_to_number(c, lx, &d) != JS_OK) return JS_THROW;
+            if (jsd_isfinite(d)) x = d;
+        }
+        if (!js_is_undefined(ly)) {
+            if (js_to_number(c, ly, &d) != JS_OK) return JS_THROW;
+            if (jsd_isfinite(d)) y = d;
+        }
+    } else if (ac >= 1) {
+        double d;
+        if (js_to_number(c, av[0], &d) != JS_OK) return JS_THROW;
+        if (jsd_isfinite(d)) x = d;
+        if (ac >= 2) {
+            if (js_to_number(c, av[1], &d) != JS_OK) return JS_THROW;
+            if (jsd_isfinite(d)) y = d;
+        }
+    }
+    *ox = x;
+    *oy = y;
+    return JS_OK;
+}
+
+static int window_scroll_apply(js_ctx *c, struct jsdom *j, double x, double y)
+{
+    js_value ev, global;
+    char ebuf[128];
+
+    if (x < 0.0) x = 0.0;
+    if (y < 0.0) y = 0.0;
+    j->scroll_x = x;
+    j->scroll_y = y;
+    if (j->scroll_cb)
+        j->scroll_cb(j->print_user, x, y);
+    if (event_make(j, j->event_proto, "scroll", js_undefined(),
+                   js_undefined(), 0, &ev) != JS_OK)
+        return JS_THROW;
+    global = js_global(c);
+    ebuf[0] = 0;
+    if (dispatch_event_value(j, global, ev, 0, ebuf, sizeof(ebuf)) < 0)
+        return JS_THROW;
+    return JS_OK;
+}
+
+static int global_scroll_to(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{
+    struct jsdom *j = binding(c);
+    double x, y;
+    (void)t;
+
+    if (!j) return js_throw_error(c, JS_ERR_ERROR, "DOM binding unavailable");
+    if (parse_scroll_args(c, ac, av, j->scroll_x, j->scroll_y, &x, &y) != JS_OK)
+        return JS_THROW;
+    if (window_scroll_apply(c, j, x, y) != JS_OK)
+        return JS_THROW;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int global_scroll_by(js_ctx *c, js_value t, int ac, js_value *av,
+                            js_value *r)
+{
+    struct jsdom *j = binding(c);
+    double dx, dy;
+    (void)t;
+
+    if (!j) return js_throw_error(c, JS_ERR_ERROR, "DOM binding unavailable");
+    if (parse_scroll_args(c, ac, av, 0.0, 0.0, &dx, &dy) != JS_OK)
+        return JS_THROW;
+    if (window_scroll_apply(c, j, j->scroll_x + dx, j->scroll_y + dy) != JS_OK)
+        return JS_THROW;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* ResizeObserver & IntersectionObserver                              */
+
+static int resize_observer_constructor(js_ctx *c, js_value t,
+                                       int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    struct resize_observer_state *st;
+    js_object *obj;
+    unsigned int slot;
+    (void)t;
+
+    if (!j || !js_is_constructing(c))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "ResizeObserver requires new");
+    if (ac < 1 || !js_is_function(av[0]))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "ResizeObserver requires a callback");
+    for (slot = 0; slot < JSDOM_OBSERVERS_MAX; slot++)
+        if (!j->resize_observers[slot]) break;
+    if (slot == JSDOM_OBSERVERS_MAX)
+        return js_throw_error(c, JS_ERR_RANGE, "too many ResizeObservers");
+    st = (struct resize_observer_state *)calloc(1, sizeof(*st));
+    if (!st)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    st->callback = av[0];
+    obj = new_host_data(j, 0, HOST_RESIZE_OBSERVER, st,
+                        j->resize_observer_proto);
+    if (!obj) {
+        free(st);
+        return JS_THROW;
+    }
+    st->self = js_object_value(obj);
+    if (js_define(c, obj, "__callback", av[0]) != JS_OK)
+        return JS_THROW;
+    j->resize_observers[slot] = st;
+    *r = st->self;
+    return JS_OK;
+}
+
+static int resize_observer_observe(js_ctx *c, js_value t,
+                                   int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_RESIZE_OBSERVER);
+    struct hostref *target = ac ? host(av[0], HOST_NODE) : 0;
+    struct resize_observer_state *st =
+        h ? (struct resize_observer_state *)h->data : 0;
+    unsigned int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal ResizeObserver receiver");
+    if (!target || target->j != h->j || target->node->type != DOM_ELEMENT)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "observe requires an Element target");
+    for (i = 0; i < st->target_count; i++) {
+        if (st->targets[i].node == target->node) {
+            st->targets[i].pending = 1;
+            *r = js_undefined();
+            return JS_OK;
+        }
+    }
+    if (st->target_count >= JSDOM_OBSERVER_TARGETS_MAX)
+        return js_throw_error(c, JS_ERR_RANGE,
+                              "too many observed targets");
+    st->targets[st->target_count].node = target->node;
+    st->targets[st->target_count].last_w = -1.0f;
+    st->targets[st->target_count].last_h = -1.0f;
+    st->targets[st->target_count].pending = 1;
+    st->target_count++;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int resize_observer_unobserve(js_ctx *c, js_value t,
+                                     int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_RESIZE_OBSERVER);
+    struct hostref *target = ac ? host(av[0], HOST_NODE) : 0;
+    struct resize_observer_state *st =
+        h ? (struct resize_observer_state *)h->data : 0;
+    unsigned int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal ResizeObserver receiver");
+    if (target) {
+        for (i = 0; i < st->target_count; i++) {
+            if (st->targets[i].node == target->node) {
+                memmove(&st->targets[i], &st->targets[i + 1],
+                        (st->target_count - i - 1) * sizeof(st->targets[0]));
+                st->target_count--;
+                break;
+            }
+        }
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int resize_observer_disconnect(js_ctx *c, js_value t,
+                                      int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_RESIZE_OBSERVER);
+    struct resize_observer_state *st =
+        h ? (struct resize_observer_state *)h->data : 0;
+    (void)ac; (void)av;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal ResizeObserver receiver");
+    st->target_count = 0;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int intersection_observer_constructor(js_ctx *c, js_value t,
+                                             int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    struct intersection_observer_state *st;
+    js_object *obj;
+    unsigned int slot;
+    (void)t;
+
+    if (!j || !js_is_constructing(c))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "IntersectionObserver requires new");
+    if (ac < 1 || !js_is_function(av[0]))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "IntersectionObserver requires a callback");
+    for (slot = 0; slot < JSDOM_OBSERVERS_MAX; slot++)
+        if (!j->intersection_observers[slot]) break;
+    if (slot == JSDOM_OBSERVERS_MAX)
+        return js_throw_error(c, JS_ERR_RANGE,
+                              "too many IntersectionObservers");
+    st = (struct intersection_observer_state *)calloc(1, sizeof(*st));
+    if (!st)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    st->callback = av[0];
+    if (ac > 1 && js_is_object(av[1])) {
+        js_value rv;
+        if (js_get(c, av[1], "root", &rv) == JS_OK) {
+            struct hostref *rh = host(rv, HOST_NODE);
+            if (rh && rh->j == j && rh->node->type == DOM_ELEMENT)
+                st->root = rh->node;
+        }
+    }
+    obj = new_host_data(j, 0, HOST_INTERSECTION_OBSERVER, st,
+                        j->intersection_observer_proto);
+    if (!obj) {
+        free(st);
+        return JS_THROW;
+    }
+    st->self = js_object_value(obj);
+    if (js_define(c, obj, "__callback", av[0]) != JS_OK)
+        return JS_THROW;
+    j->intersection_observers[slot] = st;
+    *r = st->self;
+    return JS_OK;
+}
+
+static int intersection_observer_observe(js_ctx *c, js_value t,
+                                         int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_INTERSECTION_OBSERVER);
+    struct hostref *target = ac ? host(av[0], HOST_NODE) : 0;
+    struct intersection_observer_state *st =
+        h ? (struct intersection_observer_state *)h->data : 0;
+    unsigned int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal IntersectionObserver receiver");
+    if (!target || target->j != h->j || target->node->type != DOM_ELEMENT)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "observe requires an Element target");
+    for (i = 0; i < st->target_count; i++) {
+        if (st->targets[i].node == target->node) {
+            st->targets[i].pending = 1;
+            *r = js_undefined();
+            return JS_OK;
+        }
+    }
+    if (st->target_count >= JSDOM_OBSERVER_TARGETS_MAX)
+        return js_throw_error(c, JS_ERR_RANGE,
+                              "too many observed targets");
+    st->targets[st->target_count].node = target->node;
+    st->targets[st->target_count].pending = 1;
+    st->target_count++;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int intersection_observer_unobserve(js_ctx *c, js_value t,
+                                           int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_INTERSECTION_OBSERVER);
+    struct hostref *target = ac ? host(av[0], HOST_NODE) : 0;
+    struct intersection_observer_state *st =
+        h ? (struct intersection_observer_state *)h->data : 0;
+    unsigned int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal IntersectionObserver receiver");
+    if (target) {
+        for (i = 0; i < st->target_count; i++) {
+            if (st->targets[i].node == target->node) {
+                memmove(&st->targets[i], &st->targets[i + 1],
+                        (st->target_count - i - 1) * sizeof(st->targets[0]));
+                st->target_count--;
+                break;
+            }
+        }
+    }
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int intersection_observer_disconnect(js_ctx *c, js_value t,
+                                            int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = host(t, HOST_INTERSECTION_OBSERVER);
+    struct intersection_observer_state *st =
+        h ? (struct intersection_observer_state *)h->data : 0;
+    (void)ac; (void)av;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal IntersectionObserver receiver");
+    st->target_count = 0;
+    *r = js_undefined();
+    return JS_OK;
+}
+
+static int intersection_observer_take_records(js_ctx *c, js_value t,
+                                              int ac, js_value *av, js_value *r)
+{
+    js_object *arr;
+    (void)ac; (void)av;
+    if (!host(t, HOST_INTERSECTION_OBSERVER))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal IntersectionObserver receiver");
+    arr = js_new_array(c);
+    if (!arr) return JS_THROW;
+    *r = js_object_value(arr);
+    return JS_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* navigator.clipboard                                                */
+
+static int navigator_clipboard_write_text(js_ctx *c, js_value t,
+                                          int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    const char *text;
+    unsigned long len;
+    js_value promise;
+    char *copy;
+    (void)t;
+
+    if (!j)
+        return js_throw_error(c, JS_ERR_ERROR, "DOM binding unavailable");
+    promise = js_promise_new(c);
+    if (!js_is_promise(promise))
+        return JS_THROW;
+    if (string_arg(c, ac, av, 0, &text) != JS_OK)
+        return JS_THROW;
+    len = strlen(text);
+    copy = (char *)malloc(len + 1);
+    if (!copy) {
+        (void)js_promise_reject(c, promise, js_mkcstring(c, "out of memory"));
+        *r = promise;
+        return JS_OK;
+    }
+    memcpy(copy, text, len + 1);
+    free(j->clipboard_text);
+    j->clipboard_text = copy;
+    j->clipboard_len = len;
+    if (j->clipboard_write && j->clipboard_write(j->print_user, copy, len) != 0) {
+        (void)js_promise_reject(c, promise,
+                                js_mkcstring(c, "clipboard write failed"));
+        *r = promise;
+        return JS_OK;
+    }
+    if (js_promise_resolve(c, promise, js_undefined()) != JS_OK)
+        return JS_THROW;
+    *r = promise;
+    return JS_OK;
+}
+
+static int navigator_clipboard_read_text(js_ctx *c, js_value t,
+                                         int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    js_value promise, str_val;
+    (void)t; (void)ac; (void)av;
+
+    if (!j)
+        return js_throw_error(c, JS_ERR_ERROR, "DOM binding unavailable");
+    promise = js_promise_new(c);
+    if (!js_is_promise(promise))
+        return JS_THROW;
+    if (j->clipboard_read) {
+        unsigned long len = 0;
+        char *buf = j->clipboard_read(j->print_user, &len);
+        if (buf) {
+            str_val = js_mkstring(c, buf, len);
+            free(buf);
+            if (js_fatal(c) || js_promise_resolve(c, promise, str_val) != JS_OK)
+                return JS_THROW;
+            *r = promise;
+            return JS_OK;
+        }
+    }
+    str_val = js_mkstring(c, j->clipboard_text ? j->clipboard_text : "",
+                          j->clipboard_text ? j->clipboard_len : 0ul);
+    if (js_fatal(c) || js_promise_resolve(c, promise, str_val) != JS_OK)
+        return JS_THROW;
+    *r = promise;
+    return JS_OK;
+}
+
 static int define_node_proto(struct jsdom *j)
 {
     js_ctx *c = j->ctx;
@@ -13877,6 +18906,17 @@ static int define_node_proto(struct jsdom *j)
     ACC("dataset", node_dataset_get, 0);
     ACC("classList", node_classlist_get, 0);
     ACC("style", node_style_get, 0);
+    ACC("clientWidth", node_client_width_get, 0);
+    ACC("clientHeight", node_client_height_get, 0);
+    ACC("offsetWidth", node_offset_width_get, 0);
+    ACC("offsetHeight", node_offset_height_get, 0);
+    ACC("offsetLeft", node_offset_left_get, 0);
+    ACC("offsetTop", node_offset_top_get, 0);
+    ACC("scrollWidth", node_client_width_get, 0);
+    ACC("scrollHeight", node_client_height_get, 0);
+    ACC("scrollLeft", node_scroll_pos_get, node_scroll_pos_set);
+    ACC("scrollTop", node_scroll_pos_get, node_scroll_pos_set);
+    FUN("getBoundingClientRect", node_get_bounding_client_rect, 0);
     FUN("getAttribute", node_get_attr, 1);
     FUN("getAttributeNode", node_get_attribute_node, 1);
     FUN("setAttribute", node_set_attr, 2);
@@ -13911,7 +18951,7 @@ static int define_node_proto(struct jsdom *j)
     FUN("closest", node_closest, 1);
     FUN("querySelector", node_query, 1);
     FUN("querySelectorAll", node_query_all, 1);
-    FUN("getElementsByTagName", node_query_all, 1);
+    FUN("getElementsByTagName", node_get_by_tag, 1);
     FUN("getElementsByTagNameNS", node_get_by_tag_ns, 2);
     FUN("getElementsByClassName", node_get_by_class, 1);
     FUN("addEventListener", node_add_listener, 2);
@@ -14400,7 +19440,7 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->doc_proto, "getElementById", doc_by_id, 1);
     FUN(j->doc_proto, "querySelector", doc_query, 1);
     FUN(j->doc_proto, "querySelectorAll", doc_query_all, 1);
-    FUN(j->doc_proto, "getElementsByTagName", doc_query_all, 1);
+    FUN(j->doc_proto, "getElementsByTagName", node_get_by_tag, 1);
     FUN(j->doc_proto, "getElementsByTagNameNS",
         node_get_by_tag_ns, 2);
     FUN(j->doc_proto, "getElementsByClassName", node_get_by_class, 1);
@@ -14493,17 +19533,8 @@ static int define_other_protos(struct jsdom *j)
     ACC(j->class_proto, "value", class_value_get, class_value_set);
 
     ACC(j->style_proto, "cssText", style_css_get, style_css_set);
-    ACC(j->style_proto, "display", style_display_get, style_display_set);
-    ACC(j->style_proto, "color", style_color_get, style_color_set);
-    ACC(j->style_proto, "backgroundColor", style_bg_get, style_bg_set);
-    ACC(j->style_proto, "width", style_width_get, style_width_set);
-    ACC(j->style_proto, "height", style_height_get, style_height_set);
-    ACC(j->style_proto, "margin", style_margin_get, style_margin_set);
-    ACC(j->style_proto, "padding", style_padding_get, style_padding_set);
-    ACC(j->style_proto, "fontSize", style_font_size_get, style_font_size_set);
-    ACC(j->style_proto, "fontWeight", style_font_weight_get, style_font_weight_set);
-    ACC(j->style_proto, "textAlign", style_text_align_get, style_text_align_set);
-    ACC(j->style_proto, "visibility", style_visibility_get, style_visibility_set);
+    if (!register_css_decl_accessors(c, j->style_proto))
+        return 0;
     ACC(j->style_proto, "length", style_length_get, 0);
     FUN(j->style_proto, "getPropertyValue",
         style_get_property_value, 1);
@@ -14512,6 +19543,89 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->style_proto, "getPropertyPriority",
         style_get_property_priority, 1);
     FUN(j->style_proto, "item", style_item, 1);
+
+    ACC(j->computed_style_proto, "cssText", computed_style_css_get,
+        computed_style_readonly);
+    if (!register_css_decl_accessors(c, j->computed_style_proto))
+        return 0;
+    ACC(j->computed_style_proto, "length", computed_style_length_get, 0);
+    FUN(j->computed_style_proto, "getPropertyValue",
+        computed_style_get_property_value, 1);
+    FUN(j->computed_style_proto, "setProperty",
+        computed_style_readonly, 3);
+    FUN(j->computed_style_proto, "removeProperty",
+        computed_style_readonly, 1);
+    FUN(j->computed_style_proto, "getPropertyPriority",
+        computed_style_get_property_priority, 1);
+    FUN(j->computed_style_proto, "item", computed_style_item, 1);
+
+    ACC(j->template_element_proto, "content", template_content_get, 0);
+    ACC(j->canvas_element_proto, "width",
+        canvas_width_get, canvas_width_set);
+    ACC(j->canvas_element_proto, "height",
+        canvas_height_get, canvas_height_set);
+    FUN(j->canvas_element_proto, "getContext", canvas_get_context, 1);
+    FUN(j->canvas_element_proto, "toDataURL", canvas_to_data_url, 1);
+
+    ACC(j->canvas_2d_proto, "canvas", ctx2d_canvas_get, 0);
+    ACC(j->canvas_2d_proto, "fillStyle",
+        ctx2d_fill_style_get, ctx2d_fill_style_set);
+    ACC(j->canvas_2d_proto, "strokeStyle",
+        ctx2d_stroke_style_get, ctx2d_stroke_style_set);
+    ACC(j->canvas_2d_proto, "lineWidth",
+        ctx2d_line_width_get, ctx2d_line_width_set);
+    ACC(j->canvas_2d_proto, "globalAlpha",
+        ctx2d_global_alpha_get, ctx2d_global_alpha_set);
+    ACC(j->canvas_2d_proto, "font", ctx2d_font_get, ctx2d_font_set);
+    ACC(j->canvas_2d_proto, "textAlign",
+        ctx2d_text_align_get, ctx2d_text_align_set);
+    ACC(j->canvas_2d_proto, "textBaseline",
+        ctx2d_text_baseline_get, ctx2d_text_baseline_set);
+    FUN(j->canvas_2d_proto, "save", ctx2d_save, 0);
+    FUN(j->canvas_2d_proto, "restore", ctx2d_restore, 0);
+    FUN(j->canvas_2d_proto, "translate", ctx2d_translate, 2);
+    FUN(j->canvas_2d_proto, "scale", ctx2d_scale, 2);
+    FUN(j->canvas_2d_proto, "rotate", ctx2d_rotate, 1);
+    FUN(j->canvas_2d_proto, "transform", ctx2d_transform, 6);
+    FUN(j->canvas_2d_proto, "setTransform", ctx2d_set_transform, 6);
+    FUN(j->canvas_2d_proto, "resetTransform", ctx2d_reset_transform, 0);
+    FUN(j->canvas_2d_proto, "fillRect", ctx2d_fill_rect, 4);
+    FUN(j->canvas_2d_proto, "strokeRect", ctx2d_stroke_rect, 4);
+    FUN(j->canvas_2d_proto, "clearRect", ctx2d_clear_rect, 4);
+    FUN(j->canvas_2d_proto, "beginPath", ctx2d_begin_path, 0);
+    FUN(j->canvas_2d_proto, "closePath", ctx2d_close_path, 0);
+    FUN(j->canvas_2d_proto, "moveTo", ctx2d_move_to, 2);
+    FUN(j->canvas_2d_proto, "lineTo", ctx2d_line_to, 2);
+    FUN(j->canvas_2d_proto, "rect", ctx2d_rect, 4);
+    FUN(j->canvas_2d_proto, "arc", ctx2d_arc, 6);
+    FUN(j->canvas_2d_proto, "quadraticCurveTo",
+        ctx2d_quadratic_curve_to, 4);
+    FUN(j->canvas_2d_proto, "bezierCurveTo", ctx2d_bezier_curve_to, 6);
+    FUN(j->canvas_2d_proto, "fill", ctx2d_fill, 0);
+    FUN(j->canvas_2d_proto, "stroke", ctx2d_stroke, 0);
+    FUN(j->canvas_2d_proto, "fillText", ctx2d_fill_text, 3);
+    FUN(j->canvas_2d_proto, "strokeText", ctx2d_stroke_text, 3);
+    FUN(j->canvas_2d_proto, "measureText", ctx2d_measure_text, 1);
+    FUN(j->canvas_2d_proto, "createImageData", ctx2d_create_image_data, 2);
+    FUN(j->canvas_2d_proto, "getImageData", ctx2d_get_image_data, 4);
+    FUN(j->canvas_2d_proto, "putImageData", ctx2d_put_image_data, 3);
+
+    FUN(j->dom_parser_proto, "parseFromString",
+        dom_parser_parse_from_string, 2);
+
+    FUN(j->resize_observer_proto, "observe", resize_observer_observe, 1);
+    FUN(j->resize_observer_proto, "unobserve", resize_observer_unobserve, 1);
+    FUN(j->resize_observer_proto, "disconnect",
+        resize_observer_disconnect, 0);
+
+    FUN(j->intersection_observer_proto, "observe",
+        intersection_observer_observe, 1);
+    FUN(j->intersection_observer_proto, "unobserve",
+        intersection_observer_unobserve, 1);
+    FUN(j->intersection_observer_proto, "disconnect",
+        intersection_observer_disconnect, 0);
+    FUN(j->intersection_observer_proto, "takeRecords",
+        intersection_observer_take_records, 0);
 
     ACC(j->response_proto, "status", response_status_get, 0);
     ACC(j->response_proto, "statusText", response_status_text_get, 0);
@@ -14611,13 +19725,17 @@ struct jsdom *jsdom_new(struct dom_document *doc,
 {
     struct jsdom *j;
     js_config jc;
-    js_object *docobj, *locobj, *navobj, *screenobj, *perfobj, *url_ctor;
+    js_object *docobj, *locobj, *navobj, *clipboardobj, *screenobj, *perfobj;
+    js_object *url_ctor;
     js_object *abort_controller_ctor, *abort_signal_ctor;
     js_object *event_target_ctor, *event_ctor, *custom_event_ctor;
     js_object *ui_event_ctor, *mouse_event_ctor, *keyboard_event_ctor;
     js_object *focus_event_ctor, *input_event_ctor, *pointer_event_ctor;
     js_object *node_ctor, *character_data_ctor, *text_ctor, *comment_ctor;
     js_object *element_ctor, *html_element_ctor, *svg_element_ctor;
+    js_object *html_canvas_ctor, *html_template_ctor, *canvas_2d_ctor;
+    js_object *image_data_ctor, *dom_parser_ctor;
+    js_object *resize_observer_ctor, *intersection_observer_ctor;
     js_object *fragment_ctor, *document_ctor;
     js_object *html_document_ctor;
     js_object *mutation_observer_ctor, *mutation_record_ctor;
@@ -14643,6 +19761,10 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (!j)
         return 0;
     j->doc = doc;
+    j->external_sheet = cfg ? cfg->stylesheet : 0;
+    if (j->external_sheet)
+        j->initial_style_hash = style_tags_hash(doc);
+    j->style_sheet_dirty = 1;
     j->url = dup_z(cfg && cfg->url ? cfg->url : "about:blank");
     j->base_url = dup_z(cfg && cfg->base_url ? cfg->base_url :
                         (cfg && cfg->url ? cfg->url : "about:blank"));
@@ -14652,6 +19774,10 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->cookie_get = cfg ? cfg->cookie_get : 0;
     j->cookie_set = cfg ? cfg->cookie_set : 0;
     j->fetch = cfg ? cfg->fetch : 0;
+    j->get_box_rect = cfg ? cfg->get_box_rect : 0;
+    j->scroll_cb = cfg ? cfg->scroll_cb : 0;
+    j->clipboard_write = cfg ? cfg->clipboard_write : 0;
+    j->clipboard_read = cfg ? cfg->clipboard_read : 0;
     j->print_user = cfg ? cfg->user : 0;
     j->local_storage = cfg ? cfg->local_storage : 0;
     j->session_storage = cfg ? cfg->session_storage : 0;
@@ -14706,6 +19832,10 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->element_proto = js_new_object_proto(j->ctx, j->node_proto);
     j->html_element_proto =
         js_new_object_proto(j->ctx, j->element_proto);
+    j->canvas_element_proto =
+        js_new_object_proto(j->ctx, j->html_element_proto);
+    j->template_element_proto =
+        js_new_object_proto(j->ctx, j->html_element_proto);
     j->svg_element_proto =
         js_new_object_proto(j->ctx, j->element_proto);
     j->fragment_proto = js_new_object_proto(j->ctx, j->node_proto);
@@ -14715,6 +19845,12 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->location_proto = js_new_object(j->ctx);
     j->class_proto = js_new_object(j->ctx);
     j->style_proto = js_new_object(j->ctx);
+    j->computed_style_proto = js_new_object(j->ctx);
+    j->canvas_2d_proto = js_new_object(j->ctx);
+    j->image_data_proto = js_new_object(j->ctx);
+    j->dom_parser_proto = js_new_object(j->ctx);
+    j->resize_observer_proto = js_new_object(j->ctx);
+    j->intersection_observer_proto = js_new_object(j->ctx);
     j->response_proto = js_new_object(j->ctx);
     j->request_proto = js_new_object(j->ctx);
     j->blob_proto = js_new_object(j->ctx);
@@ -14757,10 +19893,14 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (!j->event_target_proto || !j->node_proto ||
         !j->character_data_proto || !j->text_proto || !j->comment_proto ||
         !j->element_proto || !j->html_element_proto ||
+        !j->canvas_element_proto || !j->template_element_proto ||
         !j->svg_element_proto || !j->fragment_proto || !j->doc_proto ||
         !j->html_document_proto ||
         !j->location_proto ||
-        !j->class_proto || !j->style_proto || !j->response_proto ||
+        !j->class_proto || !j->style_proto || !j->computed_style_proto ||
+        !j->canvas_2d_proto || !j->image_data_proto || !j->dom_parser_proto ||
+        !j->resize_observer_proto || !j->intersection_observer_proto ||
+        !j->response_proto ||
         !j->request_proto || !j->blob_proto || !j->file_proto ||
         !j->file_reader_proto || !j->formdata_proto ||
         !j->web_iterator_proto || !j->media_query_proto ||
@@ -14820,6 +19960,26 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     html_element_ctor = js_new_native_constructor(
         j->ctx, illegal_dom_constructor, "HTMLElement", 0,
         j->html_element_proto);
+    html_canvas_ctor = js_new_native_constructor(
+        j->ctx, illegal_dom_constructor, "HTMLCanvasElement", 0,
+        j->canvas_element_proto);
+    html_template_ctor = js_new_native_constructor(
+        j->ctx, illegal_dom_constructor, "HTMLTemplateElement", 0,
+        j->template_element_proto);
+    canvas_2d_ctor = js_new_native_constructor(
+        j->ctx, illegal_dom_constructor, "CanvasRenderingContext2D", 0,
+        j->canvas_2d_proto);
+    image_data_ctor = js_new_native_constructor(
+        j->ctx, illegal_dom_constructor, "ImageData", 0,
+        j->image_data_proto);
+    dom_parser_ctor = js_new_native_constructor(
+        j->ctx, dom_parser_constructor, "DOMParser", 0, j->dom_parser_proto);
+    resize_observer_ctor = js_new_native_constructor(
+        j->ctx, resize_observer_constructor, "ResizeObserver", 1,
+        j->resize_observer_proto);
+    intersection_observer_ctor = js_new_native_constructor(
+        j->ctx, intersection_observer_constructor, "IntersectionObserver", 1,
+        j->intersection_observer_proto);
     svg_element_ctor = js_new_native_constructor(
         j->ctx, illegal_dom_constructor, "SVGElement", 0,
         j->svg_element_proto);
@@ -14884,6 +20044,9 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (!event_target_ctor || !node_ctor || !character_data_ctor ||
         !text_ctor || !comment_ctor || !element_ctor || !fragment_ctor ||
         !html_element_ctor || !svg_element_ctor ||
+        !html_canvas_ctor || !html_template_ctor || !canvas_2d_ctor ||
+        !image_data_ctor || !dom_parser_ctor ||
+        !resize_observer_ctor || !intersection_observer_ctor ||
         !document_ctor || !html_document_ctor ||
         !mutation_observer_ctor || !mutation_record_ctor ||
         !dom_exception_ctor || !attr_ctor || !named_node_map_ctor ||
@@ -14956,6 +20119,7 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->selection = selection_object
         ? js_object_value(selection_object) : js_undefined();
     navobj = js_new_object(j->ctx);
+    clipboardobj = js_new_object(j->ctx);
     languages = js_new_array(j->ctx);
     screenobj = js_new_object(j->ctx);
     orientation = js_new_object(j->ctx);
@@ -14983,7 +20147,7 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (history && !historyobj)
         history_release(history);
     if (!docobj || !locobj || !selection_object ||
-        !navobj || !languages ||
+        !navobj || !clipboardobj || !languages ||
         !orientation ||
         !screenobj || !perfobj ||
         !cryptoobj || !subtleobj ||
@@ -15002,8 +20166,14 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                       js_mkcstring(j->ctx, "en-US")) != JS_OK ||
         js_array_push(j->ctx, languages,
                       js_mkcstring(j->ctx, "en")) != JS_OK ||
+        js_define_native(j->ctx, clipboardobj, "writeText",
+                         navigator_clipboard_write_text, 1) != JS_OK ||
+        js_define_native(j->ctx, clipboardobj, "readText",
+                         navigator_clipboard_read_text, 0) != JS_OK ||
         js_define_native(j->ctx, navobj, "sendBeacon",
                          navigator_send_beacon, 2) != JS_OK ||
+        js_set(j->ctx, js_object_value(navobj), "clipboard",
+               js_object_value(clipboardobj)) != JS_OK ||
         js_set(j->ctx, js_object_value(navobj), "userAgent",
                js_mkcstring(j->ctx,
                             "Mozilla/5.0 (X11; KestrelOS) "
@@ -15072,6 +20242,12 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                          global_performance_now, 0) != JS_OK)
         goto fail;
     global = js_global(j->ctx);
+    {
+        js_value obj_ctor, freeze_fn, lang_val = js_object_value(languages), ig;
+        if (js_get(j->ctx, global, "Object", &obj_ctor) == JS_OK &&
+            js_get(j->ctx, obj_ctor, "freeze", &freeze_fn) == JS_OK)
+            (void)js_call(j->ctx, freeze_fn, obj_ctor, 1, &lang_val, &ig);
+    }
     if (js_define(j->ctx, global.u.obj, "__kestrelDocument",
                   js_object_value(docobj)) != JS_OK ||
         js_set(j->ctx, global, "document", js_object_value(docobj)) != JS_OK ||
@@ -15119,20 +20295,30 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                          global_match_media, 1) != JS_OK ||
         js_define_native(j->ctx, global.u.obj, "getSelection",
                          global_get_selection, 0) != JS_OK ||
-        js_set(j->ctx, global, "innerWidth",
-               js_number(j->viewport_width)) != JS_OK ||
-        js_set(j->ctx, global, "innerHeight",
-               js_number(j->viewport_height)) != JS_OK ||
-        js_set(j->ctx, global, "outerWidth",
-               js_number(j->viewport_width)) != JS_OK ||
-        js_set(j->ctx, global, "outerHeight",
-               js_number(j->viewport_height)) != JS_OK ||
+        js_define_native(j->ctx, global.u.obj, "scrollTo",
+                         global_scroll_to, 2) != JS_OK ||
+        js_define_native(j->ctx, global.u.obj, "scroll",
+                         global_scroll_to, 2) != JS_OK ||
+        js_define_native(j->ctx, global.u.obj, "scrollBy",
+                         global_scroll_by, 2) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "innerWidth",
+                           window_inner_w_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "innerHeight",
+                           window_inner_h_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "outerWidth",
+                           window_inner_w_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "outerHeight",
+                           window_inner_h_get, 0, 1) != JS_OK ||
         js_set(j->ctx, global, "devicePixelRatio",
                js_number(1)) != JS_OK ||
-        js_set(j->ctx, global, "scrollX", js_number(0)) != JS_OK ||
-        js_set(j->ctx, global, "scrollY", js_number(0)) != JS_OK ||
-        js_set(j->ctx, global, "pageXOffset", js_number(0)) != JS_OK ||
-        js_set(j->ctx, global, "pageYOffset", js_number(0)) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "scrollX",
+                           window_scroll_x_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "scrollY",
+                           window_scroll_y_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "pageXOffset",
+                           window_scroll_x_get, 0, 1) != JS_OK ||
+        js_define_accessor(j->ctx, global.u.obj, "pageYOffset",
+                           window_scroll_y_get, 0, 1) != JS_OK ||
         js_set(j->ctx, global, "localStorage",
                js_object_value(localobj)) != JS_OK ||
         js_set(j->ctx, global, "sessionStorage",
@@ -15157,6 +20343,20 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                js_object_value(element_ctor)) != JS_OK ||
         js_set(j->ctx, global, "HTMLElement",
                js_object_value(html_element_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "HTMLCanvasElement",
+               js_object_value(html_canvas_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "HTMLTemplateElement",
+               js_object_value(html_template_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "CanvasRenderingContext2D",
+               js_object_value(canvas_2d_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "ImageData",
+               js_object_value(image_data_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "DOMParser",
+               js_object_value(dom_parser_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "ResizeObserver",
+               js_object_value(resize_observer_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "IntersectionObserver",
+               js_object_value(intersection_observer_ctor)) != JS_OK ||
         js_set(j->ctx, global, "SVGElement",
                js_object_value(svg_element_ctor)) != JS_OK ||
         js_set(j->ctx, global, "DocumentFragment",
@@ -15233,12 +20433,30 @@ fail:
 void jsdom_free(struct jsdom *j)
 {
     struct dom_node *n;
+    unsigned int k;
     int i;
     if (!j) return;
     if (j->doc && j->doc->root)
         for (n = j->doc->root; n; n = dom_next(n))
             n->user = 0;
+    for (k = 0; k < j->parsed_doc_count; k++) {
+        if (j->parsed_docs[k] && j->parsed_docs[k]->root)
+            for (n = j->parsed_docs[k]->root; n; n = dom_next(n))
+                n->user = 0;
+    }
     js_free(j->ctx);
+    if (j->doc && j->doc->root)
+        free_subtree_canvases(j->doc->root);
+    for (k = 0; k < j->parsed_doc_count; k++) {
+        if (j->parsed_docs[k]) {
+            free_subtree_canvases(j->parsed_docs[k]->root);
+            dom_document_free(j->parsed_docs[k]);
+        }
+    }
+    free(j->parsed_docs);
+    free(j->dataset_nodes);
+    css_free(j->author_sheet);
+    free(j->clipboard_text);
     for (i = 0; i < JSDOM_FETCH_MAX; i++) {
         free(j->fetches[i].url);
         free(j->fetches[i].method);
@@ -15272,6 +20490,7 @@ int jsdom_eval(struct jsdom *j, const char *source, const char *name,
         return -1;
     js_reset_steps(j->ctx);
     rc = js_eval(j->ctx, source, name ? name : "script", &r);
+    dataset_sync_all(j);
     if (rc == JS_OK)
         return 0;
     msg = js_error_text(j->ctx, r);
@@ -15840,6 +21059,29 @@ static int pump_file_reader(struct jsdom *j, int index,
     return 1;
 }
 
+static int observer_has_pending(const struct jsdom *j)
+{
+    unsigned int i, k;
+
+    for (i = 0; i < JSDOM_OBSERVERS_MAX; i++) {
+        const struct resize_observer_state *ro = j->resize_observers[i];
+        const struct intersection_observer_state *io =
+            j->intersection_observers[i];
+
+        if (ro) {
+            for (k = 0; k < ro->target_count; k++)
+                if (ro->targets[k].pending)
+                    return 1;
+        }
+        if (io) {
+            for (k = 0; k < io->target_count; k++)
+                if (io->targets[k].pending)
+                    return 1;
+        }
+    }
+    return 0;
+}
+
 static int jsdom_needs_immediate_turn(struct jsdom *j, int jobs)
 {
     int i;
@@ -15864,6 +21106,8 @@ static int jsdom_needs_immediate_turn(struct jsdom *j, int jobs)
         if (j->mutation_observers[i] &&
             j->mutation_observers[i]->record_count)
             return 1;
+    if (observer_has_pending(j))
+        return 1;
     return 0;
 }
 
@@ -15890,10 +21134,186 @@ static int deliver_mutations(struct jsdom *j)
     return delivered;
 }
 
+static int deliver_resize_observers(struct jsdom *j)
+{
+    unsigned int i, k;
+    int delivered = 0;
+
+    for (i = 0; i < JSDOM_OBSERVERS_MAX; i++) {
+        struct resize_observer_state *st = j->resize_observers[i];
+        js_object *entries;
+        js_value args[2], ignored;
+        unsigned long n_entries = 0;
+
+        if (!st || !st->target_count)
+            continue;
+        entries = js_new_array(j->ctx);
+        if (!entries)
+            return -1;
+        for (k = 0; k < st->target_count; k++) {
+            float x = 0, y = 0, w = 0, h = 0;
+            js_object *entry;
+            js_value rect_val;
+
+            (void)node_box_rect(j, st->targets[k].node, &x, &y, &w, &h);
+            if (!st->targets[k].pending &&
+                w == st->targets[k].last_w &&
+                h == st->targets[k].last_h)
+                continue;
+            st->targets[k].pending = 0;
+            st->targets[k].last_w = w;
+            st->targets[k].last_h = h;
+            entry = js_new_object(j->ctx);
+            if (!entry ||
+                make_dom_rect(j->ctx, 0.0, 0.0, (double)w, (double)h,
+                              &rect_val) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "target",
+                       wrap_node(j, st->targets[k].node)) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "contentRect",
+                       rect_val) != JS_OK ||
+                js_array_push(j->ctx, entries,
+                              js_object_value(entry)) != JS_OK)
+                return -1;
+            n_entries++;
+        }
+        if (!n_entries)
+            continue;
+        args[0] = js_object_value(entries);
+        args[1] = st->self;
+        js_reset_steps(j->ctx);
+        if (js_call(j->ctx, st->callback, st->self,
+                    2, args, &ignored) != JS_OK)
+            return -1;
+        delivered++;
+    }
+    return delivered;
+}
+
+static int deliver_intersection_observers(struct jsdom *j)
+{
+    unsigned int i, k;
+    int delivered = 0;
+
+    for (i = 0; i < JSDOM_OBSERVERS_MAX; i++) {
+        struct intersection_observer_state *st = j->intersection_observers[i];
+        js_object *entries;
+        js_value args[2], ignored, root_bounds;
+        double rx0, ry0, rx1, ry1, rw, rh;
+        unsigned long n_entries = 0;
+        int has_pending = 0;
+
+        if (!st || !st->target_count)
+            continue;
+        for (k = 0; k < st->target_count; k++)
+            if (st->targets[k].pending) { has_pending = 1; break; }
+        if (!has_pending)
+            continue;
+        if (st->root) {
+            float fx, fy, fw, fh;
+            (void)node_box_rect(j, st->root, &fx, &fy, &fw, &fh);
+            rx0 = (double)fx; ry0 = (double)fy;
+            rw = (double)fw; rh = (double)fh;
+            rx1 = rx0 + rw; ry1 = ry0 + rh;
+        } else {
+            rx0 = j->scroll_x;
+            ry0 = j->scroll_y;
+            rw = (double)j->viewport_width;
+            rh = (double)j->viewport_height;
+            rx1 = rx0 + rw;
+            ry1 = ry0 + rh;
+        }
+        if (make_dom_rect(j->ctx, rx0, ry0, rw, rh, &root_bounds) != JS_OK)
+            return -1;
+        entries = js_new_array(j->ctx);
+        if (!entries)
+            return -1;
+        for (k = 0; k < st->target_count; k++) {
+            float fx = 0, fy = 0, fw = 0, fh = 0;
+            double bx, by, bw, bh, ix0, iy0, ix1, iy1, iw = 0, ih = 0;
+            double ratio = 0.0;
+            int connected, has_box, is_int = 0;
+            js_object *entry;
+            js_value brect, irect;
+
+            if (!st->targets[k].pending)
+                continue;
+            st->targets[k].pending = 0;
+            connected = node_is_in_main_dom(j, st->targets[k].node);
+            has_box = node_box_rect(j, st->targets[k].node, &fx, &fy, &fw, &fh);
+            bx = (double)fx; by = (double)fy;
+            bw = (double)fw; bh = (double)fh;
+            if (connected) {
+                if (!has_box && bw == 0.0 && bh == 0.0) {
+                    is_int = 1;
+                    ratio = 1.0;
+                    ix0 = bx; iy0 = by;
+                } else {
+                    ix0 = bx > rx0 ? bx : rx0;
+                    iy0 = by > ry0 ? by : ry0;
+                    ix1 = (bx + bw) < rx1 ? (bx + bw) : rx1;
+                    iy1 = (by + bh) < ry1 ? (by + bh) : ry1;
+                    if (ix1 > ix0 && iy1 > iy0) {
+                        iw = ix1 - ix0;
+                        ih = iy1 - iy0;
+                        is_int = 1;
+                        ratio = (bw * bh > 0.0)
+                            ? (iw * ih) / (bw * bh) : 1.0;
+                        if (ratio > 1.0) ratio = 1.0;
+                    } else if ((bw == 0.0 || bh == 0.0) &&
+                               bx >= rx0 && bx <= rx1 &&
+                               by >= ry0 && by <= ry1) {
+                        is_int = 1;
+                        ratio = 1.0;
+                        ix0 = bx; iy0 = by;
+                    } else {
+                        ix0 = 0.0; iy0 = 0.0;
+                    }
+                }
+            } else {
+                ix0 = 0.0; iy0 = 0.0;
+            }
+            entry = js_new_object(j->ctx);
+            if (!entry ||
+                make_dom_rect(j->ctx, bx, by, bw, bh, &brect) != JS_OK ||
+                make_dom_rect(j->ctx, ix0, iy0, iw, ih, &irect) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "target",
+                       wrap_node(j, st->targets[k].node)) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "isIntersecting",
+                       js_bool(is_int)) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "intersectionRatio",
+                       js_number(ratio)) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "boundingClientRect",
+                       brect) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "intersectionRect",
+                       irect) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "rootBounds",
+                       root_bounds) != JS_OK ||
+                js_set(j->ctx, js_object_value(entry), "time",
+                       js_number((double)(j->event_turn * 200UL))) != JS_OK ||
+                js_array_push(j->ctx, entries,
+                              js_object_value(entry)) != JS_OK)
+                return -1;
+            n_entries++;
+        }
+        if (!n_entries)
+            continue;
+        args[0] = js_object_value(entries);
+        args[1] = st->self;
+        js_reset_steps(j->ctx);
+        if (js_call(j->ctx, st->callback, st->self,
+                    2, args, &ignored) != JS_OK)
+            return -1;
+        delivered++;
+    }
+    return delivered;
+}
+
 int jsdom_pump(struct jsdom *j, char *err, unsigned long errsz)
 {
-    int i, ran = 0, jobs, mutations, pass;
+    int i, ran = 0, jobs, mutations, obs, pass;
 
+    if (err && errsz)
+        err[0] = 0;
     if (!j)
         return 0;
     for (pass = 0; pass < 64; pass++) {
@@ -15906,6 +21326,12 @@ int jsdom_pump(struct jsdom *j, char *err, unsigned long errsz)
     if (mutations < 0)
         goto fail;
     ran += mutations;
+    obs = deliver_resize_observers(j);
+    if (obs < 0) goto fail;
+    ran += obs;
+    obs = deliver_intersection_observers(j);
+    if (obs < 0) goto fail;
+    ran += obs;
     for (i = 0; i < (int)(sizeof(j->timers) / sizeof(j->timers[0])); i++) {
         js_value fn, result, special_arg;
         js_value *callback_args;
@@ -15993,10 +21419,17 @@ int jsdom_pump(struct jsdom *j, char *err, unsigned long errsz)
     if (mutations < 0)
         goto fail;
     ran += mutations;
+    obs = deliver_resize_observers(j);
+    if (obs < 0) goto fail;
+    ran += obs;
+    obs = deliver_intersection_observers(j);
+    if (obs < 0) goto fail;
+    ran += obs;
     jobs = js_run_jobs(j->ctx, 256);
     if (jobs < 0)
         goto fail;
     ran += jobs;
+    dataset_sync_all(j);
     if (!jsdom_needs_immediate_turn(j, jobs))
         break;
     }
@@ -16034,4 +21467,55 @@ void jsdom_clear_navigation(struct jsdom *j)
 const char *jsdom_document_url(const struct jsdom *j)
 {
     return j ? j->url : 0;
+}
+
+double jsdom_scroll_x(const struct jsdom *j)
+{
+    return j ? j->scroll_x : 0.0;
+}
+
+double jsdom_scroll_y(const struct jsdom *j)
+{
+    return j ? j->scroll_y : 0.0;
+}
+
+void jsdom_set_scroll(struct jsdom *j, double x, double y)
+{
+    if (!j) return;
+    j->scroll_x = x < 0.0 ? 0.0 : x;
+    j->scroll_y = y < 0.0 ? 0.0 : y;
+}
+
+void jsdom_notify_resize(struct jsdom *j, unsigned int vw, unsigned int vh,
+                         char *err, unsigned long errsz)
+{
+    unsigned int i, k;
+    js_value ev, global;
+    char ebuf[160];
+
+    if (!j)
+        return;
+    if (vw) j->viewport_width = vw;
+    if (vh) j->viewport_height = vh;
+    j->style_sheet_dirty = 1;
+    for (i = 0; i < JSDOM_OBSERVERS_MAX; i++) {
+        if (j->resize_observers[i]) {
+            for (k = 0; k < j->resize_observers[i]->target_count; k++)
+                j->resize_observers[i]->targets[k].pending = 1;
+        }
+        if (j->intersection_observers[i]) {
+            for (k = 0; k < j->intersection_observers[i]->target_count; k++)
+                j->intersection_observers[i]->targets[k].pending = 1;
+        }
+    }
+    if (event_make(j, j->event_proto, "resize", js_undefined(),
+                   js_undefined(), 0, &ev) == JS_OK) {
+        global = js_global(j->ctx);
+        ebuf[0] = 0;
+        if (dispatch_event_value(j, global, ev, 0,
+                                 err && errsz ? err : ebuf,
+                                 err && errsz ? errsz : sizeof(ebuf)) < 0)
+            return;
+    }
+    (void)jsdom_pump(j, err, errsz);
 }

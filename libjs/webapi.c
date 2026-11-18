@@ -980,6 +980,123 @@ static int urlparams_for_each(js_ctx *ctx, js_value this_value, int argc,
     return JS_OK;
 }
 
+static int urlparams_iter_self(js_ctx *ctx, js_value this_value, int argc,
+                               js_value *argv, js_value *out)
+{
+    (void)ctx;
+    (void)argc;
+    (void)argv;
+    *out = this_value;
+    return JS_OK;
+}
+
+static int urlparams_iterator_next(js_ctx *ctx, js_value this_value, int argc,
+                                   js_value *argv, js_value *out)
+{
+    js_value source_val, index_val, kind_val;
+    js_object *params, *result;
+    unsigned long index;
+    int kind;
+
+    (void)argc;
+    (void)argv;
+    if (this_value.type != JS_OBJECT ||
+        js_get(ctx, this_value, "__params", &source_val) != JS_OK ||
+        js_get(ctx, this_value, "__index", &index_val) != JS_OK ||
+        js_get(ctx, this_value, "__kind", &kind_val) != JS_OK ||
+        !(params = urlparams_this(ctx, source_val)) ||
+        index_val.type != JS_NUMBER || kind_val.type != JS_NUMBER)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid URLSearchParams iterator");
+    index = index_val.u.num < 0 ? 0 : (unsigned long)index_val.u.num;
+    kind = (int)kind_val.u.num;
+    result = js_new_object(ctx);
+    if (!result)
+        return JS_THROW;
+    if (index * 2 + 1 >= params->params_list->elen) {
+        if (js_define_enum(ctx, result, "value", js_undefined()) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(1)) != JS_OK)
+            return JS_THROW;
+    } else {
+        js_value key = params->params_list->elems[index * 2];
+        js_value val = params->params_list->elems[index * 2 + 1];
+        js_value item;
+
+        if (kind == 0) {
+            item = key;
+        } else if (kind == 1) {
+            item = val;
+        } else {
+            js_object *pair = js_new_array(ctx);
+            if (!pair ||
+                js_array_push(ctx, pair, key) != JS_OK ||
+                js_array_push(ctx, pair, val) != JS_OK)
+                return JS_THROW;
+            item = js_object_value(pair);
+        }
+        if (js_define_enum(ctx, result, "value", item) != JS_OK ||
+            js_define_enum(ctx, result, "done", js_bool(0)) != JS_OK ||
+            js_set(ctx, this_value, "__index",
+                   js_number((double)(index + 1))) != JS_OK)
+            return JS_THROW;
+    }
+    *out = js_object_value(result);
+    return JS_OK;
+}
+
+static int urlparams_iterator(js_ctx *ctx, js_value this_value,
+                              js_value *out, int kind)
+{
+    js_object *params = urlparams_this(ctx, this_value);
+    js_object *iterator;
+
+    if (!params)
+        return JS_THROW;
+    iterator = js_new_object(ctx);
+    if (!iterator ||
+        js_define(ctx, iterator, "__params", this_value) != JS_OK ||
+        js_define(ctx, iterator, "__index", js_number(0)) != JS_OK ||
+        js_define(ctx, iterator, "__kind", js_number(kind)) != JS_OK ||
+        js_define_native(ctx, iterator, "next",
+                         urlparams_iterator_next, 0) != JS_OK)
+        return JS_THROW;
+    if (ctx->sym_iterator.type == JS_SYMBOL) {
+        js_object *self_fn = js_new_native(ctx, urlparams_iter_self,
+                                           "[Symbol.iterator]", 0);
+        if (!self_fn ||
+            js_define_symbol_prop(ctx, iterator, ctx->sym_iterator,
+                                  js_object_value(self_fn),
+                                  JS_P_HIDDEN) != JS_OK)
+            return JS_THROW;
+    }
+    *out = js_object_value(iterator);
+    return JS_OK;
+}
+
+static int urlparams_keys(js_ctx *ctx, js_value this_value, int argc,
+                          js_value *argv, js_value *out)
+{
+    (void)argc;
+    (void)argv;
+    return urlparams_iterator(ctx, this_value, out, 0);
+}
+
+static int urlparams_values(js_ctx *ctx, js_value this_value, int argc,
+                            js_value *argv, js_value *out)
+{
+    (void)argc;
+    (void)argv;
+    return urlparams_iterator(ctx, this_value, out, 1);
+}
+
+static int urlparams_entries(js_ctx *ctx, js_value this_value, int argc,
+                             js_value *argv, js_value *out)
+{
+    (void)argc;
+    (void)argv;
+    return urlparams_iterator(ctx, this_value, out, 2);
+}
+
 /* ================================================================== */
 /* Registration                                                        */
 /* ================================================================== */
@@ -1019,8 +1136,22 @@ int js_init_webapis(js_ctx *ctx)
         !web_method(ctx, proto, "set", urlparams_set, 2) ||
         !web_method(ctx, proto, "sort", urlparams_sort, 0) ||
         !web_method(ctx, proto, "forEach", urlparams_for_each, 1) ||
+        !web_method(ctx, proto, "keys", urlparams_keys, 0) ||
+        !web_method(ctx, proto, "values", urlparams_values, 0) ||
         !web_method(ctx, proto, "toString", urlparams_to_string, 0) ||
         !web_constructor(ctx, urlparams_ctor, "URLSearchParams", 1, proto))
         return 0;
+    {
+        js_object *entries_fn = js_new_native(ctx, urlparams_entries,
+                                              "entries", 0);
+        if (!entries_fn ||
+            js_define(ctx, proto, "entries",
+                      js_object_value(entries_fn)) != JS_OK ||
+            (ctx->sym_iterator.type == JS_SYMBOL &&
+             js_define_symbol_prop(ctx, proto, ctx->sym_iterator,
+                                   js_object_value(entries_fn),
+                                   JS_P_HIDDEN) != JS_OK))
+            return 0;
+    }
     return 1;
 }

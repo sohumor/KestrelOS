@@ -2708,6 +2708,7 @@ static int execute_page_scripts(struct browser_page *p,
         ? (unsigned int)viewport_width : 1;
     cfg.viewport_height = viewport_height > 0
         ? (unsigned int)viewport_height : 1;
+    cfg.stylesheet = p->author;
     if (cpuinfo(&cpu) == 0 && cpu.online)
         cfg.hardware_concurrency = cpu.online;
     p->js = jsdom_new(p->doc, &cfg);
@@ -2867,10 +2868,10 @@ static void page_content_destroy(struct browser_page *p)
         css_style_dom_free(p->doc->root);
     style_engine_free(p->styles);
     p->styles = 0;
-    css_free(p->author);
-    p->author = 0;
     jsdom_free(p->js);
     p->js = 0;
+    css_free(p->author);
+    p->author = 0;
     for (im = p->images; im; im = next) {
         next = im->next;
         img_free(&im->decoded);

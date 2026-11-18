@@ -56,7 +56,8 @@ enum js_type {
     JS_BOOL      = 2,
     JS_NUMBER    = 3,
     JS_STRING    = 4,
-    JS_OBJECT    = 5
+    JS_OBJECT    = 5,
+    JS_SYMBOL    = 6
 };
 
 typedef struct js_ctx    js_ctx;
@@ -142,6 +143,7 @@ static inline int js_is_bool(js_value v)      { return v.type == JS_BOOL; }
 static inline int js_is_number(js_value v)    { return v.type == JS_NUMBER; }
 static inline int js_is_string(js_value v)    { return v.type == JS_STRING; }
 static inline int js_is_object(js_value v)    { return v.type == JS_OBJECT; }
+static inline int js_is_symbol(js_value v)    { return v.type == JS_SYMBOL; }
 int  js_is_function(js_value v);
 int  js_is_array(js_value v);
 int  js_is_promise(js_value v);
@@ -342,22 +344,24 @@ int js_run_jobs(js_ctx *ctx, unsigned long max_jobs);
 /* ---- tokens ---- */
 enum js_token {
     TK_EOF = 0, TK_IDENT, TK_NUM, TK_STR, TK_REGEX,
+    TK_TPL_FULL, TK_TPL_HEAD, TK_TPL_MID, TK_TPL_TAIL,
     TK_LBRACE, TK_RBRACE, TK_LPAREN, TK_RPAREN, TK_LBRACKET, TK_RBRACKET,
-    TK_DOT, TK_SEMI, TK_COMMA,
+    TK_DOT, TK_DOTDOTDOT, TK_OPTCHAIN, TK_SEMI, TK_COMMA,
     TK_LT, TK_GT, TK_LE, TK_GE, TK_EQ, TK_NE, TK_SEQ, TK_SNE,
-    TK_ADD, TK_SUB, TK_MUL, TK_DIV, TK_MOD,
+    TK_ADD, TK_SUB, TK_MUL, TK_DIV, TK_MOD, TK_POW,
     TK_INC, TK_DEC, TK_SHL, TK_SHR, TK_USHR,
-    TK_BAND, TK_BOR, TK_BXOR, TK_NOT, TK_BNOT, TK_ANDAND, TK_OROR,
+    TK_BAND, TK_BOR, TK_BXOR, TK_NOT, TK_BNOT, TK_ANDAND, TK_OROR, TK_QQ,
     TK_QUESTION, TK_COLON, TK_ASSIGN, TK_ARROW,
-    TK_ADD_A, TK_SUB_A, TK_MUL_A, TK_DIV_A, TK_MOD_A,
+    TK_ADD_A, TK_SUB_A, TK_MUL_A, TK_DIV_A, TK_MOD_A, TK_POW_A,
     TK_SHL_A, TK_SHR_A, TK_USHR_A, TK_BAND_A, TK_BOR_A, TK_BXOR_A,
+    TK_ANDAND_A, TK_OROR_A, TK_QQ_A,
     /* keywords -- must stay contiguous and match kw_table[] in lex.c */
-    TK_BREAK, TK_CASE, TK_CATCH, TK_CONTINUE, TK_DEBUGGER, TK_DEFAULT,
-    TK_DELETE, TK_DO, TK_ELSE, TK_FALSE, TK_FINALLY, TK_FOR, TK_FUNCTION,
-    TK_IF, TK_IN, TK_INSTANCEOF, TK_NEW, TK_NULL_KW, TK_RETURN, TK_SWITCH,
-    TK_THIS, TK_THROW, TK_TRUE, TK_TRY, TK_TYPEOF, TK_VAR, TK_CONST, TK_LET,
-    TK_VOID,
-    TK_WHILE, TK_WITH,
+    TK_BREAK, TK_CASE, TK_CATCH, TK_CLASS, TK_CONTINUE, TK_DEBUGGER,
+    TK_DEFAULT, TK_DELETE, TK_DO, TK_ELSE, TK_EXTENDS, TK_FALSE,
+    TK_FINALLY, TK_FOR, TK_FUNCTION, TK_IF, TK_IN, TK_INSTANCEOF,
+    TK_NEW, TK_NULL_KW, TK_RETURN, TK_SUPER, TK_SWITCH, TK_THIS,
+    TK_THROW, TK_TRUE, TK_TRY, TK_TYPEOF, TK_VAR, TK_CONST, TK_LET,
+    TK_VOID, TK_WHILE, TK_WITH,
     TK__COUNT
 };
 
@@ -373,6 +377,8 @@ typedef struct js_lexer {
     int          tok_line;
     js_string   *text;          /* ident name / string value / regex src */
     js_string   *flags;         /* regex flags                           */
+    js_string   *raw;           /* raw template chunk                    */
+    int          tpl_err;       /* invalid escape in template chunk      */
     double       num;
 
     int          prev_tok;      /* for the regex-vs-division heuristic   */
@@ -384,17 +390,19 @@ typedef struct js_lexer {
 
 void js_lex_init(js_lexer *lx, js_ctx *ctx, const char *src);
 int  js_lex_next(js_lexer *lx);          /* JS_OK / JS_THROW */
+int  js_lex_template_cont(js_lexer *lx); /* resume after `${expr}` */
 const char *js_token_name(int tok);
 
 /* ---- AST ---- */
 enum js_nodetype {
-    N_NUM, N_STR, N_REGEX, N_IDENT, N_THIS, N_NULL, N_BOOL,
-    N_ARRAY, N_OBJECT, N_PROP, N_FUNC,
-    N_CALL, N_NEW, N_MEMBER, N_INDEX,
-    N_PREFIX, N_POSTFIX, N_UNARY, N_BINARY, N_LOGICAL, N_ASSIGN,
+    N_NUM, N_STR, N_REGEX, N_TPL, N_IDENT, N_THIS, N_SUPER, N_NULL, N_BOOL,
+    N_ARRAY, N_OBJECT, N_PROP, N_FUNC, N_CLASS,
+    N_SPREAD, N_REST, N_DEFAULT, N_ARR_PAT, N_OBJ_PAT,
+    N_CALL, N_NEW, N_MEMBER, N_INDEX, N_OPTCHAIN,
+    N_PREFIX, N_POSTFIX, N_UNARY, N_AWAIT, N_BINARY, N_LOGICAL, N_ASSIGN,
     N_COND, N_SEQ,
     N_PROGRAM, N_BLOCK, N_VAR, N_VARDECL, N_EMPTY, N_EXPRSTMT,
-    N_IF, N_DO, N_WHILE, N_FOR, N_FORIN,
+    N_IF, N_DO, N_WHILE, N_FOR, N_FORIN, N_FOROF,
     N_CONTINUE, N_BREAK, N_RETURN, N_WITH, N_SWITCH, N_CASE, N_LABEL,
     N_THROW, N_TRY, N_FUNCDECL, N_DEBUGGER
 };
@@ -405,23 +413,29 @@ struct js_node {
     uint16_t  flags;
     uint32_t  line;
     js_string *str;        /* identifier, string literal, label, prop name  */
-    js_string *str2;       /* regex flags                                   */
+    js_string *str2;       /* regex flags / template raw chunk              */
     double     num;
-    js_node   *a, *b, *c, *d;
+    js_node   *a, *b, *c, *d, *e;
     js_node   *next;       /* sibling within a list                         */
 };
 
 /* Compiled function body, shared by every closure over it. */
 struct js_func {
     js_string *name;
-    js_node   *params;      /* N_IDENT list  */
-    js_node   *body;        /* statement list */
-    js_node   *vars;        /* hoisted N_IDENT list (var + params)         */
-    js_node   *funcs;       /* hoisted N_FUNCDECL list                     */
+    js_node   *params;      /* parameter pattern list                        */
+    js_node   *body;        /* statement list                                */
+    js_node   *vars;        /* hoisted N_IDENT list (var + params)           */
+    js_node   *funcs;       /* hoisted N_FUNCDECL list                       */
+    js_node   *lex;         /* top-level lexical declarations in body        */
     int        nparams;
     js_env    *closure;
+    js_object *home_obj;    /* home object for super lookup                  */
     js_native  native;
-    int        ctor_kind;   /* JS_CTOR_* -- how `new f()` behaves          */
+    int        ctor_kind;   /* JS_CTOR_* -- how `new f()` behaves            */
+    uint8_t    is_async;
+    uint8_t    is_class_ctor;
+    uint8_t    is_derived;
+    uint8_t    has_complex_params;
 
     /* Function.prototype.bind state; NULL target means "not bound". */
     js_object *bound_target;
@@ -456,6 +470,9 @@ int        js_str_eq(js_string *a, js_string *b);
 #define JS_P_CONFIG   0x04
 #define JS_P_ACCESSOR 0x08
 #define JS_P_DEAD     0x10   /* deleted; slot kept so ordering is stable */
+#define JS_P_CONST    0x20   /* immutable lexical binding (`const`) */
+#define JS_P_TDZ      0x40   /* uninitialized lexical binding (TDZ) */
+#define JS_P_SYMBOL   0x80   /* property keyed by a Symbol */
 #define JS_P_DEFAULT  (JS_P_ENUM | JS_P_WRITE | JS_P_CONFIG)
 #define JS_P_HIDDEN   (JS_P_WRITE | JS_P_CONFIG)
 
@@ -467,10 +484,13 @@ typedef struct js_prop {
     uint32_t   hnext;      /* hash chain, index+1, 0 = end */
 } js_prop;
 
+typedef struct js_async_task js_async_task;
+
 typedef struct js_promise_reaction {
     js_value on_fulfilled;
     js_value on_rejected;
     js_object *child;
+    js_async_task *async_task;
     struct js_promise_reaction *next;
 } js_promise_reaction;
 
@@ -488,15 +508,30 @@ enum js_class {
     JS_CLASS_TEXTENCODER, JS_CLASS_TEXTDECODER, JS_CLASS_URLSEARCHPARAMS,
     JS_CLASS_MAP, JS_CLASS_SET,
     JS_CLASS_WEAKMAP, JS_CLASS_WEAKSET,
+    JS_CLASS_SYMBOL,
     JS_CLASS_HOST
 };
 
-#define JS_NODE_ARROW 0x0001u
+#define JS_NODE_ARROW         0x0001u
+#define JS_NODE_ASYNC         0x0002u
+#define JS_NODE_OPT           0x0004u
+#define JS_NODE_PAREN         0x0008u
+#define JS_NODE_STATIC        0x0010u
+#define JS_NODE_CLASS_DECL    0x0020u
+#define JS_NODE_SHORTHAND_DEF 0x0040u
+#define JS_NODE_TAGGED        0x0080u
+#define JS_NODE_HAS_AWAIT     0x0100u
+#define JS_NODE_HAS_COMPLEX   0x0200u
+#define JS_NODE_COMPUTED      0x0400u
+
+#define JS_OBJ_SEALED 0x01u
+#define JS_OBJ_FROZEN 0x02u
 
 struct js_object {
     uint8_t    cls;
     uint8_t    extensible;
     uint8_t    sparse;      /* array with indices outside the dense run */
+    uint8_t    integrity;   /* JS_OBJ_SEALED | JS_OBJ_FROZEN for dense arrays */
     js_object *proto;
 
     js_prop   *props;
@@ -508,7 +543,7 @@ struct js_object {
     uint32_t   elen, ecap;
 
     js_func   *fn;          /* JS_CLASS_FUNCTION */
-    js_value   prim;        /* wrapper primitive / Date time value */
+    js_value   prim;        /* wrapper primitive / Date time / Symbol desc */
     js_regexp *re;          /* JS_CLASS_REGEXP */
     uint8_t    promise_state; /* 0 pending, 1 fulfilled, 2 rejected */
     js_value   promise_result;
@@ -532,16 +567,32 @@ js_object *js_obj_alloc(js_ctx *ctx, int cls, js_object *proto);
 js_object *js_uint8array_view(js_ctx *ctx, js_object *buffer,
                               uint32_t offset, uint32_t length);
 js_prop   *js_own_prop(js_object *o, js_string *key);
+js_prop   *js_own_prop_key(js_object *o, js_string *key, int is_sym);
 js_prop   *js_add_prop(js_ctx *ctx, js_object *o, js_string *key, uint32_t flags);
+js_prop   *js_add_prop_key(js_ctx *ctx, js_object *o, js_string *key, uint32_t flags);
 int        js_obj_get(js_ctx *ctx, js_object *o, js_string *key,
                       js_value this_val, js_value *out);
+int        js_obj_get_key(js_ctx *ctx, js_object *o, js_string *key, int is_sym,
+                          js_value this_val, js_value *out);
 int        js_obj_put(js_ctx *ctx, js_object *o, js_string *key, js_value v);
+int        js_obj_put_key(js_ctx *ctx, js_object *o, js_string *key, int is_sym,
+                          js_value v);
 int        js_obj_delete(js_ctx *ctx, js_object *o, js_string *key);
+int        js_obj_delete_key(js_ctx *ctx, js_object *o, js_string *key, int is_sym);
 int        js_obj_has(js_ctx *ctx, js_object *o, js_string *key);
+int        js_obj_has_key(js_ctx *ctx, js_object *o, js_string *key, int is_sym);
 int        js_obj_has_own(js_ctx *ctx, js_object *o, js_string *key);
+int        js_obj_has_own_key(js_ctx *ctx, js_object *o, js_string *key, int is_sym);
 /* [[Get]] on any value, including the primitive receivers that make
  * "abc".length and (5).toFixed(2) work without allocating a wrapper. */
 int        js_wrap_get(js_ctx *ctx, js_value base, js_string *key, js_value *out);
+int        js_wrap_get_key(js_ctx *ctx, js_value base, js_string *key,
+                           int is_sym, js_value *out);
+int        js_to_propkey(js_ctx *ctx, js_value v, js_string **out_key, int *out_sym);
+js_value   js_new_symbol(js_ctx *ctx, js_value desc);
+int        js_symbol_to_string(js_ctx *ctx, js_value sym, js_value *out);
+int        js_define_symbol_prop(js_ctx *ctx, js_object *o, js_value sym,
+                                 js_value v, uint32_t flags);
 
 /* Array index for a key, or -1. Only canonical decimal forms qualify. */
 long js_array_index(js_string *key);
@@ -552,6 +603,10 @@ struct js_env {
     js_object *vars;
     js_value   this_val;
     int        is_with;
+    js_object *home_obj;
+    js_object *active_ctor;
+    uint8_t    is_lex;
+    uint8_t    this_tdz;
     js_env    *next;        /* every env, for js_free() */
 };
 
@@ -584,8 +639,21 @@ typedef struct js_label {
     struct js_label *next;
 } js_label;
 
+/* ---- iterator protocol ---- */
+typedef struct js_iter {
+    int           kind;     /* 0 = iterator protocol, 1 = array-like fallback */
+    js_value      iter;
+    js_value      next_fn;
+    js_value      target;
+    unsigned long index;
+    unsigned long length;
+} js_iter;
+
+int js_iter_open(js_ctx *ctx, js_value iterable, js_iter *it);
+int js_iter_next(js_ctx *ctx, js_iter *it, js_value *out, int *done);
+
 /* ---- the context ---- */
-#define JS_NPROTO 28
+#define JS_NPROTO 29
 #define JS_ARGSTACK 4096        /* js_value slots shared by all call frames */
 #define JS_MAXARGS  255
 
@@ -606,6 +674,7 @@ struct js_ctx {
 
     js_object    *global;
     js_env       *genv;
+    js_env       *lex_env;      /* persistent top-level lexical scope */
 
     js_object    *proto[JS_NPROTO];
     js_object    *ctor_object;
@@ -629,6 +698,14 @@ struct js_ctx {
     js_promise_job *jobs_head;
     js_promise_job *jobs_tail;
 
+    js_value      sym_iterator;
+    js_string    *sym_iterator_key;
+    js_value      sym_tostringtag;
+    js_string    *sym_tostringtag_key;
+    js_object   **symbols;
+    uint32_t      nsymbols, csymbols;
+    js_object    *sym_registry;
+
     const char   *script_name;
 
     /* per-tag host finalizers */
@@ -644,7 +721,8 @@ struct js_ctx {
               *s_writable, *s_enumerable, *s_configurable, *s_get, *s_set,
               *s_index, *s_input, *s_lastIndex, *s_source, *s_toString,
               *s_valueOf, *s_undefined, *s_null, *s_true, *s_false,
-              *s_number, *s_string, *s_boolean, *s_object, *s_function;
+              *s_number, *s_string, *s_boolean, *s_object, *s_function,
+              *s_done, *s_next, *s_raw, *s_iterator;
 };
 
 /* proto[] slots */
@@ -653,7 +731,8 @@ enum {
     P_ERROR, P_TYPEERROR, P_RANGEERROR, P_SYNTAXERROR, P_REFERENCEERROR,
     P_EVALERROR, P_URIERROR, P_DATE, P_REGEXP, P_PROMISE, P_ARRAYBUFFER,
     P_UINT8ARRAY, P_TEXTENCODER, P_TEXTDECODER, P_URLSEARCHPARAMS,
-    P_WASM_MODULE, P_WASM_INSTANCE, P_MAP, P_SET, P_WEAKMAP, P_WEAKSET
+    P_WASM_MODULE, P_WASM_INSTANCE, P_MAP, P_SET, P_WEAKMAP, P_WEAKSET,
+    P_SYMBOL
 };
 
 /* ---- growable byte buffer (malloc-backed, charged to the heap cap) ---- */
@@ -728,14 +807,20 @@ const char *js_typeof(js_value v);
 /* ---- interpreter entry points used by builtin.c ---- */
 int js_call_func(js_ctx *ctx, js_object *f, js_value this_val,
                  int argc, js_value *argv, js_value *ret);
+int js_construct_with_target(js_ctx *ctx, js_value fnv, int argc, js_value *argv,
+                             js_object *new_target, js_value *ret);
 js_object *js_make_function(js_ctx *ctx, js_func *fn, js_env *env);
+int js_async_resume(js_ctx *ctx, js_async_task *task, int state, js_value val);
 
 /* ---- builtins ---- */
 int  js_init_builtins(js_ctx *ctx);
 int  js_init_webapis(js_ctx *ctx);
 void js_run_host_finalizers(js_ctx *ctx);
 js_object *js_new_error(js_ctx *ctx, int kind, const char *msg);
-/* Number/String/Boolean wrapper for a primitive receiver. */
+/* Number/String/Boolean/Symbol wrapper for a primitive receiver. */
 int  js_wrap_primitive(js_ctx *ctx, js_value v, js_value *out);
+int  js_promise_add_reaction(js_ctx *ctx, js_object *source,
+                             js_promise_reaction *reaction);
+int  js_promise_resolve_value(js_ctx *ctx, js_value val, js_value *out_promise);
 
 #endif /* JS_INTERNAL */

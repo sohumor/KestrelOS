@@ -23,16 +23,18 @@
 
 static const struct { const char *w; int tok; } kw_table[] = {
     { "break", TK_BREAK }, { "case", TK_CASE }, { "catch", TK_CATCH },
-    { "continue", TK_CONTINUE }, { "debugger", TK_DEBUGGER },
-    { "default", TK_DEFAULT }, { "delete", TK_DELETE }, { "do", TK_DO },
-    { "else", TK_ELSE }, { "false", TK_FALSE }, { "finally", TK_FINALLY },
-    { "for", TK_FOR }, { "function", TK_FUNCTION }, { "if", TK_IF },
-    { "in", TK_IN }, { "instanceof", TK_INSTANCEOF }, { "new", TK_NEW },
-    { "null", TK_NULL_KW }, { "return", TK_RETURN }, { "switch", TK_SWITCH },
-    { "this", TK_THIS }, { "throw", TK_THROW }, { "true", TK_TRUE },
-    { "try", TK_TRY }, { "typeof", TK_TYPEOF }, { "var", TK_VAR },
-    { "const", TK_CONST }, { "let", TK_LET }, { "void", TK_VOID },
-    { "while", TK_WHILE }, { "with", TK_WITH },
+    { "class", TK_CLASS }, { "continue", TK_CONTINUE },
+    { "debugger", TK_DEBUGGER }, { "default", TK_DEFAULT },
+    { "delete", TK_DELETE }, { "do", TK_DO }, { "else", TK_ELSE },
+    { "extends", TK_EXTENDS }, { "false", TK_FALSE },
+    { "finally", TK_FINALLY }, { "for", TK_FOR },
+    { "function", TK_FUNCTION }, { "if", TK_IF }, { "in", TK_IN },
+    { "instanceof", TK_INSTANCEOF }, { "new", TK_NEW },
+    { "null", TK_NULL_KW }, { "return", TK_RETURN }, { "super", TK_SUPER },
+    { "switch", TK_SWITCH }, { "this", TK_THIS }, { "throw", TK_THROW },
+    { "true", TK_TRUE }, { "try", TK_TRY }, { "typeof", TK_TYPEOF },
+    { "var", TK_VAR }, { "const", TK_CONST }, { "let", TK_LET },
+    { "void", TK_VOID }, { "while", TK_WHILE }, { "with", TK_WITH },
     { 0, 0 }
 };
 
@@ -40,12 +42,13 @@ const char *js_token_name(int tok)
 {
     static const char *punct[] = {
         "end of input", "identifier", "number", "string", "regular expression",
-        "{", "}", "(", ")", "[", "]", ".", ";", ",",
+        "template literal", "template head", "template middle", "template tail",
+        "{", "}", "(", ")", "[", "]", ".", "...", "?.", ";", ",",
         "<", ">", "<=", ">=", "==", "!=", "===", "!==",
-        "+", "-", "*", "/", "%", "++", "--", "<<", ">>", ">>>",
-        "&", "|", "^", "!", "~", "&&", "||", "?", ":", "=",
-        "=>",
-        "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", ">>>=", "&=", "|=", "^="
+        "+", "-", "*", "/", "%", "**", "++", "--", "<<", ">>", ">>>",
+        "&", "|", "^", "!", "~", "&&", "||", "??", "?", ":", "=", "=>",
+        "+=", "-=", "*=", "/=", "%=", "**=",
+        "<<=", ">>=", ">>>=", "&=", "|=", "^=", "&&=", "||=", "?\?="
     };
     int i;
 
@@ -102,8 +105,9 @@ static int regex_allowed(js_lexer *lx)
     case -1:                 /* start of input */
         return 1;
     case TK_IDENT: case TK_NUM: case TK_STR: case TK_REGEX:
+    case TK_TPL_FULL: case TK_TPL_TAIL:
     case TK_RBRACKET: case TK_INC: case TK_DEC:
-    case TK_THIS: case TK_TRUE: case TK_FALSE: case TK_NULL_KW:
+    case TK_THIS: case TK_SUPER: case TK_TRUE: case TK_FALSE: case TK_NULL_KW:
         return 0;
     case TK_RPAREN:
         /* `)` closing an if/while/for header is followed by a statement, so
@@ -134,6 +138,13 @@ static int utf8_put(char *b, int n, unsigned long cp)
         b[n++] = (char)(0x80 | (cp & 0x3F));
     }
     return n;
+}
+
+static int utf8_put_sb(js_sbuf *b, unsigned long cp)
+{
+    char tmp[4];
+    int n = utf8_put(tmp, 0, cp);
+    return js_sb_put(b, tmp, (unsigned long)n);
 }
 
 static int lex_string(js_lexer *lx, char quote)
@@ -192,6 +203,24 @@ static int lex_string(js_lexer *lx, char quote)
         case 'u': {
             unsigned long cp = 0;
             int i;
+            if (lx->pos < lx->len && lx->src[lx->pos] == '{') {
+                int any = 0;
+                lx->pos++;
+                while (lx->pos < lx->len && lx->src[lx->pos] != '}') {
+                    int h = hexval((unsigned char)lx->src[lx->pos]);
+                    if (h < 0) return lex_error(lx, "bad \\u{} escape");
+                    cp = cp * 16 + (unsigned long)h;
+                    if (cp > 0x10FFFFUL)
+                        return lex_error(lx, "unicode codepoint out of range");
+                    any = 1;
+                    lx->pos++;
+                }
+                if (!any || lx->pos >= lx->len || lx->src[lx->pos] != '}')
+                    return lex_error(lx, "bad \\u{} escape");
+                lx->pos++;
+                n = utf8_put(buf, n, cp);
+                break;
+            }
             if (lx->pos + 3 >= lx->len) return lex_error(lx, "bad \\u escape");
             for (i = 0; i < 4; i++) {
                 int h = hexval((unsigned char)lx->src[lx->pos + i]);
@@ -237,6 +266,207 @@ static int lex_string(js_lexer *lx, char quote)
     return lx->text ? JS_OK : JS_THROW;
 }
 
+static int lex_template(js_lexer *lx, int is_head)
+{
+    js_sbuf cooked, raw;
+    js_value cooked_v, raw_v;
+    int bad_escape = 0;
+
+    js_sb_init(&cooked, lx->ctx);
+    js_sb_init(&raw, lx->ctx);
+
+    while (lx->pos < lx->len) {
+        char c = lx->src[lx->pos];
+        if (c == '`') {
+            lx->pos++;
+            if (js_sb_finish(&raw, &raw_v) != JS_OK) {
+                js_sb_free(&cooked);
+                return JS_THROW;
+            }
+            if (bad_escape) {
+                js_sb_free(&cooked);
+                lx->text = 0;
+            } else {
+                if (js_sb_finish(&cooked, &cooked_v) != JS_OK)
+                    return JS_THROW;
+                lx->text = cooked_v.u.str;
+            }
+            lx->raw = raw_v.u.str;
+            lx->tpl_err = bad_escape;
+            lx->tok = is_head ? TK_TPL_FULL : TK_TPL_TAIL;
+            return JS_OK;
+        }
+        if (c == '$' && lx->pos + 1 < lx->len && lx->src[lx->pos + 1] == '{') {
+            lx->pos += 2;
+            if (js_sb_finish(&raw, &raw_v) != JS_OK) {
+                js_sb_free(&cooked);
+                return JS_THROW;
+            }
+            if (bad_escape) {
+                js_sb_free(&cooked);
+                lx->text = 0;
+            } else {
+                if (js_sb_finish(&cooked, &cooked_v) != JS_OK)
+                    return JS_THROW;
+                lx->text = cooked_v.u.str;
+            }
+            lx->raw = raw_v.u.str;
+            lx->tpl_err = bad_escape;
+            lx->tok = is_head ? TK_TPL_HEAD : TK_TPL_MID;
+            return JS_OK;
+        }
+        if (c == '\r') {
+            lx->pos++;
+            if (lx->pos < lx->len && lx->src[lx->pos] == '\n') lx->pos++;
+            lx->line++;
+            if (js_sb_putc(&raw, '\n') != JS_OK ||
+                (!bad_escape && js_sb_putc(&cooked, '\n') != JS_OK))
+                goto fail;
+            continue;
+        }
+        if (c == '\n') {
+            lx->pos++;
+            lx->line++;
+            if (js_sb_putc(&raw, '\n') != JS_OK ||
+                (!bad_escape && js_sb_putc(&cooked, '\n') != JS_OK))
+                goto fail;
+            continue;
+        }
+        if (c != '\\') {
+            lx->pos++;
+            if (js_sb_putc(&raw, c) != JS_OK ||
+                (!bad_escape && js_sb_putc(&cooked, c) != JS_OK))
+                goto fail;
+            continue;
+        }
+        lx->pos++;
+        if (lx->pos >= lx->len)
+            break;
+        if (js_sb_putc(&raw, '\\') != JS_OK)
+            goto fail;
+        c = lx->src[lx->pos++];
+        if (c == '\r') {
+            if (lx->pos < lx->len && lx->src[lx->pos] == '\n') lx->pos++;
+            lx->line++;
+            if (js_sb_putc(&raw, '\n') != JS_OK) goto fail;
+            continue;
+        }
+        if (c == '\n') {
+            lx->line++;
+            if (js_sb_putc(&raw, '\n') != JS_OK) goto fail;
+            continue;
+        }
+        if (js_sb_putc(&raw, c) != JS_OK)
+            goto fail;
+        switch (c) {
+        case 'n': if (!bad_escape && js_sb_putc(&cooked, '\n') != JS_OK) goto fail; break;
+        case 't': if (!bad_escape && js_sb_putc(&cooked, '\t') != JS_OK) goto fail; break;
+        case 'r': if (!bad_escape && js_sb_putc(&cooked, '\r') != JS_OK) goto fail; break;
+        case 'b': if (!bad_escape && js_sb_putc(&cooked, '\b') != JS_OK) goto fail; break;
+        case 'f': if (!bad_escape && js_sb_putc(&cooked, '\f') != JS_OK) goto fail; break;
+        case 'v': if (!bad_escape && js_sb_putc(&cooked, '\v') != JS_OK) goto fail; break;
+        case '0':
+            if (lx->pos < lx->len && is_digit((unsigned char)lx->src[lx->pos]))
+                bad_escape = 1;
+            else if (!bad_escape && js_sb_putc(&cooked, '\0') != JS_OK)
+                goto fail;
+            break;
+        case '1': case '2': case '3': case '4':
+        case '5': case '6': case '7': case '8': case '9':
+            bad_escape = 1;
+            break;
+        case 'x': {
+            int h1, h2;
+            if (lx->pos + 1 >= lx->len) { bad_escape = 1; break; }
+            h1 = hexval((unsigned char)lx->src[lx->pos]);
+            h2 = hexval((unsigned char)lx->src[lx->pos + 1]);
+            if (h1 < 0 || h2 < 0) { bad_escape = 1; break; }
+            if (js_sb_put(&raw, lx->src + lx->pos, 2) != JS_OK) goto fail;
+            lx->pos += 2;
+            if (!bad_escape && utf8_put_sb(&cooked, (unsigned long)(h1 * 16 + h2)) != JS_OK)
+                goto fail;
+            break;
+        }
+        case 'u': {
+            unsigned long cp = 0;
+            int i, ok = 1;
+            if (lx->pos < lx->len && lx->src[lx->pos] == '{') {
+                unsigned long j = lx->pos + 1;
+                int any = 0;
+                while (j < lx->len && lx->src[j] != '}') {
+                    int h = hexval((unsigned char)lx->src[j]);
+                    if (h < 0) { ok = 0; break; }
+                    cp = cp * 16 + (unsigned long)h;
+                    if (cp > 0x10FFFFUL) { ok = 0; break; }
+                    any = 1;
+                    j++;
+                }
+                if (!ok || !any || j >= lx->len || lx->src[j] != '}') {
+                    bad_escape = 1;
+                    break;
+                }
+                if (js_sb_put(&raw, lx->src + lx->pos, j - lx->pos + 1) != JS_OK)
+                    goto fail;
+                lx->pos = j + 1;
+                if (!bad_escape && utf8_put_sb(&cooked, cp) != JS_OK)
+                    goto fail;
+                break;
+            }
+            if (lx->pos + 3 >= lx->len) { bad_escape = 1; break; }
+            for (i = 0; i < 4; i++) {
+                int h = hexval((unsigned char)lx->src[lx->pos + i]);
+                if (h < 0) { ok = 0; break; }
+                cp = cp * 16 + (unsigned long)h;
+            }
+            if (!ok) { bad_escape = 1; break; }
+            if (js_sb_put(&raw, lx->src + lx->pos, 4) != JS_OK) goto fail;
+            lx->pos += 4;
+            if (cp >= 0xD800 && cp <= 0xDBFF && lx->pos + 5 < lx->len &&
+                lx->src[lx->pos] == '\\' && lx->src[lx->pos + 1] == 'u') {
+                unsigned long lo = 0;
+                int sok = 1;
+                for (i = 0; i < 4; i++) {
+                    int h = hexval((unsigned char)lx->src[lx->pos + 2 + i]);
+                    if (h < 0) { sok = 0; break; }
+                    lo = lo * 16 + (unsigned long)h;
+                }
+                if (sok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    if (js_sb_put(&raw, lx->src + lx->pos, 6) != JS_OK) goto fail;
+                    lx->pos += 6;
+                }
+            }
+            if (!bad_escape && utf8_put_sb(&cooked, cp) != JS_OK) goto fail;
+            break;
+        }
+        default:
+            if (!bad_escape && js_sb_putc(&cooked, c) != JS_OK) goto fail;
+            break;
+        }
+    }
+    js_sb_free(&cooked);
+    js_sb_free(&raw);
+    return lex_error(lx, "unterminated template literal");
+fail:
+    js_sb_free(&cooked);
+    js_sb_free(&raw);
+    return JS_THROW;
+}
+
+int js_lex_template_cont(js_lexer *lx)
+{
+    if (lx->error || lx->ctx->fatal)
+        return JS_THROW;
+    lx->prev_tok = TK_RBRACE;
+    lx->nl_before = 0;
+    lx->text = 0;
+    lx->flags = 0;
+    lx->raw = 0;
+    lx->tpl_err = 0;
+    lx->tok_line = lx->line;
+    return lex_template(lx, 0);
+}
+
 static int lex_number(js_lexer *lx)
 {
     unsigned long start = lx->pos;
@@ -252,6 +482,32 @@ static int lex_number(js_lexer *lx)
             int h = hexval((unsigned char)lx->src[i]);
             if (h < 0) break;
             v = v * 16 + h;
+        }
+        lx->pos = i;
+        lx->num = v;
+        lx->tok = TK_NUM;
+    } else if (lx->src[lx->pos] == '0' && lx->pos + 1 < lx->len &&
+               (lx->src[lx->pos + 1] == 'b' || lx->src[lx->pos + 1] == 'B')) {
+        double v = 0;
+        unsigned long i = lx->pos + 2;
+        if (i >= lx->len || (lx->src[i] != '0' && lx->src[i] != '1'))
+            return lex_error(lx, "malformed binary literal");
+        for (; i < lx->len; i++) {
+            if (lx->src[i] != '0' && lx->src[i] != '1') break;
+            v = v * 2 + (lx->src[i] - '0');
+        }
+        lx->pos = i;
+        lx->num = v;
+        lx->tok = TK_NUM;
+    } else if (lx->src[lx->pos] == '0' && lx->pos + 1 < lx->len &&
+               (lx->src[lx->pos + 1] == 'o' || lx->src[lx->pos + 1] == 'O')) {
+        double v = 0;
+        unsigned long i = lx->pos + 2;
+        if (i >= lx->len || lx->src[i] < '0' || lx->src[i] > '7')
+            return lex_error(lx, "malformed octal literal");
+        for (; i < lx->len; i++) {
+            if (lx->src[i] < '0' || lx->src[i] > '7') break;
+            v = v * 8 + (lx->src[i] - '0');
         }
         lx->pos = i;
         lx->num = v;
@@ -331,6 +587,8 @@ int js_lex_next(js_lexer *lx)
     lx->nl_before = 0;
     lx->text = 0;
     lx->flags = 0;
+    lx->raw = 0;
+    lx->tpl_err = 0;
 
     for (;;) {
         while (lx->pos < lx->len) {
@@ -408,6 +666,10 @@ int js_lex_next(js_lexer *lx)
             lx->pos++;
             return lex_string(lx, (char)c);
         }
+        if (c == '`') {
+            lx->pos++;
+            return lex_template(lx, 1);
+        }
     }
 
 #define P1(ch, t)  if (s[lx->pos] == (ch)) { lx->pos++; lx->tok = (t); return JS_OK; }
@@ -427,6 +689,19 @@ int js_lex_next(js_lexer *lx)
     P3('!', '=', '=', TK_SNE)
     P3('<', '<', '=', TK_SHL_A)
     P3('>', '>', '=', TK_SHR_A)
+    P3('*', '*', '=', TK_POW_A)
+    P3('?', '?', '=', TK_QQ_A)
+    P3('&', '&', '=', TK_ANDAND_A)
+    P3('|', '|', '=', TK_OROR_A)
+    P3('.', '.', '.', TK_DOTDOTDOT)
+    if (s[lx->pos] == '?' && lx->pos + 1 < lx->len && s[lx->pos + 1] == '.' &&
+        !(lx->pos + 2 < lx->len && is_digit((unsigned char)s[lx->pos + 2]))) {
+        lx->pos += 2;
+        lx->tok = TK_OPTCHAIN;
+        return JS_OK;
+    }
+    P2('*', '*', TK_POW)
+    P2('?', '?', TK_QQ)
     P2('=', '>', TK_ARROW)
     P2('<', '<', TK_SHL)
     P2('>', '>', TK_SHR)

@@ -2528,8 +2528,20 @@ static void paint_content(struct pstate *p, const struct lay_box *b)
     switch (b->kind) {
     case LAY_BOX_REPLACED: {
         lay_rect cr = shift_rect(lay_content_rect(b), bx, by);
+        struct image canvas_im;
         const struct image *im = (b->src && p->o->image)
             ? p->o->image(p->o->image_ctx, b->src) : 0;
+
+        if (!im && b->node && b->node->tag_id == HTAG_CANVAS &&
+            b->node->canvas && b->node->canvas->px &&
+            b->node->canvas->w > 0 && b->node->canvas->h > 0) {
+            canvas_im.w = b->node->canvas->w;
+            canvas_im.h = b->node->canvas->h;
+            canvas_im.px = b->node->canvas->px;
+            canvas_im.has_alpha = (b->node->canvas->alpha != 0);
+            canvas_im.alpha = b->node->canvas->alpha;
+            im = &canvas_im;
+        }
 
         if (b->node && (b->node->tag_id == HTAG_INPUT ||
                         b->node->tag_id == HTAG_TEXTAREA ||

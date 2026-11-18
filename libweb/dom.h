@@ -194,6 +194,13 @@ struct dom_node {
      * these; whoever sets them owns them. */
     void *style;                /* computed style (the CSS agent)       */
     void *user;                 /* anything else (layout, JS wrappers)  */
+    struct dom_canvas *canvas;  /* <canvas> 2D backing store, or 0      */
+};
+
+struct dom_canvas {
+    int w, h;
+    unsigned int *px;           /* w*h 0x00RRGGBB pixels                */
+    unsigned char *alpha;       /* w*h coverage, 255 = opaque           */
 };
 
 struct dom_document {
