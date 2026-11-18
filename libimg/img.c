@@ -30,6 +30,10 @@ const char *img_format_name(int fmt)
     case IMG_FMT_GIF:  return "GIF";
     case IMG_FMT_JPEG: return "JPEG";
     case IMG_FMT_BMP:  return "BMP";
+    case IMG_FMT_ICO:  return "ICO";
+    case IMG_FMT_SVG:  return "SVG";
+    case IMG_FMT_QOI:  return "QOI";
+    case IMG_FMT_PNM:  return "PNM";
     default:           return "unknown";
     }
 }
@@ -37,6 +41,106 @@ const char *img_format_name(int fmt)
 /* ---------------------------------------------------------------- sniffing */
 
 static const uint8_t png_sig[8] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+
+static int sniff_ws(uint8_t c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int sniff_svg_tag_at(const uint8_t *p, unsigned long len, unsigned long pos)
+{
+    if (pos + 5 > len)
+        return 0;
+    if (p[pos] != '<' ||
+        (p[pos + 1] != 's' && p[pos + 1] != 'S') ||
+        (p[pos + 2] != 'v' && p[pos + 2] != 'V') ||
+        (p[pos + 3] != 'g' && p[pos + 3] != 'G'))
+        return 0;
+    return sniff_ws(p[pos + 4]) || p[pos + 4] == '>' || p[pos + 4] == '/';
+}
+
+static int sniff_xml_ci(const uint8_t *p, unsigned long len, unsigned long pos)
+{
+    if (pos + 5 > len)
+        return 0;
+    if (p[pos] != '<' || p[pos + 1] != '?' ||
+        (p[pos + 2] != 'x' && p[pos + 2] != 'X') ||
+        (p[pos + 3] != 'm' && p[pos + 3] != 'M') ||
+        (p[pos + 4] != 'l' && p[pos + 4] != 'L'))
+        return 0;
+    return pos + 5 == len || sniff_ws(p[pos + 5]) || p[pos + 5] == '?';
+}
+
+static int sniff_svg(const uint8_t *p, unsigned long len)
+{
+    unsigned long pos = 0;
+    unsigned long limit = len < 512 ? len : 512;
+
+    if (len >= 3 && p[0] == 0xef && p[1] == 0xbb && p[2] == 0xbf)
+        pos = 3;
+    while (pos < limit && sniff_ws(p[pos]))
+        pos++;
+    /* Skip leading XML comments before <svg or <?xml (rare, harmless). */
+    while (pos + 4 <= limit && p[pos] == '<' && p[pos + 1] == '!' &&
+           p[pos + 2] == '-' && p[pos + 3] == '-') {
+        unsigned long c = pos + 4;
+        while (c + 3 <= len && !(p[c] == '-' && p[c + 1] == '-' && p[c + 2] == '>'))
+            c++;
+        if (c + 3 > len)
+            return 0;
+        pos = c + 3;
+        while (pos < limit && sniff_ws(p[pos]))
+            pos++;
+    }
+    if (sniff_svg_tag_at(p, len, pos))
+        return 1;
+    if (sniff_xml_ci(p, len, pos)) {
+        unsigned long i = pos + 5;
+        while (i < limit) {
+            if (sniff_ws(p[i])) {
+                i++;
+                continue;
+            }
+            if (p[i] == '<') {
+                if (i + 2 <= len && p[i + 1] == '?') {
+                    i += 2;
+                    while (i + 2 <= len && !(p[i] == '?' && p[i + 1] == '>'))
+                        i++;
+                    if (i + 2 > len)
+                        return 0;
+                    i += 2;
+                    continue;
+                }
+                if (i + 4 <= len && p[i + 1] == '!' &&
+                    p[i + 2] == '-' && p[i + 3] == '-') {
+                    i += 4;
+                    while (i + 3 <= len &&
+                           !(p[i] == '-' && p[i + 1] == '-' && p[i + 2] == '>'))
+                        i++;
+                    if (i + 3 > len)
+                        return 0;
+                    i += 3;
+                    continue;
+                }
+                if (i + 2 <= len && p[i + 1] == '!') {
+                    int depth = 1;
+                    i += 2;
+                    while (i < len && depth > 0) {
+                        if (p[i] == '<') depth++;
+                        else if (p[i] == '>') depth--;
+                        i++;
+                    }
+                    if (depth > 0)
+                        return 0;
+                    continue;
+                }
+                return sniff_svg_tag_at(p, len, i);
+            }
+            i++;
+        }
+    }
+    return 0;
+}
 
 int img_sniff(const void *data, unsigned long len)
 {
@@ -55,6 +159,16 @@ int img_sniff(const void *data, unsigned long len)
         return IMG_FMT_JPEG;
     if (len >= 2 && p[0] == 'B' && p[1] == 'M')
         return IMG_FMT_BMP;
+    if (len >= 4 && p[0] == 0x00 && p[1] == 0x00 &&
+        (p[2] == 0x01 || p[2] == 0x02) && p[3] == 0x00)
+        return IMG_FMT_ICO;
+    if (len >= 4 && p[0] == 'q' && p[1] == 'o' && p[2] == 'i' && p[3] == 'f')
+        return IMG_FMT_QOI;
+    if (len >= 3 && p[0] == 'P' && p[1] >= '1' && p[1] <= '6' &&
+        (sniff_ws(p[2]) || p[2] == '\v' || p[2] == '\f' || p[2] == '#'))
+        return IMG_FMT_PNM;
+    if (sniff_svg(p, len))
+        return IMG_FMT_SVG;
     return IMG_FMT_UNKNOWN;
 }
 
@@ -125,6 +239,10 @@ int img_decode(const void *data, unsigned long len, struct image *out)
     case IMG_FMT_GIF:  return gif_decode(data, len, out, 0);
     case IMG_FMT_JPEG: return jpeg_decode(data, len, out);
     case IMG_FMT_BMP:  return bmp_decode(data, len, out);
+    case IMG_FMT_ICO:  return ico_decode(data, len, out);
+    case IMG_FMT_SVG:  return svg_decode(data, len, out);
+    case IMG_FMT_QOI:  return qoi_decode(data, len, out);
+    case IMG_FMT_PNM:  return pnm_decode(data, len, out);
     default:           return IMG_ERR_FORMAT;
     }
 }
@@ -298,6 +416,10 @@ int img_probe(const void *data, unsigned long len, struct img_info *out)
     case IMG_FMT_GIF:  r = probe_gif(p, len, out);  break;
     case IMG_FMT_JPEG: r = probe_jpeg(p, len, out); break;
     case IMG_FMT_BMP:  r = probe_bmp(p, len, out);  break;
+    case IMG_FMT_ICO:  r = ico_probe(p, len, out);  break;
+    case IMG_FMT_SVG:  r = svg_probe(p, len, out);  break;
+    case IMG_FMT_QOI:  r = qoi_probe(p, len, out);  break;
+    case IMG_FMT_PNM:  r = pnm_probe(p, len, out);  break;
     default:           return IMG_ERR_FORMAT;
     }
     if (r != IMG_OK)

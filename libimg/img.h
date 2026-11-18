@@ -1,6 +1,6 @@
 #pragma once
 
-/* KestrelOS image decoding: PNG, GIF, baseline JPEG and BMP.
+/* KestrelOS image decoding: PNG, GIF, JPEG, BMP, ICO/CUR, SVG, QOI, and Netpbm.
  *
  * Everything here is pure computation over a caller-supplied byte buffer:
  * no syscalls, no I/O, no floating point, no recursion. The decoders are
@@ -63,7 +63,11 @@ enum {
     IMG_FMT_PNG,
     IMG_FMT_GIF,
     IMG_FMT_JPEG,
-    IMG_FMT_BMP
+    IMG_FMT_BMP,
+    IMG_FMT_ICO,
+    IMG_FMT_SVG,
+    IMG_FMT_QOI,
+    IMG_FMT_PNM
 };
 
 /* Identify a buffer by its magic bytes. Never reads past len. */
@@ -112,6 +116,14 @@ int img_scale(const struct image *src, int w, int h, struct image *out);
 int png_decode(const void *data, unsigned long len, struct image *out);
 int jpeg_decode(const void *data, unsigned long len, struct image *out);
 int bmp_decode(const void *data, unsigned long len, struct image *out);
+int ico_decode(const void *data, unsigned long len, struct image *out);
+int ico_probe(const void *data, unsigned long len, struct img_info *out);
+int svg_decode(const void *data, unsigned long len, struct image *out);
+int svg_probe(const void *data, unsigned long len, struct img_info *out);
+int qoi_decode(const void *data, unsigned long len, struct image *out);
+int qoi_probe(const void *data, unsigned long len, struct img_info *out);
+int pnm_decode(const void *data, unsigned long len, struct image *out);
+int pnm_probe(const void *data, unsigned long len, struct img_info *out);
 
 /* GIF, with the frame count reported separately. Only the FIRST frame is
  * decoded -- animation is out of scope. When `frames` is non-NULL it
