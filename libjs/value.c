@@ -1259,22 +1259,25 @@ double js_fmod(double a, double b)
 
 static long double expl_core(long double x)
 {
-    static const long double LN2HI = 0.693359375L;
-    static const long double LN2LO = -2.121944400546905827679e-4L;
-    long double r, s, t;
+    static const long double LN2HI = 0.6931471803691238162L;
+    static const long double LN2LO = 1.90821492927058770002e-10L;
+    static const long double LN2TINY = 2.823529056303157712e-20L;
+    long double hi, lo, r, s;
     int k, i;
 
     if (x > 11400.0L) return (long double)js_inf(0);
     if (x < -11400.0L) return 0.0L;
     k = (int)(x * 1.44269504088896340736L + (x < 0 ? -0.5L : 0.5L));
-    r = x - (long double)k * LN2HI;
-    r -= (long double)k * LN2LO;
-    /* sum r^n / n! */
-    s = 1.0L;
-    t = 1.0L;
-    for (i = 1; i <= 18; i++) {
-        t *= r / (long double)i;
-        s += t;
+    hi = x - (long double)k * LN2HI;
+    lo = -((long double)k * LN2LO) - ((long double)k * LN2TINY);
+    r = hi + lo;
+    s = 0.0L;
+    for (i = 20; i >= 2; i--)
+        s = (1.0L + s) * (r / (long double)i);
+    {
+        long double w = 1.0L + hi;
+        long double err = (hi - (w - 1.0L)) + (lo + r * s);
+        s = w + err;
     }
     /* scale by 2^k, in two steps so extreme k does not overflow long double */
     while (k > 1000) { s *= 1.0715086071862673e301L; k -= 1000; }
@@ -1372,6 +1375,10 @@ double js_pow(double x, double y)
     }
     if (x < 0 && y != js_trunc(y))
         return js_nan();
+    if (y == 0.5)
+        return x == 0 ? 0.0 : js_sqrt(x);
+    if (y == -0.5)
+        return x == 0 ? js_inf(0) : 1.0 / js_sqrt(x);
 
     /* Exact integer exponents by repeated squaring: keeps 2**10 at 1024. */
     if (y == js_trunc(y) && ay <= 1024.0) {
@@ -2228,8 +2235,13 @@ static double make_double(int neg, uint64_t mant, int ndig, int dexp, int over)
     if (dexp > 400) return neg ? js_inf(1) : js_inf(0);
     if (dexp < -400) return neg ? -0.0 : 0.0;
     r = (double)((long double)mant * js_pow10l(dexp));
-    if (!js_isinf(r))
+    if (js_isinf(r)) {
+        double max_d = dfrom(0x7FEFFFFFFFFFFFFFULL);
+        if (cmp_dec_double(mant, dexp, max_d) <= 0)
+            r = refine_double(mant, dexp, max_d);
+    } else {
         r = refine_double(mant, dexp, r);
+    }
     return neg ? -r : r;
 }
 

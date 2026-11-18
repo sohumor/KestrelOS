@@ -1,11 +1,16 @@
 /* jsdom.c - DOM/window bindings for Kestrel's small JavaScript engine. */
 
+#if defined(JS_HOST) && defined(_WIN32)
+#define _CRT_RAND_S
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #ifdef JS_HOST
+#ifndef _WIN32
 #include <sys/random.h>
+#endif
 #else
 #include <kestrel.h>
 #endif
@@ -2072,14 +2077,6 @@ static int node_owner_document_get(js_ctx *c, js_value t,
     }
     if (js_get(c, js_global(c), "document", r) != JS_OK)
         return JS_THROW;
-    return JS_OK;
-}
-
-static int node_null_get(js_ctx *c, js_value t,
-                         int ac, js_value *av, js_value *r)
-{
-    (void)c; (void)t; (void)ac; (void)av;
-    *r = js_null();
     return JS_OK;
 }
 
@@ -8782,6 +8779,21 @@ static int global_btoa(js_ctx *c, js_value t, int ac, js_value *av,
 
 static int crypto_fill(unsigned char *bytes, unsigned long length)
 {
+#if defined(JS_HOST) && defined(_WIN32)
+    unsigned long offset = 0;
+
+    while (offset < length) {
+        unsigned int val = 0;
+        unsigned long take = length - offset;
+        if (rand_s(&val) != 0)
+            return -1;
+        if (take > sizeof(val))
+            take = sizeof(val);
+        memcpy(bytes + offset, &val, take);
+        offset += take;
+    }
+    return 0;
+#else
     unsigned long offset = 0;
 
     while (offset < length) {
@@ -8793,6 +8805,7 @@ static int crypto_fill(unsigned char *bytes, unsigned long length)
         offset += (unsigned long)count;
     }
     return 0;
+#endif
 }
 
 static int crypto_get_random_values(js_ctx *c, js_value t,
@@ -14205,7 +14218,7 @@ static int define_other_protos(struct jsdom *j)
 #define FUN(p, name, fn, n) if (js_define_native(c, p, name, fn, n) != JS_OK) return 0
     ACC(j->attr_proto, "name", attr_name_get, 0);
     ACC(j->attr_proto, "nodeName", attr_name_get, 0);
-    ACC(j->attr_proto, "localName", attr_name_get, 0);
+    ACC(j->attr_proto, "localName", attr_local_name_get, 0);
     ACC(j->attr_proto, "value", attr_value_get, attr_value_set);
     ACC(j->attr_proto, "nodeValue", attr_value_get, attr_value_set);
     ACC(j->attr_proto, "textContent", attr_value_get, attr_value_set);
@@ -14213,8 +14226,8 @@ static int define_other_protos(struct jsdom *j)
     ACC(j->attr_proto, "ownerDocument", attr_owner_document_get, 0);
     ACC(j->attr_proto, "specified", attr_specified_get, 0);
     ACC(j->attr_proto, "nodeType", attr_type_get, 0);
-    ACC(j->attr_proto, "namespaceURI", node_null_get, 0);
-    ACC(j->attr_proto, "prefix", node_null_get, 0);
+    ACC(j->attr_proto, "namespaceURI", attr_namespace_get, 0);
+    ACC(j->attr_proto, "prefix", attr_prefix_get, 0);
     ACC(j->named_node_map_proto, "length",
         named_node_map_length_get, 0);
     FUN(j->named_node_map_proto, "item", named_node_map_item, 1);

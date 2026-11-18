@@ -9,7 +9,7 @@ import sys
 import tempfile
 import zlib
 
-from e2e import BOOT_TIMEOUT, Harness, t_login, t_prompt
+from e2e import BOOT_TIMEOUT, Harness, find_qemu, t_login, t_prompt
 
 
 BLOCK = 4096
@@ -65,7 +65,7 @@ def assemble(root, fs_path, disk_path):
 
 def boot_and_halt(disk_path):
     cmd = [
-        "qemu-system-x86_64",
+        find_qemu(),
         "-drive", "file=%s,format=raw" % disk_path,
         "-no-reboot",
         "-display", "none",
@@ -109,7 +109,8 @@ def verify_disk(disk_path, journal_start, inode_start):
 
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if shutil.which("qemu-system-x86_64") is None:
+    qemu = find_qemu()
+    if not (os.path.isfile(qemu) or shutil.which(qemu)):
         print("error: qemu-system-x86_64 not found in PATH", file=sys.stderr)
         return 2
     required = ("stage1.bin", "stage2.bin", "kernel.bin", "fs.img")

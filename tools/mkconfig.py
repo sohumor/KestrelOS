@@ -330,7 +330,7 @@ def write_if_changed(path, text):
     """Leave the file's mtime alone when nothing changed, so regenerating
     the configuration does not force a full kernel rebuild."""
     try:
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             if f.read() == text:
                 return False
     except IOError:
@@ -338,7 +338,7 @@ def write_if_changed(path, text):
     directory = os.path.dirname(path)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
     return True
 

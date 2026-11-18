@@ -12,6 +12,9 @@
 #define SYS_EXIT      0   /* (code) */
 #define SYS_WRITE     1   /* (fd, buf, len) -> written; fd 1/2 = console */
 #define SYS_READ      2   /* (fd, buf, len) -> read; fd 0 = console, blocks */
+#ifdef _WIN32
+#undef SYS_OPEN           /* Windows UCRT <stdio.h> defines SYS_OPEN */
+#endif
 #define SYS_OPEN      3   /* (path, flags) -> fd */
 #define SYS_CLOSE     4   /* (fd) */
 #define SYS_SPAWN     5   /* (path, argv) -> pid */

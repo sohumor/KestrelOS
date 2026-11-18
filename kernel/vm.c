@@ -4,20 +4,22 @@
 #include "vmm.h"
 #include "pmm.h"
 #include "vfs.h"
+#include "kfs.h"
 #include "blockdev.h"
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
 
-/* tools/mkimage.py writes this header at the fixed end of the 32 MiB root
- * filesystem. The data pages begin one page later, which keeps every swap
- * transfer naturally aligned to eight ATA sectors. */
-#define SWAP_START_LBA       (2048ULL + (32ULL * 1024 * 1024 / 512))
-#define SWAP_HEADER_SECTORS  8
-#define SWAP_SECTORS_PER_PAGE (PAGE_SIZE / 512)
-#define SWAP_MAX_PAGES       4096
-#define SWAP_VERSION         1
-#define VM_PMM_RESERVE       512
+/* tools/mkimage.py writes this header immediately after the root KFS
+ * filesystem partition. Derive the starting LBA from the KFS superblock at
+ * KFS_PART_LBA when present (falling back to the legacy 32 MiB offset) so
+ * resizing the filesystem image keeps swap naturally aligned to 8 sectors. */
+#define SWAP_DEFAULT_START_LBA (KFS_PART_LBA + (32ULL * 1024 * 1024 / 512))
+#define SWAP_HEADER_SECTORS    8
+#define SWAP_SECTORS_PER_PAGE  (PAGE_SIZE / 512)
+#define SWAP_MAX_PAGES         4096
+#define SWAP_VERSION           1
+#define VM_PMM_RESERVE         512
 
 struct swap_header {
     char magic[8];               /* "KSWAP01" plus NUL */
@@ -27,6 +29,7 @@ struct swap_header {
 
 static struct blockdev *swap_dev;
 static uint8_t swap_bitmap[SWAP_MAX_PAGES / 8];
+static uint64_t swap_start_lba = SWAP_DEFAULT_START_LBA;
 static uint32_t swap_pages;
 static uint32_t swap_used;
 static spinlock_t swap_lock = SPINLOCK_INIT;
@@ -50,16 +53,29 @@ void swap_init(void)
 {
     uint8_t page[PAGE_SIZE];
     struct swap_header *h = (struct swap_header *)page;
+    struct kfs_superblock *sb = (struct kfs_superblock *)page;
+    uint64_t start = SWAP_DEFAULT_START_LBA;
 
     swap_dev = blockdev_find("hda");
-    if (!swap_dev || swap_dev->block_size != 512 ||
-        swap_dev->blocks < SWAP_START_LBA + SWAP_HEADER_SECTORS ||
-        blockdev_read(swap_dev, SWAP_START_LBA, SWAP_HEADER_SECTORS,
+    if (!swap_dev || swap_dev->block_size != 512) {
+        swap_dev = NULL;
+        kprintf("vm: no valid swap extent; demand paging remains enabled\n");
+        return;
+    }
+    if (swap_dev->blocks >= (uint64_t)KFS_PART_LBA + SWAP_HEADER_SECTORS &&
+        blockdev_read(swap_dev, KFS_PART_LBA, SWAP_HEADER_SECTORS, page) == 0 &&
+        sb->magic == KFS_MAGIC && sb->total_blocks > 0) {
+        start = (uint64_t)KFS_PART_LBA +
+                (uint64_t)sb->total_blocks * KFS_SECTORS_PER_BLOCK;
+    }
+    swap_start_lba = start;
+    if (swap_dev->blocks < swap_start_lba + SWAP_HEADER_SECTORS ||
+        blockdev_read(swap_dev, swap_start_lba, SWAP_HEADER_SECTORS,
                       page) < 0 ||
         memcmp(h->magic, "KSWAP01", 8) != 0 ||
         h->version != SWAP_VERSION || h->pages == 0 ||
         h->pages > SWAP_MAX_PAGES ||
-        h->pages > (swap_dev->blocks - SWAP_START_LBA -
+        h->pages > (swap_dev->blocks - swap_start_lba -
                     SWAP_HEADER_SECTORS) / SWAP_SECTORS_PER_PAGE) {
         swap_dev = NULL;
         kprintf("vm: no valid swap extent; demand paging remains enabled\n");
@@ -118,7 +134,7 @@ static int swap_slot_in_use(uint32_t slot)
 
 static uint64_t swap_lba(uint32_t slot)
 {
-    return SWAP_START_LBA + SWAP_HEADER_SECTORS +
+    return swap_start_lba + SWAP_HEADER_SECTORS +
            (uint64_t)slot * SWAP_SECTORS_PER_PAGE;
 }
 

@@ -4474,12 +4474,12 @@ static void compute_scroll(struct lay_document *L)
 
 static unsigned long ptr_hash(const void *p)
 {
-    unsigned long v = (unsigned long)(uintptr_t)p;
+    uint64_t v = (uint64_t)(uintptr_t)p;
 
     v ^= v >> 33;
-    v *= 0xff51afd7ed558ccdUL;
+    v *= 0xff51afd7ed558ccdULL;
     v ^= v >> 29;
-    return v;
+    return (unsigned long)v;
 }
 
 static void build_node_index(struct lay_document *L)

@@ -1294,8 +1294,8 @@ static void run_limits(int quick)
         printf("   parsed %u nodes in %.2f s; the document owns %lu KiB,"
                " %lu bytes per input byte\n", d ? d->nnodes : 0,
                (double)(clock() - t0) / CLOCKS_PER_SEC,
-               d ? dom_memory_used(d) / 1024 : 0,
-               d ? dom_memory_used(d) / unit : 0);
+               (unsigned long)(d ? dom_memory_used(d) / 1024 : 0),
+               (unsigned long)(d ? dom_memory_used(d) / unit : 0));
         ok(d && d->truncated == 0, "2 MiB document hits no cap");
         ok(d && dom_find_tag(d->body, "a") != 0, "links survive");
         dom_document_free(d);

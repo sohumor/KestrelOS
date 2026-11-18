@@ -161,12 +161,13 @@ static unsigned long oom_end(void)
     } while (0)
 
 #define CHECK_EQ(a, b) do {                                             \
-        long _a = (long)(a), _b = (long)(b);                            \
+        intptr_t _a = (intptr_t)(a), _b = (intptr_t)(b);                \
         checks++;                                                       \
         if (_a != _b) {                                                 \
             failures++;                                                 \
-            printf("  FAIL [%s] %s:%d: %s == %s  (%ld vs %ld)\n",       \
-                   group, __FILE__, __LINE__, #a, #b, _a, _b);          \
+            printf("  FAIL [%s] %s:%d: %s == %s  (%lld vs %lld)\n",     \
+                   group, __FILE__, __LINE__, #a, #b,                   \
+                   (long long)_a, (long long)_b);                       \
         }                                                               \
     } while (0)
 
@@ -2065,11 +2066,11 @@ static void test_hit_test(void)
 
     /* "go " is 3 cells; the link occupies x 24..56 on the first line */
     CHECK(lay_hit_test(L, 30, 8) != 0);
-    CHECK_EQ((long)lay_link_at(L, 30, 8, &href), (long)a);
+    CHECK_EQ((intptr_t)lay_link_at(L, 30, 8, &href), (intptr_t)a);
     CHECK(href && !strcmp(href, "http://example.com/"));
-    CHECK_EQ((long)lay_link_at(L, 8, 8, 0), 0L);
-    CHECK_EQ((long)lay_link_at(L, 70, 8, 0), 0L);
-    CHECK_EQ((long)lay_link_at(L, 30, 900, 0), 0L);
+    CHECK_EQ((intptr_t)lay_link_at(L, 8, 8, 0), 0);
+    CHECK_EQ((intptr_t)lay_link_at(L, 70, 8, 0), 0);
+    CHECK_EQ((intptr_t)lay_link_at(L, 30, 900, 0), 0);
     CHECK(lay_node_at(L, 30, 8) != 0);
 
     /* clipped content is not hit */
@@ -2078,7 +2079,7 @@ static void test_hit_test(void)
     p->overflow = CSS_OVERFLOW_HIDDEN;
     p->height = LPX(4);
     L = run(t, d, 500, 300);
-    CHECK_EQ((long)lay_hit_test(L, 30, 10), 0L);
+    CHECK_EQ((intptr_t)lay_hit_test(L, 30, 10), 0);
     lay_free(L);
     tfree(t);
 }
@@ -2753,7 +2754,7 @@ static void render_pages(void)
  * 12  fuzzing
  * ================================================================== */
 
-static unsigned long rng_state = 0x2545F4914F6CDD1DUL;
+static uint64_t rng_state = 0x2545F4914F6CDD1DULL;
 
 static unsigned rnd(unsigned n)
 {

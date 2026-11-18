@@ -1,10 +1,16 @@
 # KestrelOS build. Run from Linux/WSL: make, make run, make test
-CC      := gcc
-LD      := ld
-OBJCOPY := objcopy
-NASM    := nasm
-PY      := python3
-QEMU    := qemu-system-x86_64
+CC      ?= gcc
+LD      ?= ld
+OBJCOPY ?= objcopy
+NASM    ?= nasm
+PY      ?= $(shell command -v python3 >/dev/null 2>&1 && echo python3 || echo python)
+QEMU    ?= qemu-system-x86_64
+AR      ?= ar
+
+IS_CLANG := $(findstring clang,$(shell $(CC) --version 2>/dev/null))
+TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,)
+KREG_FLAGS   := $(if $(IS_CLANG),-mgeneral-regs-only,-mno-mmx -mno-sse -mno-sse2)
+LD_NOWARN_RWX := $(if $(shell $(LD) --help 2>&1 | grep -F -- '--no-warn-rwx-segments'),--no-warn-rwx-segments,)
 
 BUILD := build
 
@@ -16,17 +22,16 @@ BUILD := build
 # itself, so the rule further down keeps it current on its own.
 -include $(BUILD)/config.mk
 
-CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
-          -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mcmodel=kernel \
-          -fno-omit-frame-pointer -Wall -Wextra -O2 -g \
+CFLAGS := $(TARGET_FLAGS) -m64 -ffreestanding -nostdlib -fno-stack-protector \
+          -fno-pic -fno-pie -fno-builtin -mno-red-zone $(KREG_FLAGS) \
+          -mcmodel=kernel -fno-omit-frame-pointer -Wall -Wextra -O2 -g \
           -Ikernel/include -Iabi -MMD -MP
-LDFLAGS := -nostdlib -z max-page-size=0x1000 --no-warn-rwx-segments
+LDFLAGS := -nostdlib -z max-page-size=0x1000 $(LD_NOWARN_RWX)
 
-UCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic -fno-pie \
-           -mno-red-zone -Wall -Wextra -O2 -g \
+UCFLAGS := $(TARGET_FLAGS) -m64 -ffreestanding -nostdlib -fno-stack-protector \
+           -fno-pic -fno-pie -fno-builtin -mno-red-zone -Wall -Wextra -O2 -g \
            -Ilibc/include -Iabi -Ilibgui \
            -Ilibz -Ilibtls -Ilibimg -Ilibweb -Ilibjs -MMD -MP
-AR      := ar
 
 KERNEL_CSRC := $(filter-out $(CONFIG_KERNEL_EXCLUDE), $(wildcard kernel/*.c))
 KERNEL_ASRC := $(wildcard kernel/*.asm)
@@ -82,9 +87,9 @@ PKG_SRC   := $(wildcard packages/*/src/*.c)
 KPKGS     := $(patsubst %,$(BUILD)/repo/%.kpkg,$(PKG_NAMES))
 PKG_PROGS := $(foreach s,$(PKG_SRC),\
                $(BUILD)/pkg/$(word 2,$(subst /, ,$(s)))/root/bin/$(notdir $(basename $(s))))
-PKG_DATA  := $(shell find packages -path '*/root/*' -type f 2>/dev/null)
+PKG_DATA  := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).replace(os.sep,'/') for r,_,fs in os.walk('packages') if '/root' in r.replace(os.sep,'/') for f in fs))" 2>/dev/null)
 
-ROOTFS_SRC := $(shell find rootfs -type f 2>/dev/null)
+ROOTFS_SRC := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).replace(os.sep,'/') for r,_,fs in os.walk('rootfs') for f in fs))" 2>/dev/null)
 
 
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
@@ -118,8 +123,8 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 # the .kmod. -fno-common keeps SHN_COMMON symbols out (the loader refuses
 # them) and -fno-asynchronous-unwind-tables keeps .eh_frame -- which is
 # SHF_ALLOC, so it would be copied and relocated for nothing -- out.
-MODCFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector -fno-pic \
-             -fno-pie -mno-red-zone -mno-mmx -mno-sse -mno-sse2 \
+MODCFLAGS := $(TARGET_FLAGS) -m64 -ffreestanding -nostdlib -fno-stack-protector \
+             -fno-pic -fno-pie -fno-builtin -mno-red-zone $(KREG_FLAGS) \
              -mcmodel=kernel -fno-common -fno-asynchronous-unwind-tables \
              -Wall -Wextra -O2 -Ikernel/include -Iabi -MMD -MP
 
@@ -158,7 +163,7 @@ $(BUILD)/stage1.bin: boot/stage1.asm
 
 $(BUILD)/stage2.bin: boot/stage2.asm $(BUILD)/kernel.bin
 	$(NASM) -f bin \
-	  -DKERNEL_SECTORS=$$(( ( $$(stat -c %s $(BUILD)/kernel.bin) + 511 ) / 512 )) \
+	  -DKERNEL_SECTORS=$$($(PY) -c "import os; print((os.path.getsize('$(BUILD)/kernel.bin')+511)//512)") \
 	  $< -o $@
 
 # ---------------- userspace ----------------
@@ -195,20 +200,25 @@ $(BUILD)/apps/%: $(BUILD)/apps/%.o $(CRT0) $(LIBC_A) $(LIBGUI_A) apps/user.ld
 # DT_NEEDED=libgreet.so plus eager PLT relocations; it intentionally links no
 # static libc, so a successful run proves that the dependency was mapped and
 # its symbols resolved.
-DYN_CFLAGS := -m64 -ffreestanding -nostdlib -fno-stack-protector \
-              -fPIC -fPIE -mno-red-zone -Wall -Wextra -O2 -g
+DYN_COMMON_CFLAGS := $(TARGET_FLAGS) -m64 -ffreestanding -nostdlib \
+                     -fno-stack-protector -fno-builtin -mno-red-zone \
+                     -Wall -Wextra -O2 -g
 
-$(BUILD)/dynamic/%.o: dynamic/%.c
+$(BUILD)/dynamic/libgreet.o: dynamic/libgreet.c
 	@mkdir -p $(dir $@)
-	$(CC) $(DYN_CFLAGS) -c $< -o $@
+	$(CC) $(DYN_COMMON_CFLAGS) -fPIC -c $< -o $@
+
+$(BUILD)/dynamic/dynhello.o: dynamic/dynhello.c
+	@mkdir -p $(dir $@)
+	$(CC) $(DYN_COMMON_CFLAGS) -fPIE -c $< -o $@
 
 $(DYNAMIC_LIB): $(BUILD)/dynamic/libgreet.o
 	@mkdir -p $(dir $@)
-	$(LD) -shared --hash-style=sysv -soname libgreet.so -o $@ $<
+	$(LD) -nostdlib -z max-page-size=0x1000 -shared --hash-style=sysv -soname libgreet.so -o $@ $<
 
 $(DYNAMIC_APP): $(BUILD)/dynamic/dynhello.o $(DYNAMIC_LIB)
 	@mkdir -p $(dir $@)
-	$(LD) -pie --hash-style=sysv -e _start -L$(BUILD)/lib \
+	$(LD) -nostdlib -z max-page-size=0x1000 -pie --hash-style=sysv -e _start -L$(BUILD)/lib \
 	  -o $@ $(BUILD)/dynamic/dynhello.o -lgreet
 
 # The browser also needs its rendering engine and the whole web stack.
@@ -251,6 +261,7 @@ $(BUILD)/pkg/$(1)/root/bin/$(2): $(BUILD)/pkgobj/$(1)/$(2).o $(CRT0) $(LIBC_A) \
 	@mkdir -p $$(dir $$@)
 	$(LD) -nostdlib -z max-page-size=0x1000 -T apps/user.ld -o $$@ \
 	  $(CRT0) $(BUILD)/pkgobj/$(1)/$(2).o $(LIBGUI_A) $(LIBC_A)
+	$(OBJCOPY) --strip-debug $$@
 endef
 $(foreach p,$(PKG_NAMES),$(foreach s,$(wildcard packages/$(p)/src/*.c),\
   $(eval $(call PKG_PROG_RULE,$(p),$(notdir $(basename $(s)))))))
@@ -282,11 +293,12 @@ $(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_S
 	  $(OBJCOPY) --strip-debug $(BUILD)/rootfs/bin/$$app; \
 	done
 	cp $(DYNAMIC_LIB) $(BUILD)/rootfs/lib/
+	$(OBJCOPY) --strip-debug $(BUILD)/rootfs/lib/libgreet.so
 	cp $(MOD_BINS) $(BUILD)/rootfs/lib/modules/
 	cp $(KPKGS) $(BUILD)/repo/index.kpi $(BUILD)/rootfs/var/pkg/repo/
 	$(PY) tools/mkfs.py --mode /etc/shadow:0600 --mode /var/pkg/db:0700 \
 	  --mode /tmp:0777 --mode /run:0777 \
-	  $(BUILD)/rootfs $@ 32
+	  $(BUILD)/rootfs $@ 64
 
 # ---------------- disk image ----------------
 

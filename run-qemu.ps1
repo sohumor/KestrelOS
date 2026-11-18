@@ -62,7 +62,10 @@ function Find-Qemu {
         'C:\qemu\qemu-system-x86_64.exe'
     )
     foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
-        if ($root) { $candidates += (Join-Path $root 'qemu\qemu-system-x86_64.exe') }
+        if ($root) {
+            $candidates += (Join-Path $root 'qemu\qemu-system-x86_64.exe')
+            $candidates += (Join-Path $root 'Programs\qemu\qemu-system-x86_64.exe')
+        }
     }
     foreach ($c in $candidates) {
         if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return $c }

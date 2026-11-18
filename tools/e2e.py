@@ -33,6 +33,7 @@ import http.server
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -40,17 +41,39 @@ import tempfile
 import threading
 import time
 
-QEMU_BASE_CMD = [
-    "qemu-system-x86_64",
-    "-drive", "file=build/os.img,format=raw",
-    # Package/filesystem tests deliberately mutate the guest disk. Keep those
-    # writes in a temporary overlay so repeated runs always start from the
-    # image produced by make and never contaminate build/os.img.
-    "-snapshot",
-    "-no-reboot",
-    "-display", "none",
-    "-serial", "stdio",
-]
+def find_qemu():
+    env_q = os.environ.get("QEMU")
+    if env_q and os.path.isfile(env_q):
+        return env_q
+    q = shutil.which("qemu-system-x86_64")
+    if q:
+        return q
+    if sys.platform == "win32":
+        candidates = [
+            os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                         "Programs", "qemu", "qemu-system-x86_64.exe"),
+            r"C:\Program Files\qemu\qemu-system-x86_64.exe",
+            r"C:\Program Files (x86)\qemu\qemu-system-x86_64.exe",
+        ]
+        for cand in candidates:
+            if cand and os.path.isfile(cand):
+                return cand
+    return "qemu-system-x86_64"
+
+
+def find_openssl():
+    p = shutil.which("openssl")
+    if p:
+        return p
+    if sys.platform == "win32":
+        for cand in (
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+        ):
+            if os.path.isfile(cand):
+                return cand
+    return None
+
 
 QEMU_NICS = {
     "rtl8139": "rtl8139",
@@ -59,7 +82,16 @@ QEMU_NICS = {
 
 
 def qemu_command(nic, cpus):
-    return QEMU_BASE_CMD + [
+    return [
+        find_qemu(),
+        "-drive", "file=build/os.img,format=raw",
+        # Package/filesystem tests deliberately mutate the guest disk. Keep those
+        # writes in a temporary overlay so repeated runs always start from the
+        # image produced by make and never contaminate build/os.img.
+        "-snapshot",
+        "-no-reboot",
+        "-display", "none",
+        "-serial", "stdio",
         "-m", "128M",
         "-smp", str(cpus),
         "-device", "%s,netdev=n0" % QEMU_NICS[nic],
@@ -117,8 +149,9 @@ def clean(text):
 
 class Harness:
     def __init__(self, cmd):
-        self.cmd = cmd
+        self.cmd = list(cmd)
         self.proc = None
+        self._sock = None
         self.buf = ""                 # cleaned, unconsumed text
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -127,13 +160,47 @@ class Harness:
         self._esc = ""                # half of an escape sequence, held back
         self.eof = False
 
+    def _use_win_tcp_serial(self):
+        if sys.platform != "win32":
+            return False
+        for i in range(len(self.cmd) - 1):
+            if self.cmd[i] == "-serial" and self.cmd[i + 1] == "stdio":
+                return True
+        return False
+
     def start(self):
-        self.proc = subprocess.Popen(
-            self.cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        if self._use_win_tcp_serial():
+            # Windows QEMU char-win-stdio drops characters after the first
+            # byte on piped stdin; use a local TCP socket instead.
+            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            srv.bind(("127.0.0.1", 0))
+            srv.listen(1)
+            port = srv.getsockname()[1]
+            cmd = list(self.cmd)
+            for i in range(len(cmd) - 1):
+                if cmd[i] == "-serial" and cmd[i + 1] == "stdio":
+                    cmd[i + 1] = "tcp:127.0.0.1:%d" % port
+                    break
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                srv.settimeout(15.0)
+                conn, _ = srv.accept()
+                conn.settimeout(None)
+                self._sock = conn
+            finally:
+                srv.close()
+        else:
+            self.proc = subprocess.Popen(
+                self.cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
         atexit.register(self.kill)
         t = threading.Thread(target=self._reader, daemon=True)
         t.start()
@@ -142,8 +209,13 @@ class Harness:
         while True:
             # read1 returns as soon as any data is available; a plain
             # buffered read(4096) would block until 4096 bytes or EOF
-
-            chunk = self.proc.stdout.read1(4096)
+            if self._sock is not None:
+                try:
+                    chunk = self._sock.recv(4096)
+                except OSError:
+                    chunk = b""
+            else:
+                chunk = self.proc.stdout.read1(4096)
             if not chunk:
                 break
             raw = self._esc + chunk.decode("utf-8", errors="replace")
@@ -237,8 +309,12 @@ class Harness:
         self.send_raw(line + "\n")
 
     def send_raw(self, data):
-        self.proc.stdin.write(data.encode("utf-8"))
-        self.proc.stdin.flush()
+        raw = data.encode("utf-8")
+        if self._sock is not None:
+            self._sock.sendall(raw)
+        else:
+            self.proc.stdin.write(raw)
+            self.proc.stdin.flush()
 
     def print_tail(self):
         print("---- last %d lines of serial output ----" % TAIL_LINES)
@@ -250,6 +326,12 @@ class Harness:
         print("---- end of tail ----")
 
     def kill(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
         if self.proc is None or self.proc.poll() is not None:
             return
         self.proc.terminate()
@@ -1272,7 +1354,7 @@ class BrowserFixtureServers:
         return thread
 
     def start(self):
-        openssl = shutil.which("openssl")
+        openssl = find_openssl()
         if not openssl:
             raise RuntimeError("openssl is required for browser TLS E2E")
 
@@ -1296,12 +1378,13 @@ class BrowserFixtureServers:
             raise RuntimeError("cannot generate negative TLS certificate: %s"
                                % made.stderr.strip())
 
+        bind_host = "127.0.0.1" if sys.platform == "win32" else "0.0.0.0"
         self.http = _QuietHTTPServer(
-            ("0.0.0.0", 0), _marker_handler(HTTP_BODY_MARKER))
+            (bind_host, 0), _marker_handler(HTTP_BODY_MARKER))
         self.cors = _QuietHTTPServer(
-            ("0.0.0.0", 0), _marker_handler(HTTP_BODY_MARKER))
+            (bind_host, 0), _marker_handler(HTTP_BODY_MARKER))
         self.https = _QuietHTTPServer(
-            ("0.0.0.0", 0), _marker_handler(TLS_NEGATIVE_BODY_MARKER))
+            (bind_host, 0), _marker_handler(TLS_NEGATIVE_BODY_MARKER))
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_3
         context.maximum_version = ssl.TLSVersion.TLSv1_3
@@ -2227,12 +2310,13 @@ def t_browser_https(h):
     for an error as well as the success marker so a readable fast failure
     is reported immediately instead of burning the whole timeout.
     """
-    h.send("/bin/browser -t https://example.com/; "
+    h.send("/bin/browser -t -v https://example.com/; "
            "echo BROWSER-HTTPS-STATUS-$?")
     block = h.capture_until(
         r"(?:^|\n)BROWSER-HTTPS-STATUS-\d+\n",
         timeout=NET_TIMEOUT, regex=True)
-    if "Example Domain" not in block:
+    if "title: Example Domain" not in block or \
+            "documentation examples" not in block:
         raise TimeoutError("browser HTTPS success marker was absent")
     if not re.search(r"(?:^|\n)BROWSER-HTTPS-STATUS-0\n", block):
         raise TimeoutError("browser HTTPS did not report explicit status 0")
