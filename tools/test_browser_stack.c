@@ -212,6 +212,15 @@ int img_decode(const void *data, unsigned long len, struct image *out)
     return IMG_ERR_FORMAT;
 }
 
+int img_scale(const struct image *src, int w, int h, struct image *out)
+{
+    (void)src;
+    (void)w;
+    (void)h;
+    memset(out, 0, sizeof(*out));
+    return IMG_ERR_FORMAT;
+}
+
 void img_free(struct image *im)
 {
     if (im)

@@ -132,6 +132,14 @@ static const char ua_css[] =
 "  noscript { display: none !important }\n"
 "}\n"
 
+/* ---- interactive disclosure and dialog ---- */
+"details { display: block }\n"
+"details > summary { display: block; font-weight: bold }\n"
+"details:not([open]) > :not(summary) { display: none !important }\n"
+"dialog:not([open]) { display: none }\n"
+"dialog[open] { display: block; border: 2px solid #404040; padding: 1em;"
+"  background-color: white; color: black; margin: 1em 0 }\n"
+
 /* ---- hidden regardless ---- */
 "[hidden] { display: none }\n"
 "[disabled] { color: #808080 }\n";

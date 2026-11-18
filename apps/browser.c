@@ -76,6 +76,11 @@ TLS_ASSERT_TRANSPORT_LAYOUT();
 #define NET_LOG_MAX     64
 #define BOOKMARK_MAX    16
 #define BOOKMARK_FILE   "/home/.browser_bookmarks"
+#define SESSION_FILE    "/home/.browser_session"
+#define SESSION_MAX_BYTES 32768UL
+#define FAVICON_CACHE_MAX 16
+#define FAVICON_SIZE    16
+#define FAVICON_MAX_BYTES (1024UL * 1024UL)
 #define DOWNLOAD_DIR    "/home/Downloads"
 #define DOWNLOAD_MAX    (16UL * 1024UL * 1024UL)
 
@@ -170,6 +175,13 @@ struct net_log_entry {
     char url[160];
 };
 
+struct favicon_entry {
+    char *url;
+    struct image icon16;
+    int state;                     /* 0 empty, 1 decoded, -1 failed */
+    unsigned long last_used;
+};
+
 struct browser_tab {
     struct browser_page *page;
     char *hist[HIST_MAX];
@@ -177,6 +189,8 @@ struct browser_tab {
     char addr[URL_MAX];
     int addr_len, addr_cur;
     int scroll;
+    int zoom_pct;
+    char *favicon_url;
     struct dom_node *focus_node;
     int focus_cursor;
     struct dom_node *hover_node;
@@ -370,66 +384,95 @@ static int path_join(const char *tok, char *out, unsigned long outsz)
     return n >= 0 && (unsigned long)n < outsz ? 0 : -1;
 }
 
+static int url_is_view_source(const char *s, const char **inner_out)
+{
+    static const char prefix[] = "view-source:";
+    int i;
+
+    if (!s)
+        return 0;
+    for (i = 0; i < 12; i++) {
+        if (ascii_lower((unsigned char)s[i]) != prefix[i])
+            return 0;
+    }
+    if (inner_out)
+        *inner_out = s + 12;
+    return 1;
+}
+
 static BROWSER_NOINLINE int url_supported(const char *s)
 {
-    struct url u;
+    const char *inner = 0;
+    struct url *u;
+    int ok;
 
-    if (url_parse(s, &u) != URL_OK || !u.has_scheme)
+    if (url_is_view_source(s, &inner)) {
+        if (!*inner || url_is_view_source(inner, 0))
+            return 0;
+        s = inner;
+    }
+    u = (struct url *)malloc(sizeof(*u));
+    if (!u)
         return 0;
-    return str_ci_eq(u.scheme, "file") || str_ci_eq(u.scheme, "http") ||
-           str_ci_eq(u.scheme, "https");
+    ok = (url_parse(s, u) == URL_OK && u->has_scheme &&
+          (str_ci_eq(u->scheme, "file") || str_ci_eq(u->scheme, "http") ||
+           str_ci_eq(u->scheme, "https")));
+    free(u);
+    return ok;
 }
 
 static BROWSER_NOINLINE int url_is_scheme(const char *s, const char *scheme)
 {
-    struct url u;
+    struct url *u;
+    int ok;
 
-    return url_parse(s, &u) == URL_OK && u.has_scheme &&
-           str_ci_eq(u.scheme, scheme);
+    u = (struct url *)malloc(sizeof(*u));
+    if (!u)
+        return 0;
+    ok = (url_parse(s, u) == URL_OK && u->has_scheme &&
+          str_ci_eq(u->scheme, scheme));
+    free(u);
+    return ok;
 }
 
-/* Turn a target typed at the shell/address bar into an absolute URL.  Local
- * files use file: URLs too, so RFC 3986 resolution works for every page. */
-static BROWSER_NOINLINE int canonicalize_input(const char *input, char *out,
-                                               unsigned long outsz, char *err,
-                                               unsigned long errsz)
-{
+struct canon_work {
     char in[URL_MAX];
     char path[URL_PATH_MAX];
     char tmp[URL_MAX];
+    char decoded[URL_PATH_MAX];
+    char inner_out[URL_MAX];
     struct url u;
+};
+
+static int canonicalize_inner(struct canon_work *w, const char *raw, char *out,
+                              unsigned long outsz, char *err,
+                              unsigned long errsz)
+{
     struct k_stat st;
     int rc;
 
-    if (trim_copy(input, in, sizeof(in)) != 0) {
-        snprintf(err, errsz, "the address is empty or too long");
-        return -1;
-    }
-
-    rc = url_parse(in, &u);
-    if (rc == URL_OK && u.has_scheme) {
+    rc = url_parse(raw, &w->u);
+    if (rc == URL_OK && w->u.has_scheme) {
         /* file:foo is interpreted relative to the shell's cwd. */
-        if (str_ci_eq(u.scheme, "file") && u.path[0] != '/') {
-            char decoded[URL_PATH_MAX];
-
-            if (url_pct_decode(u.path, ~0UL, 0, decoded,
-                               sizeof(decoded)) < 0 ||
-                path_join(decoded, path, sizeof(path)) != 0) {
+        if (str_ci_eq(w->u.scheme, "file") && w->u.path[0] != '/') {
+            if (url_pct_decode(w->u.path, ~0UL, 0, w->decoded,
+                               sizeof(w->decoded)) < 0 ||
+                path_join(w->decoded, w->path, sizeof(w->path)) != 0) {
                 snprintf(err, errsz, "the local path is too long");
                 return -1;
             }
-            if (snprintf(tmp, sizeof(tmp), "file://%s", path) < 0) {
+            if (snprintf(w->tmp, sizeof(w->tmp), "file://%s", w->path) < 0) {
                 snprintf(err, errsz, "cannot form a file URL");
                 return -1;
             }
-            rc = url_parse(tmp, &u);
+            rc = url_parse(w->tmp, &w->u);
             if (rc != URL_OK) {
                 snprintf(err, errsz, "bad file URL: %s", url_strerror(rc));
                 return -1;
             }
         }
-        url_normalize(&u, URL_N_ALL);
-        rc = url_serialize(&u, out, outsz);
+        url_normalize(&w->u, URL_N_ALL);
+        rc = url_serialize(&w->u, out, outsz);
         if (rc != URL_OK) {
             snprintf(err, errsz, "address is too long: %s",
                      url_strerror(rc));
@@ -440,34 +483,84 @@ static BROWSER_NOINLINE int canonicalize_input(const char *input, char *out,
 
     /* An existing path, or an explicitly absolute path, wins over the
      * hostname shorthand. */
-    if (path_join(in, path, sizeof(path)) == 0 &&
-        (in[0] == '/' || stat_(path, &st) == 0)) {
-        int n = snprintf(tmp, sizeof(tmp), "file://%s", path);
+    if (path_join(raw, w->path, sizeof(w->path)) == 0 &&
+        (raw[0] == '/' || stat_(w->path, &st) == 0)) {
+        int n = snprintf(w->tmp, sizeof(w->tmp), "file://%s", w->path);
 
-        if (n < 0 || (unsigned long)n >= sizeof(tmp) ||
-            url_parse(tmp, &u) != URL_OK) {
+        if (n < 0 || (unsigned long)n >= sizeof(w->tmp) ||
+            url_parse(w->tmp, &w->u) != URL_OK) {
             snprintf(err, errsz, "the local path is too long");
             return -1;
         }
-        url_normalize(&u, URL_N_ALL);
-        if (url_serialize(&u, out, outsz) != URL_OK) {
+        url_normalize(&w->u, URL_N_ALL);
+        if (url_serialize(&w->u, out, outsz) != URL_OK) {
             snprintf(err, errsz, "the local file URL is too long");
             return -1;
         }
         return 0;
     }
 
-    if (snprintf(tmp, sizeof(tmp), "http://%s", in) < 0 ||
-        url_parse(tmp, &u) != URL_OK) {
+    if (snprintf(w->tmp, sizeof(w->tmp), "http://%s", raw) < 0 ||
+        url_parse(w->tmp, &w->u) != URL_OK) {
         snprintf(err, errsz, "malformed address");
         return -1;
     }
-    url_normalize(&u, URL_N_ALL);
-    if (url_serialize(&u, out, outsz) != URL_OK) {
+    url_normalize(&w->u, URL_N_ALL);
+    if (url_serialize(&w->u, out, outsz) != URL_OK) {
         snprintf(err, errsz, "address is too long");
         return -1;
     }
     return 0;
+}
+
+/* Turn a target typed at the shell/address bar into an absolute URL.  Local
+ * files use file: URLs too, so RFC 3986 resolution works for every page. */
+static BROWSER_NOINLINE int canonicalize_input(const char *input, char *out,
+                                               unsigned long outsz, char *err,
+                                               unsigned long errsz)
+{
+    struct canon_work *w;
+    const char *inner = 0;
+    int rc;
+
+    w = (struct canon_work *)malloc(sizeof(*w));
+    if (!w) {
+        snprintf(err, errsz, "out of memory parsing address");
+        return -1;
+    }
+    if (trim_copy(input, w->in, sizeof(w->in)) != 0) {
+        snprintf(err, errsz, "the address is empty or too long");
+        free(w);
+        return -1;
+    }
+    if (url_is_view_source(w->in, &inner)) {
+        while (*inner == ' ' || *inner == '\t')
+            inner++;
+        if (!*inner) {
+            snprintf(err, errsz, "missing URL after view-source:");
+            free(w);
+            return -1;
+        }
+        if (url_is_view_source(inner, 0)) {
+            snprintf(err, errsz, "nested view-source: URLs are not supported");
+            free(w);
+            return -1;
+        }
+        rc = canonicalize_inner(w, inner, w->inner_out, sizeof(w->inner_out),
+                                err, errsz);
+        if (rc == 0) {
+            int n = snprintf(out, outsz, "view-source:%s", w->inner_out);
+            if (n < 0 || (unsigned long)n >= outsz) {
+                snprintf(err, errsz, "view-source address is too long");
+                rc = -1;
+            }
+        }
+        free(w);
+        return rc;
+    }
+    rc = canonicalize_inner(w, w->in, out, outsz, err, errsz);
+    free(w);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1247,6 +1340,109 @@ make_status_source(const char *body, unsigned long len, int status,
     out[hn + len] = 0;
     *out_len = hn + len;
     return out;
+}
+
+static BROWSER_NOINLINE char *
+make_view_source_source(const char *url, const char *body, unsigned long len,
+                        int status, int is_dark, unsigned long *out_len)
+{
+    struct bytebuf out;
+    unsigned long pos = 0, lines = 0, ln = 0;
+    char meta[96], lnum[48];
+
+    if (out_len)
+        *out_len = 0;
+    if (len == 0) {
+        lines = 1;
+    } else {
+        while (pos < len) {
+            lines++;
+            while (pos < len && body[pos] != '\n')
+                pos++;
+            if (pos < len)
+                pos++;
+        }
+    }
+
+    memset(&out, 0, sizeof(out));
+    out.limit = DOM_MAX_INPUT;
+    if (buf_add_str(&out, "<!doctype html><html><head><title>view-source: ") != 0 ||
+        buf_add_escaped_html(&out, url ? url : "", url ? strlen(url) : 0) != 0 ||
+        buf_add_str(&out, "</title><style>") != 0 ||
+        buf_add_str(&out, is_dark
+            ? "body{margin:12px;background:#0b1220;color:#e2e8f0;font-family:sans-serif;}"
+              ".vs-banner{padding:10px 14px;margin-bottom:10px;background:#132238;"
+              "border:1px solid #2b4c76;border-left:4px solid #38bdf8;color:#e2e8f0;}"
+              ".vs-badge{display:inline-block;padding:2px 8px;margin-right:8px;"
+              "background:#1d4ed8;color:#ffffff;font-family:monospace;font-weight:bold;}"
+              ".vs-url{font-family:monospace;font-weight:bold;color:#93c5fd;}"
+              ".vs-meta{margin-top:4px;font-size:12px;color:#94a3b8;}"
+              "pre.vs-code{margin:0;padding:10px 12px;background:#0f172a;color:#e2e8f0;"
+              "border:1px solid #273854;font-family:monospace;white-space:pre-wrap;"
+              "line-height:1.45;}"
+              ".vs-ln{color:#64748b;}"
+            : "body{margin:12px;background:#f8fafc;color:#0f172a;font-family:sans-serif;}"
+              ".vs-banner{padding:10px 14px;margin-bottom:10px;background:#0f2744;"
+              "border:1px solid #1e3a5f;border-left:4px solid #38bdf8;color:#f1f5f9;}"
+              ".vs-badge{display:inline-block;padding:2px 8px;margin-right:8px;"
+              "background:#0284c7;color:#ffffff;font-family:monospace;font-weight:bold;}"
+              ".vs-url{font-family:monospace;font-weight:bold;color:#bae6fd;}"
+              ".vs-meta{margin-top:4px;font-size:12px;color:#cbd5e1;}"
+              "pre.vs-code{margin:0;padding:10px 12px;background:#ffffff;color:#0f172a;"
+              "border:1px solid #cbd5e1;font-family:monospace;white-space:pre-wrap;"
+              "line-height:1.45;}"
+              ".vs-ln{color:#64748b;}") != 0 ||
+        buf_add_str(&out, "</style></head><body>"
+                          "<div class=\"vs-banner\">"
+                          "<span class=\"vs-badge\">VIEW SOURCE</span>"
+                          "<span class=\"vs-url\">") != 0 ||
+        buf_add_escaped_html(&out, url ? url : "", url ? strlen(url) : 0) != 0)
+        goto fail;
+
+    if (status)
+        snprintf(meta, sizeof(meta), "%lu bytes | %lu lines | HTTP %d",
+                 len, lines, status);
+    else
+        snprintf(meta, sizeof(meta), "%lu bytes | %lu lines | local",
+                 len, lines);
+
+    if (buf_add_str(&out, "</span><div class=\"vs-meta\">") != 0 ||
+        buf_add_escaped_html(&out, meta, strlen(meta)) != 0 ||
+        buf_add_str(&out, "</div></div><pre class=\"vs-code\">") != 0)
+        goto fail;
+
+    if (len == 0) {
+        if (buf_add_str(&out, "<span class=\"vs-ln\">   1 | </span>\n") != 0)
+            goto fail;
+    } else {
+        pos = 0;
+        while (pos < len) {
+            unsigned long ls = pos, le;
+            while (pos < len && body[pos] != '\n')
+                pos++;
+            le = pos;
+            if (pos < len)
+                pos++;
+            if (le > ls && body[le - 1] == '\r')
+                le--;
+            ln++;
+            snprintf(lnum, sizeof(lnum), "<span class=\"vs-ln\">%4lu | </span>", ln);
+            if (buf_add_str(&out, lnum) != 0 ||
+                buf_add_escaped_html(&out, body + ls, le - ls) != 0 ||
+                buf_add_str(&out, "\n") != 0)
+                goto fail;
+        }
+    }
+
+    if (buf_add_str(&out, "</pre></body></html>") != 0)
+        goto fail;
+    if (out_len)
+        *out_len = out.n;
+    return out.p;
+
+fail:
+    free(out.p);
+    return 0;
 }
 
 static BROWSER_NOINLINE char *
@@ -3770,6 +3966,117 @@ static void page_destroy(struct browser_page *p)
     free(p);
 }
 
+static int32_t zoom_scale_px(int32_t v, int zoom_pct)
+{
+    int64_t scaled;
+
+    if (v == 0 || zoom_pct == 100 || zoom_pct <= 0)
+        return v;
+    if (v > 0) {
+        scaled = ((int64_t)v * zoom_pct + 50) / 100;
+        if (scaled < 1)
+            scaled = 1;
+    } else {
+        scaled = -((-(int64_t)v * zoom_pct + 50) / 100);
+        if (scaled > -1)
+            scaled = -1;
+    }
+    return (int32_t)clamp_i64(scaled);
+}
+
+static void zoom_scale_len(struct css_len *l, int zoom_pct)
+{
+    if (!l)
+        return;
+    if (l->type == CSS_LEN_PX || l->type == CSS_LEN_CALC)
+        l->v = zoom_scale_px(l->v, zoom_pct);
+}
+
+static BROWSER_NOINLINE void zoom_scale_dom_styles(struct dom_node *root,
+                                                   int zoom_pct)
+{
+    struct dom_node *n;
+
+    if (!root || zoom_pct == 100 || zoom_pct <= 0)
+        return;
+    for (n = root; n; n = dom_next(n)) {
+        struct computed_style *cs;
+        int i;
+
+        if (n->type != DOM_ELEMENT || !n->style)
+            continue;
+        cs = (struct computed_style *)n->style;
+        cs->font_size = zoom_scale_px(cs->font_size, zoom_pct);
+        if (cs->font_size < 1)
+            cs->font_size = 1;
+        if (cs->font_size > 400)
+            cs->font_size = 400;
+        for (i = 0; i < 4; i++) {
+            cs->border_width[i] = zoom_scale_px(cs->border_width[i], zoom_pct);
+            cs->border_radius[i] = zoom_scale_px(cs->border_radius[i], zoom_pct);
+            zoom_scale_len(&cs->margin[i], zoom_pct);
+            zoom_scale_len(&cs->padding[i], zoom_pct);
+            zoom_scale_len(&cs->offset[i], zoom_pct);
+        }
+        cs->border_spacing = zoom_scale_px(cs->border_spacing, zoom_pct);
+        cs->outline_width = zoom_scale_px(cs->outline_width, zoom_pct);
+        cs->outline_offset = zoom_scale_px(cs->outline_offset, zoom_pct);
+        cs->vertical_align_px = zoom_scale_px(cs->vertical_align_px, zoom_pct);
+        cs->gap = zoom_scale_px(cs->gap, zoom_pct);
+        cs->row_gap = zoom_scale_px(cs->row_gap, zoom_pct);
+        cs->column_gap = zoom_scale_px(cs->column_gap, zoom_pct);
+        cs->letter_spacing = zoom_scale_px(cs->letter_spacing, zoom_pct);
+        zoom_scale_len(&cs->width, zoom_pct);
+        zoom_scale_len(&cs->height, zoom_pct);
+        zoom_scale_len(&cs->min_width, zoom_pct);
+        zoom_scale_len(&cs->max_width, zoom_pct);
+        zoom_scale_len(&cs->min_height, zoom_pct);
+        zoom_scale_len(&cs->max_height, zoom_pct);
+        zoom_scale_len(&cs->flex_basis, zoom_pct);
+        zoom_scale_len(&cs->line_height, zoom_pct);
+        zoom_scale_len(&cs->text_indent, zoom_pct);
+        zoom_scale_len(&cs->translate_x, zoom_pct);
+        zoom_scale_len(&cs->translate_y, zoom_pct);
+        if (cs->has_shadow) {
+            cs->shadow_x = zoom_scale_px(cs->shadow_x, zoom_pct);
+            cs->shadow_y = zoom_scale_px(cs->shadow_y, zoom_pct);
+            cs->shadow_blur = zoom_scale_px(cs->shadow_blur, zoom_pct);
+            cs->shadow_spread = zoom_scale_px(cs->shadow_spread, zoom_pct);
+        }
+        for (i = 0; i < (int)cs->grid_ncols && i < CSS_GRID_MAX_COLS; i++) {
+            if (cs->grid_cols[i].kind == CSS_GRID_PX)
+                cs->grid_cols[i].val =
+                    zoom_scale_px(cs->grid_cols[i].val, zoom_pct);
+        }
+        for (i = 0; i < (int)cs->grid_nrows && i < CSS_GRID_MAX_ROWS; i++) {
+            if (cs->grid_rows[i].kind == CSS_GRID_PX)
+                cs->grid_rows[i].val =
+                    zoom_scale_px(cs->grid_rows[i].val, zoom_pct);
+        }
+    }
+}
+
+static int page_zoom_pct(const struct browser_page *p)
+{
+    return (p && p->tab && p->tab->zoom_pct > 0) ? p->tab->zoom_pct : 100;
+}
+
+static void page_zoom_viewport(int viewport_w, int viewport_h, int zoom_pct,
+                               int *eff_w, int *eff_h)
+{
+    int vw = viewport_w > 0 ? viewport_w : 1;
+    int vh = viewport_h > 0 ? viewport_h : 1;
+
+    if (zoom_pct != 100 && zoom_pct > 0) {
+        vw = mul_div_i(vw, 100, zoom_pct);
+        vh = mul_div_i(vh, 100, zoom_pct);
+        if (vw < 1) vw = 1;
+        if (vh < 1) vh = 1;
+    }
+    *eff_w = vw;
+    *eff_h = vh;
+}
+
 static BROWSER_NOINLINE int
 page_reflow(struct browser_runtime *rt, struct browser_page *p,
             int viewport_w, int viewport_h, char *err, unsigned long errsz)
@@ -3779,7 +4086,7 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
     struct lay_opts lo;
     const struct lay_paint_item *paint_items;
     enum browser_load_state entry_state;
-    int styled;
+    int styled, zoom_pct, eff_vw, eff_vh;
 
     entry_state = p->load_state;
     if (page_transition(p, PAGE_STYLING) != 0) {
@@ -3795,7 +4102,9 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
 
     p->viewport_w = viewport_w;
     p->viewport_h = viewport_h;
-    page_fill_media(rt, viewport_w, viewport_h, &media);
+    zoom_pct = page_zoom_pct(p);
+    page_zoom_viewport(viewport_w, viewport_h, zoom_pct, &eff_vw, &eff_vh);
+    page_fill_media(rt, eff_vw, eff_vh, &media);
     css_set_media(rt->ua, &media);
     css_set_media(p->author, &media);
     sheets[0] = rt->ua;
@@ -3814,7 +4123,7 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
         snprintf(err, errsz, "out of memory creating the style engine");
         return -1;
     }
-    style_engine_set_viewport(p->styles, viewport_w, viewport_h);
+    style_engine_set_viewport(p->styles, eff_vw, eff_vh);
     styled = style_compute_tree(p->styles, p->doc->root, 0,
                                 css_style_dom_sink, 0);
     if (styled <= 0) {
@@ -3822,12 +4131,19 @@ page_reflow(struct browser_runtime *rt, struct browser_page *p,
         snprintf(err, errsz, "out of memory computing page styles");
         return -1;
     }
+    if (zoom_pct != 100)
+        zoom_scale_dom_styles(p->doc->root, zoom_pct);
 
     if (page_transition(p, PAGE_LAYOUT) != 0) {
         snprintf(err, errsz, "invalid page lifecycle transition to layout");
         return -1;
     }
     lay_opts_init(&lo, viewport_w, viewport_h);
+    if (zoom_pct != 100) {
+        lo.default_font_size = zoom_scale_px(16, zoom_pct);
+        if (lo.default_font_size < 1)
+            lo.default_font_size = 1;
+    }
     lo.image_size = page_image_size;
     lo.image_ctx = p;
     p->layout = lay_layout(p->doc, &lo);
@@ -3860,6 +4176,7 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
 {
     struct css_media media;
     struct bytebuf css;
+    int eff_vw, eff_vh;
 
     p->runtime = rt;
     p->viewport_w = viewport_w;
@@ -3886,7 +4203,9 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
         snprintf(err, errsz, "out of memory collecting page stylesheets");
         return -1;
     }
-    page_fill_media(rt, viewport_w, viewport_h, &media);
+    page_zoom_viewport(viewport_w, viewport_h, page_zoom_pct(p),
+                       &eff_vw, &eff_vh);
+    page_fill_media(rt, eff_vw, eff_vh, &media);
     p->author = css_parse(css.p, css.n, CSS_ORIGIN_AUTHOR, &media);
     free(css.p);
     if (!p->author) {
@@ -3900,7 +4219,7 @@ build_pipeline(struct browser_runtime *rt, struct browser_page *p,
         snprintf(err, errsz, "invalid page lifecycle transition to scripting");
         return -1;
     }
-    if (execute_page_scripts(p, viewport_w, viewport_h) != 0) {
+    if (execute_page_scripts(p, eff_vw, eff_vh) != 0) {
         page_transition(p, PAGE_FAILED);
         snprintf(err, errsz, "out of memory creating the JavaScript runtime");
         return -1;
@@ -4112,6 +4431,8 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
 {
     struct browser_page *p;
     struct page_load_work *w;
+    const char *fetch_target = target;
+    int is_vs;
     int rc, is_dark = 0;
 
     if (dl_out)
@@ -4121,6 +4442,9 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
         gui_settings_get(&gs);
         is_dark = !gs.light;
     }
+    is_vs = url_is_view_source(target, &fetch_target);
+    if (!is_vs)
+        fetch_target = target;
     p = (struct browser_page *)calloc(1, sizeof(*p));
     if (!p) {
         snprintf(fatal, fatalsz, "out of memory creating a page");
@@ -4153,23 +4477,25 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
     } else if (page_transition(p, PAGE_FETCHING) != 0) {
         snprintf(w->primary_error, sizeof(w->primary_error),
                  "invalid page lifecycle transition to fetching");
-    } else if (url_is_scheme(target, "file")) {
+    } else if (url_is_scheme(fetch_target, "file")) {
         p->is_local = 1;
-        if (read_local_url(target, &w->local_body, &w->body_len,
+        if (read_local_url(fetch_target, &w->local_body, &w->body_len,
                            w->primary_error,
                            sizeof(w->primary_error)) == 0) {
             w->body = w->local_body;
-            w->is_md = url_is_markdown(target);
-            w->is_html = w->is_md ? 0 : sniff_html(w->body, w->body_len);
-            tab_net_log(tab, 200, "doc", w->body_len, target);
+            if (!is_vs) {
+                w->is_md = url_is_markdown(fetch_target);
+                w->is_html = w->is_md ? 0 : sniff_html(w->body, w->body_len);
+            }
+            tab_net_log(tab, 200, "doc", w->body_len, fetch_target);
         } else {
-            tab_net_log(tab, -1, "doc", 0, target);
+            tab_net_log(tab, -1, "doc", 0, fetch_target);
         }
     } else if (netinfo(&w->net) != 0 || !w->net.up) {
         snprintf(w->primary_error, sizeof(w->primary_error),
                  "network unavailable: no NIC is configured");
     } else {
-        w->request.url = target;
+        w->request.url = fetch_target;
         w->request.method = method;
         w->request.body = request_body;
         w->request.body_len = request_len;
@@ -4178,11 +4504,11 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
         rc = http_fetch(rt->http, &w->request, &w->response);
         if (rc != HTTP_OK) {
             const char *tls_detail =
-                url_is_scheme(target, "https") &&
+                url_is_scheme(fetch_target, "https") &&
                 (rc == HTTP_E_CONNECT || rc == HTTP_E_DNS)
                     ? tls_last_transport_error() : 0;
 
-            tab_net_log(tab, rc, "doc", 0, target);
+            tab_net_log(tab, rc, "doc", 0, fetch_target);
             if (tls_detail && *tls_detail &&
                 strcmp(tls_detail, "no error") != 0)
                 snprintf(w->primary_error, sizeof(w->primary_error),
@@ -4192,11 +4518,20 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
                          http_error_text(rc));
         } else {
             const char *ct, *cd;
-            char *final_copy;
+            char *final_copy = 0;
 
             w->response_live = 1;
-            final_copy = w->response.final_url
-                ? str_dup(w->response.final_url) : 0;
+            if (w->response.final_url) {
+                if (is_vs) {
+                    unsigned long fl = strlen(w->response.final_url);
+                    final_copy = (char *)malloc(13 + fl);
+                    if (final_copy)
+                        snprintf(final_copy, 13 + fl, "view-source:%s",
+                                 w->response.final_url);
+                } else {
+                    final_copy = str_dup(w->response.final_url);
+                }
+            }
             if (!w->response.final_url) {
                 snprintf(w->primary_error, sizeof(w->primary_error),
                          "HTTP client returned no final URL");
@@ -4217,7 +4552,7 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
                 ct = http_header_get(&w->response, "Content-Type");
                 cd = http_header_get(&w->response, "Content-Disposition");
                 tab_net_log(tab, p->status, "doc", w->body_len, p->url);
-                if (rt && rt->is_gui && dl_out &&
+                if (!is_vs && rt && rt->is_gui && dl_out &&
                     p->status >= 200 && p->status < 300 &&
                     (has_attachment_disposition(cd) ||
                      (ct && *ct && !is_renderable_mime(ct)))) {
@@ -4233,13 +4568,15 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
                     page_destroy(p);
                     return 0;
                 }
-                w->is_html =
-                    (ct && (str_ci_contains(ct, "text/html") ||
-                            str_ci_contains(ct, "xhtml"))) ||
-                    sniff_html(w->body, w->body_len);
-                w->is_md =
-                    (ct && str_ci_contains(ct, "text/markdown")) ||
-                    (!w->is_html && url_is_markdown(p->url));
+                if (!is_vs) {
+                    w->is_html =
+                        (ct && (str_ci_contains(ct, "text/html") ||
+                                str_ci_contains(ct, "xhtml"))) ||
+                        sniff_html(w->body, w->body_len);
+                    w->is_md =
+                        (ct && str_ci_contains(ct, "text/markdown")) ||
+                        (!w->is_html && url_is_markdown(p->url));
+                }
                 if (p->status < 200 || p->status >= 300) {
                     p->failed = 1;
                     snprintf(p->error, sizeof(p->error), "HTTP %d %s",
@@ -4267,41 +4604,59 @@ page_load_request_tab(struct browser_runtime *rt, struct browser_tab *tab,
                  "invalid page lifecycle transition after response");
     }
     p->bytes = w->body_len;
-    p->is_html = w->is_html || w->is_md;
-    if (tab && w->body && !p->failed) {
-        char *raw_copy = (char *)malloc(w->body_len + 1);
-        if (raw_copy) {
-            if (w->body_len)
-                memcpy(raw_copy, w->body, w->body_len);
-            raw_copy[w->body_len] = 0;
+    p->is_html = is_vs ? 1 : (w->is_html || w->is_md);
+    if (is_vs) {
+        const char *disp_url = p->url;
+
+        if (tab) {
             free(tab->raw_source);
-            tab->raw_source = raw_copy;
-            tab->raw_len = w->body_len;
-            tab->raw_is_md = w->is_md;
+            tab->raw_source = 0;
+            tab->raw_len = 0;
+            tab->raw_is_md = 0;
         }
-    }
-    if (w->is_md) {
-        w->owned_source = make_markdown_source(w->body, w->body_len, is_dark,
-                                               &w->source_len);
+        url_is_view_source(p->url, &disp_url);
+        w->owned_source = make_view_source_source(disp_url, w->body,
+                                                  w->body_len, p->status,
+                                                  is_dark, &w->source_len);
         if (!w->owned_source)
             snprintf(w->primary_error, sizeof(w->primary_error),
-                     "out of memory formatting markdown");
-    } else if (!w->is_html) {
-        w->owned_source =
-            make_plain_source(w->body, w->body_len, p->status,
-                              &w->source_len);
-        if (!w->owned_source)
-            snprintf(w->primary_error, sizeof(w->primary_error),
-                     "out of memory preparing plain text");
-    } else if (p->status && (p->status < 200 || p->status >= 300)) {
-        w->owned_source =
-            make_status_source(w->body, w->body_len, p->status,
-                               &w->source_len);
-        if (!w->owned_source)
-            snprintf(w->primary_error, sizeof(w->primary_error),
-                     "out of memory preparing the HTTP error body");
+                     "out of memory preparing view-source");
     } else {
-        w->source_len = w->body_len;
+        if (tab && w->body && !p->failed) {
+            char *raw_copy = (char *)malloc(w->body_len + 1);
+            if (raw_copy) {
+                if (w->body_len)
+                    memcpy(raw_copy, w->body, w->body_len);
+                raw_copy[w->body_len] = 0;
+                free(tab->raw_source);
+                tab->raw_source = raw_copy;
+                tab->raw_len = w->body_len;
+                tab->raw_is_md = w->is_md;
+            }
+        }
+        if (w->is_md) {
+            w->owned_source = make_markdown_source(w->body, w->body_len, is_dark,
+                                                   &w->source_len);
+            if (!w->owned_source)
+                snprintf(w->primary_error, sizeof(w->primary_error),
+                         "out of memory formatting markdown");
+        } else if (!w->is_html) {
+            w->owned_source =
+                make_plain_source(w->body, w->body_len, p->status,
+                                  &w->source_len);
+            if (!w->owned_source)
+                snprintf(w->primary_error, sizeof(w->primary_error),
+                         "out of memory preparing plain text");
+        } else if (p->status && (p->status < 200 || p->status >= 300)) {
+            w->owned_source =
+                make_status_source(w->body, w->body_len, p->status,
+                                   &w->source_len);
+            if (!w->owned_source)
+                snprintf(w->primary_error, sizeof(w->primary_error),
+                         "out of memory preparing the HTTP error body");
+        } else {
+            w->source_len = w->body_len;
+        }
     }
 
     if (!w->primary_error[0] &&
@@ -4756,6 +5111,7 @@ enum ui_btn_id {
     BTN_STAR,
     BTN_PIN,
     BTN_READER,
+    BTN_ZOOM,
     BTN_FIND,
     BTN_DEV,
     BTN_COUNT
@@ -4782,9 +5138,13 @@ struct bstate {
     int status_err;
     int sb_drag;
     int quit;
+    int restoring_session;
 
     struct browser_bookmark bookmarks[BOOKMARK_MAX];
     int bookmark_count;
+
+    struct favicon_entry favicons[FAVICON_CACHE_MAX];
+    unsigned long favicon_clock;
 
     int find_open;
     char find_query[128];
@@ -4921,8 +5281,8 @@ static void tab_new_btn_rect(const struct bstate *b,
 
 static void toolbar_layout(const struct bstate *b, struct ui_btn_rect out[BTN_COUNT])
 {
-    static const int rwidths[5] = { 38, 40, 54, 34, 42 }; /* Dev, Find, Reader, Pin, Star */
-    static const int rids[5] = { BTN_DEV, BTN_FIND, BTN_READER, BTN_PIN, BTN_STAR };
+    static const int rwidths[6] = { 38, 40, 44, 54, 34, 42 }; /* Dev, Find, Zoom, Reader, Pin, Star */
+    static const int rids[6] = { BTN_DEV, BTN_FIND, BTN_ZOOM, BTN_READER, BTN_PIN, BTN_STAR };
     int y0 = TAB_H + 3;
     int bh = BAR_H - 6;
     int rx = b->win->w - PAD;
@@ -4932,7 +5292,7 @@ static void toolbar_layout(const struct bstate *b, struct ui_btn_rect out[BTN_CO
     out[BTN_FWD]    = (struct ui_btn_rect){ PAD + 46, y0, 38, bh };
     out[BTN_RELOAD] = (struct ui_btn_rect){ PAD + 88, y0, 54, bh };
 
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < 6; i++) {
         rx -= rwidths[i];
         out[rids[i]] = (struct ui_btn_rect){ rx, y0, rwidths[i], bh };
         rx -= 4;
@@ -5796,6 +6156,217 @@ static void dev_exec_repl(struct bstate *b)
     }
 }
 
+static struct favicon_entry *
+favicon_cache_find(struct bstate *b, const char *url, int touch)
+{
+    int i;
+
+    if (!b || !url || !*url)
+        return 0;
+    for (i = 0; i < FAVICON_CACHE_MAX; i++) {
+        struct favicon_entry *e = &b->favicons[i];
+
+        if (e->state != 0 && e->url && strcmp(e->url, url) == 0) {
+            if (touch)
+                e->last_used = ++b->favicon_clock;
+            return e;
+        }
+    }
+    return 0;
+}
+
+static struct favicon_entry *favicon_cache_alloc(struct bstate *b)
+{
+    int i, best = 0;
+
+    for (i = 0; i < FAVICON_CACHE_MAX; i++) {
+        if (b->favicons[i].state == 0 && !b->favicons[i].url)
+            return &b->favicons[i];
+        if (b->favicons[i].last_used < b->favicons[best].last_used)
+            best = i;
+    }
+    free(b->favicons[best].url);
+    img_free(&b->favicons[best].icon16);
+    memset(&b->favicons[best], 0, sizeof(b->favicons[best]));
+    return &b->favicons[best];
+}
+
+static void favicon_cache_free_all(struct bstate *b)
+{
+    int i;
+
+    if (!b)
+        return;
+    for (i = 0; i < FAVICON_CACHE_MAX; i++) {
+        free(b->favicons[i].url);
+        img_free(&b->favicons[i].icon16);
+        memset(&b->favicons[i], 0, sizeof(b->favicons[i]));
+    }
+}
+
+struct favicon_work {
+    char candidate[URL_MAX];
+    char err[160];
+    struct http_request req;
+    struct http_response res;
+    struct k_netinfo net;
+    struct image decoded;
+};
+
+static BROWSER_NOINLINE void
+tab_load_favicon(struct bstate *b, struct browser_tab *t)
+{
+    struct browser_page *p;
+    struct favicon_work *fw;
+    struct favicon_entry *ce;
+    struct dom_node *n;
+    int found = 0, is_data = 0, decoded_ok = 0;
+
+    if (!t)
+        return;
+    free(t->favicon_url);
+    t->favicon_url = 0;
+    p = t->page;
+    if (!b || !b->rt || !b->rt->is_gui || !p || p->failed || !p->is_html ||
+        !p->doc || !p->doc->root || t->reader_mode ||
+        url_is_view_source(p->url, 0))
+        return;
+
+    fw = (struct favicon_work *)calloc(1, sizeof(*fw));
+    if (!fw)
+        return;
+
+    for (n = p->doc->root; n; n = dom_next(n)) {
+        const char *rel, *href;
+
+        if (n->type != DOM_ELEMENT || n->tag_id != HTAG_LINK)
+            continue;
+        rel = dom_get_attr(n, "rel");
+        href = dom_get_attr(n, "href");
+        if (!rel_has_token(rel, "icon") || !href || !*href)
+            continue;
+        if (strncmp(href, "data:image/", 11) == 0) {
+            if (strlen(href) < sizeof(fw->candidate)) {
+                snprintf(fw->candidate, sizeof(fw->candidate), "%s", href);
+                is_data = 1;
+                found = 1;
+            }
+        } else if (resource_url(p, p->base_url ? p->base_url : p->url, href,
+                                fw->candidate, sizeof(fw->candidate),
+                                fw->err, sizeof(fw->err)) == 0) {
+            found = 1;
+        }
+        break;
+    }
+
+    if (!found &&
+        (url_is_scheme(p->url, "http") || url_is_scheme(p->url, "https"))) {
+        if (resource_url(p, p->url, "/favicon.ico", fw->candidate,
+                         sizeof(fw->candidate), fw->err,
+                         sizeof(fw->err)) == 0)
+            found = 1;
+    }
+
+    if (!found) {
+        free(fw);
+        return;
+    }
+
+    ce = favicon_cache_find(b, fw->candidate, 1);
+    if (ce) {
+        t->favicon_url = str_dup(fw->candidate);
+        free(fw);
+        return;
+    }
+
+    ce = favicon_cache_alloc(b);
+    if (!ce) {
+        free(fw);
+        return;
+    }
+    ce->url = str_dup(fw->candidate);
+    if (!ce->url) {
+        free(fw);
+        return;
+    }
+    ce->last_used = ++b->favicon_clock;
+    ce->state = -1;
+
+    if (is_data) {
+        unsigned char *raw = 0;
+        unsigned long raw_len = 0;
+
+        if (decode_data_image(fw->candidate, &raw, &raw_len) == 0 &&
+            raw_len > 0 && raw_len <= FAVICON_MAX_BYTES) {
+            if (img_decode(raw, raw_len, &fw->decoded) == IMG_OK)
+                decoded_ok = 1;
+        }
+        free(raw);
+    } else if (url_is_scheme(fw->candidate, "file")) {
+        char *local_buf = 0;
+        unsigned long local_len = 0;
+
+        if (read_local_url(fw->candidate, &local_buf, &local_len,
+                           fw->err, sizeof(fw->err)) == 0) {
+            tab_net_log(t, 200, "icon", local_len, fw->candidate);
+            if (local_len > 0 && local_len <= FAVICON_MAX_BYTES &&
+                img_decode(local_buf, local_len, &fw->decoded) == IMG_OK)
+                decoded_ok = 1;
+        } else {
+            tab_net_log(t, -1, "icon", 0, fw->candidate);
+        }
+        free(local_buf);
+    } else if (b->rt->http && netinfo(&fw->net) == 0 && fw->net.up) {
+        int rc;
+
+        fw->req.url = fw->candidate;
+        fw->req.accept = "image/png,image/jpeg,image/gif,image/bmp,"
+                         "image/svg+xml,image/x-icon,*/*;q=0.5";
+        fw->req.max_body = FAVICON_MAX_BYTES;
+        rc = http_fetch(b->rt->http, &fw->req, &fw->res);
+        if (rc != HTTP_OK) {
+            tab_net_log(t, rc, "icon", 0, fw->candidate);
+        } else {
+            tab_net_log(t, fw->res.status, "icon", fw->res.body_len,
+                        fw->res.final_url ? fw->res.final_url : fw->candidate);
+            if (fw->res.status >= 200 && fw->res.status < 300 &&
+                fw->res.body && fw->res.body_len > 0 &&
+                img_decode(fw->res.body, fw->res.body_len,
+                           &fw->decoded) == IMG_OK)
+                decoded_ok = 1;
+            http_response_free(&fw->res);
+        }
+    }
+
+    if (decoded_ok) {
+        if (img_scale(&fw->decoded, FAVICON_SIZE, FAVICON_SIZE,
+                      &ce->icon16) == IMG_OK)
+            ce->state = 1;
+        img_free(&fw->decoded);
+    }
+    t->favicon_url = str_dup(fw->candidate);
+    free(fw);
+}
+
+static void draw_icon16(gui_window *win, int x, int y, const struct image *im)
+{
+    int row, col;
+
+    if (!win || !im || !im->px || im->w <= 0 || im->h <= 0)
+        return;
+    for (row = 0; row < im->h; row++) {
+        for (col = 0; col < im->w; col++) {
+            long si = (long)row * im->w + col;
+            uint8_t a = (im->has_alpha && im->alpha) ? im->alpha[si] : 255u;
+
+            if (a == 255u)
+                gui_pixel(win, x + col, y + row, im->px[si] & 0x00FFFFFFu);
+            else if (a > 0)
+                gui_blend_pixel(win, x + col, y + row, im->px[si], a);
+        }
+    }
+}
+
 static void draw_tabs(struct bstate *b, const gui_theme *th)
 {
     int i, nx, ny, nw, nh;
@@ -5808,17 +6379,28 @@ static void draw_tabs(struct bstate *b, const gui_theme *th)
         const char *title = (p && p->doc && p->doc->title && *p->doc->title)
                                 ? p->doc->title
                                 : (t && t->addr[0] ? t->addr : "New Tab");
+        struct favicon_entry *fe =
+            (t && t->favicon_url) ? favicon_cache_find(b, t->favicon_url, 0) : 0;
         int px, py, pw, ph, cx, cy, cw, ch;
         int is_cur = (i == b->active_tab);
+        int has_icon = 0;
 
         tab_pill_rect(b, i, &px, &py, &pw, &ph);
+        has_icon = fe && fe->state == 1 && fe->icon16.px && pw >= 44;
         ui_box(b->win, px, py, pw, ph,
                is_cur ? th->surface : th->surface_alt,
                is_cur ? th->accent : th->border);
         if (is_cur)
             gui_rect(b->win, px + 1, py + 1, pw - 2, 2, th->accent);
-        ui_text_maxw(b->win, px + 6, py + (ph - GLYPH_H) / 2, title,
-                     pw - 24, is_cur ? th->text : th->text_dim, is_cur);
+        if (has_icon) {
+            draw_icon16(b->win, px + 5, py + (ph - FAVICON_SIZE) / 2,
+                        &fe->icon16);
+            ui_text_maxw(b->win, px + 25, py + (ph - GLYPH_H) / 2, title,
+                         pw - 43, is_cur ? th->text : th->text_dim, is_cur);
+        } else {
+            ui_text_maxw(b->win, px + 6, py + (ph - GLYPH_H) / 2, title,
+                         pw - 24, is_cur ? th->text : th->text_dim, is_cur);
+        }
         tab_close_rect(b, i, &cx, &cy, &cw, &ch);
         ui_text(b->win, cx + 3, cy + (ch - GLYPH_H) / 2, "x",
                 th->text_dim, 0);
@@ -5832,7 +6414,8 @@ static void draw_toolbar(struct bstate *b, const gui_theme *th)
 {
     struct browser_tab *t = active_tab(b);
     struct ui_btn_rect br[BTN_COUNT];
-    int starred;
+    char zoom_lbl[16];
+    int starred, zoom_pct;
 
     toolbar_layout(b, br);
     gui_rect(b->win, 0, TAB_H, b->win->w, BAR_H, th->panel_hi);
@@ -5874,6 +6457,8 @@ static void draw_toolbar(struct bstate *b, const gui_theme *th)
     starred = (t && t->page && t->page->url)
                   ? bookmark_find_index(b, t->page->url) >= 0
                   : 0;
+    zoom_pct = (t && t->zoom_pct > 0) ? t->zoom_pct : 100;
+    snprintf(zoom_lbl, sizeof(zoom_lbl), "%d%%", zoom_pct);
     ui_button_th(b->win, th, br[BTN_STAR].x, br[BTN_STAR].y,
                  br[BTN_STAR].w, br[BTN_STAR].h,
                  "Star", t && t->page != 0, starred);
@@ -5883,6 +6468,9 @@ static void draw_toolbar(struct bstate *b, const gui_theme *th)
     ui_button_th(b->win, th, br[BTN_READER].x, br[BTN_READER].y,
                  br[BTN_READER].w, br[BTN_READER].h,
                  "Reader", t && t->page != 0, t && t->reader_mode);
+    ui_button_th(b->win, th, br[BTN_ZOOM].x, br[BTN_ZOOM].y,
+                 br[BTN_ZOOM].w, br[BTN_ZOOM].h,
+                 zoom_lbl, t && t->page != 0, zoom_pct != 100);
     ui_button_th(b->win, th, br[BTN_FIND].x, br[BTN_FIND].y,
                  br[BTN_FIND].w, br[BTN_FIND].h,
                  "Find", t && t->page != 0, b->find_open);
@@ -6235,6 +6823,8 @@ static void tab_destroy(struct browser_tab *t)
     }
     free(t->raw_source);
     t->raw_source = 0;
+    free(t->favicon_url);
+    t->favicon_url = 0;
     free(t);
 }
 
@@ -6275,6 +6865,80 @@ static void runtime_persist_state(struct browser_runtime *rt, int save_cookies)
         if (jar)
             cookie_jar_save(jar, COOKIE_DEFAULT_FILE, now);
     }
+}
+
+static BROWSER_NOINLINE void session_clear_file(void)
+{
+    syscall(SYS_UNLINK, (long)SESSION_FILE, 0, 0, 0);
+}
+
+static BROWSER_NOINLINE void session_save(const struct bstate *b)
+{
+    struct bytebuf out;
+    char line[64];
+    int i, fd, active, saved = 0;
+    unsigned long wrote = 0;
+
+    if (!b || !b->rt || !b->rt->is_gui || b->restoring_session)
+        return;
+    if (b->tab_count <= 0) {
+        session_clear_file();
+        return;
+    }
+    memset(&out, 0, sizeof(out));
+    out.limit = SESSION_MAX_BYTES;
+    active = b->active_tab;
+    if (active < 0)
+        active = 0;
+    if (active >= b->tab_count)
+        active = b->tab_count - 1;
+    snprintf(line, sizeof(line), "active=%d\n", active);
+    if (buf_add_str(&out, line) != 0) {
+        free(out.p);
+        return;
+    }
+    for (i = 0; i < b->tab_count; i++) {
+        const struct browser_tab *t = b->tabs[i];
+        const char *url;
+        int z;
+
+        if (!t)
+            continue;
+        url = (t->page && t->page->url[0]) ? t->page->url : t->addr;
+        if (!url || !url[0] || strchr(url, '\n') || strchr(url, '\r'))
+            continue;
+        z = t->zoom_pct > 0 ? t->zoom_pct : 100;
+        snprintf(line, sizeof(line), "zoom=%d\n", z);
+        if (buf_add_str(&out, line) != 0 ||
+            buf_add_str(&out, "tab=") != 0 ||
+            buf_add_str(&out, url) != 0 ||
+            buf_add(&out, "\n", 1) != 0) {
+            free(out.p);
+            return;
+        }
+        saved++;
+    }
+    if (saved == 0) {
+        free(out.p);
+        session_clear_file();
+        return;
+    }
+    syscall(SYS_MKDIR, (long)"/home", 0, 0, 0);
+#ifdef JS_HOST
+    fd = open(SESSION_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#else
+    fd = open(SESSION_FILE, O_WRONLY | O_CREAT | O_TRUNC);
+#endif
+    if (fd >= 0) {
+        while (wrote < out.n) {
+            long n = write(fd, out.p + wrote, out.n - wrote);
+            if (n <= 0)
+                break;
+            wrote += (unsigned long)n;
+        }
+        close(fd);
+    }
+    free(out.p);
 }
 
 static BROWSER_NOINLINE void set_fragment_scroll(struct bstate *b)
@@ -6418,7 +7082,9 @@ load_gui_request(struct bstate *b, const char *url, int push,
     }
 
     page_apply_to_tab(b, t, next, history_copy, push);
+    tab_load_favicon(b, t);
     runtime_persist_state(b->rt, 1);
+    session_save(b);
     return 0;
 }
 
@@ -6831,7 +7497,8 @@ static BROWSER_NOINLINE void tab_sync_active_view(struct bstate *b)
     find_refresh(b, 0);
 }
 
-static BROWSER_NOINLINE int tab_new(struct bstate *b, const char *url)
+static BROWSER_NOINLINE int tab_new_zoom(struct bstate *b, const char *url,
+                                         int zoom_pct)
 {
     struct browser_tab *t;
     int prev = b->active_tab;
@@ -6846,6 +7513,7 @@ static BROWSER_NOINLINE int tab_new(struct bstate *b, const char *url)
         return -1;
     }
     t->hist_i = -1;
+    t->zoom_pct = (zoom_pct > 0) ? zoom_pct : 100;
     b->tabs[b->tab_count] = t;
     b->active_tab = b->tab_count++;
     b->addr_focus = 0;
@@ -6864,6 +7532,11 @@ static BROWSER_NOINLINE int tab_new(struct bstate *b, const char *url)
     return 0;
 }
 
+static BROWSER_NOINLINE int tab_new(struct bstate *b, const char *url)
+{
+    return tab_new_zoom(b, url, 100);
+}
+
 static void tab_switch(struct bstate *b, int idx)
 {
     if (idx < 0 || idx >= b->tab_count || idx == b->active_tab)
@@ -6872,6 +7545,7 @@ static void tab_switch(struct bstate *b, int idx)
     b->addr_focus = 0;
     b->repl_focus = 0;
     tab_sync_active_view(b);
+    session_save(b);
 }
 
 static BROWSER_NOINLINE void tab_close(struct bstate *b, int idx)
@@ -6887,6 +7561,7 @@ static BROWSER_NOINLINE void tab_close(struct bstate *b, int idx)
     if (b->tab_count == 0) {
         b->active_tab = -1;
         b->quit = 1;
+        session_clear_file();
         return;
     }
     if (b->active_tab >= b->tab_count)
@@ -6896,6 +7571,209 @@ static BROWSER_NOINLINE void tab_close(struct bstate *b, int idx)
     b->addr_focus = 0;
     b->repl_focus = 0;
     tab_sync_active_view(b);
+    session_save(b);
+}
+
+struct session_work {
+    char urls[MAX_TABS][URL_MAX];
+    int zooms[MAX_TABS];
+    int count;
+    int active;
+};
+
+static int valid_zoom_pct(int z)
+{
+    return z == 90 || z == 100 || z == 125 || z == 150;
+}
+
+static BROWSER_NOINLINE int session_restore(struct bstate *b)
+{
+    struct session_work *sw;
+    struct k_stat st;
+    char *data, *p, *end;
+    unsigned long got = 0;
+    int fd, i, pending_zoom = 100;
+
+    if (!b || !b->rt || !b->rt->is_gui)
+        return 0;
+    if (stat_(SESSION_FILE, &st) != 0 || st.is_dir ||
+        st.size <= 0 || (unsigned long)st.size > SESSION_MAX_BYTES)
+        return 0;
+    fd = open(SESSION_FILE, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    data = (char *)malloc((unsigned long)st.size + 1);
+    sw = (struct session_work *)calloc(1, sizeof(*sw));
+    if (!data || !sw) {
+        close(fd);
+        free(data);
+        free(sw);
+        return 0;
+    }
+    while (got < (unsigned long)st.size) {
+        long n = read(fd, data + got, (unsigned long)st.size - got);
+        if (n <= 0)
+            break;
+        got += (unsigned long)n;
+    }
+    close(fd);
+    data[got] = 0;
+
+    p = data;
+    end = data + got;
+    while (p < end) {
+        char *nl = p, *tail;
+
+        while (nl < end && *nl != '\n' && *nl != '\r')
+            nl++;
+        tail = nl;
+        *nl = 0;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        while (tail > p && (tail[-1] == ' ' || tail[-1] == '\t'))
+            *--tail = 0;
+        if (*p && *p != '#') {
+            if (strncmp(p, "active=", 7) == 0) {
+                sw->active = atoi(p + 7);
+            } else if (strncmp(p, "zoom=", 5) == 0) {
+                int z = atoi(p + 5);
+                if (valid_zoom_pct(z))
+                    pending_zoom = z;
+            } else {
+                const char *u = (strncmp(p, "tab=", 4) == 0) ? (p + 4) : p;
+                if (*u && sw->count < MAX_TABS &&
+                    canonicalize_input(u, sw->urls[sw->count], URL_MAX,
+                                       b->load_error,
+                                       sizeof(b->load_error)) == 0 &&
+                    url_supported(sw->urls[sw->count])) {
+                    sw->zooms[sw->count] = pending_zoom;
+                    sw->count++;
+                }
+                pending_zoom = 100;
+            }
+        }
+        p = nl + 1;
+        while (p < end && (*p == '\n' || *p == '\r'))
+            p++;
+    }
+    free(data);
+    if (sw->count == 0) {
+        free(sw);
+        return 0;
+    }
+
+    b->restoring_session = 1;
+    b->tabs[0] = (struct browser_tab *)calloc(1, sizeof(*b->tabs[0]));
+    if (!b->tabs[0]) {
+        b->restoring_session = 0;
+        free(sw);
+        return 0;
+    }
+    b->tabs[0]->hist_i = -1;
+    b->tabs[0]->zoom_pct = valid_zoom_pct(sw->zooms[0]) ? sw->zooms[0] : 100;
+    b->tab_count = 1;
+    b->active_tab = 0;
+    load_gui(b, sw->urls[0], 1);
+    for (i = 1; i < sw->count; i++)
+        tab_new_zoom(b, sw->urls[i],
+                     valid_zoom_pct(sw->zooms[i]) ? sw->zooms[i] : 100);
+    if (sw->active < 0)
+        sw->active = 0;
+    if (sw->active >= b->tab_count)
+        sw->active = b->tab_count - 1;
+    tab_switch(b, sw->active);
+    b->restoring_session = 0;
+    session_save(b);
+    free(sw);
+    return b->tab_count > 0;
+}
+
+static int tab_reflow_active(struct bstate *b, char *err, unsigned long errsz);
+
+static BROWSER_NOINLINE void set_tab_zoom(struct bstate *b, int zoom_pct)
+{
+    struct browser_tab *t = active_tab(b);
+    struct browser_page *p = t ? t->page : 0;
+    char zbuf[24];
+    char err[192];
+
+    if (!t)
+        return;
+    if (!valid_zoom_pct(zoom_pct))
+        zoom_pct = 100;
+    if (t->zoom_pct == zoom_pct)
+        return;
+    t->zoom_pct = zoom_pct;
+    if (p)
+        tab_reflow_active(b, err, sizeof(err));
+    snprintf(zbuf, sizeof(zbuf), "%d%%", t->zoom_pct);
+    set_status(b, 0, "Zoom", zbuf);
+    session_save(b);
+}
+
+static void cycle_tab_zoom(struct bstate *b)
+{
+    struct browser_tab *t = active_tab(b);
+    int cur = (t && t->zoom_pct > 0) ? t->zoom_pct : 100;
+    int next;
+
+    if (cur == 100)
+        next = 125;
+    else if (cur == 125)
+        next = 150;
+    else if (cur == 150)
+        next = 90;
+    else
+        next = 100;
+    set_tab_zoom(b, next);
+}
+
+static void step_tab_zoom(struct bstate *b, int dir)
+{
+    static const int levels[4] = { 90, 100, 125, 150 };
+    struct browser_tab *t = active_tab(b);
+    int cur = (t && t->zoom_pct > 0) ? t->zoom_pct : 100;
+    int i, idx = 1;
+
+    for (i = 0; i < 4; i++) {
+        if (levels[i] == cur) {
+            idx = i;
+            break;
+        }
+    }
+    idx += dir;
+    if (idx < 0)
+        idx = 0;
+    if (idx > 3)
+        idx = 3;
+    set_tab_zoom(b, levels[idx]);
+}
+
+static BROWSER_NOINLINE void open_view_source_tab(struct bstate *b)
+{
+    struct browser_tab *t = active_tab(b);
+    struct browser_page *p = t ? t->page : 0;
+    char *vs_url;
+    unsigned long nlen;
+
+    if (!p || !p->url[0])
+        return;
+    if (url_is_view_source(p->url, 0)) {
+        set_status(b, 0, "Already viewing source", p->url);
+        return;
+    }
+    nlen = 12 + strlen(p->url) + 1;
+    vs_url = (char *)malloc(nlen);
+    if (!vs_url) {
+        set_status(b, 1, "out of memory opening view-source", "");
+        return;
+    }
+    snprintf(vs_url, nlen, "view-source:%s", p->url);
+    if (b->tab_count < MAX_TABS)
+        tab_new(b, vs_url);
+    else
+        load_gui(b, vs_url, 1);
+    free(vs_url);
 }
 
 static struct dom_node *element_ancestor(struct dom_node *n, int tag)
@@ -7498,6 +8376,12 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
     if (!t)
         return;
     switch (key) {
+    case 21:       open_view_source_tab(b); return;  /* ctrl-U */
+    case '0':      set_tab_zoom(b, 100);    return;
+    case '+':
+    case '=':      step_tab_zoom(b, 1);     return;
+    case '-':
+    case '_':      step_tab_zoom(b, -1);    return;
     case KEY_UP:   t->scroll -= GLYPH_H * 2; break;
     case KEY_DOWN: t->scroll += GLYPH_H * 2; break;
     case KEY_PGUP: t->scroll -= page_step;   break;
@@ -7642,6 +8526,9 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
         } else if (pt_in_rect(x, y, br[BTN_READER].x, br[BTN_READER].y,
                               br[BTN_READER].w, br[BTN_READER].h)) {
             toggle_reader_mode(b);
+        } else if (pt_in_rect(x, y, br[BTN_ZOOM].x, br[BTN_ZOOM].y,
+                              br[BTN_ZOOM].w, br[BTN_ZOOM].h)) {
+            cycle_tab_zoom(b);
         } else if (pt_in_rect(x, y, br[BTN_FIND].x, br[BTN_FIND].y,
                               br[BTN_FIND].w, br[BTN_FIND].h)) {
             b->find_open = !b->find_open;
@@ -7788,7 +8675,9 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
             if (action->tag_id == HTAG_A || action->tag_id == HTAG_INPUT ||
                 action->tag_id == HTAG_BUTTON ||
                 action->tag_id == HTAG_SELECT ||
-                action->tag_id == HTAG_TEXTAREA)
+                action->tag_id == HTAG_TEXTAREA ||
+                (action->tag_id == HTAG_SUMMARY && action->parent &&
+                 action->parent->tag_id == HTAG_DETAILS))
                 break;
         }
         if (!action)
@@ -7831,6 +8720,16 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
                 t->select_open_node = (t->select_open_node == action)
                                           ? 0 : action;
                 t->select_hover = -1;
+            } else if (action->tag_id == HTAG_SUMMARY && action->parent &&
+                       action->parent->tag_id == HTAG_DETAILS) {
+                struct dom_node *det = action->parent;
+                if (dom_has_attr(det, "open"))
+                    dom_remove_attr(det, "open");
+                else
+                    dom_set_attr(det, "open", "");
+                if (p->js)
+                    jsdom_dispatch(p->js, det, "toggle",
+                                   event_error, sizeof(event_error));
             }
         }
         if (p->js) {
@@ -7862,7 +8761,8 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
         if (allow && ((action && action->type == DOM_ELEMENT &&
                        (action->tag_id == HTAG_INPUT ||
                         action->tag_id == HTAG_SELECT ||
-                        action->tag_id == HTAG_BUTTON)) ||
+                        action->tag_id == HTAG_BUTTON ||
+                        action->tag_id == HTAG_SUMMARY)) ||
                       p->has_hover_css)) {
             tab_reflow_active(b, event_error, sizeof(event_error));
         }
@@ -7932,7 +8832,7 @@ static BROWSER_NOINLINE int gui_update_hover(struct bstate *b, int x, int y)
 }
 
 static BROWSER_NOINLINE int
-gui_mode(struct browser_runtime *rt, const char *start_url)
+gui_mode(struct browser_runtime *rt, const char *start_url, int allow_restore)
 {
     struct bstate *b;
     struct k_event ev;
@@ -7959,18 +8859,22 @@ gui_mode(struct browser_runtime *rt, const char *start_url)
     bookmarks_load(b);
     recompute_layout_dims(b, 0, 0, 0, 0);
 
-    b->tabs[0] = (struct browser_tab *)calloc(1, sizeof(*b->tabs[0]));
-    if (!b->tabs[0]) {
-        gui_close(b->win);
-        free(b);
-        return 1;
-    }
-    b->tabs[0]->hist_i = -1;
-    b->tab_count = 1;
-    b->active_tab = 0;
+    if (!allow_restore || !session_restore(b)) {
+        b->tabs[0] = (struct browser_tab *)calloc(1, sizeof(*b->tabs[0]));
+        if (!b->tabs[0]) {
+            favicon_cache_free_all(b);
+            gui_close(b->win);
+            free(b);
+            return 1;
+        }
+        b->tabs[0]->hist_i = -1;
+        b->tabs[0]->zoom_pct = 100;
+        b->tab_count = 1;
+        b->active_tab = 0;
 
-    if (load_gui(b, start_url, 1) != 0)
-        result = 1;
+        if (load_gui(b, start_url, 1) != 0)
+            result = 1;
+    }
     draw(b);
 
     while (!b->quit) {
@@ -8066,10 +8970,13 @@ gui_mode(struct browser_runtime *rt, const char *start_url)
     }
 
     runtime_persist_state(b->rt, 1);
+    if (b->tab_count > 0)
+        session_save(b);
     for (i = 0; i < b->tab_count; i++) {
         tab_destroy(b->tabs[i]);
         b->tabs[i] = 0;
     }
+    favicon_cache_free_all(b);
     gui_close(b->win);
     free(b);
     return result;
@@ -8092,7 +8999,7 @@ static void usage(void)
     printf("In the window: click links, Back/Fwd/Reload, arrows/wheel,\n");
     printf("ctrl-T/W/N/P tabs, ctrl-L address, ctrl-R reload, ctrl-B back,\n");
     printf("ctrl-E forward, ctrl-F find, ctrl-D bookmark, ctrl-O reader,\n");
-    printf("ctrl-K inspector, ctrl-Q quit.\n");
+    printf("ctrl-U view-source, +/-/0 zoom, ctrl-K inspector, ctrl-Q quit.\n");
 }
 
 struct startup_work {
@@ -8106,7 +9013,7 @@ int main(int argc, char **argv)
     struct startup_work *w;
     const char *target = 0;
     int text = 0, cols = TEXT_COLS, links = 0, verbose = 0;
-    int i, rc;
+    int i, rc, allow_restore = 0;
 
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
@@ -8134,9 +9041,10 @@ int main(int argc, char **argv)
     }
 
     if (!target) {
-        if (!text)
+        if (!text) {
             target = BROWSER_HOME;
-        else {
+            allow_restore = 1;
+        } else {
             usage();
             return 2;
         }
@@ -8165,7 +9073,7 @@ int main(int argc, char **argv)
     if (text)
         rc = text_mode(&w->runtime, w->url, cols, links, verbose);
     else
-        rc = gui_mode(&w->runtime, w->url);
+        rc = gui_mode(&w->runtime, w->url, allow_restore);
 
     runtime_destroy(&w->runtime);
     free(w);
