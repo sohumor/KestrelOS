@@ -821,6 +821,7 @@ static int alen(js_ctx *ctx, js_object *o, unsigned long *n)
     js_value v;
 
     if (o->cls == JS_CLASS_ARRAY) { *n = o->elen; return JS_OK; }
+    if (js_is_typedarray_cls(o->cls)) { *n = o->view_length; return JS_OK; }
     if (js_obj_get(ctx, o, ctx->s_length, js_object_value(o), &v) != JS_OK)
         return JS_THROW;
     {
@@ -849,6 +850,10 @@ static int aget(js_ctx *ctx, js_object *o, unsigned long i, js_value *v)
     js_string *k;
 
     if (o->cls == JS_CLASS_ARRAY && i < o->elen) { *v = o->elems[i]; return JS_OK; }
+    if (js_is_typedarray_cls(o->cls) && i < o->view_length) {
+        *v = js_number(js_typedarray_read(o, (uint32_t)i));
+        return JS_OK;
+    }
     k = idx_key(ctx, i);
     if (!k) return JS_THROW;
     return js_obj_get(ctx, o, k, js_object_value(o), v);
@@ -878,6 +883,12 @@ static int aput(js_ctx *ctx, js_object *o, unsigned long i, js_value v)
         }
         if (!o->extensible)
             return js_throw_error(ctx, JS_ERR_TYPE, "array is not extensible");
+    } else if (js_is_typedarray_cls(o->cls)) {
+        double d;
+        if (js_to_number(ctx, v, &d) != JS_OK) return JS_THROW;
+        if (i < o->view_length)
+            js_typedarray_write_num(o, (uint32_t)i, d);
+        return JS_OK;
     }
     k = idx_key(ctx, i);
     if (!k) return JS_THROW;
@@ -908,11 +919,21 @@ static const char *class_name(int cls)
     case JS_CLASS_MATH:      return "Math";
     case JS_CLASS_JSON:      return "JSON";
     case JS_CLASS_PROMISE:   return "Promise";
-    case JS_CLASS_ARRAYBUFFER:return "ArrayBuffer";
-    case JS_CLASS_UINT8ARRAY: return "Uint8Array";
-    case JS_CLASS_TEXTENCODER:return "TextEncoder";
-    case JS_CLASS_TEXTDECODER:return "TextDecoder";
-    case JS_CLASS_URLSEARCHPARAMS:return "URLSearchParams";
+    case JS_CLASS_ARRAYBUFFER:       return "ArrayBuffer";
+    case JS_CLASS_INT8ARRAY:         return "Int8Array";
+    case JS_CLASS_UINT8ARRAY:        return "Uint8Array";
+    case JS_CLASS_UINT8CLAMPEDARRAY: return "Uint8ClampedArray";
+    case JS_CLASS_INT16ARRAY:        return "Int16Array";
+    case JS_CLASS_UINT16ARRAY:       return "Uint16Array";
+    case JS_CLASS_INT32ARRAY:        return "Int32Array";
+    case JS_CLASS_UINT32ARRAY:       return "Uint32Array";
+    case JS_CLASS_FLOAT32ARRAY:      return "Float32Array";
+    case JS_CLASS_FLOAT64ARRAY:      return "Float64Array";
+    case JS_CLASS_DATAVIEW:          return "DataView";
+    case JS_CLASS_TEXTENCODER:       return "TextEncoder";
+    case JS_CLASS_TEXTDECODER:       return "TextDecoder";
+    case JS_CLASS_URLSEARCHPARAMS:   return "URLSearchParams";
+    case JS_CLASS_URL:               return "URL";
     case JS_CLASS_MAP:       return "Map";
     case JS_CLASS_SET:       return "Set";
     case JS_CLASS_WEAKMAP:   return "WeakMap";
@@ -1001,6 +1022,20 @@ static int bi_obj_hasown(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+static int bi_object_hasown(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                            js_value *ret)
+{
+    js_string *k;
+    int is_sym = 0;
+    js_object *o;
+
+    (void)t;
+    if (this_object(ctx, arg(argc, argv, 0), &o) != JS_OK) return JS_THROW;
+    if (js_to_propkey(ctx, arg(argc, argv, 1), &k, &is_sym) != JS_OK) return JS_THROW;
+    *ret = js_bool(js_obj_has_own_key(ctx, o, k, is_sym));
+    return JS_OK;
+}
+
 static int bi_obj_isproto(js_ctx *ctx, js_value t, int argc, js_value *argv,
                           js_value *ret)
 {
@@ -1049,13 +1084,14 @@ static int own_names(js_ctx *ctx, js_value v, int only_enum, js_value *ret)
     o = v.u.obj;
     a = js_new_array(ctx);
     if (!a) return JS_THROW;
-    if (o->cls == JS_CLASS_ARRAY) {
-        for (i = 0; i < o->elen; i++) {
+    if (o->cls == JS_CLASS_ARRAY || js_is_typedarray_cls(o->cls)) {
+        uint32_t elen = o->cls == JS_CLASS_ARRAY ? o->elen : o->view_length;
+        for (i = 0; i < elen; i++) {
             js_string *k = idx_key(ctx, i);
             if (!k || js_array_push(ctx, a, js_string_value(k)) != JS_OK)
                 return JS_THROW;
         }
-        if (!only_enum &&
+        if (o->cls == JS_CLASS_ARRAY && !only_enum &&
             js_array_push(ctx, a, js_string_value(ctx->s_length)) != JS_OK)
             return JS_THROW;
     }
@@ -1546,6 +1582,17 @@ static int bi_object_getdesc(js_ctx *ctx, js_value t, int argc, js_value *argv,
                 js_define_enum(ctx, d, "enumerable", js_bool(1)) != JS_OK ||
                 js_define_enum(ctx, d, "configurable",
                                js_bool(!(ov.u.obj->integrity & JS_OBJ_SEALED))) != JS_OK)
+                return JS_THROW;
+            *ret = js_object_value(d);
+        } else if (js_is_typedarray_cls(ov.u.obj->cls) && i >= 0 &&
+                   (uint32_t)i < ov.u.obj->view_length) {
+            d = js_new_object(ctx);
+            if (!d) return JS_THROW;
+            if (js_define_enum(ctx, d, "value",
+                               js_number(js_typedarray_read(ov.u.obj, (uint32_t)i))) != JS_OK ||
+                js_define_enum(ctx, d, "writable", js_bool(1)) != JS_OK ||
+                js_define_enum(ctx, d, "enumerable", js_bool(1)) != JS_OK ||
+                js_define_enum(ctx, d, "configurable", js_bool(1)) != JS_OK)
                 return JS_THROW;
             *ret = js_object_value(d);
         }
@@ -2439,11 +2486,11 @@ static int bi_array_includes(js_ctx *ctx, js_value t, int argc,
     return JS_OK;
 }
 
-static int array_find(js_ctx *ctx, int return_index, js_value t,
-                      int argc, js_value *argv, js_value *ret)
+static int array_find_dir(js_ctx *ctx, int from_end, int return_index,
+                          js_value t, int argc, js_value *argv, js_value *ret)
 {
     js_object *object;
-    unsigned long length, i;
+    unsigned long length, k;
     js_value callback = arg(argc, argv, 0);
     js_value this_arg = arg(argc, argv, 1);
 
@@ -2453,10 +2500,11 @@ static int array_find(js_ctx *ctx, int return_index, js_value t,
     if (!js_is_function(callback))
         return js_throw_error(ctx, JS_ERR_TYPE,
                               "Array find callback must be a function");
-    for (i = 0; i < length; i++) {
+    for (k = 0; k < length; k++) {
+        unsigned long i = from_end ? (length - 1 - k) : k;
         js_value value, args[3], selected;
 
-        if (aget(ctx, object, i, &value) != JS_OK)
+        if (js_step(ctx) != JS_OK || aget(ctx, object, i, &value) != JS_OK)
             return JS_THROW;
         args[0] = value;
         args[1] = js_number((double)i);
@@ -2475,13 +2523,25 @@ static int array_find(js_ctx *ctx, int return_index, js_value t,
 static int bi_array_find(js_ctx *ctx, js_value t, int argc,
                          js_value *argv, js_value *ret)
 {
-    return array_find(ctx, 0, t, argc, argv, ret);
+    return array_find_dir(ctx, 0, 0, t, argc, argv, ret);
 }
 
 static int bi_array_findindex(js_ctx *ctx, js_value t, int argc,
                               js_value *argv, js_value *ret)
 {
-    return array_find(ctx, 1, t, argc, argv, ret);
+    return array_find_dir(ctx, 0, 1, t, argc, argv, ret);
+}
+
+static int bi_array_findlast(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    return array_find_dir(ctx, 1, 0, t, argc, argv, ret);
+}
+
+static int bi_array_findlastindex(js_ctx *ctx, js_value t, int argc,
+                                  js_value *argv, js_value *ret)
+{
+    return array_find_dir(ctx, 1, 1, t, argc, argv, ret);
 }
 
 #define ARRAY_FLAT_MAX 1000000UL
@@ -2639,36 +2699,25 @@ static int sort_cmp(js_ctx *ctx, js_value cmp, js_value a, js_value b, int *err)
     }
 }
 
-static int bi_array_sort(js_ctx *ctx, js_value t, int argc, js_value *argv,
-                         js_value *ret)
+static int merge_sort_values(js_ctx *ctx, js_value *buf, unsigned long n,
+                             js_value cmp)
 {
-    js_object *o;
-    unsigned long n, width, i;
-    js_value cmp = arg(argc, argv, 0);
-    js_value *buf, *tmp;
+    js_value *tmp;
+    unsigned long width, i;
     int err = 0;
 
-    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
-    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
-    if (n >= 2 && check_array_mutable(ctx, o, 0) != JS_OK) return JS_THROW;
-    *ret = js_object_value(o);
-    if (n < 2) return JS_OK;
-    if (n > 1000000UL)
-        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large to sort");
-
-    buf = (js_value *)js_alloc(ctx, n * sizeof(js_value));
+    if (n < 2)
+        return JS_OK;
     tmp = (js_value *)js_alloc(ctx, n * sizeof(js_value));
-    if (!buf || !tmp) return JS_THROW;
-    for (i = 0; i < n; i++)
-        if (aget(ctx, o, i, &buf[i]) != JS_OK) return JS_THROW;
-
+    if (!tmp)
+        return JS_THROW;
     /* Bottom-up merge sort: stable, O(n log n) comparator calls, and no
      * recursion, which matters on a 64 KiB stack. */
     for (width = 1; width < n; width *= 2) {
         unsigned long lo;
         for (lo = 0; lo < n; lo += 2 * width) {
             unsigned long mid = lo + width, hi = lo + 2 * width;
-            unsigned long a = lo, b = mid, k = lo;
+            unsigned long a = lo, b, k = lo;
             if (mid > n) mid = n;
             if (hi > n) hi = n;
             b = mid;
@@ -2685,8 +2734,167 @@ static int bi_array_sort(js_ctx *ctx, js_value t, int argc, js_value *argv,
         }
         for (i = 0; i < n; i++) buf[i] = tmp[i];
     }
+    return JS_OK;
+}
+
+static int bi_array_sort(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_object *o;
+    unsigned long n, i;
+    js_value cmp = arg(argc, argv, 0);
+    js_value *buf;
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (n >= 2 && check_array_mutable(ctx, o, 0) != JS_OK) return JS_THROW;
+    *ret = js_object_value(o);
+    if (n < 2) return JS_OK;
+    if (n > 1000000UL)
+        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large to sort");
+
+    buf = (js_value *)js_alloc(ctx, n * sizeof(js_value));
+    if (!buf) return JS_THROW;
+    for (i = 0; i < n; i++)
+        if (aget(ctx, o, i, &buf[i]) != JS_OK) return JS_THROW;
+    if (merge_sort_values(ctx, buf, n, cmp) != JS_OK) return JS_THROW;
     for (i = 0; i < n; i++)
         if (aput(ctx, o, i, buf[i]) != JS_OK) return JS_THROW;
+    return JS_OK;
+}
+
+static int bi_array_toreversed(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *o, *out;
+    unsigned long n, i;
+
+    (void)argc; (void)argv;
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (n > 1000000UL)
+        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large");
+    out = js_new_array(ctx);
+    if (!out) return JS_THROW;
+    for (i = n; i > 0; i--) {
+        js_value v;
+        if (js_step(ctx) != JS_OK || aget(ctx, o, i - 1, &v) != JS_OK ||
+            js_array_push(ctx, out, v) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_array_tosorted(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    js_object *o, *out;
+    unsigned long n, i;
+    js_value cmp = arg(argc, argv, 0);
+    js_value *buf;
+
+    if (cmp.type != JS_UNDEFINED && !js_is_function(cmp))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Array.prototype.toSorted comparator must be a function");
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (n > 1000000UL)
+        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large to sort");
+    out = js_new_array(ctx);
+    if (!out) return JS_THROW;
+    if (n == 0) {
+        *ret = js_object_value(out);
+        return JS_OK;
+    }
+    buf = (js_value *)js_alloc(ctx, n * sizeof(js_value));
+    if (!buf) return JS_THROW;
+    for (i = 0; i < n; i++)
+        if (aget(ctx, o, i, &buf[i]) != JS_OK) return JS_THROW;
+    if (merge_sort_values(ctx, buf, n, cmp) != JS_OK) return JS_THROW;
+    for (i = 0; i < n; i++)
+        if (js_array_push(ctx, out, buf[i]) != JS_OK) return JS_THROW;
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_array_tospliced(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_object *o, *out;
+    unsigned long n, start = 0, dcount = 0, ins = 0, new_len, i;
+    double d;
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (argc > 0) {
+        if (js_to_integer(ctx, argv[0], &d) != JS_OK) return JS_THROW;
+        start = rel_index(d, n);
+        if (argc == 1) {
+            dcount = n - start;
+        } else {
+            if (js_to_integer(ctx, argv[1], &d) != JS_OK) return JS_THROW;
+            if (d < 0) d = 0;
+            if (d > (double)(n - start)) d = (double)(n - start);
+            dcount = (unsigned long)d;
+            ins = (unsigned long)(argc - 2);
+        }
+    }
+    if (n - dcount > 1000000UL || ins > 1000000UL - (n - dcount))
+        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large");
+    new_len = (n - dcount) + ins;
+    (void)new_len;
+    out = js_new_array(ctx);
+    if (!out) return JS_THROW;
+    for (i = 0; i < start; i++) {
+        js_value v;
+        if (js_step(ctx) != JS_OK || aget(ctx, o, i, &v) != JS_OK ||
+            js_array_push(ctx, out, v) != JS_OK)
+            return JS_THROW;
+    }
+    for (i = 0; i < ins; i++)
+        if (js_array_push(ctx, out, argv[i + 2]) != JS_OK) return JS_THROW;
+    for (i = start + dcount; i < n; i++) {
+        js_value v;
+        if (js_step(ctx) != JS_OK || aget(ctx, o, i, &v) != JS_OK ||
+            js_array_push(ctx, out, v) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(out);
+    return JS_OK;
+}
+
+static int bi_array_with(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    js_object *o, *out;
+    unsigned long n, actual, i;
+    double d, idx_d;
+    js_value val = arg(argc, argv, 1);
+
+    if (this_object(ctx, t, &o) != JS_OK) return JS_THROW;
+    if (alen(ctx, o, &n) != JS_OK) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    idx_d = d < 0 ? d + (double)n : d;
+    if (js_isnan(idx_d) || idx_d < 0 || idx_d >= (double)n)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "invalid index for Array.prototype.with");
+    if (n > 1000000UL)
+        return js_throw_error(ctx, JS_ERR_RANGE, "array is too large");
+    actual = (unsigned long)idx_d;
+    out = js_new_array(ctx);
+    if (!out) return JS_THROW;
+    for (i = 0; i < n; i++) {
+        js_value v;
+        if (i == actual) {
+            v = val;
+        } else if (aget(ctx, o, i, &v) != JS_OK) {
+            return JS_THROW;
+        }
+        if (js_step(ctx) != JS_OK || js_array_push(ctx, out, v) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_object_value(out);
     return JS_OK;
 }
 
@@ -2954,7 +3162,19 @@ static int re_getter(js_ctx *ctx, js_value t, js_value *ret, int which)
     case 0: *ret = js_string_value(ro->re->source); break;
     case 1: *ret = js_bool(ro->re->global); break;
     case 2: *ret = js_bool(ro->re->ignore_case); break;
-    default: *ret = js_bool(ro->re->multiline); break;
+    case 3: *ret = js_bool(ro->re->multiline); break;
+    default: {
+        char fbuf[4];
+        int fn = 0;
+        js_string *s;
+        if (ro->re->global) fbuf[fn++] = 'g';
+        if (ro->re->ignore_case) fbuf[fn++] = 'i';
+        if (ro->re->multiline) fbuf[fn++] = 'm';
+        s = js_str_new(ctx, fbuf, (unsigned long)fn);
+        if (!s) return JS_THROW;
+        *ret = js_string_value(s);
+        break;
+    }
     }
     return JS_OK;
 }
@@ -2967,6 +3187,8 @@ static int bi_re_icase(js_ctx *ctx, js_value t, int argc, js_value *argv, js_val
 { (void)argc; (void)argv; return re_getter(ctx, t, ret, 2); }
 static int bi_re_multi(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
 { (void)argc; (void)argv; return re_getter(ctx, t, ret, 3); }
+static int bi_re_flags(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ (void)argc; (void)argv; return re_getter(ctx, t, ret, 4); }
 
 /* Coerce a String.prototype argument to a regexp, as match/search/split do. */
 static js_object *to_regexp(js_ctx *ctx, js_value v)
@@ -6351,276 +6573,1399 @@ static int promise_static_reject(js_ctx *ctx, js_value t, int argc,
 
 #define ARRAYBUFFER_BYTE_MAX (8UL * 1024UL * 1024UL)
 
+static int to_index(js_ctx *ctx, js_value v, unsigned long max_val,
+                    unsigned long *out)
+{
+    double d;
+
+    if (v.type == JS_UNDEFINED) {
+        *out = 0;
+        return JS_OK;
+    }
+    if (js_to_integer(ctx, v, &d) != JS_OK)
+        return JS_THROW;
+    if (d < 0 || js_isinf(d) || d > (double)max_val)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "index or length is out of range");
+    *out = (unsigned long)d;
+    return JS_OK;
+}
+
 static int arraybuffer_ctor(js_ctx *ctx, js_value t, int argc,
                             js_value *argv, js_value *ret)
 {
-    uint32_t len = 0;
+    unsigned long len = 0;
     (void)t;
 
-    if (argc && js_to_uint32(ctx, argv[0], &len) != JS_OK)
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Constructor ArrayBuffer requires 'new'");
+    if (argc > 0 && to_index(ctx, argv[0], ARRAYBUFFER_BYTE_MAX, &len) != JS_OK)
         return JS_THROW;
-    if (len > ARRAYBUFFER_BYTE_MAX)
-        return js_throw_error(ctx, JS_ERR_RANGE,
-                              "ArrayBuffer is too large");
     *ret = js_arraybuffer_new(ctx, 0, len);
     return js_is_arraybuffer(*ret) ? JS_OK : JS_THROW;
+}
+
+static int arraybuffer_byte_length_get(js_ctx *ctx, js_value t, int argc,
+                                       js_value *argv, js_value *ret)
+{
+    unsigned long len = 0;
+    (void)argc; (void)argv;
+
+    if (!js_arraybuffer_data(t, &len))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "ArrayBuffer.byteLength receiver is invalid");
+    *ret = js_number((double)len);
+    return JS_OK;
 }
 
 static int arraybuffer_slice(js_ctx *ctx, js_value t, int argc,
                              js_value *argv, js_value *ret)
 {
     const uint8_t *data;
-    unsigned long len;
-    int32_t begin = 0, end;
+    unsigned long len, first, final;
+    double d;
 
     data = (const uint8_t *)js_arraybuffer_data(t, &len);
     if (!data)
         return js_throw_error(ctx, JS_ERR_TYPE,
                               "ArrayBuffer.slice receiver is invalid");
-    end = (int32_t)len;
-    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
-        return JS_THROW;
-    if (argc > 1 && js_to_int32(ctx, argv[1], &end) != JS_OK)
-        return JS_THROW;
-    if (begin < 0) begin += (int32_t)len;
-    if (end < 0) end += (int32_t)len;
-    if (begin < 0) begin = 0;
-    if (end < begin) end = begin;
-    if ((unsigned long)begin > len) begin = (int32_t)len;
-    if ((unsigned long)end > len) end = (int32_t)len;
-    *ret = js_arraybuffer_new(ctx, data + begin,
-                             (unsigned long)(end - begin));
+    if (argc > 0) {
+        if (js_to_integer(ctx, argv[0], &d) != JS_OK) return JS_THROW;
+        first = rel_index(d, len);
+    } else {
+        first = 0;
+    }
+    if (argc > 1 && argv[1].type != JS_UNDEFINED) {
+        if (js_to_integer(ctx, argv[1], &d) != JS_OK) return JS_THROW;
+        final = rel_index(d, len);
+    } else {
+        final = len;
+    }
+    if (final < first)
+        final = first;
+    *ret = js_arraybuffer_new(ctx, data + first, final - first);
     return js_is_arraybuffer(*ret) ? JS_OK : JS_THROW;
 }
 
-static js_object *uint8array_this(js_ctx *ctx, js_value value)
+/* ================================================================== */
+/* TypedArray family                                                   */
+/* ================================================================== */
+
+struct ta_spec {
+    uint8_t     cls;
+    uint8_t     proto;
+    uint8_t     elem_size;
+    const char *name;
+};
+
+static const struct ta_spec ta_specs[9] = {
+    { JS_CLASS_INT8ARRAY,         P_INT8ARRAY,         1, "Int8Array" },
+    { JS_CLASS_UINT8ARRAY,        P_UINT8ARRAY,        1, "Uint8Array" },
+    { JS_CLASS_UINT8CLAMPEDARRAY, P_UINT8CLAMPEDARRAY, 1, "Uint8ClampedArray" },
+    { JS_CLASS_INT16ARRAY,        P_INT16ARRAY,        2, "Int16Array" },
+    { JS_CLASS_UINT16ARRAY,       P_UINT16ARRAY,       2, "Uint16Array" },
+    { JS_CLASS_INT32ARRAY,        P_INT32ARRAY,        4, "Int32Array" },
+    { JS_CLASS_UINT32ARRAY,       P_UINT32ARRAY,       4, "Uint32Array" },
+    { JS_CLASS_FLOAT32ARRAY,      P_FLOAT32ARRAY,      4, "Float32Array" },
+    { JS_CLASS_FLOAT64ARRAY,      P_FLOAT64ARRAY,      8, "Float64Array" }
+};
+
+static js_object *typedarray_this(js_ctx *ctx, js_value value)
 {
-    if (!js_is_uint8array(value)) {
-        js_throw_error(ctx, JS_ERR_TYPE, "invalid Uint8Array receiver");
+    if (!js_is_typedarray(value)) {
+        js_throw_error(ctx, JS_ERR_TYPE, "invalid TypedArray receiver");
         return 0;
     }
     return value.u.obj;
 }
 
-static int uint8array_length_get(js_ctx *ctx, js_value t, int argc,
+static int typedarray_base_ctor(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret)
+{
+    (void)t; (void)argc; (void)argv; (void)ret;
+    return js_throw_error(ctx, JS_ERR_TYPE,
+                          "Abstract class TypedArray not directly constructable");
+}
+
+static int typedarray_length_get(js_ctx *ctx, js_value t, int argc,
                                  js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
+    js_object *o = typedarray_this(ctx, t);
     (void)argc; (void)argv;
     if (!o) return JS_THROW;
     *ret = js_number((double)o->view_length);
     return JS_OK;
 }
 
-static int uint8array_byte_offset_get(js_ctx *ctx, js_value t, int argc,
+static int typedarray_byte_length_get(js_ctx *ctx, js_value t, int argc,
                                       js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
+    js_object *o = typedarray_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_number((double)o->byte_length);
+    return JS_OK;
+}
+
+static int typedarray_byte_offset_get(js_ctx *ctx, js_value t, int argc,
+                                      js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t);
     (void)argc; (void)argv;
     if (!o) return JS_THROW;
     *ret = js_number((double)o->byte_offset);
     return JS_OK;
 }
 
-static int uint8array_buffer_get(js_ctx *ctx, js_value t, int argc,
+static int typedarray_buffer_get(js_ctx *ctx, js_value t, int argc,
                                  js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
+    js_object *o = typedarray_this(ctx, t);
     (void)argc; (void)argv;
     if (!o) return JS_THROW;
     *ret = js_object_value(o->view_buffer);
     return JS_OK;
 }
 
-static int uint8array_ctor(js_ctx *ctx, js_value t, int argc,
-                           js_value *argv, js_value *ret)
+static void apply_new_target_proto(js_ctx *ctx, js_object *o)
 {
-    js_value source = arg(argc, argv, 0);
-    js_object *view = 0;
-    uint32_t offset = 0, length = 0;
+    js_value pv;
+    if (!ctx->new_target || !o)
+        return;
+    if (js_obj_get(ctx, ctx->new_target, ctx->s_prototype,
+                   js_object_value(ctx->new_target), &pv) == JS_OK &&
+        pv.type == JS_OBJECT)
+        o->proto = pv.u.obj;
+}
+
+static int collect_ta_elements(js_ctx *ctx, js_value source, js_object **out_arr,
+                               unsigned long max_count)
+{
+    js_object *arr;
     unsigned long i, count = 0;
-    (void)t;
 
-    if (js_is_undefined(source)) {
-        *ret = js_uint8array_new(ctx, 0, 0);
-        return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+    if (source.type == JS_OBJECT && source.u.obj->cls == JS_CLASS_ARRAY &&
+        (!ctx->sym_iterator_key ||
+         !js_own_prop_key(source.u.obj, ctx->sym_iterator_key, 1))) {
+        *out_arr = source.u.obj;
+        if (source.u.obj->elen > max_count)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "TypedArray source is too large");
+        return JS_OK;
     }
-    if (js_is_arraybuffer(source)) {
-        unsigned long bytes = 0;
-
-        js_arraybuffer_data(source, &bytes);
-        if (argc > 1 && js_to_uint32(ctx, argv[1], &offset) != JS_OK)
+    arr = js_new_array(ctx);
+    if (!arr) return JS_THROW;
+    if (ctx->sym_iterator_key) {
+        js_value iter_fn = js_undefined();
+        if (js_wrap_get_key(ctx, source, ctx->sym_iterator_key, 1,
+                            &iter_fn) != JS_OK)
             return JS_THROW;
-        if ((unsigned long)offset > bytes)
-            return js_throw_error(ctx, JS_ERR_RANGE,
-                                  "Uint8Array byteOffset is out of range");
-        length = (uint32_t)(bytes - offset);
-        if (argc > 2 && !js_is_undefined(argv[2]) &&
-            js_to_uint32(ctx, argv[2], &length) != JS_OK)
-            return JS_THROW;
-        if ((unsigned long)length > bytes - offset)
-            return js_throw_error(ctx, JS_ERR_RANGE,
-                                  "Uint8Array length is out of range");
-        view = js_uint8array_view(ctx, source.u.obj, offset, length);
-        *ret = view ? js_object_value(view) : js_undefined();
-        return view ? JS_OK : JS_THROW;
-    }
-    if (js_is_number(source)) {
-        double d;
-
-        if (js_to_number(ctx, source, &d) != JS_OK)
-            return JS_THROW;
-        if (d < 0 || d > ARRAYBUFFER_BYTE_MAX || d != js_floor(d))
-            return js_throw_error(ctx, JS_ERR_RANGE,
-                                  "Uint8Array length is invalid");
-        *ret = js_uint8array_new(ctx, 0, (unsigned long)d);
-        return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+        if (iter_fn.type != JS_UNDEFINED) {
+            js_iter it;
+            if (js_iter_open(ctx, source, &it) != JS_OK)
+                return JS_THROW;
+            for (i = 0; ; i++) {
+                js_value item;
+                int done = 0;
+                if (js_step(ctx) != JS_OK ||
+                    js_iter_next(ctx, &it, &item, &done) != JS_OK)
+                    return JS_THROW;
+                if (done) break;
+                if (i >= max_count)
+                    return js_throw_error(ctx, JS_ERR_RANGE,
+                                          "TypedArray source is too large");
+                if (js_array_push(ctx, arr, item) != JS_OK)
+                    return JS_THROW;
+            }
+            *out_arr = arr;
+            return JS_OK;
+        }
     }
     {
         js_object *input;
-
         if (this_object(ctx, source, &input) != JS_OK ||
             alen(ctx, input, &count) != JS_OK)
             return JS_THROW;
-        if (count > ARRAYBUFFER_BYTE_MAX)
+        if (count > max_count)
             return js_throw_error(ctx, JS_ERR_RANGE,
-                                  "Uint8Array source is too large");
-        *ret = js_uint8array_new(ctx, 0, count);
-        if (!js_is_uint8array(*ret))
-            return JS_THROW;
-        view = ret->u.obj;
+                                  "TypedArray source is too large");
         for (i = 0; i < count; i++) {
             js_value item;
-            uint32_t byte;
-
-            if (aget(ctx, input, i, &item) != JS_OK ||
-                js_to_uint32(ctx, item, &byte) != JS_OK)
+            if (js_step(ctx) != JS_OK || aget(ctx, input, i, &item) != JS_OK ||
+                js_array_push(ctx, arr, item) != JS_OK)
                 return JS_THROW;
-            view->view_buffer->buffer[i] = (uint8_t)byte;
+        }
+    }
+    *out_arr = arr;
+    return JS_OK;
+}
+
+static int typedarray_ctor_impl(js_ctx *ctx, int cls, js_value t,
+                                int argc, js_value *argv, js_value *ret)
+{
+    js_value source = arg(argc, argv, 0);
+    int es = js_typedarray_elem_size(cls);
+    unsigned long max_elems = ARRAYBUFFER_BYTE_MAX / (unsigned long)es;
+    js_object *view = 0;
+    (void)t;
+
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "TypedArray constructor requires 'new'");
+    if (js_is_undefined(source)) {
+        *ret = js_typedarray_new(ctx, cls, 0, 0);
+        if (js_is_typedarray(*ret)) apply_new_target_proto(ctx, ret->u.obj);
+        return js_is_typedarray(*ret) ? JS_OK : JS_THROW;
+    }
+    if (js_is_arraybuffer(source)) {
+        unsigned long bytes = 0, offset = 0, length = 0;
+
+        js_arraybuffer_data(source, &bytes);
+        if (argc > 1 && !js_is_undefined(argv[1])) {
+            if (to_index(ctx, argv[1], bytes, &offset) != JS_OK)
+                return JS_THROW;
+            if (offset % (unsigned long)es != 0)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "TypedArray byteOffset must be aligned");
+        }
+        if (argc > 2 && !js_is_undefined(argv[2])) {
+            if (to_index(ctx, argv[2], max_elems, &length) != JS_OK)
+                return JS_THROW;
+            if (length > (bytes - offset) / (unsigned long)es)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "TypedArray length is out of range");
+        } else {
+            if ((bytes - offset) % (unsigned long)es != 0)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "ArrayBuffer byteLength must be aligned");
+            length = (bytes - offset) / (unsigned long)es;
+        }
+        view = js_typedarray_view(ctx, cls, source.u.obj,
+                                  (uint32_t)offset, (uint32_t)length);
+        if (!view) return JS_THROW;
+        apply_new_target_proto(ctx, view);
+        *ret = js_object_value(view);
+        return JS_OK;
+    }
+    if (source.type != JS_OBJECT) {
+        unsigned long len = 0;
+        if (to_index(ctx, source, max_elems, &len) != JS_OK)
+            return JS_THROW;
+        *ret = js_typedarray_new(ctx, cls, 0, len);
+        if (js_is_typedarray(*ret)) apply_new_target_proto(ctx, ret->u.obj);
+        return js_is_typedarray(*ret) ? JS_OK : JS_THROW;
+    }
+    if (js_is_typedarray(source)) {
+        js_object *src = source.u.obj;
+        unsigned long count = src->view_length, i;
+
+        if (count > max_elems)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "TypedArray source is too large");
+        *ret = js_typedarray_new(ctx, cls, 0, count);
+        if (!js_is_typedarray(*ret)) return JS_THROW;
+        view = ret->u.obj;
+        apply_new_target_proto(ctx, view);
+        if (src->cls == cls && count) {
+            memcpy(view->view_buffer->buffer,
+                   src->view_buffer->buffer + src->byte_offset,
+                   count * (unsigned long)es);
+        } else {
+            for (i = 0; i < count; i++)
+                js_typedarray_write_num(view, (uint32_t)i,
+                                        js_typedarray_read(src, (uint32_t)i));
+        }
+        return JS_OK;
+    }
+    {
+        js_object *arr = 0;
+        unsigned long i;
+
+        if (collect_ta_elements(ctx, source, &arr, max_elems) != JS_OK)
+            return JS_THROW;
+        *ret = js_typedarray_new(ctx, cls, 0, arr->elen);
+        if (!js_is_typedarray(*ret)) return JS_THROW;
+        view = ret->u.obj;
+        apply_new_target_proto(ctx, view);
+        for (i = 0; i < arr->elen; i++) {
+            if (js_step(ctx) != JS_OK ||
+                js_typedarray_write(ctx, view, (uint32_t)i,
+                                    arr->elems[i]) != JS_OK)
+                return JS_THROW;
         }
     }
     return JS_OK;
 }
 
-static void relative_range(int32_t *begin, int32_t *end, uint32_t length)
+#define DEFINE_TA_CTOR(fn_name, ta_cls) \
+    static int fn_name(js_ctx *ctx, js_value t, int argc, js_value *argv, \
+                       js_value *ret) \
+    { return typedarray_ctor_impl(ctx, (ta_cls), t, argc, argv, ret); }
+
+DEFINE_TA_CTOR(int8array_ctor, JS_CLASS_INT8ARRAY)
+DEFINE_TA_CTOR(uint8array_ctor, JS_CLASS_UINT8ARRAY)
+DEFINE_TA_CTOR(uint8clampedarray_ctor, JS_CLASS_UINT8CLAMPEDARRAY)
+DEFINE_TA_CTOR(int16array_ctor, JS_CLASS_INT16ARRAY)
+DEFINE_TA_CTOR(uint16array_ctor, JS_CLASS_UINT16ARRAY)
+DEFINE_TA_CTOR(int32array_ctor, JS_CLASS_INT32ARRAY)
+DEFINE_TA_CTOR(uint32array_ctor, JS_CLASS_UINT32ARRAY)
+DEFINE_TA_CTOR(float32array_ctor, JS_CLASS_FLOAT32ARRAY)
+DEFINE_TA_CTOR(float64array_ctor, JS_CLASS_FLOAT64ARRAY)
+
+static int typedarray_cls_from_ctor(js_ctx *ctx, js_value ctor_v, int *out_cls)
 {
-    if (*begin < 0) *begin += (int32_t)length;
-    if (*end < 0) *end += (int32_t)length;
-    if (*begin < 0) *begin = 0;
-    if (*end < 0) *end = 0;
-    if ((uint32_t)*begin > length) *begin = (int32_t)length;
-    if ((uint32_t)*end > length) *end = (int32_t)length;
-    if (*end < *begin) *end = *begin;
+    js_value pv;
+    js_object *walk;
+    int guard = 0, i;
+
+    if (!js_is_function(ctor_v) ||
+        js_obj_get(ctx, ctor_v.u.obj, ctx->s_prototype, ctor_v, &pv) != JS_OK ||
+        pv.type != JS_OBJECT)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "TypedArray static method requires a TypedArray constructor");
+    for (walk = pv.u.obj; walk && guard < 32; walk = walk->proto, guard++) {
+        for (i = 0; i < 9; i++) {
+            if (walk == ctx->proto[ta_specs[i].proto]) {
+                *out_cls = ta_specs[i].cls;
+                return JS_OK;
+            }
+        }
+    }
+    return js_throw_error(ctx, JS_ERR_TYPE,
+                          "TypedArray static method requires a TypedArray constructor");
 }
 
-static int uint8array_subarray(js_ctx *ctx, js_value t, int argc,
+static int typedarray_from(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    int cls = 0, es;
+    js_value source = arg(argc, argv, 0);
+    js_value mapfn = arg(argc, argv, 1);
+    js_value this_arg = arg(argc, argv, 2);
+    js_object *view, *arr = 0;
+    unsigned long max_elems, count, i;
+
+    if (typedarray_cls_from_ctor(ctx, t, &cls) != JS_OK)
+        return JS_THROW;
+    if (mapfn.type != JS_UNDEFINED && !js_is_function(mapfn))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "TypedArray.from mapper must be a function");
+    if (source.type == JS_UNDEFINED || source.type == JS_NULL)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "TypedArray.from cannot convert null or undefined");
+    es = js_typedarray_elem_size(cls);
+    max_elems = ARRAYBUFFER_BYTE_MAX / (unsigned long)es;
+    if (js_is_typedarray(source) &&
+        (!ctx->sym_iterator_key ||
+         !js_own_prop_key(source.u.obj, ctx->sym_iterator_key, 1))) {
+        js_object *src = source.u.obj;
+        count = src->view_length;
+        if (count > max_elems)
+            return js_throw_error(ctx, JS_ERR_RANGE,
+                                  "TypedArray.from source is too large");
+        *ret = js_typedarray_new(ctx, cls, 0, count);
+        if (!js_is_typedarray(*ret)) return JS_THROW;
+        view = ret->u.obj;
+        for (i = 0; i < count; i++) {
+            double d = js_typedarray_read(src, (uint32_t)i);
+            if (mapfn.type != JS_UNDEFINED) {
+                js_value args[2], mapped;
+                args[0] = js_number(d);
+                args[1] = js_number((double)i);
+                if (js_call(ctx, mapfn, this_arg, 2, args, &mapped) != JS_OK ||
+                    js_typedarray_write(ctx, view, (uint32_t)i, mapped) != JS_OK)
+                    return JS_THROW;
+            } else {
+                js_typedarray_write_num(view, (uint32_t)i, d);
+            }
+        }
+        return JS_OK;
+    }
+    if (collect_ta_elements(ctx, source, &arr, max_elems) != JS_OK)
+        return JS_THROW;
+    count = arr->elen;
+    *ret = js_typedarray_new(ctx, cls, 0, count);
+    if (!js_is_typedarray(*ret)) return JS_THROW;
+    view = ret->u.obj;
+    for (i = 0; i < count; i++) {
+        js_value item = arr->elems[i];
+        if (js_step(ctx) != JS_OK) return JS_THROW;
+        if (mapfn.type != JS_UNDEFINED) {
+            js_value args[2], mapped;
+            args[0] = item;
+            args[1] = js_number((double)i);
+            if (js_call(ctx, mapfn, this_arg, 2, args, &mapped) != JS_OK)
+                return JS_THROW;
+            item = mapped;
+        }
+        if (js_typedarray_write(ctx, view, (uint32_t)i, item) != JS_OK)
+            return JS_THROW;
+    }
+    return JS_OK;
+}
+
+static int typedarray_of(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    int cls = 0, i;
+    js_object *view;
+
+    if (typedarray_cls_from_ctor(ctx, t, &cls) != JS_OK)
+        return JS_THROW;
+    *ret = js_typedarray_new(ctx, cls, 0, (unsigned long)argc);
+    if (!js_is_typedarray(*ret)) return JS_THROW;
+    view = ret->u.obj;
+    for (i = 0; i < argc; i++) {
+        if (js_typedarray_write(ctx, view, (uint32_t)i, argv[i]) != JS_OK)
+            return JS_THROW;
+    }
+    return JS_OK;
+}
+
+static void relative_range_ul(double begin_d, double end_d, uint32_t length,
+                              uint32_t *out_begin, uint32_t *out_end)
+{
+    unsigned long b = rel_index(begin_d, length);
+    unsigned long e = rel_index(end_d, length);
+    if (e < b) e = b;
+    *out_begin = (uint32_t)b;
+    *out_end = (uint32_t)e;
+}
+
+static int typedarray_subarray(js_ctx *ctx, js_value t, int argc,
                                js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
+    js_object *o = typedarray_this(ctx, t);
     js_object *view;
-    int32_t begin = 0, end;
+    double bd = 0, ed;
+    uint32_t begin, end;
+    int es;
 
     if (!o) return JS_THROW;
-    end = (int32_t)o->view_length;
-    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
+    es = js_typedarray_elem_size(o->cls);
+    ed = (double)o->view_length;
+    if (argc > 0 && argv[0].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[0], &bd) != JS_OK)
         return JS_THROW;
-    if (argc > 1 && !js_is_undefined(argv[1]) &&
-        js_to_int32(ctx, argv[1], &end) != JS_OK)
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[1], &ed) != JS_OK)
         return JS_THROW;
-    relative_range(&begin, &end, o->view_length);
-    view = js_uint8array_view(ctx, o->view_buffer,
-                              o->byte_offset + (uint32_t)begin,
-                              (uint32_t)(end - begin));
+    relative_range_ul(bd, ed, o->view_length, &begin, &end);
+    view = js_typedarray_view(ctx, o->cls, o->view_buffer,
+                              o->byte_offset + begin * (uint32_t)es,
+                              end - begin);
     *ret = view ? js_object_value(view) : js_undefined();
     return view ? JS_OK : JS_THROW;
 }
 
-static int uint8array_slice(js_ctx *ctx, js_value t, int argc,
+static int typedarray_slice(js_ctx *ctx, js_value t, int argc,
                             js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
-    int32_t begin = 0, end;
+    js_object *o = typedarray_this(ctx, t);
+    double bd = 0, ed;
+    uint32_t begin, end;
+    int es;
 
     if (!o) return JS_THROW;
-    end = (int32_t)o->view_length;
-    if (argc > 0 && js_to_int32(ctx, argv[0], &begin) != JS_OK)
+    es = js_typedarray_elem_size(o->cls);
+    ed = (double)o->view_length;
+    if (argc > 0 && argv[0].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[0], &bd) != JS_OK)
         return JS_THROW;
-    if (argc > 1 && !js_is_undefined(argv[1]) &&
-        js_to_int32(ctx, argv[1], &end) != JS_OK)
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[1], &ed) != JS_OK)
         return JS_THROW;
-    relative_range(&begin, &end, o->view_length);
-    *ret = js_uint8array_new(
-        ctx, o->view_buffer->buffer + o->byte_offset + (uint32_t)begin,
+    relative_range_ul(bd, ed, o->view_length, &begin, &end);
+    *ret = js_typedarray_new(
+        ctx, o->cls,
+        o->view_buffer->buffer + o->byte_offset + begin * (uint32_t)es,
         (unsigned long)(end - begin));
-    return js_is_uint8array(*ret) ? JS_OK : JS_THROW;
+    return js_is_typedarray(*ret) ? JS_OK : JS_THROW;
 }
 
-static int uint8array_set(js_ctx *ctx, js_value t, int argc,
+static int typedarray_set(js_ctx *ctx, js_value t, int argc,
                           js_value *argv, js_value *ret)
 {
-    js_object *dst = uint8array_this(ctx, t);
+    js_object *dst = typedarray_this(ctx, t);
     js_object *source;
-    unsigned long count, i;
-    uint32_t offset = 0;
+    unsigned long count, offset = 0, i;
+    int dst_es;
 
     if (!dst) return JS_THROW;
+    dst_es = js_typedarray_elem_size(dst->cls);
     if (argc < 1 || this_object(ctx, argv[0], &source) != JS_OK ||
         alen(ctx, source, &count) != JS_OK)
         return JS_THROW;
-    if (argc > 1 && js_to_uint32(ctx, argv[1], &offset) != JS_OK)
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        to_index(ctx, argv[1], 0xFFFFFFFFUL, &offset) != JS_OK)
         return JS_THROW;
     if (offset > dst->view_length ||
         count > (unsigned long)dst->view_length - offset)
         return js_throw_error(ctx, JS_ERR_RANGE,
-                              "Uint8Array.set source does not fit");
-    if (source->cls == JS_CLASS_UINT8ARRAY) {
-        memmove(dst->view_buffer->buffer + dst->byte_offset + offset,
-                source->view_buffer->buffer + source->byte_offset, count);
+                              "TypedArray.set source does not fit");
+    if (js_is_typedarray_cls(source->cls)) {
+        if (source->cls == dst->cls) {
+            if (count)
+                memmove(dst->view_buffer->buffer + dst->byte_offset +
+                            offset * (unsigned long)dst_es,
+                        source->view_buffer->buffer + source->byte_offset,
+                        count * (unsigned long)dst_es);
+        } else if (source->view_buffer == dst->view_buffer && count) {
+            double *tmp = (double *)js_alloc(ctx, count * sizeof(double));
+            if (!tmp) return JS_THROW;
+            for (i = 0; i < count; i++)
+                tmp[i] = js_typedarray_read(source, (uint32_t)i);
+            for (i = 0; i < count; i++)
+                js_typedarray_write_num(dst, (uint32_t)(offset + i), tmp[i]);
+        } else {
+            for (i = 0; i < count; i++)
+                js_typedarray_write_num(dst, (uint32_t)(offset + i),
+                                        js_typedarray_read(source, (uint32_t)i));
+        }
     } else {
         for (i = 0; i < count; i++) {
             js_value item;
-            uint32_t byte;
-
-            if (aget(ctx, source, i, &item) != JS_OK ||
-                js_to_uint32(ctx, item, &byte) != JS_OK)
+            if (js_step(ctx) != JS_OK || aget(ctx, source, i, &item) != JS_OK ||
+                js_typedarray_write(ctx, dst, (uint32_t)(offset + i),
+                                    item) != JS_OK)
                 return JS_THROW;
-            dst->view_buffer->buffer[dst->byte_offset + offset + i] =
-                (uint8_t)byte;
         }
     }
     *ret = js_undefined();
     return JS_OK;
 }
 
-static int uint8array_fill(js_ctx *ctx, js_value t, int argc,
+static int typedarray_fill(js_ctx *ctx, js_value t, int argc,
                            js_value *argv, js_value *ret)
 {
-    js_object *o = uint8array_this(ctx, t);
-    uint32_t byte = 0;
-    int32_t begin = 0, end;
+    js_object *o = typedarray_this(ctx, t);
+    double val = 0, bd = 0, ed;
+    uint32_t begin, end, i;
 
     if (!o) return JS_THROW;
-    if (argc > 0 && js_to_uint32(ctx, argv[0], &byte) != JS_OK)
+    if (js_to_number(ctx, arg(argc, argv, 0), &val) != JS_OK)
         return JS_THROW;
-    end = (int32_t)o->view_length;
-    if (argc > 1 && js_to_int32(ctx, argv[1], &begin) != JS_OK)
+    ed = (double)o->view_length;
+    if (argc > 1 && argv[1].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[1], &bd) != JS_OK)
         return JS_THROW;
-    if (argc > 2 && !js_is_undefined(argv[2]) &&
-        js_to_int32(ctx, argv[2], &end) != JS_OK)
+    if (argc > 2 && argv[2].type != JS_UNDEFINED &&
+        js_to_integer(ctx, argv[2], &ed) != JS_OK)
         return JS_THROW;
-    relative_range(&begin, &end, o->view_length);
-    memset(o->view_buffer->buffer + o->byte_offset + (uint32_t)begin,
-           (unsigned char)byte, (unsigned long)(end - begin));
+    relative_range_ul(bd, ed, o->view_length, &begin, &end);
+    for (i = begin; i < end; i++)
+        js_typedarray_write_num(o, i, val);
     *ret = t;
     return JS_OK;
 }
+
+static int typedarray_at(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t);
+    double d = 0;
+
+    if (!o) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK)
+        return JS_THROW;
+    if (d < 0) d += (double)o->view_length;
+    if (d < 0 || d >= (double)o->view_length) {
+        *ret = js_undefined();
+        return JS_OK;
+    }
+    *ret = js_number(js_typedarray_read(o, (uint32_t)d));
+    return JS_OK;
+}
+
+static int typedarray_foreach(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t);
+    js_value fn = arg(argc, argv, 0), self = arg(argc, argv, 1);
+    uint32_t i;
+
+    if (!o) return JS_THROW;
+    if (!js_is_function(fn))
+        return js_throw_error(ctx, JS_ERR_TYPE, "callback is not a function");
+    for (i = 0; i < o->view_length; i++) {
+        js_value args[3], ignored;
+        if (js_step(ctx) != JS_OK) return JS_THROW;
+        args[0] = js_number(js_typedarray_read(o, i));
+        args[1] = js_number((double)i);
+        args[2] = t;
+        if (js_call(ctx, fn, self, 3, args, &ignored) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+static int typedarray_map(js_ctx *ctx, js_value t, int argc,
+                          js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t), *out;
+    js_value fn = arg(argc, argv, 0), self = arg(argc, argv, 1), ov;
+    uint32_t i;
+
+    if (!o) return JS_THROW;
+    if (!js_is_function(fn))
+        return js_throw_error(ctx, JS_ERR_TYPE, "callback is not a function");
+    ov = js_typedarray_new(ctx, o->cls, 0, o->view_length);
+    if (!js_is_typedarray(ov)) return JS_THROW;
+    out = ov.u.obj;
+    for (i = 0; i < o->view_length; i++) {
+        js_value args[3], mapped;
+        if (js_step(ctx) != JS_OK) return JS_THROW;
+        args[0] = js_number(js_typedarray_read(o, i));
+        args[1] = js_number((double)i);
+        args[2] = t;
+        if (js_call(ctx, fn, self, 3, args, &mapped) != JS_OK ||
+            js_typedarray_write(ctx, out, i, mapped) != JS_OK)
+            return JS_THROW;
+    }
+    *ret = ov;
+    return JS_OK;
+}
+
+static int typedarray_filter(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t), *kept, *out;
+    js_value fn = arg(argc, argv, 0), self = arg(argc, argv, 1), ov;
+    uint32_t i;
+
+    if (!o) return JS_THROW;
+    if (!js_is_function(fn))
+        return js_throw_error(ctx, JS_ERR_TYPE, "callback is not a function");
+    kept = js_new_array(ctx);
+    if (!kept) return JS_THROW;
+    for (i = 0; i < o->view_length; i++) {
+        js_value args[3], sel;
+        if (js_step(ctx) != JS_OK) return JS_THROW;
+        args[0] = js_number(js_typedarray_read(o, i));
+        args[1] = js_number((double)i);
+        args[2] = t;
+        if (js_call(ctx, fn, self, 3, args, &sel) != JS_OK)
+            return JS_THROW;
+        if (js_to_boolean(sel) && js_array_push(ctx, kept, args[0]) != JS_OK)
+            return JS_THROW;
+    }
+    ov = js_typedarray_new(ctx, o->cls, 0, kept->elen);
+    if (!js_is_typedarray(ov)) return JS_THROW;
+    out = ov.u.obj;
+    for (i = 0; i < kept->elen; i++)
+        js_typedarray_write_num(out, i, kept->elems[i].u.num);
+    *ret = ov;
+    return JS_OK;
+}
+
+static int typedarray_indexof(js_ctx *ctx, js_value t, int argc,
+                              js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t);
+    js_value needle = arg(argc, argv, 0);
+    double d = 0;
+    uint32_t i;
+
+    if (!o) return JS_THROW;
+    *ret = js_number(-1);
+    if (o->view_length == 0) return JS_OK;
+    if (argc > 1 && js_to_integer(ctx, argv[1], &d) != JS_OK)
+        return JS_THROW;
+    if (d < 0) { d += (double)o->view_length; if (d < 0) d = 0; }
+    if (d >= (double)o->view_length || needle.type != JS_NUMBER ||
+        js_isnan(needle.u.num))
+        return JS_OK;
+    for (i = (uint32_t)d; i < o->view_length; i++) {
+        if (js_typedarray_read(o, i) == needle.u.num) {
+            *ret = js_number((double)i);
+            return JS_OK;
+        }
+    }
+    return JS_OK;
+}
+
+static int ta_num_cmp(js_ctx *ctx, js_value cmp, double a, double b, int *err)
+{
+    *err = 0;
+    if (js_is_function(cmp)) {
+        js_value args[2], r;
+        double d;
+        args[0] = js_number(a);
+        args[1] = js_number(b);
+        if (js_call(ctx, cmp, js_undefined(), 2, args, &r) != JS_OK) {
+            *err = 1;
+            return 0;
+        }
+        if (js_to_number(ctx, r, &d) != JS_OK) { *err = 1; return 0; }
+        if (js_isnan(d)) return 0;
+        return d < 0 ? -1 : (d > 0 ? 1 : 0);
+    }
+    if (js_isnan(a)) return js_isnan(b) ? 0 : 1;
+    if (js_isnan(b)) return -1;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    if (a == 0.0 && b == 0.0) {
+        int aneg = (1.0 / a < 0), bneg = (1.0 / b < 0);
+        if (aneg != bneg) return aneg ? -1 : 1;
+    }
+    return 0;
+}
+
+static int ta_sort_buf(js_ctx *ctx, double *buf, unsigned long n, js_value cmp)
+{
+    double *tmp;
+    unsigned long width, i;
+    int err = 0;
+
+    if (n < 2) return JS_OK;
+    tmp = (double *)js_alloc(ctx, n * sizeof(double));
+    if (!tmp) return JS_THROW;
+    for (width = 1; width < n; width *= 2) {
+        unsigned long lo;
+        for (lo = 0; lo < n; lo += 2 * width) {
+            unsigned long mid = lo + width, hi = lo + 2 * width;
+            unsigned long a = lo, b, k = lo;
+            if (mid > n) mid = n;
+            if (hi > n) hi = n;
+            b = mid;
+            while (a < mid && b < hi) {
+                if (js_step(ctx) != JS_OK) return JS_THROW;
+                if (ta_num_cmp(ctx, cmp, buf[b], buf[a], &err) < 0)
+                    tmp[k++] = buf[b++];
+                else
+                    tmp[k++] = buf[a++];
+                if (err) return JS_THROW;
+            }
+            while (a < mid) tmp[k++] = buf[a++];
+            while (b < hi) tmp[k++] = buf[b++];
+        }
+        for (i = 0; i < n; i++) buf[i] = tmp[i];
+    }
+    return JS_OK;
+}
+
+static int typedarray_sort_impl(js_ctx *ctx, js_value t, int argc,
+                                js_value *argv, js_value *ret, int copy)
+{
+    js_object *o = typedarray_this(ctx, t), *dst;
+    js_value cmp = arg(argc, argv, 0);
+    double *buf;
+    uint32_t i;
+
+    if (!o) return JS_THROW;
+    if (cmp.type != JS_UNDEFINED && !js_is_function(cmp))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "TypedArray sort comparator must be a function");
+    if (copy) {
+        js_value ov = js_typedarray_new(ctx, o->cls, 0, o->view_length);
+        if (!js_is_typedarray(ov)) return JS_THROW;
+        dst = ov.u.obj;
+        *ret = ov;
+    } else {
+        dst = o;
+        *ret = t;
+    }
+    if (o->view_length < 2) {
+        if (copy && o->view_length == 1)
+            js_typedarray_write_num(dst, 0, js_typedarray_read(o, 0));
+        return JS_OK;
+    }
+    buf = (double *)js_alloc(ctx, (unsigned long)o->view_length * sizeof(double));
+    if (!buf) return JS_THROW;
+    for (i = 0; i < o->view_length; i++)
+        buf[i] = js_typedarray_read(o, i);
+    if (ta_sort_buf(ctx, buf, o->view_length, cmp) != JS_OK)
+        return JS_THROW;
+    for (i = 0; i < o->view_length; i++)
+        js_typedarray_write_num(dst, i, buf[i]);
+    return JS_OK;
+}
+
+static int typedarray_sort(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                           js_value *ret)
+{ return typedarray_sort_impl(ctx, t, argc, argv, ret, 0); }
+
+static int typedarray_tosorted(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                               js_value *ret)
+{ return typedarray_sort_impl(ctx, t, argc, argv, ret, 1); }
+
+static int typedarray_toreversed(js_ctx *ctx, js_value t, int argc,
+                                 js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t), *dst;
+    js_value ov;
+    uint32_t i;
+    (void)argc; (void)argv;
+
+    if (!o) return JS_THROW;
+    ov = js_typedarray_new(ctx, o->cls, 0, o->view_length);
+    if (!js_is_typedarray(ov)) return JS_THROW;
+    dst = ov.u.obj;
+    for (i = 0; i < o->view_length; i++)
+        js_typedarray_write_num(dst, i,
+                                js_typedarray_read(o, o->view_length - 1 - i));
+    *ret = ov;
+    return JS_OK;
+}
+
+static int typedarray_with(js_ctx *ctx, js_value t, int argc,
+                           js_value *argv, js_value *ret)
+{
+    js_object *o = typedarray_this(ctx, t), *dst;
+    double d = 0, idx_d, val = 0;
+    js_value ov;
+    uint32_t actual, i;
+
+    if (!o) return JS_THROW;
+    if (js_to_integer(ctx, arg(argc, argv, 0), &d) != JS_OK ||
+        js_to_number(ctx, arg(argc, argv, 1), &val) != JS_OK)
+        return JS_THROW;
+    idx_d = d < 0 ? d + (double)o->view_length : d;
+    if (js_isnan(idx_d) || idx_d < 0 || idx_d >= (double)o->view_length)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "invalid index for TypedArray.prototype.with");
+    actual = (uint32_t)idx_d;
+    ov = js_typedarray_new(ctx, o->cls, 0, o->view_length);
+    if (!js_is_typedarray(ov)) return JS_THROW;
+    dst = ov.u.obj;
+    for (i = 0; i < o->view_length; i++)
+        js_typedarray_write_num(dst, i,
+                                i == actual ? val : js_typedarray_read(o, i));
+    *ret = ov;
+    return JS_OK;
+}
+
+static int typedarray_keys(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_keys(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_values(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_values(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_entries(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_entries(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_join(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_join(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_tostring(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_tostring(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_includes(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_includes(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_lastindexof(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_lastindexof(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_find(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_find(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_findindex(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_findindex(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_findlast(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_findlast(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_findlastindex(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_findlastindex(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_every(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_every(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_some(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_some(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_reduce(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_reduce(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_reduceright(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_reduceright(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_reverse(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_reverse(ctx, t, argc, argv, ret) : JS_THROW; }
+static int typedarray_copywithin(js_ctx *ctx, js_value t, int argc, js_value *argv, js_value *ret)
+{ return typedarray_this(ctx, t) ? bi_array_copywithin(ctx, t, argc, argv, ret) : JS_THROW; }
+
+/* ================================================================== */
+/* DataView                                                            */
+/* ================================================================== */
+
+enum dv_kind {
+    DV_I8 = 0, DV_U8, DV_I16, DV_U16, DV_I32, DV_U32, DV_F32, DV_F64
+};
+
+static const uint8_t dv_sizes[8] = { 1, 1, 2, 2, 4, 4, 4, 8 };
+
+static js_object *dataview_this(js_ctx *ctx, js_value value)
+{
+    if (!js_is_dataview(value)) {
+        js_throw_error(ctx, JS_ERR_TYPE, "invalid DataView receiver");
+        return 0;
+    }
+    return value.u.obj;
+}
+
+static int dataview_ctor(js_ctx *ctx, js_value t, int argc,
+                         js_value *argv, js_value *ret)
+{
+    js_value buf_v = arg(argc, argv, 0);
+    unsigned long buf_bytes = 0, offset = 0, length = 0;
+    js_object *o;
+    (void)t;
+
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Constructor DataView requires 'new'");
+    if (!js_is_arraybuffer(buf_v))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "First argument to DataView constructor must be an ArrayBuffer");
+    js_arraybuffer_data(buf_v, &buf_bytes);
+    if (argc > 1 && !js_is_undefined(argv[1]) &&
+        to_index(ctx, argv[1], buf_bytes, &offset) != JS_OK)
+        return JS_THROW;
+    if (argc > 2 && !js_is_undefined(argv[2])) {
+        if (to_index(ctx, argv[2], buf_bytes - offset, &length) != JS_OK)
+            return JS_THROW;
+    } else {
+        length = buf_bytes - offset;
+    }
+    o = js_obj_alloc(ctx, JS_CLASS_DATAVIEW, ctx->proto[P_DATAVIEW]);
+    if (!o) return JS_THROW;
+    o->view_buffer = buf_v.u.obj;
+    o->byte_offset = (uint32_t)offset;
+    o->byte_length = (uint32_t)length;
+    apply_new_target_proto(ctx, o);
+    *ret = js_object_value(o);
+    return JS_OK;
+}
+
+static int dataview_buffer_get(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    js_object *o = dataview_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_object_value(o->view_buffer);
+    return JS_OK;
+}
+
+static int dataview_byte_offset_get(js_ctx *ctx, js_value t, int argc,
+                                    js_value *argv, js_value *ret)
+{
+    js_object *o = dataview_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_number((double)o->byte_offset);
+    return JS_OK;
+}
+
+static int dataview_byte_length_get(js_ctx *ctx, js_value t, int argc,
+                                    js_value *argv, js_value *ret)
+{
+    js_object *o = dataview_this(ctx, t);
+    (void)argc; (void)argv;
+    if (!o) return JS_THROW;
+    *ret = js_number((double)o->byte_length);
+    return JS_OK;
+}
+
+static int dataview_get_impl(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret, int kind)
+{
+    js_object *o = dataview_this(ctx, t);
+    unsigned long offset = 0;
+    int sz = dv_sizes[kind], le, i;
+    const uint8_t *p;
+    uint64_t u = 0;
+
+    if (!o) return JS_THROW;
+    if (to_index(ctx, arg(argc, argv, 0), 0xFFFFFFFFUL, &offset) != JS_OK)
+        return JS_THROW;
+    le = argc > 1 ? js_to_boolean(argv[1]) : 0;
+    if (offset > o->byte_length ||
+        (unsigned long)sz > (unsigned long)o->byte_length - offset)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Offset is outside the bounds of the DataView");
+    p = o->view_buffer->buffer + o->byte_offset + offset;
+    for (i = 0; i < sz; i++) {
+        int shift = le ? (i * 8) : ((sz - 1 - i) * 8);
+        u |= (uint64_t)p[i] << shift;
+    }
+    switch (kind) {
+    case DV_I8: {
+        uint8_t v = (uint8_t)u;
+        int8_t s;
+        memcpy(&s, &v, 1);
+        *ret = js_number((double)s);
+        break;
+    }
+    case DV_U8:
+        *ret = js_number((double)(uint8_t)u);
+        break;
+    case DV_I16: {
+        uint16_t v = (uint16_t)u;
+        int16_t s;
+        memcpy(&s, &v, 2);
+        *ret = js_number((double)s);
+        break;
+    }
+    case DV_U16:
+        *ret = js_number((double)(uint16_t)u);
+        break;
+    case DV_I32: {
+        uint32_t v = (uint32_t)u;
+        int32_t s;
+        memcpy(&s, &v, 4);
+        *ret = js_number((double)s);
+        break;
+    }
+    case DV_U32:
+        *ret = js_number((double)(uint32_t)u);
+        break;
+    case DV_F32: {
+        uint32_t v = (uint32_t)u;
+        float f;
+        memcpy(&f, &v, 4);
+        *ret = js_number((double)f);
+        break;
+    }
+    default: {
+        double d;
+        memcpy(&d, &u, 8);
+        *ret = js_number(d);
+        break;
+    }
+    }
+    return JS_OK;
+}
+
+static int dataview_set_impl(js_ctx *ctx, js_value t, int argc,
+                             js_value *argv, js_value *ret, int kind)
+{
+    js_object *o = dataview_this(ctx, t);
+    unsigned long offset = 0;
+    int sz = dv_sizes[kind], le, i;
+    uint8_t *p;
+    uint64_t u = 0;
+    double d = 0;
+    uint32_t u32 = 0;
+
+    if (!o) return JS_THROW;
+    if (to_index(ctx, arg(argc, argv, 0), 0xFFFFFFFFUL, &offset) != JS_OK)
+        return JS_THROW;
+    if (kind == DV_F32 || kind == DV_F64) {
+        if (js_to_number(ctx, arg(argc, argv, 1), &d) != JS_OK)
+            return JS_THROW;
+    } else {
+        if (js_to_uint32(ctx, arg(argc, argv, 1), &u32) != JS_OK)
+            return JS_THROW;
+    }
+    le = argc > 2 ? js_to_boolean(argv[2]) : 0;
+    if (offset > o->byte_length ||
+        (unsigned long)sz > (unsigned long)o->byte_length - offset)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "Offset is outside the bounds of the DataView");
+    switch (kind) {
+    case DV_I8:
+    case DV_U8:
+        u = u32 & 0xFFu;
+        break;
+    case DV_I16:
+    case DV_U16:
+        u = u32 & 0xFFFFu;
+        break;
+    case DV_I32:
+    case DV_U32:
+        u = u32;
+        break;
+    case DV_F32: {
+        float f = (float)d;
+        uint32_t fbits;
+        memcpy(&fbits, &f, 4);
+        u = fbits;
+        break;
+    }
+    default:
+        memcpy(&u, &d, 8);
+        break;
+    }
+    p = o->view_buffer->buffer + o->byte_offset + offset;
+    for (i = 0; i < sz; i++) {
+        int shift = le ? (i * 8) : ((sz - 1 - i) * 8);
+        p[i] = (uint8_t)((u >> shift) & 0xFFu);
+    }
+    *ret = js_undefined();
+    return JS_OK;
+}
+
+#define DEFINE_DV_ACCESSOR(name, kind) \
+    static int dataview_get_##name(js_ctx *ctx, js_value t, int argc, \
+                                   js_value *argv, js_value *ret) \
+    { return dataview_get_impl(ctx, t, argc, argv, ret, (kind)); } \
+    static int dataview_set_##name(js_ctx *ctx, js_value t, int argc, \
+                                   js_value *argv, js_value *ret) \
+    { return dataview_set_impl(ctx, t, argc, argv, ret, (kind)); }
+
+DEFINE_DV_ACCESSOR(int8, DV_I8)
+DEFINE_DV_ACCESSOR(uint8, DV_U8)
+DEFINE_DV_ACCESSOR(int16, DV_I16)
+DEFINE_DV_ACCESSOR(uint16, DV_U16)
+DEFINE_DV_ACCESSOR(int32, DV_I32)
+DEFINE_DV_ACCESSOR(uint32, DV_U32)
+DEFINE_DV_ACCESSOR(float32, DV_F32)
+DEFINE_DV_ACCESSOR(float64, DV_F64)
 
 static int arraybuffer_is_view(js_ctx *ctx, js_value t, int argc,
                                js_value *argv, js_value *ret)
 {
     (void)ctx; (void)t;
-    *ret = js_bool(argc > 0 && js_is_uint8array(argv[0]));
+    *ret = js_bool(argc > 0 &&
+                   (js_is_typedarray(argv[0]) || js_is_dataview(argv[0])));
     return JS_OK;
+}
+
+/* ================================================================== */
+/* structuredClone                                                     */
+/* ================================================================== */
+
+struct sc_entry {
+    js_object *src;
+    js_object *dst;
+};
+
+struct sc_map {
+    js_ctx          *ctx;
+    struct sc_entry *tab;
+    uint32_t         cap;
+    uint32_t         count;
+};
+
+static uint32_t sc_hash(const js_object *o)
+{
+    uintptr_t x = (uintptr_t)o >> 4;
+    return (uint32_t)(x * 2654435761u);
+}
+
+static int sc_map_init(struct sc_map *m, js_ctx *ctx)
+{
+    m->ctx = ctx;
+    m->cap = 32;
+    m->count = 0;
+    m->tab = (struct sc_entry *)js_alloc(ctx, m->cap * sizeof(struct sc_entry));
+    return m->tab ? JS_OK : JS_THROW;
+}
+
+static js_object *sc_map_find(const struct sc_map *m, const js_object *src)
+{
+    uint32_t idx = sc_hash(src) & (m->cap - 1);
+    while (m->tab[idx].src) {
+        if (m->tab[idx].src == src)
+            return m->tab[idx].dst;
+        idx = (idx + 1) & (m->cap - 1);
+    }
+    return 0;
+}
+
+static int sc_map_put(struct sc_map *m, js_object *src, js_object *dst)
+{
+    uint32_t idx;
+
+    if ((m->count + 1) * 2 >= m->cap) {
+        uint32_t ncap = m->cap * 2, i;
+        struct sc_entry *nt = (struct sc_entry *)js_alloc(
+            m->ctx, (unsigned long)ncap * sizeof(struct sc_entry));
+        if (!nt) return JS_THROW;
+        for (i = 0; i < m->cap; i++) {
+            if (!m->tab[i].src) continue;
+            idx = sc_hash(m->tab[i].src) & (ncap - 1);
+            while (nt[idx].src) idx = (idx + 1) & (ncap - 1);
+            nt[idx] = m->tab[i];
+        }
+        m->tab = nt;
+        m->cap = ncap;
+    }
+    idx = sc_hash(src) & (m->cap - 1);
+    while (m->tab[idx].src) {
+        if (m->tab[idx].src == src) {
+            m->tab[idx].dst = dst;
+            return JS_OK;
+        }
+        idx = (idx + 1) & (m->cap - 1);
+    }
+    m->tab[idx].src = src;
+    m->tab[idx].dst = dst;
+    m->count++;
+    return JS_OK;
+}
+
+static int sc_throw_dataclone(js_ctx *ctx, const char *msg)
+{
+    js_object *e = js_new_error(ctx, JS_ERR_ERROR, msg);
+    if (!e) return JS_THROW;
+    if (js_define(ctx, e, "name", js_mkcstring(ctx, "DataCloneError")) != JS_OK)
+        return JS_THROW;
+    return js_throw(ctx, js_object_value(e));
+}
+
+static int sc_clone_val(js_ctx *ctx, struct sc_map *m, js_value v, js_value *out);
+
+static int sc_clone_props(js_ctx *ctx, struct sc_map *m, js_object *src,
+                          js_object *dst)
+{
+    uint32_t i;
+
+    for (i = 0; i < src->nprops; i++) {
+        js_prop *sp = &src->props[i];
+        js_string *key;
+        js_value pv, cv;
+        js_prop *dp;
+
+        if ((sp->flags & (JS_P_DEAD | JS_P_SYMBOL)) ||
+            !(sp->flags & JS_P_ENUM))
+            continue;
+        key = sp->key;
+        if (js_step(ctx) != JS_OK ||
+            js_obj_get_key(ctx, src, key, 0, js_object_value(src), &pv) != JS_OK ||
+            sc_clone_val(ctx, m, pv, &cv) != JS_OK)
+            return JS_THROW;
+        dp = js_add_prop_key(ctx, dst, key, JS_P_DEFAULT);
+        if (!dp) return JS_THROW;
+        dp->flags = JS_P_DEFAULT;
+        dp->setter = js_undefined();
+        dp->value = cv;
+    }
+    return JS_OK;
+}
+
+static int sc_clone_obj(js_ctx *ctx, struct sc_map *m, js_object *src,
+                        js_value *out)
+{
+    js_object *dst = sc_map_find(m, src);
+    uint32_t i;
+
+    if (dst) {
+        *out = js_object_value(dst);
+        return JS_OK;
+    }
+    if (js_step(ctx) != JS_OK)
+        return JS_THROW;
+    if (ctx->depth >= ctx->cfg.max_depth)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "maximum structuredClone recursion depth exceeded");
+    ctx->depth++;
+
+    if (src->cls == JS_CLASS_DATE) {
+        dst = js_obj_alloc(ctx, JS_CLASS_DATE, ctx->proto[P_DATE]);
+        if (!dst) goto fail;
+        dst->prim = src->prim;
+        if (sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_REGEXP) {
+        dst = new_regexp_obj(ctx, src->re);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_ARRAYBUFFER) {
+        js_value ab = js_arraybuffer_new(ctx, src->buffer, src->byte_length);
+        if (!js_is_arraybuffer(ab)) goto fail;
+        dst = ab.u.obj;
+        if (sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (js_is_typedarray_cls(src->cls)) {
+        js_value cbuf;
+        if (sc_clone_val(ctx, m, js_object_value(src->view_buffer),
+                         &cbuf) != JS_OK)
+            goto fail;
+        dst = js_typedarray_view(ctx, src->cls, cbuf.u.obj,
+                                  src->byte_offset, src->view_length);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_DATAVIEW) {
+        js_value cbuf;
+        if (sc_clone_val(ctx, m, js_object_value(src->view_buffer),
+                         &cbuf) != JS_OK)
+            goto fail;
+        dst = js_obj_alloc(ctx, JS_CLASS_DATAVIEW, ctx->proto[P_DATAVIEW]);
+        if (!dst) goto fail;
+        dst->view_buffer = cbuf.u.obj;
+        dst->byte_offset = src->byte_offset;
+        dst->byte_length = src->byte_length;
+        if (sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_ARRAY) {
+        dst = js_new_array(ctx);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+        for (i = 0; i < src->elen; i++) {
+            js_value cv;
+            if (sc_clone_val(ctx, m, src->elems[i], &cv) != JS_OK ||
+                js_array_push(ctx, dst, cv) != JS_OK)
+                goto fail;
+        }
+        if (sc_clone_props(ctx, m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_MAP) {
+        dst = collection_alloc(ctx, JS_CLASS_MAP);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+        for (i = 0; i < src->collection_keys->elen; i++) {
+            js_value ck, cv;
+            if (sc_clone_val(ctx, m, src->collection_keys->elems[i], &ck) != JS_OK ||
+                sc_clone_val(ctx, m, src->collection_values->elems[i], &cv) != JS_OK ||
+                collection_store(ctx, dst, ck, cv) != JS_OK)
+                goto fail;
+        }
+    } else if (src->cls == JS_CLASS_SET) {
+        dst = collection_alloc(ctx, JS_CLASS_SET);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+        for (i = 0; i < src->collection_keys->elen; i++) {
+            js_value ck;
+            if (sc_clone_val(ctx, m, src->collection_keys->elems[i], &ck) != JS_OK ||
+                collection_store(ctx, dst, ck, ck) != JS_OK)
+                goto fail;
+        }
+    } else if (src->cls == JS_CLASS_OBJECT) {
+        dst = js_new_object(ctx);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+        if (sc_clone_props(ctx, m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_STRING || src->cls == JS_CLASS_NUMBER ||
+               src->cls == JS_CLASS_BOOLEAN) {
+        int pslot = src->cls == JS_CLASS_STRING ? P_STRING
+                  : src->cls == JS_CLASS_NUMBER ? P_NUMBER : P_BOOLEAN;
+        dst = js_obj_alloc(ctx, src->cls, ctx->proto[pslot]);
+        if (!dst) goto fail;
+        dst->prim = src->prim;
+        if (sc_map_put(m, src, dst) != JS_OK) goto fail;
+    } else if (src->cls == JS_CLASS_ERROR) {
+        js_value msgv;
+        dst = js_obj_alloc(ctx, JS_CLASS_ERROR,
+                           src->proto ? src->proto : ctx->proto[P_ERROR]);
+        if (!dst || sc_map_put(m, src, dst) != JS_OK) goto fail;
+        if (js_obj_get(ctx, src, ctx->s_message, js_object_value(src), &msgv) == JS_OK &&
+            msgv.type == JS_STRING) {
+            if (js_define(ctx, dst, "message", msgv) != JS_OK) goto fail;
+        }
+    } else {
+        ctx->depth--;
+        return sc_throw_dataclone(ctx, "object could not be cloned");
+    }
+
+    ctx->depth--;
+    *out = js_object_value(dst);
+    return JS_OK;
+fail:
+    ctx->depth--;
+    return JS_THROW;
+}
+
+static int sc_clone_val(js_ctx *ctx, struct sc_map *m, js_value v, js_value *out)
+{
+    switch (v.type) {
+    case JS_UNDEFINED:
+    case JS_NULL:
+    case JS_BOOL:
+    case JS_NUMBER:
+    case JS_STRING:
+        *out = v;
+        return JS_OK;
+    case JS_SYMBOL:
+        return sc_throw_dataclone(ctx, "Symbol could not be cloned");
+    case JS_OBJECT:
+        return sc_clone_obj(ctx, m, v.u.obj, out);
+    default:
+        return sc_throw_dataclone(ctx, "value could not be cloned");
+    }
+}
+
+static int bi_structured_clone(js_ctx *ctx, js_value t, int argc,
+                               js_value *argv, js_value *ret)
+{
+    struct sc_map map;
+    (void)t;
+
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "structuredClone requires at least 1 argument");
+    if (sc_map_init(&map, ctx) != JS_OK)
+        return JS_THROW;
+    return sc_clone_val(ctx, &map, argv[0], ret);
 }
 
 static int promise_all_item(js_ctx *ctx, js_value t, int argc,
@@ -7702,6 +9047,8 @@ int js_init_builtins(js_ctx *ctx)
     }
     for (i = P_TYPEERROR; i <= P_URIERROR; i++)
         ctx->proto[i]->proto = ctx->proto[P_ERROR];
+    for (i = P_INT8ARRAY; i <= P_FLOAT64ARRAY; i++)
+        ctx->proto[i]->proto = ctx->proto[P_TYPEDARRAY];
 
     /* ---- Symbol (registered early so prototypes can use well-known symbols) ---- */
     ctx->sym_registry = js_obj_alloc(ctx, JS_CLASS_OBJECT, 0);
@@ -7754,6 +9101,7 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(ctx->ctor_object, "fromEntries", bi_object_fromentries, 1);
     DEFN(ctx->ctor_object, "assign", bi_object_assign, 2);
     DEFN(ctx->ctor_object, "is", bi_object_is, 2);
+    DEFN(ctx->ctor_object, "hasOwn", bi_object_hasown, 2);
     DEFN(ctx->ctor_object, "getOwnPropertyNames", bi_object_names, 1);
     DEFN(ctx->ctor_object, "getOwnPropertySymbols", bi_object_getsyms, 1);
     DEFN(ctx->ctor_object, "getPrototypeOf", bi_object_getproto, 1);
@@ -7794,6 +9142,8 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "includes", bi_array_includes, 1);
     DEFN(p, "find", bi_array_find, 1);
     DEFN(p, "findIndex", bi_array_findindex, 1);
+    DEFN(p, "findLast", bi_array_findlast, 1);
+    DEFN(p, "findLastIndex", bi_array_findlastindex, 1);
     DEFN(p, "flat", bi_array_flat, 0);
     DEFN(p, "flatMap", bi_array_flatmap, 1);
     DEFN(p, "at", bi_array_at, 1);
@@ -7812,6 +9162,10 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(p, "entries", bi_array_entries, 0);
     DEFN(p, "reverse", bi_array_reverse, 0);
     DEFN(p, "sort", bi_array_sort, 1);
+    DEFN(p, "toReversed", bi_array_toreversed, 0);
+    DEFN(p, "toSorted", bi_array_tosorted, 1);
+    DEFN(p, "toSpliced", bi_array_tospliced, 2);
+    DEFN(p, "with", bi_array_with, 2);
     DEFN(p, "forEach", bi_array_foreach, 1);
     DEFN(p, "map", bi_array_map, 1);
     DEFN(p, "filter", bi_array_filter, 1);
@@ -7964,7 +9318,8 @@ int js_init_builtins(js_ctx *ctx)
     if (js_define_accessor(ctx, p, "source", bi_re_source, 0, 0) != JS_OK ||
         js_define_accessor(ctx, p, "global", bi_re_global, 0, 0) != JS_OK ||
         js_define_accessor(ctx, p, "ignoreCase", bi_re_icase, 0, 0) != JS_OK ||
-        js_define_accessor(ctx, p, "multiline", bi_re_multi, 0, 0) != JS_OK)
+        js_define_accessor(ctx, p, "multiline", bi_re_multi, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "flags", bi_re_flags, 0, 0) != JS_OK)
         return 0;
     ctx->ctor_regexp = mkctor(ctx, bi_regexp_ctor, "RegExp", 2, p);
     if (!ctx->ctor_regexp) return 0;
@@ -7986,6 +9341,9 @@ int js_init_builtins(js_ctx *ctx)
 
     /* ---- ArrayBuffer ---- */
     p = ctx->proto[P_ARRAYBUFFER];
+    if (js_define_accessor(ctx, p, "byteLength",
+                           arraybuffer_byte_length_get, 0, 0) != JS_OK)
+        return 0;
     DEFN(p, "slice", arraybuffer_slice, 2);
     {
         js_object *arraybuffer_ctor_obj =
@@ -7994,39 +9352,113 @@ int js_init_builtins(js_ctx *ctx)
         DEFN(arraybuffer_ctor_obj, "isView", arraybuffer_is_view, 1);
     }
 
-    /* ---- Uint8Array ---- */
-    p = ctx->proto[P_UINT8ARRAY];
-    if (js_define_accessor(ctx, p, "length",
-                           uint8array_length_get, 0, 0) != JS_OK ||
-        js_define_accessor(ctx, p, "byteLength",
-                           uint8array_length_get, 0, 0) != JS_OK ||
-        js_define_accessor(ctx, p, "byteOffset",
-                           uint8array_byte_offset_get, 0, 0) != JS_OK ||
-        js_define_accessor(ctx, p, "buffer",
-                           uint8array_buffer_get, 0, 0) != JS_OK)
-        return 0;
-    DEFN(p, "set", uint8array_set, 2);
-    DEFN(p, "subarray", uint8array_subarray, 2);
-    DEFN(p, "slice", uint8array_slice, 2);
-    DEFN(p, "fill", uint8array_fill, 3);
-    DEFN(p, "keys", bi_array_keys, 0);
+    /* ---- TypedArray family ---- */
     {
-        js_object *u8_vals = js_new_native(ctx, bi_array_values, "values", 0);
-        if (!u8_vals ||
-            js_define(ctx, p, "values", js_object_value(u8_vals)) != JS_OK ||
+        static const js_native ta_ctors[9] = {
+            int8array_ctor, uint8array_ctor, uint8clampedarray_ctor,
+            int16array_ctor, uint16array_ctor,
+            int32array_ctor, uint32array_ctor,
+            float32array_ctor, float64array_ctor
+        };
+        js_object *ta_base;
+        js_object *ta_vals;
+        js_prop *cp;
+
+        p = ctx->proto[P_TYPEDARRAY];
+        if (js_define_accessor(ctx, p, "length",
+                               typedarray_length_get, 0, 0) != JS_OK ||
+            js_define_accessor(ctx, p, "byteLength",
+                               typedarray_byte_length_get, 0, 0) != JS_OK ||
+            js_define_accessor(ctx, p, "byteOffset",
+                               typedarray_byte_offset_get, 0, 0) != JS_OK ||
+            js_define_accessor(ctx, p, "buffer",
+                               typedarray_buffer_get, 0, 0) != JS_OK)
+            return 0;
+        DEFN(p, "set", typedarray_set, 1);
+        DEFN(p, "subarray", typedarray_subarray, 2);
+        DEFN(p, "slice", typedarray_slice, 2);
+        DEFN(p, "fill", typedarray_fill, 1);
+        DEFN(p, "at", typedarray_at, 1);
+        DEFN(p, "forEach", typedarray_foreach, 1);
+        DEFN(p, "map", typedarray_map, 1);
+        DEFN(p, "filter", typedarray_filter, 1);
+        DEFN(p, "indexOf", typedarray_indexof, 1);
+        DEFN(p, "lastIndexOf", typedarray_lastindexof, 1);
+        DEFN(p, "includes", typedarray_includes, 1);
+        DEFN(p, "find", typedarray_find, 1);
+        DEFN(p, "findIndex", typedarray_findindex, 1);
+        DEFN(p, "findLast", typedarray_findlast, 1);
+        DEFN(p, "findLastIndex", typedarray_findlastindex, 1);
+        DEFN(p, "every", typedarray_every, 1);
+        DEFN(p, "some", typedarray_some, 1);
+        DEFN(p, "reduce", typedarray_reduce, 1);
+        DEFN(p, "reduceRight", typedarray_reduceright, 1);
+        DEFN(p, "reverse", typedarray_reverse, 0);
+        DEFN(p, "copyWithin", typedarray_copywithin, 2);
+        DEFN(p, "sort", typedarray_sort, 1);
+        DEFN(p, "toReversed", typedarray_toreversed, 0);
+        DEFN(p, "toSorted", typedarray_tosorted, 1);
+        DEFN(p, "with", typedarray_with, 2);
+        DEFN(p, "join", typedarray_join, 1);
+        DEFN(p, "toString", typedarray_tostring, 0);
+        DEFN(p, "keys", typedarray_keys, 0);
+        ta_vals = js_new_native(ctx, typedarray_values, "values", 0);
+        if (!ta_vals ||
+            js_define(ctx, p, "values", js_object_value(ta_vals)) != JS_OK ||
             js_define_symbol_prop(ctx, p, ctx->sym_iterator,
-                                  js_object_value(u8_vals),
+                                  js_object_value(ta_vals),
                                   JS_P_HIDDEN) != JS_OK)
             return 0;
+        DEFN(p, "entries", typedarray_entries, 0);
+
+        ta_base = js_new_native(ctx, typedarray_base_ctor, "TypedArray", 0);
+        if (!ta_base) return 0;
+        ta_base->fn->ctor_kind = JS_CTOR_NATIVE;
+        DEFV(ta_base, "prototype", js_object_value(p));
+        cp = js_add_prop(ctx, p, ctx->s_constructor, JS_P_HIDDEN);
+        if (!cp) return 0;
+        cp->value = js_object_value(ta_base);
+        DEFN(ta_base, "from", typedarray_from, 1);
+        DEFN(ta_base, "of", typedarray_of, 0);
+
+        for (i = 0; i < 9; i++) {
+            js_object *tp = ctx->proto[ta_specs[i].proto];
+            js_object *tc;
+            DEFV(tp, "BYTES_PER_ELEMENT", js_number((double)ta_specs[i].elem_size));
+            tc = mkctor(ctx, ta_ctors[i], ta_specs[i].name, 3, tp);
+            if (!tc) return 0;
+            tc->proto = ta_base;
+            DEFV(tc, "BYTES_PER_ELEMENT", js_number((double)ta_specs[i].elem_size));
+        }
     }
-    DEFN(p, "entries", bi_array_entries, 0);
-    DEFV(p, "BYTES_PER_ELEMENT", js_number(1));
-    {
-        js_object *uint8_ctor_obj =
-            mkctor(ctx, uint8array_ctor, "Uint8Array", 3, p);
-        if (!uint8_ctor_obj) return 0;
-        DEFV(uint8_ctor_obj, "BYTES_PER_ELEMENT", js_number(1));
-    }
+
+    /* ---- DataView ---- */
+    p = ctx->proto[P_DATAVIEW];
+    if (js_define_accessor(ctx, p, "buffer",
+                           dataview_buffer_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "byteOffset",
+                           dataview_byte_offset_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, p, "byteLength",
+                           dataview_byte_length_get, 0, 0) != JS_OK)
+        return 0;
+    DEFN(p, "getInt8", dataview_get_int8, 1);
+    DEFN(p, "getUint8", dataview_get_uint8, 1);
+    DEFN(p, "getInt16", dataview_get_int16, 1);
+    DEFN(p, "getUint16", dataview_get_uint16, 1);
+    DEFN(p, "getInt32", dataview_get_int32, 1);
+    DEFN(p, "getUint32", dataview_get_uint32, 1);
+    DEFN(p, "getFloat32", dataview_get_float32, 1);
+    DEFN(p, "getFloat64", dataview_get_float64, 1);
+    DEFN(p, "setInt8", dataview_set_int8, 2);
+    DEFN(p, "setUint8", dataview_set_uint8, 2);
+    DEFN(p, "setInt16", dataview_set_int16, 2);
+    DEFN(p, "setUint16", dataview_set_uint16, 2);
+    DEFN(p, "setInt32", dataview_set_int32, 2);
+    DEFN(p, "setUint32", dataview_set_uint32, 2);
+    DEFN(p, "setFloat32", dataview_set_float32, 2);
+    DEFN(p, "setFloat64", dataview_set_float64, 2);
+    if (!mkctor(ctx, dataview_ctor, "DataView", 1, p))
+        return 0;
 
     /* ---- Map ---- */
     p = ctx->proto[P_MAP];
@@ -8207,6 +9639,7 @@ int js_init_builtins(js_ctx *ctx)
     DEFN(g, "decodeURIComponent", bi_decodeuri, 1);
     DEFN(g, "decodeURI", bi_decodeuri, 1);
     DEFN(g, "eval", bi_eval, 1);
+    DEFN(g, "structuredClone", bi_structured_clone, 1);
     DEFV(g, "globalThis", js_object_value(g));
     return 1;
 }

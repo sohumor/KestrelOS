@@ -149,6 +149,8 @@ int  js_is_array(js_value v);
 int  js_is_promise(js_value v);
 int  js_is_arraybuffer(js_value v);
 int  js_is_uint8array(js_value v);
+int  js_is_typedarray(js_value v);
+int  js_is_dataview(js_value v);
 int  js_is_urlsearchparams(js_value v);
 
 /* Bytes of a string value; `len` may be NULL. NULL for non-strings. */
@@ -504,8 +506,14 @@ enum js_class {
     JS_CLASS_OBJECT = 0, JS_CLASS_ARRAY, JS_CLASS_FUNCTION, JS_CLASS_ERROR,
     JS_CLASS_DATE, JS_CLASS_REGEXP, JS_CLASS_STRING, JS_CLASS_NUMBER,
     JS_CLASS_BOOLEAN, JS_CLASS_ARGUMENTS, JS_CLASS_MATH, JS_CLASS_JSON,
-    JS_CLASS_PROMISE, JS_CLASS_ARRAYBUFFER, JS_CLASS_UINT8ARRAY,
+    JS_CLASS_PROMISE, JS_CLASS_ARRAYBUFFER,
+    JS_CLASS_INT8ARRAY, JS_CLASS_UINT8ARRAY, JS_CLASS_UINT8CLAMPEDARRAY,
+    JS_CLASS_INT16ARRAY, JS_CLASS_UINT16ARRAY,
+    JS_CLASS_INT32ARRAY, JS_CLASS_UINT32ARRAY,
+    JS_CLASS_FLOAT32ARRAY, JS_CLASS_FLOAT64ARRAY,
+    JS_CLASS_DATAVIEW,
     JS_CLASS_TEXTENCODER, JS_CLASS_TEXTDECODER, JS_CLASS_URLSEARCHPARAMS,
+    JS_CLASS_URL,
     JS_CLASS_MAP, JS_CLASS_SET,
     JS_CLASS_WEAKMAP, JS_CLASS_WEAKSET,
     JS_CLASS_SYMBOL,
@@ -564,6 +572,18 @@ struct js_object {
 };
 
 js_object *js_obj_alloc(js_ctx *ctx, int cls, js_object *proto);
+static inline int js_is_typedarray_cls(int cls)
+{
+    return cls >= JS_CLASS_INT8ARRAY && cls <= JS_CLASS_FLOAT64ARRAY;
+}
+int        js_typedarray_elem_size(int cls);
+double     js_typedarray_read(js_object *o, uint32_t idx);
+void       js_typedarray_write_num(js_object *o, uint32_t idx, double d);
+int        js_typedarray_write(js_ctx *ctx, js_object *o, uint32_t idx, js_value v);
+js_object *js_typedarray_view(js_ctx *ctx, int cls, js_object *buffer,
+                               uint32_t offset, uint32_t length);
+js_value   js_typedarray_new(js_ctx *ctx, int cls, const void *data,
+                             unsigned long length);
 js_object *js_uint8array_view(js_ctx *ctx, js_object *buffer,
                               uint32_t offset, uint32_t length);
 js_prop   *js_own_prop(js_object *o, js_string *key);
@@ -653,7 +673,7 @@ int js_iter_open(js_ctx *ctx, js_value iterable, js_iter *it);
 int js_iter_next(js_ctx *ctx, js_iter *it, js_value *out, int *done);
 
 /* ---- the context ---- */
-#define JS_NPROTO 29
+#define JS_NPROTO 40
 #define JS_ARGSTACK 4096        /* js_value slots shared by all call frames */
 #define JS_MAXARGS  255
 
@@ -730,7 +750,13 @@ enum {
     P_OBJECT = 0, P_FUNCTION, P_ARRAY, P_STRING, P_NUMBER, P_BOOLEAN,
     P_ERROR, P_TYPEERROR, P_RANGEERROR, P_SYNTAXERROR, P_REFERENCEERROR,
     P_EVALERROR, P_URIERROR, P_DATE, P_REGEXP, P_PROMISE, P_ARRAYBUFFER,
-    P_UINT8ARRAY, P_TEXTENCODER, P_TEXTDECODER, P_URLSEARCHPARAMS,
+    P_TYPEDARRAY,
+    P_INT8ARRAY, P_UINT8ARRAY, P_UINT8CLAMPEDARRAY,
+    P_INT16ARRAY, P_UINT16ARRAY,
+    P_INT32ARRAY, P_UINT32ARRAY,
+    P_FLOAT32ARRAY, P_FLOAT64ARRAY,
+    P_DATAVIEW,
+    P_TEXTENCODER, P_TEXTDECODER, P_URLSEARCHPARAMS, P_URL,
     P_WASM_MODULE, P_WASM_INSTANCE, P_MAP, P_SET, P_WEAKMAP, P_WEAKSET,
     P_SYMBOL
 };

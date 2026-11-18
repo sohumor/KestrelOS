@@ -476,7 +476,7 @@ static int copy_own_enum_props(js_ctx *ctx, js_object *dst, js_object *src,
             dp->setter = js_undefined();
             dp->value = src->elems[i];
         }
-    } else if (src->cls == JS_CLASS_UINT8ARRAY) {
+    } else if (js_is_typedarray_cls(src->cls)) {
         for (i = 0; i < src->view_length; i++) {
             js_string *k = index_key(ctx, i);
             js_prop *dp;
@@ -487,7 +487,7 @@ static int copy_own_enum_props(js_ctx *ctx, js_object *dst, js_object *src,
             if (!dp) return JS_THROW;
             dp->flags = JS_P_DEFAULT;
             dp->setter = js_undefined();
-            dp->value = js_number((double)src->view_buffer->buffer[src->byte_offset + i]);
+            dp->value = js_number(js_typedarray_read(src, i));
         }
     } else if (src->cls == JS_CLASS_STRING && src->prim.type == JS_STRING) {
         for (i = 0; i < src->prim.u.str->len; i++) {
@@ -4044,8 +4044,9 @@ static js_string **enum_keys(js_ctx *ctx, js_object *o, int *count)
         uint32_t i;
         js_string *k;
 
-        if (level->cls == JS_CLASS_ARRAY) {
-            for (i = 0; i < level->elen && n < JS_MAX_ENUM; i++) {
+        if (level->cls == JS_CLASS_ARRAY || js_is_typedarray_cls(level->cls)) {
+            uint32_t elen = level->cls == JS_CLASS_ARRAY ? level->elen : level->view_length;
+            for (i = 0; i < elen && n < JS_MAX_ENUM; i++) {
                 js_object *q;
                 int shadowed = 0;
                 k = index_key(ctx, i);
