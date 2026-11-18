@@ -111,9 +111,11 @@ void net_poll(void)
 void net_wait_tick(void)
 {
     net_poll();
-    if (sched_active)
+    if (sched_active) {
+        if (current && current->kill_pending)
+            return;
         task_sleep_ticks(1);
-    else
+    } else
         __asm__ volatile("hlt");
 }
 
@@ -227,6 +229,8 @@ static int arp_resolve(uint32_t ip, uint8_t *mac_out)
         while (timer_ticks() < deadline) {
             if (arp_lookup(target, mac_out))
                 return 0;
+            if (current && current->kill_pending)
+                return -1;
             net_wait_tick();
         }
     }
@@ -415,6 +419,8 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
             return got > start ? (long)((got - start) * 10) : 0;
         }
         spin_unlock_irqrestore(&ping_lock, f);
+        if (current && current->kill_pending)
+            break;
         net_wait_tick();
     }
     f = spin_lock_irqsave(&ping_lock);

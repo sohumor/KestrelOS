@@ -1,5 +1,6 @@
 #include "keyboard.h"
 #include "input.h"
+#include "kestrel_abi.h"
 #include "interrupts.h"
 #include "io.h"
 #include "random.h"
@@ -87,6 +88,10 @@ static void kbd_irq(struct regs *r)
     }
     if (alt && sc == 0x3E) {
         input_push(KEY_WM_CLOSE);
+        return;
+    }
+    if (alt && sc >= 0x02 && sc <= 0x05) {
+        input_push((uint8_t)(KEY_WM_WS1 + (sc - 0x02)));
         return;
     }
 

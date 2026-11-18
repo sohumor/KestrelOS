@@ -10,6 +10,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "pulse.h"
 
 extern void enter_usermode(uint64_t entry, uint64_t user_rsp,
                            uint64_t argc, uint64_t argv)
@@ -23,6 +24,11 @@ struct uproc_pkg {
     int argc;
     char argv[UPROC_MAX_ARGS][UPROC_ARG_MAX];
     struct k_spawn_io io;
+    int n_fds;
+    int32_t fd_nums[K_SPAWN_CAPS_MAX_FDS];
+    struct file *fds[K_SPAWN_CAPS_MAX_FDS];
+    int has_cap_mask;
+    uint64_t cap_mask;
 };
 
 /* copy_str_from_user's "no NUL within max" result; the destination still
@@ -31,30 +37,62 @@ struct uproc_pkg {
 
 /* --- exit-code ring for waitpid ------------------------------------- */
 
-#define EXIT_RING 64
+#define EXIT_RING 128
 
 static struct {
     int pid;
+    int ppid;
     long code;
+    int collected;
 } exit_ring[EXIT_RING];
 static int exit_head;
 static spinlock_t exit_lock = SPINLOCK_INIT;
 
 void uproc_record_exit(int pid, long code)
 {
+    int ppid = current ? current->parent_pid : 0;
+    const char *name = current ? current->name : "";
     uint64_t f = spin_lock_irqsave(&exit_lock);
     exit_ring[exit_head].pid = pid;
+    exit_ring[exit_head].ppid = ppid;
     exit_ring[exit_head].code = code;
+    exit_ring[exit_head].collected = 0;
     exit_head = (exit_head + 1) % EXIT_RING;
     spin_unlock_irqrestore(&exit_lock, f);
+
+    pulse_emit(K_TOPIC_PROC, K_PULSE_PROC_EXIT,
+               (uint32_t)pid, (uint32_t)code, name);
 }
 
-static int exit_lookup(int pid, long *code)
+static int exit_collect_pid(int pid, long *code)
+{
+    if (pid <= 0)
+        return 0;
+    uint64_t f = spin_lock_irqsave(&exit_lock);
+    for (int i = 0; i < EXIT_RING; i++) {
+        int idx = (exit_head - 1 - i + EXIT_RING) % EXIT_RING;
+        if (exit_ring[idx].pid == pid && !exit_ring[idx].collected) {
+            *code = exit_ring[idx].code;
+            exit_ring[idx].collected = 1;
+            spin_unlock_irqrestore(&exit_lock, f);
+            return 1;
+        }
+    }
+    spin_unlock_irqrestore(&exit_lock, f);
+    return 0;
+}
+
+static int exit_collect_any(int ppid, int *pid_out, long *code)
 {
     uint64_t f = spin_lock_irqsave(&exit_lock);
     for (int i = 0; i < EXIT_RING; i++) {
-        if (exit_ring[i].pid == pid && pid > 0) {
-            *code = exit_ring[i].code;
+        int idx = (exit_head + i) % EXIT_RING;
+        if (exit_ring[idx].pid > 0 &&
+            exit_ring[idx].ppid == ppid &&
+            !exit_ring[idx].collected) {
+            *pid_out = exit_ring[idx].pid;
+            *code = exit_ring[idx].code;
+            exit_ring[idx].collected = 1;
             spin_unlock_irqrestore(&exit_lock, f);
             return 1;
         }
@@ -69,17 +107,18 @@ long uproc_waitpid(int pid)
         return -1;
     for (;;) {
         long code;
-        int alive, done;
+        int alive;
 
-        done = exit_lookup(pid, &code);
-
-        if (done)
+        if (exit_collect_pid(pid, &code))
             return code;
         alive = task_exists(pid);
-        if (!alive && exit_lookup(pid, &code))
-            return code;
-        if (!alive)
+        if (!alive) {
+            if (exit_collect_pid(pid, &code))
+                return code;
             return -1;             /* never existed, or record overwritten */
+        }
+        if (current && current->kill_pending)
+            return -1;
         task_sleep_ticks(1);
     }
 }
@@ -91,25 +130,26 @@ long uproc_waitany(int *pid_out)
 {
     *pid_out = 0;
     for (;;) {
+        int found_pid = 0;
+        long code = -1;
+
+        if (exit_collect_any(current->pid, &found_pid, &code)) {
+            *pid_out = found_pid;
+            return code;
+        }
+
         int child_pids[64];
         int children = task_child_pids(current->pid, child_pids,
                                        (int)(sizeof(child_pids) /
                                              sizeof(child_pids[0])));
-        int found_pid = 0;
-        long code = -1;
-
-        for (int i = 0; i < children; i++) {
-            if (exit_lookup(child_pids[i], &code)) {
-                found_pid = child_pids[i];
-                break;
+        if (!children) {
+            if (exit_collect_any(current->pid, &found_pid, &code)) {
+                *pid_out = found_pid;
+                return code;
             }
+            return -1;
         }
-
-        if (found_pid) {
-            *pid_out = found_pid;
-            return code;
-        }
-        if (!children)
+        if (current && current->kill_pending)
             return -1;
         task_sleep_ticks(1);
     }
@@ -127,6 +167,8 @@ static uint8_t *slurp_file(const char *path, uint32_t *size_out)
     uint32_t got = 0;
 
     if (vfs_stat(path, &st) < 0 || st.is_dir || st.size == 0)
+        return NULL;
+    if (pmm_free_pages() <= 256 + ((uint64_t)st.size + PAGE_SIZE - 1) / PAGE_SIZE)
         return NULL;
     buf = kmalloc(st.size);
     if (!buf)
@@ -180,20 +222,41 @@ static uint64_t build_user_stack(const struct uproc_pkg *pkg,
     return sp;
 }
 
+static void free_pkg(struct uproc_pkg *pkg)
+{
+    if (!pkg)
+        return;
+    for (int i = 0; i < pkg->n_fds; i++) {
+        if (pkg->fds[i]) {
+            vfs_close(pkg->fds[i]);
+            pkg->fds[i] = NULL;
+        }
+    }
+    kfree(pkg);
+}
+
 /* Runs as the new task, still in kernel mode on its kernel stack. */
 static void user_task_thunk(void *arg)
 {
     struct uproc_pkg *pkg = arg;
     uint64_t *pml4 = NULL;
-    uint8_t *buf;
+    uint8_t *buf = NULL;
     struct file *backing = NULL;
     uint32_t fsize = 0;
     uint64_t entry, brk, argv_user, rsp, f;
     int argc;
 
+    if (pmm_free_pages() <= 256) {
+        kprintf("uproc: out of memory spawning %s\n", pkg->path);
+        goto fail;
+    }
     buf = slurp_file(pkg->path, &fsize);
     if (!buf) {
         kprintf("uproc: cannot read %s\n", pkg->path);
+        goto fail;
+    }
+    if (pmm_free_pages() <= 256) {
+        kprintf("uproc: out of memory for address space of %s\n", pkg->path);
         goto fail;
     }
 
@@ -246,6 +309,14 @@ static void user_task_thunk(void *arg)
         }
     }
 
+    for (int i = 0; i < pkg->n_fds; i++) {
+        int cfd = pkg->fd_nums[i];
+        if (current->files[cfd])
+            vfs_close(current->files[cfd]);
+        current->files[cfd] = pkg->fds[i];
+        pkg->fds[i] = NULL;
+    }
+
     current->user_heap_start = brk;
     current->user_brk = brk;
 
@@ -262,12 +333,21 @@ static void user_task_thunk(void *arg)
     rsp = build_user_stack(pkg, &argv_user);
     argc = pkg->argc;
 
-    kfree(pkg);
+    if (pkg->has_cap_mask) {
+        current->cap_mask = pkg->cap_mask;
+        if (current->uid != 0)
+            current->cap_mask &= ~KCAP_ADMIN;
+    }
+
+    free_pkg(pkg);
     kfree(buf);
+    pulse_emit(K_TOPIC_PROC, K_PULSE_PROC_SPAWN,
+               (uint32_t)current->pid, (uint32_t)current->parent_pid,
+               current->name);
     enter_usermode(entry, rsp, (uint64_t)argc, argv_user);
 
 live_fail:
-    kfree(pkg);
+    free_pkg(pkg);
     kfree(buf);
     uproc_record_exit(current->pid, -1);
     task_exit(-1);
@@ -282,19 +362,58 @@ fail:
         vfs_close(backing);
     if (buf)
         kfree(buf);
-    kfree(pkg);
+    free_pkg(pkg);
     uproc_record_exit(current->pid, -1);
     task_exit(-1);
+}
+
+static int spawn_pkg(struct uproc_pkg *pkg)
+{
+    const char *name;
+    struct task *t;
+    int pid = -1;
+
+    name = strrchr(pkg->path, '/');
+    name = name ? name + 1 : pkg->path;
+
+    /* The scheduler publishes the PID through pid_out before it releases
+     * its cross-CPU run-queue lock. The child may complete immediately
+     * after publication without leaving us to dereference a freed task. */
+    t = kthread_create_with_pid(user_task_thunk, pkg, name, &pid);
+    if (!t) {
+        free_pkg(pkg);
+        return -1;
+    }
+    return pid;
+}
+
+static int pkg_set_io(struct uproc_pkg *pkg, const char *in_path,
+                      const char *out_path, int append)
+{
+    /* A truncated redirection target would open the wrong file, so an
+     * over-long path fails the spawn instead. */
+    if (in_path && in_path[0]) {
+        if (strlen(in_path) >= sizeof(pkg->io.in_path))
+            return -1;
+        strncpy(pkg->io.in_path, in_path, sizeof(pkg->io.in_path) - 1);
+    }
+    if (out_path && out_path[0]) {
+        if (strlen(out_path) >= sizeof(pkg->io.out_path))
+            return -1;
+        strncpy(pkg->io.out_path, out_path, sizeof(pkg->io.out_path) - 1);
+    }
+    pkg->io.out_append = append ? 1 : 0;
+    return 0;
 }
 
 int uproc_spawn_io(const char *path, char *const argv[], int argc,
                    const char *in_path, const char *out_path, int append)
 {
     struct uproc_pkg *pkg;
-    struct task *t;
-    const char *name;
 
     if (!path || !path[0] || argc < 0)
+        return -1;
+    if (pmm_free_pages() <= 256)
         return -1;
     if (argc > UPROC_MAX_ARGS)
         argc = UPROC_MAX_ARGS;
@@ -308,38 +427,11 @@ int uproc_spawn_io(const char *path, char *const argv[], int argc,
         if (argv && argv[i])
             strncpy(pkg->argv[i], argv[i], UPROC_ARG_MAX - 1);
 
-    /* A truncated redirection target would open the wrong file, so an
-     * over-long path fails the spawn instead. */
-    if (in_path && in_path[0]) {
-        if (strlen(in_path) >= sizeof(pkg->io.in_path)) {
-            kfree(pkg);
-            return -1;
-        }
-        strncpy(pkg->io.in_path, in_path, sizeof(pkg->io.in_path) - 1);
-    }
-    if (out_path && out_path[0]) {
-        if (strlen(out_path) >= sizeof(pkg->io.out_path)) {
-            kfree(pkg);
-            return -1;
-        }
-        strncpy(pkg->io.out_path, out_path, sizeof(pkg->io.out_path) - 1);
-    }
-    pkg->io.out_append = append ? 1 : 0;
-
-    name = strrchr(path, '/');
-    name = name ? name + 1 : path;
-
-    /* The scheduler publishes the PID through pid_out before it releases
-     * its cross-CPU run-queue lock. The child may complete immediately
-     * after publication without leaving us to dereference a freed task. */
-    int pid = -1;
-    t = kthread_create_with_pid(user_task_thunk, pkg, name, &pid);
-
-    if (!t) {
-        kfree(pkg);
+    if (pkg_set_io(pkg, in_path, out_path, append) < 0) {
+        free_pkg(pkg);
         return -1;
     }
-    return pid;
+    return spawn_pkg(pkg);
 }
 
 int uproc_spawn(const char *path, char *const argv[], int argc)
@@ -347,49 +439,65 @@ int uproc_spawn(const char *path, char *const argv[], int argc)
     return uproc_spawn_io(path, argv, argc, NULL, NULL, 0);
 }
 
-/* Bounded copy-in of a spawn's path + argv from the current process.
- * Fills path/args/kargv; returns argc (>= 0) or -1 on a bad pointer. */
-static int spawn_args_from_user(const char *upath, char *const *uargv,
-                                char path[UPROC_PATH_MAX],
-                                char args[UPROC_MAX_ARGS][UPROC_ARG_MAX],
-                                char *kargv[UPROC_MAX_ARGS])
+/* Heap-allocated bounded copy-in of a spawn's path + argv from the current
+ * process so ~4.5 KiB of argument buffers never sit on the kernel stack. */
+static struct uproc_pkg *alloc_pkg_from_user(const char *upath,
+                                             char *const *uargv)
 {
-    int argc = 0;
+    struct uproc_pkg *pkg;
 
-    if (copy_str_from_user(path, upath, UPROC_PATH_MAX) < 0)
-        return -1;
+    if (pmm_free_pages() <= 256)
+        return NULL;
+    pkg = kzalloc(sizeof(*pkg));
+    if (!pkg)
+        return NULL;
+
+    if (copy_str_from_user(pkg->path, upath, UPROC_PATH_MAX) < 0 ||
+        !pkg->path[0])
+        goto fail;
 
     if (uargv) {
-        while (argc < UPROC_MAX_ARGS) {
+        while (pkg->argc < UPROC_MAX_ARGS) {
             uint64_t p;
-            if (copy_from_user(&p, (const uint8_t *)uargv + argc * 8, 8) < 0)
-                return -1;
+            if (copy_from_user(&p,
+                               (const uint8_t *)uargv + pkg->argc * 8, 8) < 0)
+                goto fail;
             if (!p)
                 break;
             /* An over-long argument is truncated, matching what the
              * in-kernel uproc_spawn() path does; only an unreadable
              * pointer fails the whole spawn. */
-            long n = copy_str_from_user(args[argc], (const void *)p,
-                                        UPROC_ARG_MAX);
+            long n = copy_str_from_user(pkg->argv[pkg->argc],
+                                        (const void *)p, UPROC_ARG_MAX);
             if (n < 0 && n != UPROC_COPY_TRUNC)
-                return -1;
-            kargv[argc] = args[argc];
-            argc++;
+                goto fail;
+            pkg->argc++;
         }
     }
-    return argc;
+    return pkg;
+
+fail:
+    kfree(pkg);
+    return NULL;
+}
+
+static int spawn_user_allowed(void)
+{
+    if (current && current->user && !(current->cap_mask & KCAP_SPAWN))
+        return 0;
+    return 1;
 }
 
 int uproc_spawn_from_user(const char *upath, char *const *uargv)
 {
-    char path[UPROC_PATH_MAX];
-    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
-    char *kargv[UPROC_MAX_ARGS];
-    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+    struct uproc_pkg *pkg;
 
-    if (argc < 0)
+    if (!spawn_user_allowed())
         return -1;
-    return uproc_spawn(path, argc ? kargv : NULL, argc);
+    pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg)
+        return -1;
+    return spawn_pkg(pkg);
 }
 
 /* Replace the caller with a new program. There is no fork here, so this is
@@ -399,15 +507,15 @@ int uproc_spawn_from_user(const char *upath, char *const *uargv)
  * caller does not return. */
 long uproc_exec_from_user(const char *upath, char *const *uargv)
 {
-    char path[UPROC_PATH_MAX];
-    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
-    char *kargv[UPROC_MAX_ARGS];
-    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+    struct uproc_pkg *pkg;
 
-    if (argc < 0)
+    if (!spawn_user_allowed())
+        return -1;
+    pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg)
         return -1;
 
-    int pid = uproc_spawn(path, argc ? kargv : NULL, argc);
+    int pid = spawn_pkg(pkg);
     if (pid < 0)
         return -1;
 
@@ -420,13 +528,91 @@ int uproc_spawn_io_from_user(const char *upath, char *const *uargv,
                              const char *in_path, const char *out_path,
                              int append)
 {
-    char path[UPROC_PATH_MAX];
-    char args[UPROC_MAX_ARGS][UPROC_ARG_MAX];
-    char *kargv[UPROC_MAX_ARGS];
-    int argc = spawn_args_from_user(upath, uargv, path, args, kargv);
+    struct uproc_pkg *pkg;
 
-    if (argc < 0)
+    if (!spawn_user_allowed())
         return -1;
-    return uproc_spawn_io(path, argc ? kargv : NULL, argc,
-                          in_path, out_path, append);
+    pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg)
+        return -1;
+    if (pkg_set_io(pkg, in_path, out_path, append) < 0) {
+        free_pkg(pkg);
+        return -1;
+    }
+    return spawn_pkg(pkg);
+}
+
+static int str_terminated_in(const char *s, size_t max)
+{
+    for (size_t i = 0; i < max; i++)
+        if (s[i] == '\0')
+            return 1;
+    return 0;
+}
+
+int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
+                               const struct k_spawn_caps *kcaps)
+{
+    struct uproc_pkg *pkg;
+
+    if (!spawn_user_allowed())
+        return -1;
+    if (!upath || !kcaps || kcaps->n_fds > K_SPAWN_CAPS_MAX_FDS)
+        return -1;
+    if (!str_terminated_in(kcaps->cwd, sizeof(kcaps->cwd)))
+        return -1;
+
+    pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg)
+        return -1;
+
+    for (uint32_t i = 0; i < kcaps->n_fds; i++) {
+        int32_t cfd = kcaps->fds[i].child_fd;
+        int32_t pfd = kcaps->fds[i].parent_fd;
+        if (cfd < 0 || cfd >= MAX_OPEN_FILES ||
+            pfd < 0 || pfd >= MAX_OPEN_FILES)
+            goto fail;
+
+        struct file *pf = current->files[pfd];
+        if (!pf) {
+            if (pfd >= 3)
+                goto fail;
+            pkg->fd_nums[pkg->n_fds] = cfd;
+            pkg->fds[pkg->n_fds] = NULL;
+            pkg->n_fds++;
+        } else {
+            struct file *dup = vfs_file_dup(pf);
+            if (!dup)
+                goto fail;
+            pkg->fd_nums[pkg->n_fds] = cfd;
+            pkg->fds[pkg->n_fds] = dup;
+            pkg->n_fds++;
+        }
+    }
+
+    if (kcaps->cwd[0]) {
+        int slot = -1;
+        if (pkg->argc > 0 &&
+            strncmp(pkg->argv[pkg->argc - 1], "--cwd=", 6) == 0) {
+            slot = pkg->argc - 1;
+        } else if (pkg->argc < UPROC_MAX_ARGS) {
+            slot = pkg->argc++;
+        }
+        if (slot >= 0) {
+            memcpy(pkg->argv[slot], "--cwd=", 6);
+            strncpy(pkg->argv[slot] + 6, kcaps->cwd, UPROC_ARG_MAX - 7);
+            pkg->argv[slot][UPROC_ARG_MAX - 1] = '\0';
+        }
+    }
+
+    pkg->has_cap_mask = 1;
+    pkg->cap_mask = kcaps->cap_mask
+                  ? (current->cap_mask & kcaps->cap_mask)
+                  : current->cap_mask;
+
+    return spawn_pkg(pkg);
+
+fail:
+    free_pkg(pkg);
+    return -1;
 }

@@ -12,6 +12,8 @@
 #include "uproc.h"
 #include "wm.h"
 
+#include "pulse.h"
+
 /* KestrelOS window manager / compositor.
  *
  * A window is a kernel object that owns one contiguous run of physical
@@ -72,26 +74,42 @@
 #define WM_HEAL_TICKS   50                    /* ~1 s at 50 Hz */
 
 #define WM_MAX_DAMAGE   8
+#define WM_SHADOW_PX    5
 
 /* ---------------------------------------------------------------- theme */
 
-#define C_DESKTOP       0x00090D16
-#define C_BORDER_F      0x004B6382
-#define C_BORDER_B      0x00232E3D
-#define C_TITLE_F       0x00172234
-#define C_TITLE_B       0x00131B28
-#define C_TITLE_EDGE_F  0x005BA8FF
-#define C_TITLE_EDGE_B  0x002B394D
-#define C_TEXT_F        0x00EDF4FC
-#define C_TEXT_B        0x008B9AAF
-#define C_BUTTON_F      0x0028394F
-#define C_BUTTON_B      0x001E2938
-#define C_CLOSE_F       0x00E05A65
-#define C_CLOSE_B       0x00314256
-#define C_CLOSE_X_F     0x00FFFFFF
-#define C_CLOSE_X_B     0x00B6C2D2
 #define C_CURSOR_EDGE   0x00000000
 #define C_CURSOR_FILL   0x00FFFFFF
+
+static const struct k_wm_theme wm_theme_default = {
+    .desktop_bg      = 0x00090D16,
+    .title_active    = 0x00172234,
+    .title_inactive  = 0x00131B28,
+    .border_active   = 0x004B6382,
+    .border_inactive = 0x00232E3D,
+    .accent          = 0x005BA8FF,
+    .text_active     = 0x00EDF4FC,
+    .text_inactive   = 0x008B9AAF,
+    .btn_bg          = 0x0028394F,
+    .close_bg        = 0x00E05A65,
+    .close_fg        = 0x00FFFFFF,
+    ._pad            = 0,
+};
+
+static struct k_wm_theme wm_theme = {
+    .desktop_bg      = 0x00090D16,
+    .title_active    = 0x00172234,
+    .title_inactive  = 0x00131B28,
+    .border_active   = 0x004B6382,
+    .border_inactive = 0x00232E3D,
+    .accent          = 0x005BA8FF,
+    .text_active     = 0x00EDF4FC,
+    .text_inactive   = 0x008B9AAF,
+    .btn_bg          = 0x0028394F,
+    .close_bg        = 0x00E05A65,
+    .close_fg        = 0x00FFFFFF,
+    ._pad            = 0,
+};
 
 /* 12x19 arrow. 'X' is the black outline, '.' the white body, ' ' passes
  * the background through, which is what makes it readable over anything. */
@@ -136,8 +154,13 @@ struct window {
 
     int       x, y;          /* client-area origin on screen */
     int       w, h;          /* client-area size */
+    int       orig_x, orig_y;/* pre-maximize client origin */
+    int       orig_w, orig_h;/* pre-maximize client size */
     uint32_t  flags;         /* K_WIN_* */
     bool      minimized;     /* linked but omitted from hit-test/paint */
+    bool      maximized;     /* toggled by title [+] or K_WIN_CTL_MAXIMIZE */
+    bool      pinned;        /* visible on every workspace */
+    uint8_t   workspace;     /* 0 .. K_WM_MAX_WORKSPACES - 1 */
     char      title[64];
 
     uint64_t  phys;          /* first frame of the pixel run */
@@ -162,6 +185,7 @@ static bool     full_repaint;
 static volatile bool compositing;    /* a paint pass is in flight */
 
 static int      focus = -1;          /* slot index, or -1 */
+static int      current_ws = 0;      /* active workspace 0..3 */
 static int      dragging = -1;       /* slot being dragged by the title bar */
 static int      drag_dx, drag_dy;    /* pointer offset inside the window */
 static int      press_grab = -1;     /* slot that owns the button press */
@@ -328,6 +352,13 @@ static inline bool win_decorated(const struct window *win)
     return !(win->flags & (K_WIN_NODECOR | K_WIN_DESKTOP));
 }
 
+static inline bool win_visible(const struct window *win)
+{
+    return win->used && !win->dying && !win->minimized &&
+           ((win->flags & (K_WIN_DESKTOP | K_WIN_NODECOR)) ||
+            win->pinned || (int)win->workspace == current_ws);
+}
+
 /* Outer rectangle including decorations. */
 static void win_frame(const struct window *win, struct rect *out)
 {
@@ -344,10 +375,21 @@ static void win_frame(const struct window *win, struct rect *out)
     out->h = win->h + 2 * WM_BORDER + WM_TITLE_H;
 }
 
+/* Outer bounding rectangle including decorations and drop shadow, for damage(). */
+static void win_bounds(const struct window *win, struct rect *out)
+{
+    win_frame(win, out);
+    if (win_decorated(win)) {
+        out->w += WM_SHADOW_PX;
+        out->h += WM_SHADOW_PX;
+    }
+}
+
 /* Title bar and caption buttons in screen coordinates. Button widths are
  * zero when the window is too narrow to hold usable controls. */
 static void win_title_rects(const struct window *win, struct rect *bar,
-                            struct rect *minimize, struct rect *close)
+                            struct rect *maximize, struct rect *minimize,
+                            struct rect *close)
 {
     bar->x = win->x;
     bar->y = win->y - WM_TITLE_H;
@@ -358,11 +400,22 @@ static void win_title_rects(const struct window *win, struct rect *bar,
     close->y = bar->y + (WM_TITLE_H - WM_BUTTON_SZ) / 2;
     close->w = WM_BUTTON_SZ;
     close->h = WM_BUTTON_SZ;
+
     minimize->x = close->x - WM_BUTTON_GAP - WM_BUTTON_SZ;
     minimize->y = close->y;
     minimize->w = WM_BUTTON_SZ;
     minimize->h = WM_BUTTON_SZ;
 
+    maximize->x = minimize->x - WM_BUTTON_GAP - WM_BUTTON_SZ;
+    maximize->y = close->y;
+    maximize->w = WM_BUTTON_SZ;
+    maximize->h = WM_BUTTON_SZ;
+
+    if (bar->w < 3 * WM_BUTTON_SZ + 2 * WM_BUTTON_GAP +
+                 2 * WM_BUTTON_PAD) {
+        maximize->w = 0;
+        maximize->h = 0;
+    }
     if (bar->w < 2 * WM_BUTTON_SZ + WM_BUTTON_GAP +
                  2 * WM_BUTTON_PAD) {
         minimize->w = 0;
@@ -458,13 +511,14 @@ static bool z_raise(int idx)
     return changed;
 }
 
-/* Topmost focusable window, or -1. */
+/* Topmost visible focusable window on the active workspace, or -1. */
 static int z_top_focusable(void)
 {
-    for (int i = nz - 1; i >= 0; i--)
-        if (!(wins[zord[i]].flags & K_WIN_DESKTOP) &&
-            !wins[zord[i]].minimized)
+    for (int i = nz - 1; i >= 0; i--) {
+        const struct window *win = &wins[zord[i]];
+        if (!(win->flags & K_WIN_DESKTOP) && win_visible(win))
             return zord[i];
+    }
     return -1;
 }
 
@@ -524,24 +578,28 @@ static void set_focus(int idx)
     int old;
 
     if (idx >= 0 &&
-        ((wins[idx].flags & K_WIN_DESKTOP) || wins[idx].minimized))
+        ((wins[idx].flags & K_WIN_DESKTOP) || !win_visible(&wins[idx])))
         return;                       /* the desktop layer never takes focus */
     if (focus == idx)
         return;
 
     old = focus;
-    focus = idx;
+    __atomic_store_n(&focus, idx, __ATOMIC_RELEASE);
 
     if (old >= 0 && wins[old].used && !wins[old].dying) {
         evq_push(&wins[old], KEV_FOCUS, 0, 0, 0, 0);
-        win_frame(&wins[old], &f);
+        win_bounds(&wins[old], &f);
         damage(f.x, f.y, f.w, f.h);
     }
     if (idx >= 0) {
         evq_push(&wins[idx], KEV_FOCUS, 0, 0, 1, 0);
-        win_frame(&wins[idx], &f);
+        win_bounds(&wins[idx], &f);
         damage(f.x, f.y, f.w, f.h);
     }
+    pulse_emit(K_TOPIC_WIN, K_PULSE_WIN_FOCUS,
+                  idx >= 0 ? (uint32_t)idx : (uint32_t)-1,
+                  idx >= 0 ? (uint32_t)wins[idx].pid : 0,
+                  idx >= 0 ? wins[idx].title : "");
 }
 
 /* ------------------------------------------------- clipped drawing ops */
@@ -625,14 +683,76 @@ static void caption_button(const struct rect *clip, const struct rect *r,
 
 /* ---------------------------------------------------------- compositing */
 
+static inline uint32_t darken_shadow_px(uint32_t p, int d)
+{
+    switch (d) {
+    case 0:  return p - ((p >> 2) & 0x3F3F3FU) - ((p >> 4) & 0x0F0F0FU);
+    case 1:  return p - ((p >> 2) & 0x3F3F3FU);
+    case 2:  return p - ((p >> 3) & 0x1F1F1FU) - ((p >> 4) & 0x0F0F0FU);
+    case 3:  return p - ((p >> 3) & 0x1F1F1FU);
+    default: return p - ((p >> 4) & 0x0F0F0FU);
+    }
+}
+
+static void paint_shadow(const struct window *win, const struct rect *clip)
+{
+    uint32_t *back = fb_back();
+    struct rect frame, bot, right, o;
+    int stride;
+
+    if (!back)
+        return;
+    win_frame(win, &frame);
+    stride = (int)fb_width();
+
+    /* Bottom shadow band: (wx-1..wx+w+5, wy+h+1..wy+h+6) */
+    bot.x = frame.x;
+    bot.y = frame.y + frame.h;
+    bot.w = frame.w + WM_SHADOW_PX;
+    bot.h = WM_SHADOW_PX;
+    if (rect_isect(&bot, clip, &o)) {
+        for (int r = 0; r < o.h; r++) {
+            int py = o.y + r;
+            int dy = py - bot.y;
+            uint32_t *row = back + (uint64_t)py * (uint64_t)stride;
+            for (int c = 0; c < o.w; c++) {
+                int px = o.x + c;
+                int dx = px - (frame.x + frame.w);
+                int d = dx > dy ? dx : dy;
+                row[px] = darken_shadow_px(row[px], d);
+            }
+        }
+    }
+
+    /* Right shadow band: (wx+w+1..wx+w+6, frame.y+2..wy+h+1) */
+    if (frame.h > 2) {
+        right.x = frame.x + frame.w;
+        right.y = frame.y + 2;
+        right.w = WM_SHADOW_PX;
+        right.h = frame.h - 2;
+        if (rect_isect(&right, clip, &o)) {
+            for (int r = 0; r < o.h; r++) {
+                int py = o.y + r;
+                uint32_t *row = back + (uint64_t)py * (uint64_t)stride;
+                for (int c = 0; c < o.w; c++) {
+                    int px = o.x + c;
+                    row[px] = darken_shadow_px(row[px], px - right.x);
+                }
+            }
+        }
+    }
+}
+
 static void paint_decor(const struct window *win, const struct rect *clip)
 {
-    struct rect frame, bar, minimize, close, tclip, o;
+    struct rect frame, bar, maximize, minimize, close, tclip, o;
     bool foc = (focus == win_index(win));
-    uint32_t border = foc ? C_BORDER_F : C_BORDER_B;
-    uint32_t barbg  = foc ? C_TITLE_F  : C_TITLE_B;
-    uint32_t edge   = foc ? C_TITLE_EDGE_F : C_TITLE_EDGE_B;
-    uint32_t text   = foc ? C_TEXT_F   : C_TEXT_B;
+    uint32_t border = foc ? wm_theme.border_active : wm_theme.border_inactive;
+    uint32_t barbg  = foc ? wm_theme.title_active  : wm_theme.title_inactive;
+    uint32_t edge   = foc ? wm_theme.accent        : wm_theme.border_inactive;
+    uint32_t text   = foc ? wm_theme.text_active   : wm_theme.text_inactive;
+    uint32_t mbg    = foc ? wm_theme.btn_bg        : wm_theme.border_inactive;
+    uint32_t mfg    = text;
 
     win_frame(win, &frame);
 
@@ -644,33 +764,48 @@ static void paint_decor(const struct window *win, const struct rect *clip)
     fill_clip(clip, frame.x + frame.w - WM_BORDER, frame.y, WM_BORDER,
               frame.h, border);
 
-    win_title_rects(win, &bar, &minimize, &close);
+    win_title_rects(win, &bar, &maximize, &minimize, &close);
     fill_clip(clip, bar.x, bar.y, bar.w, bar.h, barbg);
     fill_clip(clip, bar.x, bar.y + bar.h - 2, bar.w, 2, edge);
 
-    /* Title text, clipped to the space left of the close box so a long
-     * name is cut off rather than scribbled over the button. */
+    /* Title text, clipped to the space left of the caption buttons so a
+     * long name is cut off rather than scribbled over the buttons. */
     tclip.x = bar.x + WM_TITLE_PAD;
     tclip.y = bar.y;
     tclip.h = bar.h - 1;
-    tclip.w = (minimize.w ? minimize.x - 8 :
+    tclip.w = (maximize.w ? maximize.x - 8 :
+               minimize.w ? minimize.x - 8 :
                close.w ? close.x - 8 : bar.x + bar.w - 4) - tclip.x;
     if (tclip.w > 0 && rect_isect(&tclip, clip, &o))
         text_clip(&o, tclip.x, bar.y + (WM_TITLE_H - FONT_H) / 2,
                   win->title, text, barbg);
 
-    if (minimize.w) {
-        uint32_t mbg = foc ? C_BUTTON_F : C_BUTTON_B;
-        uint32_t mfg = foc ? C_TEXT_F : C_TEXT_B;
+    if (maximize.w) {
+        caption_button(clip, &maximize, mbg);
+        if (win->maximized) {
+            fill_clip(clip, maximize.x + 7, maximize.y + 4, 7, 1, mfg);
+            fill_clip(clip, maximize.x + 13, maximize.y + 4, 1, 7, mfg);
+            fill_clip(clip, maximize.x + 4, maximize.y + 7, 7, 2, mfg);
+            fill_clip(clip, maximize.x + 4, maximize.y + 13, 7, 1, mfg);
+            fill_clip(clip, maximize.x + 4, maximize.y + 7, 1, 7, mfg);
+            fill_clip(clip, maximize.x + 10, maximize.y + 7, 1, 7, mfg);
+        } else {
+            fill_clip(clip, maximize.x + 5, maximize.y + 5, 8, 2, mfg);
+            fill_clip(clip, maximize.x + 5, maximize.y + 12, 8, 1, mfg);
+            fill_clip(clip, maximize.x + 5, maximize.y + 5, 1, 8, mfg);
+            fill_clip(clip, maximize.x + 12, maximize.y + 5, 1, 8, mfg);
+        }
+    }
 
+    if (minimize.w) {
         caption_button(clip, &minimize, mbg);
         fill_clip(clip, minimize.x + 5, minimize.y + minimize.h - 6,
                   minimize.w - 10, 2, mfg);
     }
 
     if (close.w) {
-        uint32_t cbg = foc ? C_CLOSE_F : C_CLOSE_B;
-        uint32_t cfg = foc ? C_CLOSE_X_F : C_CLOSE_X_B;
+        uint32_t cbg = foc ? wm_theme.close_bg : wm_theme.border_inactive;
+        uint32_t cfg = foc ? wm_theme.close_fg : wm_theme.text_inactive;
 
         caption_button(clip, &close, cbg);
         for (int i = 5; i < close.w - 5; i++) {
@@ -683,8 +818,10 @@ static void paint_decor(const struct window *win, const struct rect *clip)
 
 static void paint_window(const struct window *win, const struct rect *clip)
 {
-    if (win_decorated(win))
+    if (win_decorated(win)) {
+        paint_shadow(win, clip);
         paint_decor(win, clip);
+    }
     blit_clip(clip, win->x, win->y, win->w, win->h, win->pix, win->w);
 }
 
@@ -736,11 +873,12 @@ static bool desktop_covers(const struct rect *clip)
 static void compose_rect(const struct rect *clip)
 {
     if (!desktop_covers(clip))
-        fb_fill_rect(clip->x, clip->y, clip->w, clip->h, C_DESKTOP);
+        fb_fill_rect(clip->x, clip->y, clip->w, clip->h,
+                     wm_theme.desktop_bg);
 
     for (int i = 0; i < nz; i++) {
         struct window *win = &wins[zord[i]];
-        if (!win->used || win->dying || win->minimized || !win->pix)
+        if (!win_visible(win) || !win->pix)
             continue;
         paint_window(win, clip);
     }
@@ -754,6 +892,7 @@ enum {
     HIT_NONE = 0,
     HIT_CLIENT,
     HIT_TITLE,
+    HIT_MAXIMIZE,
     HIT_MINIMIZE,
     HIT_CLOSE,
     HIT_FRAME,
@@ -767,9 +906,9 @@ static int hit_test(int mx, int my, int *region)
     for (int i = nz - 1; i >= 0; i--) {
         int idx = zord[i];
         struct window *win = &wins[idx];
-        struct rect frame, client, bar, minimize, close;
+        struct rect frame, client, bar, maximize, minimize, close;
 
-        if (!win->used || win->dying || win->minimized)
+        if (!win_visible(win))
             continue;
 
         win_frame(win, &frame);
@@ -783,13 +922,17 @@ static int hit_test(int mx, int my, int *region)
             return idx;
         }
         if (win_decorated(win)) {
-            win_title_rects(win, &bar, &minimize, &close);
+            win_title_rects(win, &bar, &maximize, &minimize, &close);
             if (close.w && rect_contains(&close, mx, my)) {
                 *region = HIT_CLOSE;
                 return idx;
             }
             if (minimize.w && rect_contains(&minimize, mx, my)) {
                 *region = HIT_MINIMIZE;
+                return idx;
+            }
+            if (maximize.w && rect_contains(&maximize, mx, my)) {
+                *region = HIT_MAXIMIZE;
                 return idx;
             }
             if (rect_contains(&bar, mx, my)) {
@@ -805,16 +948,32 @@ static int hit_test(int mx, int my, int *region)
 
 /* ------------------------------------------------------- input routing */
 
+static int wm_resize_window(int slot, int nw, int nh);
+
+static void switch_workspace(int ws)
+{
+    if (ws < 0 || ws >= K_WM_MAX_WORKSPACES)
+        return;
+    if (current_ws == ws)
+        return;
+    current_ws = ws;
+    dragging = -1;
+    press_grab = -1;
+    set_focus(z_top_focusable());
+    damage_all();
+    pulse_emit(K_TOPIC_WIN, K_PULSE_WIN_WS, (uint32_t)current_ws, 0, "ws");
+}
+
 static void move_window(int idx, int nx, int ny)
 {
     struct window *win = &wins[idx];
     struct rect before, after;
 
-    win_frame(win, &before);
+    win_bounds(win, &before);
     win->x = nx;
     win->y = ny;
     win_clamp(win);
-    win_frame(win, &after);
+    win_bounds(win, &after);
 
     if (before.x == after.x && before.y == after.y)
         return;
@@ -825,15 +984,15 @@ static void move_window(int idx, int nx, int ny)
 static void minimize_window(int idx)
 {
     struct window *win = &wins[idx];
-    struct rect frame;
+    struct rect bounds;
 
     if (win->minimized || (win->flags & K_WIN_DESKTOP))
         return;
-    win_frame(win, &frame);
+    win_bounds(win, &bounds);
     if (focus == idx)
         set_focus(-1);
     win->minimized = true;
-    damage(frame.x, frame.y, frame.w, frame.h);
+    damage(bounds.x, bounds.y, bounds.w, bounds.h);
     if (focus < 0)
         set_focus(z_top_focusable());
 }
@@ -841,21 +1000,76 @@ static void minimize_window(int idx)
 static void restore_window(int idx, bool activate)
 {
     struct window *win = &wins[idx];
-    struct rect frame;
+    struct rect bounds;
 
     if (win->flags & K_WIN_DESKTOP)
         return;
+    if (activate && win_decorated(win) && !win->pinned &&
+        (int)win->workspace != current_ws)
+        switch_workspace(win->workspace);
     win->minimized = false;
     z_raise(idx);
-    win_frame(win, &frame);
-    damage(frame.x, frame.y, frame.w, frame.h);
+    win_bounds(win, &bounds);
+    damage(bounds.x, bounds.y, bounds.w, bounds.h);
     if (activate)
         set_focus(idx);
 }
 
-/* Alt-Tab walks backward through the visible stack and restores a minimized
- * candidate when necessary. Captionless shell popups participate naturally,
- * which makes the launcher dismissible with the same task-switch shortcut. */
+static int toggle_maximize(int slot)
+{
+    struct window *win;
+    struct rect bounds;
+    int sw = (int)fb_width(), sh = (int)fb_height();
+
+    if (slot < 0 || slot >= WM_MAX_WINDOWS)
+        return -1;
+    win = &wins[slot];
+    if (!win->used || win->dying || (win->flags & K_WIN_DESKTOP))
+        return -1;
+
+    if (!win->maximized) {
+        int wx = 0;
+        int wy = win_decorated(win) ? (WM_DECOR_TITLE_H + 34) : 34;
+        int ww = sw;
+        int wh = sh - wy - 58;
+
+        if (wh < 48) {
+            wy = win_decorated(win) ? (WM_DECOR_TITLE_H + WM_BORDER) : 0;
+            wh = sh - wy - (win_decorated(win) ? WM_BORDER : 0);
+        }
+        if (ww < 64) ww = 64;
+        if (ww > WM_MAX_W) ww = WM_MAX_W;
+        if (wh < 48) wh = 48;
+        if (wh > WM_MAX_H) wh = WM_MAX_H;
+
+        win->orig_x = win->x;
+        win->orig_y = win->y;
+        win->orig_w = win->w;
+        win->orig_h = win->h;
+
+        if (wm_resize_window(slot, ww, wh) < 0)
+            return -1;
+        win->maximized = true;
+        move_window(slot, wx, wy);
+        win_bounds(win, &bounds);
+        damage(bounds.x, bounds.y, bounds.w, bounds.h);
+    } else {
+        int rw = imax(64, imin(WM_MAX_W, win->orig_w));
+        int rh = imax(48, imin(WM_MAX_H, win->orig_h));
+
+        if (wm_resize_window(slot, rw, rh) < 0)
+            return -1;
+        win->maximized = false;
+        move_window(slot, win->orig_x, win->orig_y);
+        win_bounds(win, &bounds);
+        damage(bounds.x, bounds.y, bounds.w, bounds.h);
+    }
+    return 0;
+}
+
+/* Alt-Tab walks backward through the current workspace stack and restores a
+ * minimized candidate when necessary. Captionless shell popups participate
+ * naturally, which makes the launcher dismissible with the same shortcut. */
 static void focus_next_window(void)
 {
     int start = nz - 1;
@@ -874,7 +1088,9 @@ static void focus_next_window(void)
             pos += nz;
         idx = zord[pos];
         if (wins[idx].used && !wins[idx].dying &&
-            !(wins[idx].flags & K_WIN_DESKTOP)) {
+            !(wins[idx].flags & K_WIN_DESKTOP) &&
+            ((wins[idx].flags & K_WIN_NODECOR) || wins[idx].pinned ||
+             (int)wins[idx].workspace == current_ws)) {
             restore_window(idx, true);
             return;
         }
@@ -905,7 +1121,7 @@ static void on_press(int mx, int my, uint32_t buttons)
     if (!(win->flags & K_WIN_DESKTOP)) {
         struct rect f;
         if (z_raise(idx)) {
-            win_frame(win, &f);
+            win_bounds(win, &f);
             damage(f.x, f.y, f.w, f.h);
         }
         set_focus(idx);
@@ -914,6 +1130,10 @@ static void on_press(int mx, int my, uint32_t buttons)
     switch (region) {
     case HIT_CLOSE:
         evq_push(win, KEV_CLOSE, 0, 0, 0, buttons);
+        break;
+    case HIT_MAXIMIZE:
+        if (buttons & K_MOUSE_LEFT)
+            toggle_maximize(idx);
         break;
     case HIT_MINIMIZE:
         if (buttons & K_MOUSE_LEFT)
@@ -978,6 +1198,18 @@ static void on_release(int mx, int my, uint32_t buttons)
     }
 }
 
+static void on_wheel(int mx, int my, uint32_t delta, uint32_t buttons)
+{
+    int region, idx = hit_test(mx, my, &region);
+
+    if (idx < 0 || region != HIT_CLIENT)
+        return;
+    struct window *win = &wins[idx];
+    if (!win_visible(win))
+        return;
+    evq_push(win, KEV_MOUSE_WHEEL, mx - win->x, my - win->y, delta, buttons);
+}
+
 static void pump_mouse(void)
 {
     struct k_event ev;
@@ -993,6 +1225,9 @@ static void pump_mouse(void)
             break;
         case KEV_MOUSE_UP:
             on_release(ev.x, ev.y, ev.buttons);
+            break;
+        case KEV_MOUSE_WHEEL:
+            on_wheel(ev.x, ev.y, ev.key, ev.buttons);
             break;
         default:
             break;
@@ -1025,6 +1260,10 @@ static void pump_keyboard(void)
         if (c == KEY_WM_CLOSE) {
             if (focus >= 0 && wins[focus].used && !wins[focus].dying)
                 evq_push(&wins[focus], KEV_CLOSE, 0, 0, 0, 0);
+            continue;
+        }
+        if (c >= KEY_WM_WS1 && c <= KEY_WM_WS4) {
+            switch_workspace(c - KEY_WM_WS1);
             continue;
         }
         if (c == KEY_LAUNCHER) {
@@ -1093,6 +1332,78 @@ static void win_release(struct window *win)
     irq_restore(f);
 }
 
+/* Caller holds wm_lock(). Dynamically reallocate and remap the pixel buffer. */
+static int wm_resize_window(int slot, int nw, int nh)
+{
+    struct window *win;
+    struct rect old_bounds, new_bounds;
+    uint64_t need, new_phys, old_phys, f;
+    uint32_t *new_pix;
+    int new_npages, old_npages, copy_w, copy_h;
+
+    if (slot < 0 || slot >= WM_MAX_WINDOWS)
+        return -1;
+    win = &wins[slot];
+    if (!win->used || win->dying || !win->pix ||
+        (win->flags & K_WIN_DESKTOP))
+        return -1;
+    if (nw < 64 || nw > WM_MAX_W || nh < 48 || nh > WM_MAX_H)
+        return -1;
+    if (nw == win->w && nh == win->h)
+        return 0;
+
+    new_npages = (int)(((uint64_t)nw * (uint64_t)nh * 4 + PAGE_SIZE - 1) /
+                       PAGE_SIZE);
+    if ((uint64_t)new_npages * PAGE_SIZE > USER_WIN_STRIDE)
+        return -1;
+    if (!owner_space_alive(win))
+        return -1;
+
+    need = (uint64_t)new_npages + (uint64_t)new_npages / 512 + 8 +
+           WM_PMM_RESERVE;
+    if (pmm_free_pages() < need)
+        return -1;
+
+    new_phys = pmm_alloc_contig(new_npages);
+    new_pix = (uint32_t *)P2V(new_phys);
+
+    copy_w = imin(win->w, nw);
+    copy_h = imin(win->h, nh);
+    for (int row = 0; row < copy_h; row++) {
+        memcpy(new_pix + (uint64_t)row * (uint64_t)nw,
+               win->pix + (uint64_t)row * (uint64_t)win->w,
+               (size_t)copy_w * sizeof(uint32_t));
+    }
+
+    win_bounds(win, &old_bounds);
+    old_phys = win->phys;
+    old_npages = win->npages;
+
+    unmap_run(win->pml4, win->uva, old_npages);
+    for (int i = 0; i < new_npages; i++)
+        vmm_map_page(win->pml4, win->uva + (uint64_t)i * PAGE_SIZE,
+                     new_phys + (uint64_t)i * PAGE_SIZE, PTE_U | PTE_W);
+
+    f = irq_save();
+    win->w = nw;
+    win->h = nh;
+    win->phys = new_phys;
+    win->npages = new_npages;
+    win->pix = new_pix;
+    bool can_free = !compositing;
+    irq_restore(f);
+
+    if (can_free && old_phys && old_npages > 0)
+        pmm_free_contig(old_phys, old_npages);
+
+    win_clamp(win);
+    win_bounds(win, &new_bounds);
+    damage(old_bounds.x, old_bounds.y, old_bounds.w, old_bounds.h);
+    damage(new_bounds.x, new_bounds.y, new_bounds.w, new_bounds.h);
+    evq_push(win, KEV_RESIZE, nw, nh, 0, 0);
+    return 0;
+}
+
 /* Fast half: take the window out of every list that the compositor and the
  * input router walk, so nothing can reach it again. Interrupts off. */
 static void win_unlink(struct window *win)
@@ -1102,7 +1413,7 @@ static void win_unlink(struct window *win)
     z_remove(idx);
     win->dying = true;
     if (focus == idx)
-        focus = -1;
+        __atomic_store_n(&focus, -1, __ATOMIC_RELEASE);
     if (dragging == idx)
         dragging = -1;
     if (press_grab == idx)
@@ -1121,18 +1432,24 @@ static int live_window_count(void)
 
 static void win_destroy(struct window *win)
 {
-    struct rect frame;
+    struct rect bounds;
+    char title[24];
+    uint32_t wid = win->wid;
+    uint32_t pid = (uint32_t)win->pid;
     bool defer;
     uint64_t f;
 
-    win_frame(win, &frame);
+    strncpy(title, win->title, sizeof(title) - 1);
+    title[sizeof(title) - 1] = '\0';
+    win_bounds(win, &bounds);
 
     f = irq_save();
     win_unlink(win);
     defer = compositing;
     irq_restore(f);
 
-    damage(frame.x, frame.y, frame.w, frame.h);
+    damage(bounds.x, bounds.y, bounds.w, bounds.h);
+    pulse_emit(K_TOPIC_WIN, K_PULSE_WIN_CLOSE, wid, pid, title);
 
     /* Focus follows the stack: hand it to whatever is now on top. */
     if (focus < 0)
@@ -1160,11 +1477,13 @@ void wm_init(void)
     memset(dmg, 0, sizeof(dmg));
     nz = 0;
     ndmg = 0;
-    active = false;
+    __atomic_store_n(&active, false, __ATOMIC_RELEASE);
     restore_console = false;
     full_repaint = false;
     compositing = false;
-    focus = -1;
+    __atomic_store_n(&focus, -1, __ATOMIC_RELEASE);
+    current_ws = 0;
+    wm_theme = wm_theme_default;
     dragging = -1;
     press_grab = -1;
     ptr_x = ptr_y = 0;
@@ -1177,6 +1496,12 @@ void wm_init(void)
 bool wm_active(void)
 {
     return __atomic_load_n(&active, __ATOMIC_ACQUIRE);
+}
+
+bool wm_keyboard_captured(void)
+{
+    return __atomic_load_n(&active, __ATOMIC_ACQUIRE) &&
+           __atomic_load_n(&focus, __ATOMIC_ACQUIRE) >= 0;
 }
 
 void wm_tick(void)
@@ -1193,7 +1518,7 @@ void wm_tick(void)
     if (restore_console) {
         f = irq_save();
         restore_console = false;
-        active = false;
+        __atomic_store_n(&active, false, __ATOMIC_RELEASE);
         ndmg = 0;
         full_repaint = false;
         irq_restore(f);
@@ -1300,6 +1625,8 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
         return -1;
     if (copy_from_user(&req, (const void *)ureq, sizeof(req)) < 0)
         return -1;
+    if (req.flags & ~(uint32_t)(K_WIN_NODECOR | K_WIN_DESKTOP))
+        return -1;
     if (!user_range_ok((const void *)uout, sizeof(info)))
         return -1;
 
@@ -1332,6 +1659,16 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
 
     wm_lock();
 
+    if (req.flags & K_WIN_DESKTOP) {
+        for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+            if (wins[i].used && !wins[i].dying &&
+                (wins[i].flags & K_WIN_DESKTOP)) {
+                wm_unlock();
+                return -1;
+            }
+        }
+    }
+
     /* Reserve the slot before the slow work so two concurrent creates
      * cannot land on the same wid (and the same user address). */
     f = irq_save();
@@ -1363,6 +1700,13 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     win->y = req.y;
     sanitize_title(win->title, req.title);
     win_clamp(win);
+    win->orig_x = win->x;
+    win->orig_y = win->y;
+    win->orig_w = win->w;
+    win->orig_h = win->h;
+    win->maximized = false;
+    win->pinned = false;
+    win->workspace = (uint8_t)current_ws;
 
     phys = pmm_alloc_contig(npages);
     for (int i = 0; i < npages; i++)
@@ -1391,7 +1735,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
 
     f = irq_save();
     if (!active) {
-        active = true;
+        __atomic_store_n(&active, true, __ATOMIC_RELEASE);
         ndmg = 0;
         full_repaint = true;
         ptr_x = pointer.x;
@@ -1400,8 +1744,10 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     z_insert(slot);
     irq_restore(f);
 
+    pulse_emit(K_TOPIC_WIN, K_PULSE_WIN_OPEN, win->wid,
+                  (uint32_t)win->pid, win->title);
     set_focus(slot);
-    win_frame(win, &frame);
+    win_bounds(win, &frame);
     damage(frame.x, frame.y, frame.w, frame.h);
     wm_unlock();
     return 0;
@@ -1554,6 +1900,14 @@ long wm_sys_list(uint64_t index, uint64_t uout)
             out.state |= K_WIN_STATE_FOCUSED;
         if (win->minimized)
             out.state |= K_WIN_STATE_MINIMIZED;
+        if (win->pinned)
+            out.state |= K_WIN_STATE_PINNED;
+        if (win->maximized)
+            out.state |= K_WIN_STATE_MAXIMIZED;
+        out.state |= ((uint32_t)(win->workspace & K_WIN_STATE_WS_MASK)
+                      << K_WIN_STATE_WS_SHIFT);
+        out.state |= ((uint32_t)(current_ws & K_WIN_STATE_WS_MASK)
+                      << K_WIN_STATE_ACTIVE_WS_SHIFT);
         strncpy(out.title, win->title, sizeof(out.title) - 1);
         wm_unlock();
         return copy_to_user((void *)uout, &out, sizeof(out)) < 0 ? -1 : 0;
@@ -1562,23 +1916,67 @@ long wm_sys_list(uint64_t index, uint64_t uout)
     return -1;
 }
 
+static void sync_window_visibility(int idx)
+{
+    struct window *win = &wins[idx];
+    struct rect bounds;
+
+    if (!win->minimized) {
+        win_bounds(win, &bounds);
+        damage(bounds.x, bounds.y, bounds.w, bounds.h);
+    }
+    if (!win->pinned && (int)win->workspace != current_ws) {
+        if (dragging == idx)
+            dragging = -1;
+        if (press_grab == idx)
+            press_grab = -1;
+        if (focus == idx)
+            set_focus(z_top_focusable());
+    }
+}
+
 long wm_sys_ctl(uint64_t wid, uint64_t action)
 {
     struct window *win;
     int idx;
 
     wm_lock();
-    if (wid >= WM_MAX_WINDOWS || !caller_is_desktop()) {
+    if (!caller_is_desktop() || !current) {
+        wm_unlock();
+        return -1;
+    }
+    if (action == K_WIN_CTL_SWITCH_WS) {
+        if (wid >= K_WM_MAX_WORKSPACES) {
+            wm_unlock();
+            return -1;
+        }
+        switch_workspace((int)wid);
+        wm_unlock();
+        return 0;
+    }
+    if (wid >= WM_MAX_WINDOWS) {
         wm_unlock();
         return -1;
     }
     win = &wins[wid];
     if (!win->used || win->dying || (win->flags & K_WIN_DESKTOP) ||
-        !current || win->uid != current->uid) {
+        win->uid != current->uid) {
         wm_unlock();
         return -1;
     }
     idx = win_index(win);
+
+    if ((action & 0xFFU) == K_WIN_CTL_MOVE_WS) {
+        uint64_t ws = action >> 8;
+        if (ws >= K_WM_MAX_WORKSPACES) {
+            wm_unlock();
+            return -1;
+        }
+        win->workspace = (uint8_t)ws;
+        sync_window_visibility(idx);
+        wm_unlock();
+        return 0;
+    }
 
     switch (action) {
     case K_WIN_CTL_FOCUS:
@@ -1591,10 +1989,67 @@ long wm_sys_ctl(uint64_t wid, uint64_t action)
     case K_WIN_CTL_CLOSE:
         evq_push(win, KEV_CLOSE, 0, 0, 0, 0);
         break;
+    case K_WIN_CTL_MAXIMIZE:
+        if (win->minimized)
+            restore_window(idx, true);
+        if (toggle_maximize(idx) < 0) {
+            wm_unlock();
+            return -1;
+        }
+        break;
+    case K_WIN_CTL_TOGGLE_PIN:
+        win->pinned = !win->pinned;
+        sync_window_visibility(idx);
+        break;
     default:
         wm_unlock();
         return -1;
     }
     wm_unlock();
     return 0;
+}
+
+long wm_sys_theme(uint64_t utheme)
+{
+    struct k_wm_theme t;
+    uint32_t uid;
+
+    if (!current)
+        return -1;
+    if (copy_from_user(&t, (const void *)utheme, sizeof(t)) < 0)
+        return -1;
+
+    wm_lock();
+    if (!caller_is_desktop() && current->uid != 0) {
+        wm_unlock();
+        return -1;
+    }
+    wm_theme = t;
+    damage_all();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        if (wins[i].used && !wins[i].dying)
+            evq_push(&wins[i], KEV_THEME, 0, 0, 0, 0);
+    }
+    uid = current->uid;
+    wm_unlock();
+
+    pulse_emit(K_TOPIC_THEME, K_PULSE_THEME_SET, uid, 0, "theme");
+    return 0;
+}
+
+long wm_sys_resize(uint64_t wid, uint64_t w, uint64_t h)
+{
+    long rc;
+
+    if (w < 64 || w > WM_MAX_W || h < 48 || h > WM_MAX_H)
+        return -1;
+
+    wm_lock();
+    if (!win_lookup(wid)) {
+        wm_unlock();
+        return -1;
+    }
+    rc = wm_resize_window((int)wid, (int)w, (int)h);
+    wm_unlock();
+    return rc;
 }

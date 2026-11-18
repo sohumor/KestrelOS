@@ -170,6 +170,10 @@ int kfs_mkdir(struct kfs_fs *fs, const char *path, uint16_t mode,
 /* Remove a file, or an empty directory. Returns 0 or -1. */
 int kfs_unlink(struct kfs_fs *fs, const char *path, uint32_t mtime);
 
+/* Move/rename a regular file within the filesystem atomically. Returns 0 or -1. */
+int kfs_rename(struct kfs_fs *fs, const char *oldpath, const char *newpath,
+               uint32_t mtime);
+
 /* Fetch the index'th valid entry (free slots skipped) of directory `ino`
  * into *out. Returns 0, or -1 past the end / on error. */
 int kfs_readdir(struct kfs_fs *fs, uint32_t ino, int index,

@@ -68,6 +68,8 @@ struct task {
     int cpu;                     /* running CPU, -1 while not running */
     int affinity;                /* -1 = any CPU; idle tasks are pinned */
     bool idle;
+    uint64_t cap_mask;
+    char unveil_prefix[64];
 };
 
 extern bool sched_active;
@@ -81,6 +83,7 @@ struct task *proc_prepare_cpu(unsigned cpu, uint64_t *stack_top);
 void schedule(void);
 void yield(void);
 void task_sleep_ticks(uint64_t t);
+void task_stop_current(void);
 __attribute__((noreturn)) void task_exit(int code);
 void task_wake_sleepers(void);
 void task_signal_wake(struct task *t, bool resume_stopped);
@@ -100,12 +103,12 @@ void task_check_kill(void);
 static inline uint64_t irq_save(void)
 {
     uint64_t f;
-    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f));
+    __asm__ volatile("pushfq; pop %0; cli" : "=r"(f) : : "memory");
     return f;
 }
 
 static inline void irq_restore(uint64_t f)
 {
     if (f & 0x200)
-        __asm__ volatile("sti");
+        __asm__ volatile("sti" : : : "memory");
 }

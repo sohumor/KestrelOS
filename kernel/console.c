@@ -5,6 +5,7 @@
 #include "fb.h"
 #include "font.h"
 #include "spinlock.h"
+#include "wm.h"
 
 /* System console: an ANSI/VT100 subset (CSI 2J/H/f/K/m/A-D and ?25l/h)
  * on top of one of two backends.
@@ -128,7 +129,7 @@ static void paint_dirty(bool blit)
 /* Called after every operation that can move the caret or change a cell. */
 static void fb_sync(void)
 {
-    if (!fb_mode)
+    if (!fb_mode || wm_active())
         return;
 
     if (drawn_row >= 0 &&
@@ -201,7 +202,7 @@ void console_set_color(uint8_t fg, uint8_t bg)
     color = fg | (bg << 4);
 }
 
-void console_clear(void)
+static void console_clear_locked(void)
 {
     for (int r = 0; r < con_h; r++)
         for (int c = 0; c < con_w; c++)
@@ -209,9 +210,12 @@ void console_clear(void)
     cur_row = 0;
     cur_col = 0;
     if (fb_mode) {
-        /* Repaint the margins outside the character grid too. */
-        fb_fill_rect(0, 0, (int)fb_width(), (int)fb_height(),
-                     cga_rgb[(color >> 4) & 0x0F]);
+        /* Repaint the margins outside the character grid too, unless the
+         * compositor currently owns the framebuffer. */
+        if (!wm_active()) {
+            fb_fill_rect(0, 0, (int)fb_width(), (int)fb_height(),
+                         cga_rgb[(color >> 4) & 0x0F]);
+        }
         for (int r = 0; r < con_h; r++)
             mark_row(r);
         drawn_row = -1;
@@ -221,8 +225,16 @@ void console_clear(void)
     fb_sync();
 }
 
+void console_clear(void)
+{
+    uint64_t flags = spin_lock_irqsave(&console_lock);
+    console_clear_locked();
+    spin_unlock_irqrestore(&console_lock, flags);
+}
+
 void console_init(void)
 {
+    uint64_t flags = spin_lock_irqsave(&console_lock);
     vga = P2V(0xB8000);
     fb_mode = fb_present();
 
@@ -254,7 +266,8 @@ void console_init(void)
 
     console_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     esc_state = ESC_NONE;
-    console_clear();
+    console_clear_locked();
+    spin_unlock_irqrestore(&console_lock, flags);
 }
 
 static void scroll(void)
@@ -262,12 +275,17 @@ static void scroll(void)
     if (fb_mode) {
         /* The shadow buffer has to agree with the grid before its pixels
          * are shifted, and the old block cursor must not be dragged
-         * along with them. */
-        if (drawn_row >= 0) {
-            mark(drawn_row, drawn_col);
+         * along with them. When the compositor owns the framebuffer, keep
+         * updating the cell grid without touching fb_back(). */
+        if (!wm_active()) {
+            if (drawn_row >= 0) {
+                mark(drawn_row, drawn_col);
+                drawn_row = -1;
+            }
+            paint_dirty(false);
+        } else {
             drawn_row = -1;
         }
-        paint_dirty(false);
 
         memmove(cell_ch[0], cell_ch[1],
                 (size_t)(con_h - 1) * CON_MAX_COLS);
@@ -278,11 +296,13 @@ static void scroll(void)
             cell_at[con_h - 1][c] = color;
         }
 
-        uint32_t *b = fb_back();
-        if (b) {
-            size_t stride = fb_width();
-            memmove(b, b + stride * FONT_H,
-                    stride * (size_t)(con_h - 1) * FONT_H * sizeof(uint32_t));
+        if (!wm_active()) {
+            uint32_t *b = fb_back();
+            if (b) {
+                size_t stride = fb_width();
+                memmove(b, b + stride * FONT_H,
+                        stride * (size_t)(con_h - 1) * FONT_H * sizeof(uint32_t));
+            }
         }
         mark_row(con_h - 1);
         full_flush = true;
@@ -351,7 +371,7 @@ static void esc_final(char c)
     switch (c) {
     case 'J':
         if (esc_param(0, 0) == 2)
-            console_clear();
+            console_clear_locked();
         break;
     case 'H':
     case 'f':

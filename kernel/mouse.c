@@ -18,6 +18,7 @@
 #include "interrupts.h"
 #include "io.h"
 #include "random.h"
+#include "spinlock.h"
 
 #define PS2_DATA   0x60
 #define PS2_STAT   0x64
@@ -58,6 +59,7 @@ static struct mouse_state ms;
 
 static struct k_event evq[EVQ_SIZE];
 static volatile unsigned ev_head, ev_tail;
+static spinlock_t mouse_lock = SPINLOCK_INIT;
 
 /* ---------------------------------------------------------------- 8042 */
 
@@ -129,7 +131,8 @@ static int aux_set_rate(uint8_t rate)
 
 /* ------------------------------------------------------------- events */
 
-static void ev_push(uint32_t type, int32_t x, int32_t y, uint32_t buttons)
+static void ev_push(uint32_t type, int32_t x, int32_t y, uint32_t key,
+                    uint32_t buttons)
 {
     /* Coalesce a run of moves so fast motion cannot flood the queue. */
     if (type == KEV_MOUSE_MOVE && ev_head != ev_tail) {
@@ -149,7 +152,7 @@ static void ev_push(uint32_t type, int32_t x, int32_t y, uint32_t buttons)
     evq[ev_head].type = type;
     evq[ev_head].x = x;
     evq[ev_head].y = y;
-    evq[ev_head].key = 0;
+    evq[ev_head].key = key;
     evq[ev_head].buttons = buttons;
     ev_head = next;
 }
@@ -168,8 +171,10 @@ static void handle_packet(void)
     int dx = (flags & 0x10) ? (int)ms.pkt[1] - 256 : (int)ms.pkt[1];
     int dy = (flags & 0x20) ? (int)ms.pkt[2] - 256 : (int)ms.pkt[2];
 
-int nx = ms.x + (dx * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
-int ny = ms.y - (dy * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
+    uint64_t f = spin_lock_irqsave(&mouse_lock);
+
+    int nx = ms.x + (dx * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
+    int ny = ms.y - (dy * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
 
     if (nx < 0) nx = 0;
     if (ny < 0) ny = 0;
@@ -185,17 +190,24 @@ int ny = ms.y - (dy * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
     ms.buttons = now;
 
     if (moved)
-        ev_push(KEV_MOUSE_MOVE, nx, ny, now);
+        ev_push(KEV_MOUSE_MOVE, nx, ny, 0, now);
 
     uint32_t changed = old ^ now;
     for (uint32_t bit = 1; bit <= K_MOUSE_MIDDLE; bit <<= 1) {
         if (!(changed & bit))
             continue;
-        ev_push((now & bit) ? KEV_MOUSE_DOWN : KEV_MOUSE_UP, nx, ny, now);
+        ev_push((now & bit) ? KEV_MOUSE_DOWN : KEV_MOUSE_UP, nx, ny, 0, now);
     }
 
-    /* pkt[3] carries the wheel delta on IntelliMouse devices; the event
-     * ABI has no scroll type yet, so it is parsed and dropped. */
+    if (ms.packet_size == 4) {
+        int dz = (int)(ms.pkt[3] & 0x0F);
+        if (dz & 8)
+            dz -= 16;
+        if (dz != 0)
+            ev_push(KEV_MOUSE_WHEEL, nx, ny, (uint32_t)(int32_t)(-dz), now);
+    }
+
+    spin_unlock_irqrestore(&mouse_lock, f);
 }
 
 static void mouse_irq(struct regs *r)
@@ -307,36 +319,33 @@ void mouse_get(struct k_mouse *out)
 {
     if (!out)
         return;
+    uint64_t f = spin_lock_irqsave(&mouse_lock);
     out->x = ms.x;
     out->y = ms.y;
     out->buttons = ms.buttons;
     out->present = ms.present ? 1 : 0;
+    spin_unlock_irqrestore(&mouse_lock, f);
 }
 
 bool mouse_pop_event(struct k_event *ev)
 {
-    uint64_t flags;
-
     if (!ev || !ms.present)
         return false;
 
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    cli();
-
+    uint64_t flags = spin_lock_irqsave(&mouse_lock);
     bool got = false;
     if (ev_head != ev_tail) {
         *ev = evq[ev_tail];
         ev_tail = (ev_tail + 1) % EVQ_SIZE;
         got = true;
     }
-
-    if (flags & 0x200)
-        sti();
+    spin_unlock_irqrestore(&mouse_lock, flags);
     return got;
 }
 
 void mouse_set_bounds(int w, int h)
 {
+    uint64_t f = spin_lock_irqsave(&mouse_lock);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
     ms.bound_w = w;
@@ -345,4 +354,5 @@ void mouse_set_bounds(int w, int h)
     if (ms.y > h - 1) ms.y = h - 1;
     if (ms.x < 0) ms.x = 0;
     if (ms.y < 0) ms.y = 0;
+    spin_unlock_irqrestore(&mouse_lock, f);
 }

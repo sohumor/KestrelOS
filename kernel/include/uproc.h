@@ -41,6 +41,10 @@ int uproc_spawn_io_from_user(const char *upath, char *const *uargv,
                              const char *in_path, const char *out_path,
                              int append);
 
+struct k_spawn_caps;
+int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
+                               const struct k_spawn_caps *kcaps);
+
 /* Exit-code ring for waitpid; record is called right before task_exit. */
 void uproc_record_exit(int pid, long code);
 long uproc_waitpid(int pid);

@@ -46,6 +46,7 @@ struct file {
 
 int  vfs_init(void);   /* register the filesystems and mount / and /dev */
 struct file *vfs_open(const char *path, int flags);
+struct file *vfs_file_dup(struct file *f);
 void vfs_close(struct file *f);
 long vfs_read(struct file *f, void *buf, unsigned long n);
 long vfs_write(struct file *f, const void *buf, unsigned long n);
@@ -54,6 +55,7 @@ int  vfs_stat(const char *path, struct k_stat *st);
 int  vfs_readdir(const char *path, int index, struct k_dirent *de);
 int  vfs_unlink(const char *path);
 int  vfs_mkdir(const char *path);
+int  vfs_rename(const char *oldpath, const char *newpath);
 
 /* Owner / permission changes. chmod needs the caller to own the file (or
  * be root); chown is root-only. Both return 0 or -1. */

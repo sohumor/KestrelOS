@@ -26,6 +26,7 @@ struct blockdev {
     char name[BLOCKDEV_NAME_MAX];   /* "hda", "ram0", ... NUL-terminated */
     uint32_t block_size;            /* bytes per block, a power of two */
     uint64_t blocks;                /* device size in blocks */
+    const char *owner;              /* owning module name, or NULL */
     void *priv;                     /* driver's own handle */
     int (*read)(struct blockdev *bd, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blockdev *bd, uint64_t lba, uint32_t count,

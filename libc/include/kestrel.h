@@ -37,8 +37,21 @@ int spawn(const char *path, char *const argv[]);     /* -> pid or -1 */
  * struct k_spawn_io's 128-byte fields returns -1. -> pid or -1 */
 int spawn_io(const char *path, char *const argv[], const char *in_path,
              const char *out_path, int append);
+int spawn_caps(const char *path, char *const argv[],
+               const struct k_spawn_caps *caps);
+int pipe_(int fds[2]);
+int dup2_(int oldfd, int newfd);
+int rename_(const char *oldpath, const char *newpath);
+int sandbox(uint64_t drop_caps, const char *unveil_prefix);
 int waitpid(int pid);                                /* blocks; -> exit code */
+int waitany(int *pid_out);                           /* blocks; -> exit code */
 int getpid(void);
+uint32_t getuid_(void);
+uint32_t getgid_(void);
+int setuid_(uint32_t uid);
+int chmod_(const char *path, uint32_t mode);
+int chown_(const char *path, uint32_t uid, uint32_t gid);
+unsigned long time_(void);
 void sleep_ms(unsigned long ms);
 void yield_(void);
 
@@ -80,6 +93,16 @@ char *ip_ntoa(uint32_t ip_be, char buf[16]);
  * Stores up to n-1 bytes plus NUL (newline not stored). Returns buf,
  * or 0 (NULL) if ctrl-D was pressed on an empty line. */
 char *readline(char *buf, int n);
+
+/* ---- Kestrel Pulses, Talon Parcels & Compositor ---- */
+int  pulse_poll(struct k_pulse_query *query, struct k_pulse *out);
+int  parcel_put(uint32_t type, const char *mime, const char *label,
+                const void *data, uint32_t size);
+long parcel_get(uint32_t slot_or_id, struct k_parcel_info *info,
+                void *buf, uint32_t bufsz);
+int  parcel_list(int index, struct k_parcel_info *info);
+int  wm_theme(const struct k_wm_theme *theme);
+int  win_resize(uint32_t wid, int w, int h);
 
 /* ---- terminal helpers (ANSI escapes on fd 1) ---- */
 #define TERM_BLACK   30

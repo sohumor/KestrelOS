@@ -1,6 +1,9 @@
 #include "kernel.h"
 #include "string.h"
 #include "net.h"
+#include "udp.h"
+#include "random.h"
+#include "proc.h"
 
 /* Minimal DNS A-record resolver over UDP port 53. */
 
@@ -56,8 +59,6 @@ static int skip_name(const uint8_t *msg, int msglen, int off)
 
 int dns_resolve(const char *name, uint32_t *ip_be)
 {
-    static uint16_t counter;
-
     if (!name || !ip_be || !name[0])
         return -1;
     if (parse_dotted(name, ip_be) == 0)
@@ -67,8 +68,7 @@ int dns_resolve(const char *name, uint32_t *ip_be)
 
     uint8_t q[DNS_MSG_MAX];
     memset(q, 0, 12);
-    counter++;
-    uint16_t id = (uint16_t)(0x4B00 ^ counter);
+    uint16_t id = (uint16_t)random_u32();
     q[0] = (uint8_t)(id >> 8);
     q[1] = (uint8_t)id;
     q[2] = 0x01;                         /* RD */
@@ -94,15 +94,31 @@ int dns_resolve(const char *name, uint32_t *ip_be)
     q[off++] = 0; q[off++] = 1;          /* QCLASS = IN */
     int qlen = off;
 
-    uint16_t sport = (uint16_t)(0xC000 + (counter & 0x0FFF));
+    uint16_t sport = 0;
+    int bound = 0;
+    for (int tries = 0; tries < 16; tries++) {
+        uint16_t cand = (uint16_t)(0xC000 + (random_u32() & 0x0FFF));
+        if (udp_bind(cand) == 0) {
+            sport = cand;
+            bound = 1;
+            break;
+        }
+    }
+    if (!bound)
+        return -1;
+
     int found = 0;
 
     for (int attempt = 0; attempt < 2 && !found; attempt++) {
+        if (current && current->kill_pending)
+            break;
         if (udp_send(net_dns_addr(), sport, 53, q, qlen) < 0)
             continue;
 
         uint8_t r[DNS_MSG_MAX];
         int n = udp_recv(sport, r, sizeof(r), 1000);
+        if (current && current->kill_pending)
+            break;
         if (n < 12)
             continue;
         if (r[0] != q[0] || r[1] != q[1])

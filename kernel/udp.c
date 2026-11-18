@@ -4,6 +4,7 @@
 #include "proc.h"
 #include "kheap.h"
 #include "net.h"
+#include "udp.h"
 #include "spinlock.h"
 
 /* UDP: port bindings with small per-port receive queues.
@@ -121,12 +122,20 @@ static struct udp_bind *bind_get(uint16_t port)
     return 0;
 }
 
+int udp_bind(uint16_t port)
+{
+    if (!net_ready() || port == 0)
+        return -1;
+    return bind_get(port) ? 0 : -1;
+}
+
 void udp_unbind(uint16_t port)
 {
+    int pid = current ? current->pid : 0;
+    bool is_kernel = (!current || !current->user);
     uint64_t f = spin_lock_irqsave(&udp_lock);
     struct udp_bind *b = bind_find_locked(port);
-    if (!b)
-    {
+    if (!b || (b->owner_pid != pid && !(b->owner_pid == 0 && is_kernel))) {
         spin_unlock_irqrestore(&udp_lock, f);
         return;
     }
@@ -221,6 +230,8 @@ int udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms)
         }
         spin_unlock_irqrestore(&udp_lock, f);
         if (timer_ticks() >= deadline)
+            return -1;
+        if (current && current->kill_pending)
             return -1;
         net_wait_tick();
     }

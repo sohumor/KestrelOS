@@ -116,6 +116,9 @@ int main(int argc, char **argv)
     if (strcmp(src, dst) == 0)
         return 0;   /* same path: nothing to do */
 
+    if (rename_(src, dst) == 0)
+        return 0;
+
     if (copy_file(src, dst) != 0)
         return 1;
 

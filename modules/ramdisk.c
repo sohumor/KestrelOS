@@ -64,6 +64,7 @@ static struct blockdev rd_dev = {
     .name = "ram0",
     .block_size = RD_BLOCK_SIZE,
     .blocks = RD_BLOCKS,
+    .owner = "ramdisk",
     .read = rd_read,
     .write = rd_write,
 };

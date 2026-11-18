@@ -2,7 +2,10 @@
 #include "string.h"
 #include "netdev.h"
 #include "net.h"
+#include "udp.h"
 #include "dhcp.h"
+#include "random.h"
+#include "pulse.h"
 
 #define DHCP_BOOTREQUEST 1
 #define DHCP_BOOTREPLY   2
@@ -51,7 +54,7 @@ int dhcp_discover(void)
     struct dhcp_packet pkt;
     memset(&pkt, 0, sizeof(pkt));
 
-    uint32_t xid = 0x3903F123u;
+    uint32_t xid = random_u32();
     pkt.op = DHCP_BOOTREQUEST;
     pkt.htype = DHCP_HTYPE_ETH;
     pkt.hlen = 6;
@@ -75,9 +78,12 @@ int dhcp_discover(void)
 
     int pkt_len = sizeof(struct dhcp_packet) - sizeof(pkt.options) + opt_idx;
 
+    if (udp_bind(68) < 0)
+        return -1;
+
     /* Send DHCPDISCOVER */
     if (udp_send(0xFFFFFFFFu, 68, 67, &pkt, pkt_len) < 0)
-        return -1;
+        goto fail;
 
     struct dhcp_packet resp;
     uint32_t offered_ip = 0, server_id = 0;
@@ -85,7 +91,7 @@ int dhcp_discover(void)
 
     int resp_len = udp_recv(68, &resp, sizeof(resp), 1500);
     if (resp_len < 240 || resp.op != DHCP_BOOTREPLY || resp.xid != htonl(xid))
-        return -1;
+        goto fail;
 
     offered_ip = resp.yiaddr;
 
@@ -117,7 +123,7 @@ int dhcp_discover(void)
     }
 
     if (msg_type != DHCPOFFER || offered_ip == 0)
-        return -1;
+        goto fail;
 
     /* Send DHCPREQUEST */
     memset(&pkt, 0, sizeof(pkt));
@@ -150,11 +156,11 @@ int dhcp_discover(void)
     pkt_len = sizeof(struct dhcp_packet) - sizeof(pkt.options) + opt_idx;
 
     if (udp_send(0xFFFFFFFFu, 68, 67, &pkt, pkt_len) < 0)
-        return -1;
+        goto fail;
 
     resp_len = udp_recv(68, &resp, sizeof(resp), 1500);
     if (resp_len < 240 || resp.op != DHCP_BOOTREPLY || resp.xid != htonl(xid))
-        return -1;
+        goto fail;
 
     opts = resp.options;
     max_opts = resp_len - (sizeof(struct dhcp_packet) - sizeof(resp.options));
@@ -186,5 +192,10 @@ int dhcp_discover(void)
         return -1;
 
     net_configure(offered_ip, mask, gw, dns);
+    pulse_emit(K_TOPIC_NET, K_PULSE_NET_CHANGE, offered_ip, 1, "dhcp");
     return 0;
+
+fail:
+    udp_unbind(68);
+    return -1;
 }

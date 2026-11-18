@@ -2,6 +2,9 @@
 #include "interrupts.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "wm.h"
+
+extern bool wm_keyboard_captured(void) __attribute__((weak));
 
 #define BUFSZ 512
 
@@ -46,12 +49,17 @@ int input_trygetc(void)
 int input_getc(void)
 {
     for (;;) {
-        int c = input_trygetc();
-        if (c >= 0)
-            return c;
-        if (sched_active)
-            yield();
-        else
+        if (!(wm_keyboard_captured && wm_keyboard_captured())) {
+            int c = input_trygetc();
+            if (c >= 0)
+                return c;
+        }
+        if (sched_active) {
+            if (current && current->kill_pending)
+                return -1;
+            task_sleep_ticks(1);
+        } else {
             __asm__ volatile("sti; hlt");
+        }
     }
 }

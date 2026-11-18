@@ -4,6 +4,11 @@
 #include "vfs.h"
 #include "mount.h"
 #include "blockdev.h"
+#include "config.h"
+#include "module.h"
+#include "wm.h"
+
+extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "kheap.h"
 #include "string.h"
 #include "proc.h"
@@ -371,13 +376,26 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
                      (vfs_flags_allow_write(flags) ? VFS_W : 0)))
         return NULL;
 
-    df = devfile_new(DEV_BLOCKDEV, flags);
-    if (df == NULL)
+#ifdef CONFIG_MODULES
+    if (bd->owner != NULL && module_get(bd->owner) != 0)
         return NULL;
+#endif
+    df = devfile_new(DEV_BLOCKDEV, flags);
+    if (df == NULL) {
+#ifdef CONFIG_MODULES
+        if (bd->owner != NULL)
+            module_put(bd->owner);
+#endif
+        return NULL;
+    }
     df->bd = bd;
     df->bounce = kmalloc(bd->block_size);
     if (df->bounce == NULL || handle_register(df) < 0) {
         devfile_free(df);
+#ifdef CONFIG_MODULES
+        if (bd->owner != NULL)
+            module_put(bd->owner);
+#endif
         return NULL;
     }
     return &df->f;
@@ -386,11 +404,18 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
 static void devfs_op_close(struct file *f)
 {
     struct devfile *df = (struct devfile *)f;
+    const char *owner = NULL;
 
     if (df == NULL)
         return;
+    if (df->dev == DEV_BLOCKDEV && df->bd != NULL)
+        owner = df->bd->owner;
     handle_unregister(df);
     devfile_free(df);
+#ifdef CONFIG_MODULES
+    if (owner != NULL)
+        module_put(owner);
+#endif
 }
 
 /* --- reads ------------------------------------------------------------- */
@@ -406,10 +431,12 @@ static long read_console(void *buf, unsigned long n)
     /* Block for the first byte, then drain whatever else is queued. */
     int c = input_getc();
     if (c < 0)
-        return 0;
+        return (current && current->kill_pending) ? -1 : 0;
     p[i++] = (uint8_t)c;
 
     while (i < n) {
+        if (wm_keyboard_captured && wm_keyboard_captured())
+            break;
         c = input_trygetc();
         if (c < 0)
             break;

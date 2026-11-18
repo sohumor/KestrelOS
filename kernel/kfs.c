@@ -953,6 +953,7 @@ static int lookup_parent(struct kfs_fs *fs, const char *path, char *name)
  * its work through the *_locked helpers, which never take it again. */
 
 static int truncate_locked(struct kfs_fs *fs, uint32_t ino, uint32_t mtime);
+static int inode_is_open(struct kfs_fs *fs, uint32_t ino);
 
 static int create_locked(struct kfs_fs *fs, const char *path, uint16_t mode,
                          uint32_t uid, uint32_t gid, uint32_t mtime)
@@ -1046,6 +1047,8 @@ static int unlink_locked(struct kfs_fs *fs, const char *path, uint32_t mtime)
         return -1;
     if (ip.type == KFS_TYPE_DIR && !dir_is_empty(fs, ino))
         return -1;
+    if (inode_is_open(fs, ino))
+        return -1;              /* still open: the slot must not be reused */
     /* Detach the name first: a failing dir_remove() must never leave an
      * entry pointing at an inode slot that has already been freed. */
     if (dir_remove(fs, (uint32_t)parent, name, mtime) < 0)
@@ -1063,6 +1066,91 @@ int kfs_unlink(struct kfs_fs *fs, const char *path, uint32_t mtime)
     fs_lock();
     int r = fs->mounted && journal_begin(fs) == 0
                 ? unlink_locked(fs, path, mtime) : -1;
+    if (r == 0) {
+        if (journal_commit(fs) < 0)
+            r = -1;
+    } else {
+        journal_abort();
+    }
+    fs_unlock();
+    return r;
+}
+
+static int rename_locked(struct kfs_fs *fs, const char *oldpath,
+                         const char *newpath, uint32_t mtime)
+{
+    char oldname[60], newname[60];
+    struct kfs_inode src_ip, dst_ip;
+    struct kfs_dirent de;
+    uint32_t old_slot = 0, dst_slot = 0;
+
+    int old_parent = lookup_parent(fs, oldpath, oldname);
+    int new_parent = lookup_parent(fs, newpath, newname);
+    if (old_parent < 0 || new_parent < 0)
+        return -1;
+    if (strcmp(oldname, ".") == 0 || strcmp(oldname, "..") == 0 ||
+        strcmp(newname, ".") == 0 || strcmp(newname, "..") == 0)
+        return -1;
+    if ((uint32_t)old_parent == (uint32_t)new_parent &&
+        strcmp(oldname, newname) == 0)
+        return -1;
+
+    uint32_t src_ino = dir_lookup(fs, (uint32_t)old_parent, oldname,
+                                  &old_slot);
+    if (!src_ino || iget(fs, src_ino, &src_ip) < 0)
+        return -1;
+    if (src_ip.type != KFS_TYPE_FILE)
+        return -1;
+
+    uint32_t dst_ino = dir_lookup(fs, (uint32_t)new_parent, newname,
+                                  &dst_slot);
+    if (dst_ino) {
+        if (dst_ino == src_ino || iget(fs, dst_ino, &dst_ip) < 0)
+            return -1;
+        if (dst_ip.type != KFS_TYPE_FILE)
+            return -1;
+        if (inode_is_open(fs, dst_ino))
+            return -1;
+
+        memset(&de, 0, sizeof(de));
+        de.ino = src_ino;
+        strncpy(de.name, newname, sizeof(de.name) - 1);
+        if (writei(fs, (uint32_t)new_parent, dst_slot, &de, sizeof(de),
+                   mtime) != sizeof(de))
+            return -1;
+        if (dir_remove(fs, (uint32_t)old_parent, oldname, mtime) < 0)
+            return -1;
+        if (truncate_locked(fs, dst_ino, mtime) < 0)
+            return -1;
+        ifree(fs, dst_ino);
+        return 0;
+    }
+
+    if ((uint32_t)old_parent == (uint32_t)new_parent) {
+        memset(&de, 0, sizeof(de));
+        de.ino = src_ino;
+        strncpy(de.name, newname, sizeof(de.name) - 1);
+        if (writei(fs, (uint32_t)old_parent, old_slot, &de, sizeof(de),
+                   mtime) != sizeof(de))
+            return -1;
+        return 0;
+    }
+
+    if (dir_add(fs, (uint32_t)new_parent, newname, src_ino, mtime) < 0)
+        return -1;
+    if (dir_remove(fs, (uint32_t)old_parent, oldname, mtime) < 0)
+        return -1;
+    return 0;
+}
+
+int kfs_rename(struct kfs_fs *fs, const char *oldpath, const char *newpath,
+               uint32_t mtime)
+{
+    if (fs == NULL || oldpath == NULL || newpath == NULL)
+        return -1;
+    fs_lock();
+    int r = fs->mounted && journal_begin(fs) == 0
+                ? rename_locked(fs, oldpath, newpath, mtime) : -1;
     if (r == 0) {
         if (journal_commit(fs) < 0)
             r = -1;
@@ -1609,6 +1697,10 @@ static struct file *kfs_op_open(struct mount *m, const char *path, int flags)
 
     if (inode_ref(fs, (uint32_t)ino) < 0)
         return NULL;
+    if (kfs_lookup_in(fs, (uint32_t)parent, name) != ino) {
+        inode_unref(fs, (uint32_t)ino);
+        return NULL;
+    }
 
     if ((flags & O_TRUNC) && ip.type == KFS_TYPE_FILE) {
         if (kfs_truncate(fs, (uint32_t)ino, vfs_now()) < 0) {
@@ -1760,7 +1852,7 @@ static int kfs_op_unlink(struct mount *m, const char *path)
     struct kfs_fs *fs = mount_fs(m);
     struct kfs_inode dirp;
     char name[KFS_NAME_MAX + 1];
-    int parent, ino;
+    int parent;
 
     if (fs == NULL || path == NULL)
         return -1;
@@ -1769,11 +1861,6 @@ static int kfs_op_unlink(struct mount *m, const char *path)
         return -1;
     if (!perm_ok(&dirp, VFS_W | VFS_X))
         return -1;
-    ino = kfs_lookup_in(fs, (uint32_t)parent, name);
-    if (ino < 0)
-        return -1;
-    if (inode_is_open(fs, (uint32_t)ino))
-        return -1;              /* still open: the slot must not be reused */
     return kfs_unlink(fs, path, vfs_now());
 }
 
@@ -1793,6 +1880,31 @@ static int kfs_op_mkdir(struct mount *m, const char *path)
         return -1;
     return kfs_mkdir(fs, path, KFS_DEFAULT_DIR_MODE, vfs_uid(), vfs_gid(),
                      vfs_now());
+}
+
+static int kfs_op_rename(struct mount *m, const char *oldpath,
+                         const char *newpath)
+{
+    struct kfs_fs *fs = mount_fs(m);
+    struct kfs_inode old_dirp, new_dirp;
+    char oldname[KFS_NAME_MAX + 1], newname[KFS_NAME_MAX + 1];
+    int old_parent, new_parent;
+
+    if (fs == NULL || oldpath == NULL || newpath == NULL)
+        return -1;
+    old_parent = resolve(fs, oldpath, 1, oldname);
+    if (old_parent < 0 || kfs_iget(fs, (uint32_t)old_parent, &old_dirp) < 0)
+        return -1;
+    if (!perm_ok(&old_dirp, VFS_W | VFS_X))
+        return -1;
+
+    new_parent = resolve(fs, newpath, 1, newname);
+    if (new_parent < 0 || kfs_iget(fs, (uint32_t)new_parent, &new_dirp) < 0)
+        return -1;
+    if (!perm_ok(&new_dirp, VFS_W | VFS_X))
+        return -1;
+
+    return kfs_rename(fs, oldpath, newpath, vfs_now());
 }
 
 static int kfs_op_chmod(struct mount *m, const char *path, uint32_t mode)
@@ -1879,6 +1991,7 @@ static struct fs_ops kfs_ops = {
     .readdir = kfs_op_readdir,
     .unlink  = kfs_op_unlink,
     .mkdir   = kfs_op_mkdir,
+    .rename  = kfs_op_rename,
     .chmod   = kfs_op_chmod,
     .chown   = kfs_op_chown,
     .statfs  = kfs_op_statfs,

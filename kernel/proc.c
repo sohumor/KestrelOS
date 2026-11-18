@@ -85,7 +85,7 @@ int task_signal_pid(int pid, int sig, uint32_t sender_uid,
     int rc = signal_queue_task(t, sig);
     if (rc == 0 &&
         (t->state == TASK_SLEEPING ||
-         (sig == SIGCONT && t->state == TASK_STOPPED)))
+         ((sig == SIGCONT || sig == SIGKILL) && t->state == TASK_STOPPED)))
         t->state = TASK_RUNNABLE;
     spin_unlock_irqrestore(&sched_lock, flags);
     return rc;
@@ -267,10 +267,10 @@ static void schedule_locked(uint64_t flags)
         return;
     }
 
-    if (prev->state == TASK_RUNNING) {
+    if (prev->state == TASK_RUNNING)
         prev->state = TASK_RUNNABLE;
+    if (prev->state != TASK_RUNNING)
         prev->cpu = -1;
-    }
     pick->state = TASK_RUNNING;
     pick->cpu = (int)cpu;
     smp_set_current_task(pick);
@@ -307,6 +307,22 @@ void task_sleep_ticks(uint64_t t)
     current->cpu = -1;
     current->sleep_until = timer_ticks() + t;
     schedule_locked(f);
+}
+
+void task_stop_current(void)
+{
+    uint64_t flags = irq_save();
+    spin_lock(&sched_lock);
+    if (!current || current->kill_pending ||
+        (__atomic_load_n(&current->sig_pending, __ATOMIC_SEQ_CST) &
+         ((1ULL << (SIGKILL - 1)) | (1ULL << (SIGCONT - 1))))) {
+        spin_unlock(&sched_lock);
+        irq_restore(flags);
+        return;
+    }
+    current->state = TASK_STOPPED;
+    current->cpu = -1;
+    schedule_locked(flags);
 }
 
 void task_exit(int code)
@@ -374,11 +390,21 @@ struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
     t->parent_pid = current ? current->pid : 0;
     t->cpu = -1;
     t->affinity = -1;
+    t->cap_mask = KCAP_ALL;
+    t->unveil_prefix[0] = '\0';
     /* Children run as their parent, so the VFS permission checks mean
      * something once login drops privileges. */
     if (current) {
         t->uid = current->uid;
         t->gid = current->gid;
+        if (current->user) {
+            t->cap_mask = current->cap_mask;
+            strncpy(t->unveil_prefix, current->unveil_prefix,
+                    sizeof(t->unveil_prefix) - 1);
+            t->unveil_prefix[sizeof(t->unveil_prefix) - 1] = '\0';
+        }
+        if (t->uid != 0)
+            t->cap_mask &= ~KCAP_ADMIN;
     }
     fpu_attach(t);
     if (!t->kstack || !t->fpu_alloc) {
@@ -428,6 +454,8 @@ struct task *proc_prepare_cpu(unsigned cpu, uint64_t *stack_top)
     t->idle = true;
     t->affinity = (int)cpu;
     t->cpu = (int)cpu;
+    t->cap_mask = KCAP_ALL;
+    t->unveil_prefix[0] = '\0';
     strncpy(t->name, "idle/ap", TASK_NAME_MAX - 1);
     fpu_attach(t);
     if (!t->kstack || !t->fpu_alloc) {
@@ -469,7 +497,7 @@ int task_kill(struct task *t)
         return -1;
     }
     t->kill_pending = 1;
-    if (t->state == TASK_SLEEPING)
+    if (t->state == TASK_SLEEPING || t->state == TASK_STOPPED)
         t->state = TASK_RUNNABLE;    /* so it reaches its next checkpoint */
     spin_unlock_irqrestore(&sched_lock, flags);
     signal_send(t, SIGKILL);
@@ -516,6 +544,8 @@ void proc_init(void)
     t->idle = false;
     t->affinity = 0;
     t->cpu = 0;
+    t->cap_mask = KCAP_ALL;
+    t->unveil_prefix[0] = '\0';
     fpu_attach(t);
     smp_set_current_task(t);
     all_tasks = t;

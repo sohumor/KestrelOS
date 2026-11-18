@@ -56,7 +56,7 @@ int signal_send(struct task *t, int sig)
     int rc = signal_queue_task(t, sig);
     if (rc < 0)
         return rc;
-    task_signal_wake(t, sig == SIGCONT);
+    task_signal_wake(t, sig == SIGCONT || sig == SIGKILL);
     return 0;
 }
 
@@ -119,8 +119,7 @@ void signal_deliver_pending(struct task *t, struct regs *r)
 
         if (action.handler == SIG_DFL) {
             if (default_stops(sig)) {
-                t->state = TASK_STOPPED;
-                schedule();
+                task_stop_current();
                 continue;           /* resumes here after SIGCONT */
             }
             terminate_for_signal(t, sig);

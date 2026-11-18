@@ -282,8 +282,8 @@ static int slurp_dynamic(const char *path, uint8_t **image_out,
     uint8_t *buf;
     uint32_t done = 0;
 
-    if (vfs_stat(path, &st) < 0 || st.is_dir || st.size == 0 ||
-        st.size > ELF_MAX_FILE_SIZE)
+    if (vfs_stat(path, &st) < 0 || st.is_dir ||
+        st.size < sizeof(struct elf64_ehdr) || st.size > ELF_MAX_FILE_SIZE)
         return -1;
     f = vfs_open(path, O_RDONLY);
     if (!f)
@@ -450,8 +450,12 @@ static int dynamic_link(struct task *task, struct dyn_object *objects,
             dep->base = ELF_DSO_BASE +
                         (uint64_t)(count - 1) * ELF_DSO_STRIDE;
             strncpy(dep->name, name, sizeof(dep->name) - 1);
-            if (!ehdr_valid(dep->eh) || dep->eh->e_type != ELF_ET_DYN)
+            if (dep->size < sizeof(struct elf64_ehdr) ||
+                !ehdr_valid(dep->eh) || dep->eh->e_type != ELF_ET_DYN) {
+                vfs_close(dep->backing);
+                dep->backing = NULL;
                 return -1;
+            }
 
             task->vm_files[task->vm_file_count++] = dep->backing;
             if (register_segments(task, dep, max_end) < 0)

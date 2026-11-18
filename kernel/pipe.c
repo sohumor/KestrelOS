@@ -104,7 +104,7 @@ static unsigned long ring_put(struct pipe *p, const uint8_t *src,
     return done;
 }
 
-long pipe_read(struct file *f, void *buf, unsigned long n)
+long pipe_read_ex(struct file *f, void *buf, unsigned long n, int blocking)
 {
     struct pipe *p;
     unsigned long got;
@@ -125,15 +125,22 @@ long pipe_read(struct file *f, void *buf, unsigned long n)
             spin_unlock_irqrestore(&p->lock, fl);
             return (long)got;
         }
-        if (p->writers <= 0) {
+        if (p->writers <= 0 || !blocking) {
             spin_unlock_irqrestore(&p->lock, fl);
-            return 0;           /* EOF: last writer closed */
+            return 0;           /* EOF or non-blocking empty */
         }
         spin_unlock_irqrestore(&p->lock, fl);
+        if (current && current->kill_pending)
+            return -1;
         /* Empty but still writable: wait. task_sleep_ticks() is safe here
          * because the pipe holds no lock of its own. */
         task_sleep_ticks(1);
     }
+}
+
+long pipe_read(struct file *f, void *buf, unsigned long n)
+{
+    return pipe_read_ex(f, buf, n, 1);
 }
 
 long pipe_write(struct file *f, const void *buf, unsigned long n)
@@ -164,6 +171,8 @@ long pipe_write(struct file *f, const void *buf, unsigned long n)
             continue;
         }
         spin_unlock_irqrestore(&p->lock, fl);
+        if (current && current->kill_pending)
+            return -1;
         task_sleep_ticks(1);    /* full: wait for the reader to drain it */
     }
     return (long)done;

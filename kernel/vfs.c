@@ -174,6 +174,67 @@ int vfs_flags_allow_write(int flags)
     return acc == O_WRONLY || acc == O_RDWR;
 }
 
+static int unveil_canon_path(const char *path, char *out, size_t outsz)
+{
+    size_t len = 1;
+    const char *p = path;
+
+    if (!path || path[0] != '/' || outsz < 2)
+        return -1;
+    out[0] = '/';
+    out[1] = '\0';
+
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (*p == '\0')
+            break;
+        const char *start = p;
+        while (*p && *p != '/')
+            p++;
+        size_t clen = (size_t)(p - start);
+        if (clen == 1 && start[0] == '.')
+            continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.') {
+            while (len > 1 && out[len - 1] != '/')
+                len--;
+            if (len > 1)
+                len--;
+            out[len] = '\0';
+            continue;
+        }
+        if (len > 1) {
+            if (len + 1 >= outsz)
+                return -1;
+            out[len++] = '/';
+        }
+        if (len + clen >= outsz)
+            return -1;
+        memcpy(out + len, start, clen);
+        len += clen;
+        out[len] = '\0';
+    }
+    return 0;
+}
+
+static int unveil_allows(const char *path)
+{
+    char canon[256];
+    char prefix[64];
+
+    if (!current || current->unveil_prefix[0] == '\0')
+        return 1;
+    if (unveil_canon_path(current->unveil_prefix, prefix, sizeof(prefix)) < 0)
+        return 0;
+    if (unveil_canon_path(path, canon, sizeof(canon)) < 0)
+        return 0;
+    if (prefix[0] == '/' && prefix[1] == '\0')
+        return 1;
+    size_t plen = strlen(prefix);
+    return strncmp(canon, prefix, plen) == 0 &&
+           (canon[plen] == '\0' || canon[plen] == '/');
+}
+
 /* --- pipes as ordinary handles ---------------------------------------
  * pipe.c owns the ring buffer; the ops vector below is what lets a pipe
  * end travel the same read/write path as a file. Seek is absent, so
@@ -248,7 +309,7 @@ struct file *vfs_open(const char *path, int flags)
     struct mount *m;
     struct file *f;
 
-    if (path == NULL)
+    if (path == NULL || !unveil_allows(path))
         return NULL;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->open == NULL)
@@ -266,7 +327,7 @@ int vfs_stat(const char *path, struct k_stat *st)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || st == NULL)
+    if (path == NULL || st == NULL || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->stat == NULL)
@@ -279,7 +340,7 @@ int vfs_readdir(const char *path, int index, struct k_dirent *de)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || de == NULL || index < 0)
+    if (path == NULL || de == NULL || index < 0 || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->readdir == NULL)
@@ -292,7 +353,7 @@ int vfs_unlink(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL)
+    if (path == NULL || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->unlink == NULL)
@@ -305,7 +366,7 @@ int vfs_mkdir(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL)
+    if (path == NULL || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->mkdir == NULL)
@@ -313,12 +374,30 @@ int vfs_mkdir(const char *path)
     return m->type->ops->mkdir(m, rel);
 }
 
+int vfs_rename(const char *oldpath, const char *newpath)
+{
+    const char *oldrel, *newrel;
+    struct mount *oldm, *newm;
+
+    if (oldpath == NULL || newpath == NULL)
+        return -1;
+    if (!unveil_allows(oldpath) || !unveil_allows(newpath))
+        return -1;
+    oldm = mount_resolve(oldpath, &oldrel);
+    newm = mount_resolve(newpath, &newrel);
+    if (oldm == NULL || newm == NULL || oldm != newm)
+        return -1;
+    if (oldm->type->ops->rename == NULL)
+        return -1;
+    return oldm->type->ops->rename(oldm, oldrel, newrel);
+}
+
 int vfs_chmod(const char *path, uint32_t mode)
 {
     const char *rel;
     struct mount *m;
 
-    if (path == NULL)
+    if (path == NULL || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chmod == NULL)
@@ -331,7 +410,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL)
+    if (path == NULL || !unveil_allows(path))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chown == NULL)
@@ -346,12 +425,22 @@ int vfs_exec_ok(const char *path)
 {
     struct k_stat st;
 
+    if (path == NULL || !unveil_allows(path))
+        return 0;
     if (vfs_stat(path, &st) < 0 || st.is_dir)
         return 0;
     return vfs_perm_ok(st.mode, st.uid, st.gid, VFS_X) ? 1 : 0;
 }
 
 /* --- handle dispatch -------------------------------------------------- */
+
+struct file *vfs_file_dup(struct file *f)
+{
+    if (f == NULL)
+        return NULL;
+    __atomic_add_fetch(&f->refs, 1, __ATOMIC_ACQ_REL);
+    return f;
+}
 
 void vfs_close(struct file *f)
 {

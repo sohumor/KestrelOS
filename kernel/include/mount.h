@@ -61,6 +61,7 @@ struct fs_ops {
                     struct k_dirent *de);
     int  (*unlink)(struct mount *m, const char *path);
     int  (*mkdir)(struct mount *m, const char *path);
+    int  (*rename)(struct mount *m, const char *oldrel, const char *newrel);
     int  (*chmod)(struct mount *m, const char *path, uint32_t mode);
     int  (*chown)(struct mount *m, const char *path, uint32_t uid,
                   uint32_t gid);

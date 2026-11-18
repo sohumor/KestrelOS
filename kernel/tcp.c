@@ -7,6 +7,7 @@
 #include "tcp.h"
 #include "tcp_reassembly.h"
 #include "spinlock.h"
+#include "random.h"
 
 /* TCP (client side).
  *
@@ -950,10 +951,7 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
         return -1;
     }
 
-    /* ISN from the tick counter mixed with the local port: enough to keep
-     * two connections on the same port pair from sharing a sequence space. */
-    uint32_t isn = (uint32_t)(timer_ticks() * 62500u) ^
-                   (((uint32_t)lport << 16) | (uint32_t)lport);
+    uint32_t isn = random_u32();
 
     f = spin_lock_irqsave(&tcp_lock);
     c->state = TCP_SYN_SENT;
@@ -1007,6 +1005,8 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
         if (reset || state == TCP_CLOSED)
             break;
         if (timer_ticks() >= deadline)
+            break;
+        if (current && current->kill_pending)
             break;
         conn_pump(c);                 /* SYN retransmission */
         net_wait_tick();
@@ -1079,6 +1079,8 @@ int tcp_send(int handle, const void *buf, int len)
         conn_pump(c);
         if (timer_ticks() >= deadline)
             break;
+        if (current && current->kill_pending)
+            return -1;
         net_wait_tick();
     }
 
@@ -1134,6 +1136,8 @@ int tcp_recv(int handle, void *buf, int max, int timeout_ms)
         conn_pump(c);
         if (timer_ticks() >= deadline)
             return -1;
+        if (current && current->kill_pending)
+            return -1;
         net_wait_tick();
     }
 }
@@ -1167,6 +1171,8 @@ int tcp_close(int handle)
                     c->state == TCP_TIME_WAIT;
         spin_unlock_irqrestore(&tcp_lock, f);
         if (done)
+            break;
+        if (current && current->kill_pending)
             break;
         net_wait_tick();
     }

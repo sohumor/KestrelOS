@@ -25,11 +25,13 @@ struct pipe {
  * (nothing allocated) on failure. Close each end with vfs_close(). */
 int pipe_create(struct file **read_end, struct file **write_end);
 
-/* Read/write a pipe end. Called only from vfs_read()/vfs_write(), which
- * dispatch on f->type; buf must be a kernel buffer.
- *   read:  blocks while empty and a writer exists, 0 at EOF, -1 on misuse
+/* Read/write a pipe end. Called only from vfs_read()/vfs_write() or
+ * non-blocking syscall paths; buf must be a kernel buffer.
+ *   read:  blocks while empty and a writer exists (if blocking != 0),
+ *          0 at EOF (or when empty and blocking == 0), -1 on misuse/kill
  *   write: blocks while full and a reader exists, -1 when the readers are
- *          all gone before anything was written */
+ *          all gone before anything was written or on kill */
+long pipe_read_ex(struct file *f, void *buf, unsigned long n, int blocking);
 long pipe_read(struct file *f, void *buf, unsigned long n);
 long pipe_write(struct file *f, const void *buf, unsigned long n);
 

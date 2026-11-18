@@ -25,6 +25,9 @@
 #include "random.h"
 #include "vm.h"
 #include "signal.h"
+#include "kheap.h"
+#include "pulse.h"
+#include "parcel.h"
 #include "string.h"
 #include "kestrel_abi.h"
 #include "smp.h"
@@ -37,7 +40,7 @@ extern void (*user_fault_hook)(struct regs *r);
 
 #define USER_VA_LIMIT 0x0000800000000000ULL
 #define COPY_CHUNK    256
-#define FILE_CHUNK    512
+#define FILE_CHUNK    4096
 #define UDP_MAX       1400
 #define BRK_CEILING   (USER_STACK_TOP - (64ULL << 20))
 #define BRK_MAX_GROW  16384          /* pages per call: 64 MiB */
@@ -112,9 +115,20 @@ static struct file *fd_file(uint64_t fd)
     return current->files[fd];
 }
 
+static void *alloc_io_chunk(uint8_t stack_buf[COPY_CHUNK], uint64_t *max_out)
+{
+    void *p = kmalloc(FILE_CHUNK);
+    if (p) {
+        *max_out = FILE_CHUNK;
+        return p;
+    }
+    *max_out = COPY_CHUNK;
+    return stack_buf;
+}
+
 static long sys_write(uint64_t fd, uint64_t ubuf, uint64_t len)
 {
-    char chunk[FILE_CHUNK];
+    uint8_t small[COPY_CHUNK];
     uint64_t done = 0;
 
     if ((fd == 1 || fd == 2) && !current->files[fd]) {
@@ -122,9 +136,9 @@ static long sys_write(uint64_t fd, uint64_t ubuf, uint64_t len)
             uint64_t n = len - done;
             if (n > COPY_CHUNK)
                 n = COPY_CHUNK;
-            if (copy_from_user(chunk, (const void *)(ubuf + done), n) < 0)
+            if (copy_from_user(small, (const void *)(ubuf + done), n) < 0)
                 return done ? (long)done : -1;
-            output_write(chunk, (unsigned long)n);
+            output_write((const char *)small, (unsigned long)n);
             done += n;
         }
         return (long)done;
@@ -133,25 +147,33 @@ static long sys_write(uint64_t fd, uint64_t ubuf, uint64_t len)
     struct file *f = fd_file(fd);
     if (!f)
         return -1;
+    uint64_t chunk_sz = 0;
+    uint8_t *chunk = alloc_io_chunk(small, &chunk_sz);
     while (done < len) {
         uint64_t n = len - done;
-        if (n > FILE_CHUNK)
-            n = FILE_CHUNK;
-        if (copy_from_user(chunk, (const void *)(ubuf + done), n) < 0)
+        if (n > chunk_sz)
+            n = chunk_sz;
+        if (copy_from_user(chunk, (const void *)(ubuf + done), n) < 0) {
+            if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
+        }
         long w = vfs_write(f, chunk, n);
-        if (w < 0)
+        if (w < 0) {
+            if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
+        }
         done += (uint64_t)w;
         if ((uint64_t)w < n)
             break;
     }
+    if (chunk != small)
+        kfree(chunk);
     return (long)done;
 }
 
 static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
 {
-    uint8_t chunk[FILE_CHUNK];
+    uint8_t small[COPY_CHUNK];
 
     if (len == 0)
         return 0;
@@ -160,15 +182,19 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
         /* Raw console bytes, special keys arrive as values >= 0x80. */
         uint64_t want = len > COPY_CHUNK ? COPY_CHUNK : len;
         uint64_t got = 0;
-        if (blocking)
-            chunk[got++] = (uint8_t)input_getc();
+        if (blocking) {
+            int ch = input_getc();
+            if (ch < 0)
+                return -1;
+            small[got++] = (uint8_t)ch;
+        }
         while (got < want) {
             int c = input_trygetc();
             if (c < 0)
                 break;
-            chunk[got++] = (uint8_t)c;
+            small[got++] = (uint8_t)c;
         }
-        if (got && copy_to_user((void *)ubuf, chunk, got) < 0)
+        if (got && copy_to_user((void *)ubuf, small, got) < 0)
             return -1;
         return (long)got;
     }
@@ -176,28 +202,43 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
     struct file *f = fd_file(fd);
     if (!f)
         return -1;
+    uint64_t chunk_sz = 0;
+    uint8_t *chunk = alloc_io_chunk(small, &chunk_sz);
     uint64_t done = 0;
     while (done < len) {
         uint64_t n = len - done;
-        if (n > FILE_CHUNK)
-            n = FILE_CHUNK;
-        long g = vfs_read(f, chunk, n);
-        if (g < 0)
+        if (n > chunk_sz)
+            n = chunk_sz;
+        long g = (f->type == FILE_PIPE)
+                     ? pipe_read_ex(f, chunk, n, blocking)
+                     : vfs_read(f, chunk, n);
+        if (g < 0) {
+            if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
+        }
         if (g == 0)
             break;
-        if (copy_to_user((void *)(ubuf + done), chunk, (uint64_t)g) < 0)
+        if (copy_to_user((void *)(ubuf + done), chunk, (uint64_t)g) < 0) {
+            if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
+        }
         done += (uint64_t)g;
-        if ((uint64_t)g < n)
+        if (f->type == FILE_PIPE || (uint64_t)g < n)
             break;
     }
+    if (chunk != small)
+        kfree(chunk);
     return (long)done;
 }
 
 static long sys_open(uint64_t upath, uint64_t flags)
 {
     char path[UPROC_PATH_MAX];
+    if (!(current->cap_mask & KCAP_FS_READ))
+        return -1;
+    if ((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
+        !(current->cap_mask & KCAP_FS_WRITE))
+        return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
     struct file *f = vfs_open(path, (int)flags);
@@ -390,6 +431,8 @@ static long sys_rtc(uint64_t urtc)
 
 static long sys_power(uint64_t action)
 {
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+        return -1;
     switch (action) {
     case K_POWER_REBOOT:
         kprintf("power: reboot requested by %s (pid %d)\n",
@@ -425,13 +468,13 @@ static long sys_pipe(uint64_t ufds)
     if (pipe_create(&rd, &wr) < 0)
         return -1;
 
-    fds[0] = fd_alloc_from(0, rd);
+    fds[0] = fd_alloc_from(3, rd);
     if (fds[0] < 0) {
         vfs_close(rd);
         vfs_close(wr);
         return -1;
     }
-    fds[1] = fd_alloc_from(0, wr);
+    fds[1] = fd_alloc_from(3, wr);
     if (fds[1] < 0) {
         current->files[fds[0]] = NULL;
         vfs_close(rd);
@@ -471,10 +514,12 @@ static long sys_dup2(uint64_t oldfd, uint64_t newfd)
 
 static long sys_setuid(uint64_t uid)
 {
-    if (current->uid != 0)
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
         return -1;                   /* only root may change identity */
     current->uid = (uint32_t)uid;
     current->gid = (uint32_t)uid;
+    if (uid != 0)
+        current->cap_mask &= ~KCAP_ADMIN;
     return 0;
 }
 
@@ -522,7 +567,7 @@ static long sys_insmod(uint64_t upath)
 {
     char path[UPROC_PATH_MAX];
 
-    if (current->uid != 0)
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -533,7 +578,7 @@ static long sys_rmmod(uint64_t uname)
 {
     char name[MODULE_NAME_MAX];
 
-    if (current->uid != 0)
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(name, (const void *)uname, sizeof(name)) < 0)
         return -1;
@@ -562,7 +607,7 @@ static long sys_mount(uint64_t upath, uint64_t utype, uint64_t udev)
 {
     char path[UPROC_PATH_MAX], type[32], dev[32];
 
-    if (current->uid != 0)
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -581,7 +626,7 @@ static long sys_umount(uint64_t upath)
 {
     char path[UPROC_PATH_MAX];
 
-    if (current->uid != 0)
+    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -713,7 +758,7 @@ static long sys_waitany(uint64_t upid)
 
 static long sys_getrandom(uint64_t ubuf, uint64_t len, uint64_t flags)
 {
-    uint8_t chunk[FILE_CHUNK];
+    uint8_t chunk[COPY_CHUNK];
     uint64_t done = 0;
     unsigned rflags = 0;
 
@@ -744,6 +789,201 @@ static long sys_swapinfo(uint64_t utotal, uint64_t uused)
         copy_to_user((void *)uused, &used_kb, sizeof(used_kb)) < 0)
         return -1;
     return 0;
+}
+
+static int sandbox_norm_prefix(const char *in, char *out, size_t cap)
+{
+    size_t len = 1;
+    const char *p = in;
+
+    if (!in || !out || cap < 2 || in[0] != '/')
+        return -1;
+    out[0] = '/';
+    out[1] = '\0';
+
+    while (*p) {
+        while (*p == '/')
+            p++;
+        if (*p == '\0')
+            break;
+        const char *start = p;
+        while (*p && *p != '/')
+            p++;
+        size_t clen = (size_t)(p - start);
+        if (clen == 1 && start[0] == '.')
+            continue;
+        if (clen == 2 && start[0] == '.' && start[1] == '.')
+            return -1;
+        if (len > 1) {
+            if (len + 1 >= cap)
+                return -1;
+            out[len++] = '/';
+        }
+        if (len + clen >= cap)
+            return -1;
+        memcpy(out + len, start, clen);
+        len += clen;
+        out[len] = '\0';
+    }
+    return 0;
+}
+
+static long sys_spawn_caps(uint64_t upath, uint64_t uargv, uint64_t ucaps)
+{
+    struct k_spawn_caps kcaps;
+
+    if (!(current->cap_mask & KCAP_SPAWN) || ucaps == 0)
+        return -1;
+    if (copy_from_user(&kcaps, (const void *)ucaps, sizeof(kcaps)) < 0)
+        return -1;
+    return uproc_spawn_caps_from_user((const char *)upath,
+                                      (char *const *)uargv, &kcaps);
+}
+
+static long sys_sandbox(uint64_t drop_caps, uint64_t uprefix)
+{
+    char raw[sizeof(current->unveil_prefix)];
+    char norm[sizeof(current->unveil_prefix)];
+
+    if (uprefix != 0) {
+        if (copy_str_from_user(raw, (const void *)uprefix, sizeof(raw)) < 0)
+            return -1;
+        if (sandbox_norm_prefix(raw, norm, sizeof(norm)) < 0)
+            return -1;
+        if (current->unveil_prefix[0] != '\0' &&
+            strcmp(current->unveil_prefix, "/") != 0) {
+            size_t plen = strlen(current->unveil_prefix);
+            if (strncmp(norm, current->unveil_prefix, plen) != 0 ||
+                (norm[plen] != '\0' && norm[plen] != '/'))
+                return -1;
+        }
+        memcpy(current->unveil_prefix, norm, sizeof(norm));
+    }
+
+    current->cap_mask &= ~(drop_caps & KCAP_ALL);
+    return 0;
+}
+
+static long sys_rename(uint64_t uold, uint64_t unew)
+{
+    char oldp[UPROC_PATH_MAX], newp[UPROC_PATH_MAX];
+
+    if (!(current->cap_mask & KCAP_FS_WRITE))
+        return -1;
+    if (copy_str_from_user(oldp, (const void *)uold, sizeof(oldp)) < 0)
+        return -1;
+    if (copy_str_from_user(newp, (const void *)unew, sizeof(newp)) < 0)
+        return -1;
+    return vfs_rename(oldp, newp);
+}
+
+static long sys_pulse_poll(uint64_t uquery, uint64_t uout)
+{
+    struct k_pulse_query q;
+    struct k_pulse *kout = NULL;
+
+    if (!(current->cap_mask & KCAP_IPC))
+        return -1;
+    if (copy_from_user(&q, (const void *)uquery, sizeof(q)) < 0)
+        return -1;
+
+    uint32_t limit = q.max_out > 64 ? 64 : q.max_out;
+    if (limit > 0 && uout == 0)
+        return -1;
+    if (limit > 0) {
+        kout = kmalloc((size_t)limit * sizeof(*kout));
+        if (!kout)
+            return -1;
+    }
+
+    long n = pulse_poll(&q, kout);
+    if (n > 0 && copy_to_user((void *)uout, kout, (size_t)n * sizeof(*kout)) < 0) {
+        kfree(kout);
+        return -1;
+    }
+    if (n >= 0 && copy_to_user((void *)uquery, &q, sizeof(q)) < 0) {
+        kfree(kout);
+        return -1;
+    }
+    kfree(kout);
+    return n;
+}
+
+static long sys_parcel_put(uint64_t ureq)
+{
+    struct k_parcel_put req;
+    void *kbuf = NULL;
+
+    if (!(current->cap_mask & KCAP_IPC))
+        return -1;
+    if (copy_from_user(&req, (const void *)ureq, sizeof(req)) < 0)
+        return -1;
+    if (req.size > K_PARCEL_MAX_BYTES)
+        return -1;
+    if (req.size > 0) {
+        kbuf = kmalloc(req.size);
+        if (!kbuf)
+            return -1;
+        if (copy_from_user(kbuf, (const void *)req.data, req.size) < 0) {
+            kfree(kbuf);
+            return -1;
+        }
+    }
+
+    long id = parcel_put(&req, kbuf);
+    kfree(kbuf);
+    return id;
+}
+
+static long sys_parcel_get(uint64_t slot_or_id, uint64_t uinfo,
+                           uint64_t ubuf, uint64_t bufsz)
+{
+    struct k_parcel_info kinfo;
+    void *kbuf = NULL;
+
+    if (!(current->cap_mask & KCAP_IPC))
+        return -1;
+    if (uinfo == 0 && (ubuf == 0 || bufsz == 0))
+        return -1;
+
+    uint32_t want = bufsz > K_PARCEL_MAX_BYTES
+                  ? K_PARCEL_MAX_BYTES : (uint32_t)bufsz;
+    if (ubuf != 0 && want > 0) {
+        kbuf = kmalloc(want);
+        if (!kbuf)
+            return -1;
+    }
+
+    long copied = parcel_get((uint32_t)slot_or_id, &kinfo, kbuf, kbuf ? want : 0);
+    if (copied >= 0) {
+        if (uinfo != 0 && copy_to_user((void *)uinfo, &kinfo, sizeof(kinfo)) < 0) {
+            kfree(kbuf);
+            return -1;
+        }
+        if (copied > 0 && ubuf != 0 &&
+            copy_to_user((void *)ubuf, kbuf, (size_t)copied) < 0) {
+            kfree(kbuf);
+            return -1;
+        }
+    }
+    kfree(kbuf);
+    return copied;
+}
+
+static long sys_parcel_list(uint64_t index, uint64_t uinfo)
+{
+    struct k_parcel_info kinfo;
+
+    if (!(current->cap_mask & KCAP_IPC) || uinfo == 0)
+        return -1;
+    if (parcel_list((uint32_t)index, &kinfo) < 0)
+        return -1;
+    return copy_to_user((void *)uinfo, &kinfo, sizeof(kinfo)) < 0 ? -1 : 0;
+}
+
+static int cap_has(uint64_t cap)
+{
+    return (current->cap_mask & cap) != 0;
 }
 
 /* --- dispatcher ------------------------------------------------------- */
@@ -782,10 +1022,11 @@ static void syscall_dispatch(struct regs *r)
         break;
     }
     case SYS_SPAWN:
-        ret = uproc_spawn_from_user((const char *)a1, (char *const *)a2);
+        ret = cap_has(KCAP_SPAWN)
+            ? uproc_spawn_from_user((const char *)a1, (char *const *)a2) : -1;
         break;
     case SYS_SPAWN_IO:
-        ret = sys_spawn_io(a1, a2, a3);
+        ret = cap_has(KCAP_SPAWN) ? sys_spawn_io(a1, a2, a3) : -1;
         break;
     case SYS_WAITPID:
         ret = uproc_waitpid((int)a1);
@@ -804,16 +1045,16 @@ static void syscall_dispatch(struct regs *r)
         ret = 0;
         break;
     case SYS_READDIR:
-        ret = sys_readdir(a1, a2, a3);
+        ret = cap_has(KCAP_FS_READ) ? sys_readdir(a1, a2, a3) : -1;
         break;
     case SYS_UNLINK:
-        ret = sys_path_op(a1, vfs_unlink);
+        ret = cap_has(KCAP_FS_WRITE) ? sys_path_op(a1, vfs_unlink) : -1;
         break;
     case SYS_MKDIR:
-        ret = sys_path_op(a1, vfs_mkdir);
+        ret = cap_has(KCAP_FS_WRITE) ? sys_path_op(a1, vfs_mkdir) : -1;
         break;
     case SYS_STAT:
-        ret = sys_stat(a1, a2);
+        ret = cap_has(KCAP_FS_READ) ? sys_stat(a1, a2) : -1;
         break;
     case SYS_BRK:
         ret = sys_brk(a1);
@@ -828,19 +1069,19 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_psinfo(a1, a2);
         break;
     case SYS_DNS:
-        ret = sys_dns(a1, a2);
+        ret = cap_has(KCAP_NET) ? sys_dns(a1, a2) : -1;
         break;
     case SYS_PING:
-        ret = icmp_ping((uint32_t)a1, (uint32_t)a2);
+        ret = cap_has(KCAP_NET) ? icmp_ping((uint32_t)a1, (uint32_t)a2) : -1;
         break;
     case SYS_UDP_SEND:
-        ret = sys_udp_send(a1, a2, a3, a4);
+        ret = cap_has(KCAP_NET) ? sys_udp_send(a1, a2, a3, a4) : -1;
         break;
     case SYS_UDP_RECV:
-        ret = sys_udp_recv(a1, a2, a3, a4);
+        ret = cap_has(KCAP_NET) ? sys_udp_recv(a1, a2, a3, a4) : -1;
         break;
     case SYS_NETINFO:
-        ret = sys_netinfo(a1);
+        ret = cap_has(KCAP_NET) ? sys_netinfo(a1) : -1;
         break;
     case SYS_RTC:
         ret = sys_rtc(a1);
@@ -851,19 +1092,20 @@ static void syscall_dispatch(struct regs *r)
 
     /* --- descriptors and processes --- */
     case SYS_PIPE:
-        ret = sys_pipe(a1);
+        ret = cap_has(KCAP_IPC) ? sys_pipe(a1) : -1;
         break;
     case SYS_DUP2:
         ret = sys_dup2(a1, a2);
         break;
     case SYS_KILL:
-        ret = sys_kill(a1, a2);
+        ret = cap_has(KCAP_IPC) ? sys_kill(a1, a2) : -1;
         break;
     case SYS_WAITANY:
         ret = sys_waitany(a1);
         break;
     case SYS_EXEC:
-        ret = uproc_exec_from_user((const char *)a1, (char *const *)a2);
+        ret = cap_has(KCAP_SPAWN)
+            ? uproc_exec_from_user((const char *)a1, (char *const *)a2) : -1;
         break;
 
     /* --- users and permissions --- */
@@ -877,10 +1119,10 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_setuid(a1);
         break;
     case SYS_CHMOD:
-        ret = sys_chmod(a1, a2);
+        ret = cap_has(KCAP_FS_WRITE) ? sys_chmod(a1, a2) : -1;
         break;
     case SYS_CHOWN:
-        ret = sys_chown(a1, a2, a3);
+        ret = cap_has(KCAP_FS_WRITE) ? sys_chown(a1, a2, a3) : -1;
         break;
 
     /* --- time and logging --- */
@@ -948,45 +1190,76 @@ static void syscall_dispatch(struct regs *r)
 
     /* --- graphics, input, windows --- */
     case SYS_FBINFO:
-        ret = sys_fbinfo(a1);
+        ret = cap_has(KCAP_WM) ? sys_fbinfo(a1) : -1;
         break;
     case SYS_MOUSE:
-        ret = sys_mouse(a1);
+        ret = cap_has(KCAP_WM) ? sys_mouse(a1) : -1;
         break;
     case SYS_WIN_CREATE:
-        ret = wm_sys_create(a1, a2);
+        ret = cap_has(KCAP_WM) ? wm_sys_create(a1, a2) : -1;
         break;
     case SYS_WIN_DESTROY:
-        ret = wm_sys_destroy(a1);
+        ret = cap_has(KCAP_WM) ? wm_sys_destroy(a1) : -1;
         break;
     case SYS_WIN_FLUSH:
-        ret = wm_sys_flush(a1);
+        ret = cap_has(KCAP_WM) ? wm_sys_flush(a1) : -1;
         break;
     case SYS_WIN_EVENT:
-        ret = wm_sys_event(a1, a2, a3);
+        ret = cap_has(KCAP_WM) ? wm_sys_event(a1, a2, a3) : -1;
         break;
     case SYS_WIN_MOVE:
-        ret = wm_sys_move(a1, (int)(int64_t)a2, (int)(int64_t)a3);
+        ret = cap_has(KCAP_WM)
+            ? wm_sys_move(a1, (int)(int64_t)a2, (int)(int64_t)a3) : -1;
         break;
     case SYS_WIN_LIST:
-        ret = wm_sys_list(a1, a2);
+        ret = cap_has(KCAP_WM) ? wm_sys_list(a1, a2) : -1;
         break;
     case SYS_WIN_CTL:
-        ret = wm_sys_ctl(a1, a2);
+        ret = cap_has(KCAP_WM) ? wm_sys_ctl(a1, a2) : -1;
         break;
 
     /* --- TCP --- */
     case SYS_TCP_CONNECT:
-        ret = tcp_connect((uint32_t)a1, (uint16_t)a2, (int)a3);
+        ret = cap_has(KCAP_NET)
+            ? tcp_connect((uint32_t)a1, (uint16_t)a2, (int)a3) : -1;
         break;
     case SYS_TCP_SEND:
-        ret = sys_tcp_send(a1, a2, a3);
+        ret = cap_has(KCAP_NET) ? sys_tcp_send(a1, a2, a3) : -1;
         break;
     case SYS_TCP_RECV:
-        ret = sys_tcp_recv(a1, a2, a3, a4);
+        ret = cap_has(KCAP_NET) ? sys_tcp_recv(a1, a2, a3, a4) : -1;
         break;
     case SYS_TCP_CLOSE:
-        ret = tcp_close((int)a1);
+        ret = cap_has(KCAP_NET) ? tcp_close((int)a1) : -1;
+        break;
+
+    /* --- capabilities, atomic rename, pulses, talon parcels, WM v2 --- */
+    case SYS_SPAWN_CAPS:
+        ret = sys_spawn_caps(a1, a2, a3);
+        break;
+    case SYS_SANDBOX:
+        ret = sys_sandbox(a1, a2);
+        break;
+    case SYS_RENAME:
+        ret = sys_rename(a1, a2);
+        break;
+    case SYS_PULSE_POLL:
+        ret = sys_pulse_poll(a1, a2);
+        break;
+    case SYS_PARCEL_PUT:
+        ret = sys_parcel_put(a1);
+        break;
+    case SYS_PARCEL_GET:
+        ret = sys_parcel_get(a1, a2, a3, a4);
+        break;
+    case SYS_PARCEL_LIST:
+        ret = sys_parcel_list(a1, a2);
+        break;
+    case SYS_WM_THEME:
+        ret = cap_has(KCAP_WM) ? wm_sys_theme(a1) : -1;
+        break;
+    case SYS_WIN_RESIZE:
+        ret = cap_has(KCAP_WM) ? wm_sys_resize(a1, a2, a3) : -1;
         break;
 
     default:

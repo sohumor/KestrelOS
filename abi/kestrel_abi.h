@@ -96,6 +96,17 @@
 #define SYS_WIN_LIST    67 /* (index, struct k_winsummary*) -> 0/-1 */
 #define SYS_WIN_CTL     68 /* (wid, K_WIN_CTL_*) -> 0/-1 */
 
+/* --- KestrelOS capability, pulse, parcel & desktop extensions -------- */
+#define SYS_SPAWN_CAPS  69 /* (path, argv, struct k_spawn_caps*) -> pid/-1 */
+#define SYS_SANDBOX     70 /* (drop_caps, unveil_prefix_or_NULL) -> 0/-1 */
+#define SYS_RENAME      71 /* (oldpath, newpath) -> 0/-1 */
+#define SYS_PULSE_POLL  72 /* (u64 *seq_inout, topic_mask, struct k_pulse* + pack) -> n/-1 */
+#define SYS_PARCEL_PUT  73 /* (meta_packed_or_info, data, len) -> id/-1 */
+#define SYS_PARCEL_GET  74 /* (slot_or_id, struct k_parcel_info*, buf, bufsz) -> bytes/-1 */
+#define SYS_PARCEL_LIST 75 /* (index, struct k_parcel_info*) -> 0/-1 */
+#define SYS_WM_THEME    76 /* (const struct k_wm_theme*) -> 0/-1 */
+#define SYS_WIN_RESIZE  77 /* (wid, new_w, new_h) -> 0/-1 */
+
 /* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
  * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
 #define GRND_NONBLOCK 0x01
@@ -259,6 +270,10 @@ struct k_netinfo {
 #define KEY_WM_NEXT  0x89  /* Alt-Tab */
 #define KEY_WM_CLOSE 0x8A  /* Alt-F4 */
 #define KEY_LAUNCHER 0x8B  /* Super key; routed to the desktop shell */
+#define KEY_WM_WS1   0x8C  /* Alt-1 */
+#define KEY_WM_WS2   0x8D  /* Alt-2 */
+#define KEY_WM_WS3   0x8E  /* Alt-3 */
+#define KEY_WM_WS4   0x8F  /* Alt-4 */
 
 /* --- kernel log ---------------------------------------------------- */
 
@@ -360,8 +375,13 @@ struct k_wininfo {
 /* Desktop-shell view of one ordinary application window. The compositor
  * exposes these records only to a process that owns a K_WIN_DESKTOP window,
  * and only for windows belonging to the same uid. */
-#define K_WIN_STATE_FOCUSED   0x01U
-#define K_WIN_STATE_MINIMIZED 0x02U
+#define K_WIN_STATE_FOCUSED         0x01U
+#define K_WIN_STATE_MINIMIZED       0x02U
+#define K_WIN_STATE_PINNED          0x04U
+#define K_WIN_STATE_MAXIMIZED       0x08U
+#define K_WIN_STATE_WS_SHIFT        8
+#define K_WIN_STATE_WS_MASK         0x03U
+#define K_WIN_STATE_ACTIVE_WS_SHIFT 10
 
 struct k_winsummary {
     uint32_t wid;
@@ -373,26 +393,148 @@ struct k_winsummary {
     char title[64];
 };
 
-#define K_WIN_CTL_FOCUS    0
-#define K_WIN_CTL_MINIMIZE 1
-#define K_WIN_CTL_RESTORE  2
-#define K_WIN_CTL_CLOSE    3
+#define K_WIN_CTL_FOCUS      0
+#define K_WIN_CTL_MINIMIZE   1
+#define K_WIN_CTL_RESTORE    2
+#define K_WIN_CTL_CLOSE      3
+#define K_WIN_CTL_MAXIMIZE   4
+#define K_WIN_CTL_SWITCH_WS  5  /* wid = target workspace 0..3 */
+#define K_WIN_CTL_MOVE_WS    6  /* action = K_WIN_CTL_MOVE_WS | (ws << 8) */
+#define K_WIN_CTL_TOGGLE_PIN 7
 
 /* Window event types */
-#define KEV_NONE       0
-#define KEV_KEY        1   /* key in .key (ASCII or KEY_* code) */
-#define KEV_MOUSE_MOVE 2
-#define KEV_MOUSE_DOWN 3
-#define KEV_MOUSE_UP   4
-#define KEV_CLOSE      5   /* the user clicked the close box */
-#define KEV_FOCUS      6   /* .key 1 = gained focus, 0 = lost */
-#define KEV_RESIZE     7
+#define KEV_NONE        0
+#define KEV_KEY         1  /* key in .key (ASCII or KEY_* code) */
+#define KEV_MOUSE_MOVE  2
+#define KEV_MOUSE_DOWN  3
+#define KEV_MOUSE_UP    4
+#define KEV_CLOSE       5  /* the user clicked the close box */
+#define KEV_FOCUS       6  /* .key 1 = gained focus, 0 = lost */
+#define KEV_RESIZE      7  /* .x = new_w, .y = new_h */
+#define KEV_MOUSE_WHEEL 8  /* .x/.y client coords, (int32_t).key = delta (+ up) */
+#define KEV_THEME       9  /* compositor/system theme updated */
 
 struct k_event {
     uint32_t type;
     int32_t  x, y;         /* client-relative for mouse events */
     uint32_t key;
     uint32_t buttons;
+};
+
+/* --- capabilities & capability spawn -------------------------------- */
+
+#define KCAP_FS_READ   (1ULL << 0)
+#define KCAP_FS_WRITE  (1ULL << 1)
+#define KCAP_NET       (1ULL << 2)
+#define KCAP_WM        (1ULL << 3)
+#define KCAP_SPAWN     (1ULL << 4)
+#define KCAP_IPC       (1ULL << 5)
+#define KCAP_ADMIN     (1ULL << 6)
+#define KCAP_ALL       0x7FULL
+#define KCAP_USER_DEF  (KCAP_ALL & ~KCAP_ADMIN)
+
+#define K_SPAWN_CAPS_MAX_FDS 8
+#define K_SPAWN_CLOSE_OTHER  0x01U
+
+struct k_spawn_fd {
+    int32_t child_fd;
+    int32_t parent_fd;
+};
+
+struct k_spawn_caps {
+    struct k_spawn_fd fds[K_SPAWN_CAPS_MAX_FDS];
+    uint32_t n_fds;
+    uint32_t flags;
+    uint64_t cap_mask;     /* 0 = inherit caller caps unchanged */
+    char cwd[128];         /* "" = do not append --cwd= */
+};
+
+/* --- Kernel Pulses (monotonic event stream) ------------------------- */
+
+#define K_TOPIC_PROC   0x01U
+#define K_TOPIC_WIN    0x02U
+#define K_TOPIC_THEME  0x04U
+#define K_TOPIC_FS     0x08U
+#define K_TOPIC_NET    0x10U
+#define K_TOPIC_PARCEL 0x20U
+#define K_TOPIC_ALL    0x3FU
+
+#define K_PULSE_PROC_SPAWN  1
+#define K_PULSE_PROC_EXIT   2
+#define K_PULSE_WIN_OPEN    3
+#define K_PULSE_WIN_CLOSE   4
+#define K_PULSE_WIN_FOCUS   5
+#define K_PULSE_WIN_WS      6
+#define K_PULSE_THEME_SET   7
+#define K_PULSE_FS_CHANGE   8
+#define K_PULSE_NET_CHANGE  9
+#define K_PULSE_PARCEL_NEW  10
+
+struct k_pulse {
+    uint64_t seq;
+    uint32_t topic;
+    uint32_t kind;
+    uint32_t arg0;
+    uint32_t arg1;
+    char tag[24];
+};
+
+struct k_pulse_query {
+    uint64_t seq;          /* in: last seen seq; out: latest seq */
+    uint32_t topic_mask;
+    uint32_t max_out;
+    uint32_t timeout_ms;   /* 0 = non-blocking poll */
+    uint32_t _pad;
+};
+
+/* --- Talon typed clipboard parcels ---------------------------------- */
+
+#define K_PARCEL_NONE      0
+#define K_PARCEL_TEXT      1
+#define K_PARCEL_PATH      2
+#define K_PARCEL_URL       3
+#define K_PARCEL_COLOR     4
+#define K_PARCEL_NUMBER    5
+#define K_PARCEL_KREC      6
+#define K_PARCEL_IMAGE     7
+#define K_PARCEL_MAX_SLOTS 8
+#define K_PARCEL_MAX_BYTES 65536
+
+struct k_parcel_info {
+    uint32_t id;
+    uint32_t type;
+    uint32_t size;
+    uint32_t time;
+    int32_t src_pid;
+    char mime[24];
+    char label[48];
+};
+
+struct k_parcel_put {
+    uint32_t type;
+    uint32_t size;
+    uint64_t data;         /* user pointer to payload bytes */
+    char mime[24];
+    char label[48];
+};
+
+/* --- Compositor theme sync ------------------------------------------ */
+
+#define K_WM_MAX_WORKSPACES 4
+
+struct k_wm_theme {
+    uint32_t desktop_bg;
+    uint32_t title_active;
+    uint32_t title_inactive;
+    uint32_t border_active;
+    uint32_t border_inactive;
+    uint32_t accent;
+    uint32_t text_active;
+    uint32_t text_inactive;
+    uint32_t btn_bg;
+    uint32_t close_bg;
+    uint32_t close_fg;
+    uint32_t _pad;
 };
 
 /* Userspace virtual memory layout */

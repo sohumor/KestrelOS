@@ -113,7 +113,7 @@ void *malloc(unsigned long size)
     struct heap_block *blk;
     unsigned long want;
 
-    if (size == 0)
+    if (size == 0 || size > (~0UL - HEAP_GROW_STEP - HEADER_SIZE))
         return 0;
     want = align_up(size, HEAP_ALIGN);
 

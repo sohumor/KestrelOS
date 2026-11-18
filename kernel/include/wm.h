@@ -38,6 +38,7 @@
 
 void wm_init(void);
 bool wm_active(void);
+bool wm_keyboard_captured(void);
 
 /* Compose one frame: repaint whatever changed. Driven by a kernel thread. */
 void wm_tick(void);
@@ -57,3 +58,5 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms);
 long wm_sys_move(uint64_t wid, int x, int y);
 long wm_sys_list(uint64_t index, uint64_t uout);
 long wm_sys_ctl(uint64_t wid, uint64_t action);
+long wm_sys_theme(uint64_t utheme);
+long wm_sys_resize(uint64_t wid, uint64_t w, uint64_t h);

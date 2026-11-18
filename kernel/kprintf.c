@@ -145,6 +145,9 @@ void kvprintf(const char *fmt, va_list ap)
         case '%':
             kputc('%');
             break;
+        case '\0':
+            fmt--;
+            break;
         default:
             kputc('%');
             kputc(*fmt);

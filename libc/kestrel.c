@@ -87,14 +87,118 @@ int spawn_io(const char *path, char *const argv[], const char *in_path,
     return (int)syscall(SYS_SPAWN_IO, (long)path, (long)argv, (long)&io, 0);
 }
 
+int spawn_caps(const char *path, char *const argv[],
+               const struct k_spawn_caps *caps)
+{
+    return (int)syscall(SYS_SPAWN_CAPS, (long)path, (long)argv, (long)caps, 0);
+}
+
+int pipe_(int fds[2])
+{
+    return (int)syscall(SYS_PIPE, (long)fds, 0, 0, 0);
+}
+
+int dup2_(int oldfd, int newfd)
+{
+    return (int)syscall(SYS_DUP2, oldfd, newfd, 0, 0);
+}
+
+int rename_(const char *oldpath, const char *newpath)
+{
+    return (int)syscall(SYS_RENAME, (long)oldpath, (long)newpath, 0, 0);
+}
+
+int sandbox(uint64_t drop_caps, const char *unveil_prefix)
+{
+    return (int)syscall(SYS_SANDBOX, (long)drop_caps, (long)unveil_prefix, 0, 0);
+}
+
 int waitpid(int pid)
 {
     return (int)syscall(SYS_WAITPID, pid, 0, 0, 0);
 }
 
+int waitany(int *pid_out)
+{
+    return (int)syscall(SYS_WAITANY, (long)pid_out, 0, 0, 0);
+}
+
 int getpid(void)
 {
     return (int)syscall(SYS_GETPID, 0, 0, 0, 0);
+}
+
+uint32_t getuid_(void)
+{
+    return (uint32_t)syscall(SYS_GETUID, 0, 0, 0, 0);
+}
+
+uint32_t getgid_(void)
+{
+    return (uint32_t)syscall(SYS_GETGID, 0, 0, 0, 0);
+}
+
+int setuid_(uint32_t uid)
+{
+    return (int)syscall(SYS_SETUID, (long)uid, 0, 0, 0);
+}
+
+int chmod_(const char *path, uint32_t mode)
+{
+    return (int)syscall(SYS_CHMOD, (long)path, (long)mode, 0, 0);
+}
+
+int chown_(const char *path, uint32_t uid, uint32_t gid)
+{
+    return (int)syscall(SYS_CHOWN, (long)path, (long)uid, (long)gid, 0);
+}
+
+unsigned long time_(void)
+{
+    return (unsigned long)syscall(SYS_TIME, 0, 0, 0, 0);
+}
+
+int pulse_poll(struct k_pulse_query *query, struct k_pulse *out)
+{
+    return (int)syscall(SYS_PULSE_POLL, (long)query, (long)out, 0, 0);
+}
+
+int parcel_put(uint32_t type, const char *mime, const char *label,
+               const void *data, uint32_t size)
+{
+    struct k_parcel_put req;
+
+    memset(&req, 0, sizeof(req));
+    req.type = type;
+    req.size = size;
+    req.data = (uint64_t)(unsigned long)data;
+    if (mime)
+        strncpy(req.mime, mime, sizeof(req.mime) - 1);
+    if (label)
+        strncpy(req.label, label, sizeof(req.label) - 1);
+    return (int)syscall(SYS_PARCEL_PUT, (long)&req, 0, 0, 0);
+}
+
+long parcel_get(uint32_t slot_or_id, struct k_parcel_info *info,
+                void *buf, uint32_t bufsz)
+{
+    return syscall(SYS_PARCEL_GET, (long)slot_or_id, (long)info,
+                   (long)buf, (long)bufsz);
+}
+
+int parcel_list(int index, struct k_parcel_info *info)
+{
+    return (int)syscall(SYS_PARCEL_LIST, (long)index, (long)info, 0, 0);
+}
+
+int wm_theme(const struct k_wm_theme *theme)
+{
+    return (int)syscall(SYS_WM_THEME, (long)theme, 0, 0, 0);
+}
+
+int win_resize(uint32_t wid, int w, int h)
+{
+    return (int)syscall(SYS_WIN_RESIZE, (long)wid, (long)w, (long)h, 0);
 }
 
 void sleep_ms(unsigned long ms)
