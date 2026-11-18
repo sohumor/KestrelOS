@@ -374,16 +374,16 @@ static int send_cmd(const char *verb, const char *name)
         return 1;
     }
 
-    for (i = 0; i < 50; i++) {           /* up to 5 s */
+    for (i = 0; i < 150; i++) {          /* up to 15 s */
         if (stat_(CMD_PATH, &st) < 0)
             break;
         sleep_ms(100);
     }
-    if (i == 50) {
+    if (i == 150) {
         printf("service: init did not pick up the request\n");
         return 1;
     }
-    for (i = 0; i < 10; i++) {           /* the ack lands just after */
+    for (i = 0; i < 40; i++) {           /* up to 2 s; ack lands just after */
         if (read_file(ACK_PATH, ack, sizeof(ack)) > 0)
             break;
         sleep_ms(50);

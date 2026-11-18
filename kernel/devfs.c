@@ -20,6 +20,7 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "random.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "flight.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -31,9 +32,10 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
  * are rendered into a private buffer at open() so that a reader sees one
  * consistent snapshot rather than a table mutating under it. */
 
-#define DEVFS_MAX_OPEN 32
-#define DEVFS_LINE_MAX 192
-#define DEVFS_TEXT_MAX 1024
+#define DEVFS_MAX_OPEN   32
+#define DEVFS_LINE_MAX   192
+#define DEVFS_TEXT_MAX   1024
+#define DEVFS_FLIGHT_MAX 24568
 
 struct devfile {
     struct file f;              /* MUST stay first: handles are cast to this */
@@ -67,6 +69,7 @@ static const struct devdesc devtab[] = {
     { "klog",    DEV_KLOG,    0644 },
     { "mounts",  DEV_MOUNTS,  0444 },
     { "blocks",  DEV_BLOCKS,  0444 },
+    { "flight",  DEV_FLIGHT,  0444 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -262,6 +265,8 @@ static uint32_t dev_size(int id)
     case DEV_MOUNTS:
     case DEV_BLOCKS:
         return text_size(id);
+    case DEV_FLIGHT:
+        return flight_render_krec(NULL, DEVFS_FLIGHT_MAX);
     default:
         return 0;
     }
@@ -358,6 +363,13 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
             df->textlen = (d->id == DEV_MOUNTS)
                             ? render_mounts(df->text, DEVFS_TEXT_MAX)
                             : render_blocks(df->text, DEVFS_TEXT_MAX);
+        } else if (d->id == DEV_FLIGHT) {
+            df->text = kmalloc(DEVFS_FLIGHT_MAX);
+            if (df->text == NULL) {
+                devfile_free(df);
+                return NULL;
+            }
+            df->textlen = flight_render_krec(df->text, DEVFS_FLIGHT_MAX);
         }
         if (handle_register(df) < 0) {
             devfile_free(df);
@@ -547,6 +559,7 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
         return read_klog(df, buf, n);
     case DEV_MOUNTS:
     case DEV_BLOCKS:
+    case DEV_FLIGHT:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);
@@ -685,7 +698,8 @@ static long devfs_op_seek(struct file *f, long off, int whence)
         return -1;
     if (df->dev == DEV_BLOCKDEV)
         return seek_bounded(df, off, whence, blk_size_bytes(df->bd));
-    if (df->dev == DEV_MOUNTS || df->dev == DEV_BLOCKS)
+    if (df->dev == DEV_MOUNTS || df->dev == DEV_BLOCKS ||
+        df->dev == DEV_FLIGHT)
         return seek_bounded(df, off, whence, df->textlen);
     if (df->dev == DEV_KLOG && whence == 0 && off == 0) {
         df->ent = 0;

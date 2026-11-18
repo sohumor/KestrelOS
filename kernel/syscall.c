@@ -31,6 +31,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "smp.h"
+#include "flight.h"
 
 /* Hooks exported by idt.c. */
 extern void (*syscall_entry_hook)(struct regs *r);
@@ -275,6 +276,21 @@ static int str_terminated(const char *s, size_t max)
     return 0;
 }
 
+static void flight_record_spawn(long pid, const char *upath)
+{
+    char path[UPROC_PATH_MAX];
+    const char *detail = "";
+
+    if (pid <= 0)
+        return;
+    if (upath && copy_str_from_user(path, upath, sizeof(path)) >= 0) {
+        const char *slash = strrchr(path, '/');
+        detail = (slash && slash[1]) ? (slash + 1) : path;
+    }
+    flight_record(FLIGHT_CAT_PROC, "spawn", (int16_t)pid,
+                  (uint64_t)(current ? current->pid : 0), 0, detail);
+}
+
 static long sys_spawn_io(uint64_t upath, uint64_t uargv, uint64_t uio)
 {
     struct k_spawn_io io;
@@ -286,10 +302,12 @@ static long sys_spawn_io(uint64_t upath, uint64_t uargv, uint64_t uio)
     if (!str_terminated(io.in_path, sizeof(io.in_path)) ||
         !str_terminated(io.out_path, sizeof(io.out_path)))
         return -1;
-    return uproc_spawn_io_from_user((const char *)upath,
-                                    (char *const *)uargv,
-                                    io.in_path, io.out_path,
-                                    io.out_append ? 1 : 0);
+    long pid = uproc_spawn_io_from_user((const char *)upath,
+                                        (char *const *)uargv,
+                                        io.in_path, io.out_path,
+                                        io.out_append ? 1 : 0);
+    flight_record_spawn(pid, (const char *)upath);
+    return pid;
 }
 
 static long sys_stat(uint64_t upath, uint64_t ust)
@@ -836,8 +854,10 @@ static long sys_spawn_caps(uint64_t upath, uint64_t uargv, uint64_t ucaps)
         return -1;
     if (copy_from_user(&kcaps, (const void *)ucaps, sizeof(kcaps)) < 0)
         return -1;
-    return uproc_spawn_caps_from_user((const char *)upath,
-                                      (char *const *)uargv, &kcaps);
+    long pid = uproc_spawn_caps_from_user((const char *)upath,
+                                          (char *const *)uargv, &kcaps);
+    flight_record_spawn(pid, (const char *)upath);
+    return pid;
 }
 
 static long sys_sandbox(uint64_t drop_caps, uint64_t uprefix)
@@ -1024,6 +1044,7 @@ static void syscall_dispatch(struct regs *r)
     case SYS_SPAWN:
         ret = cap_has(KCAP_SPAWN)
             ? uproc_spawn_from_user((const char *)a1, (char *const *)a2) : -1;
+        flight_record_spawn(ret, (const char *)a1);
         break;
     case SYS_SPAWN_IO:
         ret = cap_has(KCAP_SPAWN) ? sys_spawn_io(a1, a2, a3) : -1;

@@ -702,6 +702,7 @@ static void order_services(void)
 
 static void state_write(void)
 {
+    static int state_mode_set;
     char buf[STATESZ];
     long n;
     int fd;
@@ -732,7 +733,10 @@ static void state_write(void)
     n = write(fd, buf, sizeof(buf));
     close(fd);
     if (n == (long)sizeof(buf)) {
-        chmod_(STATE_PATH, 0644);
+        if (!state_mode_set) {
+            if (chmod_(STATE_PATH, 0644) == 0)
+                state_mode_set = 1;
+        }
         state_dirty = 0;
     }
 }

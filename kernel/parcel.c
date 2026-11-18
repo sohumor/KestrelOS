@@ -8,6 +8,7 @@
 #include "vfs.h"
 
 #include "pulse.h"
+#include "flight.h"
 
 #define PARCEL_MAX_UIDS    8
 #define PARCEL_PMM_RESERVE 64
@@ -152,6 +153,9 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
 
     pulse_emit(K_TOPIC_PARCEL, K_PULSE_PARCEL_NEW, id, req->type,
                       info.label);
+    flight_record(FLIGHT_CAT_TALON, "parcel_put",
+                  (int16_t)info.src_pid, (uint64_t)id,
+                  (uint64_t)req->type, info.label);
     return (long)id;
 }
 

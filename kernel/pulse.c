@@ -4,6 +4,7 @@
 #include "timer.h"
 #include "string.h"
 #include "spinlock.h"
+#include "flight.h"
 
 #define PULSE_RING_SIZE 128
 #define PULSE_MAX_OUT   64
@@ -30,6 +31,9 @@ void pulse_emit(uint32_t topic, uint32_t kind, uint32_t arg0, uint32_t arg1,
             p->tag[i] = tag[i];
     }
     spin_unlock_irqrestore(&pulse_lock, f);
+    flight_record(FLIGHT_CAT_PULSE, "pulse_emit",
+                  current ? (int16_t)current->pid : 0,
+                  (uint64_t)kind, (uint64_t)topic, tag ? tag : "");
 }
 
 static uint32_t pulse_drain(struct k_pulse_query *q, struct k_pulse *out,

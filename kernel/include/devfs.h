@@ -32,6 +32,7 @@
 #define DEV_MOUNTS   8
 #define DEV_BLOCKS   9
 #define DEV_BLOCKDEV 10         /* any registered struct blockdev */
+#define DEV_FLIGHT   11         /* flight recorder @krec snapshot */
 
 /* Register the "devfs" filesystem type. Idempotent. */
 void devfs_init(void);

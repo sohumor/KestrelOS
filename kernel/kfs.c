@@ -8,6 +8,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "flight.h"
 
 /* KFS driver, on-disk format v3. File data and metadata are committed
  * together through a fixed checksummed redo journal. A handful
@@ -60,30 +61,34 @@ _Static_assert(sizeof(struct kfs_journal_header) <= KFS_BLOCK_SIZE,
 
 static struct kfs_fs instances[KFS_MAX_MOUNTS];
 
-/* Whole-driver mutex. `fs_held` is the flag; `fs_owner` makes it
- * recursive so a public entry point reached from another one (unlink ->
- * truncate) does not deadlock against itself. Waiters back off with
- * task_sleep_ticks(1) rather than spinning. Before proc_init() runs there
- * is exactly one thread of control and `current` is NULL, so the wait loop
+/* Whole-driver recursive FIFO ticket mutex. `fs_owner` allows recursive
+ * re-entry when a public entry point reaches another one (unlink ->
+ * truncate) without deadlocking against itself. Waiters take a FIFO
+ * ticket and back off with task_sleep_ticks(1) rather than spinning or
+ * starving under 4-CPU contention. Before proc_init() runs there is
+ * exactly one thread of control and `current` is NULL, so the wait loop
  * must never be entered then -- hence the sched_active guard. */
 static struct task *fs_owner;
-static volatile int fs_held;
+static uint32_t fs_next_ticket;
+static uint32_t fs_serving;
 static int fs_depth;
 static spinlock_t kfs_meta_lock = SPINLOCK_INIT;
 
 static void fs_lock(void)
 {
-    if (__atomic_load_n(&fs_owner, __ATOMIC_ACQUIRE) == current) {
+    struct task *self = current;
+    if (self && __atomic_load_n(&fs_owner, __ATOMIC_ACQUIRE) == self) {
         fs_depth++;
         return;
     }
-    while (__atomic_exchange_n(&fs_held, 1, __ATOMIC_ACQUIRE)) {
+    uint32_t ticket = __atomic_fetch_add(&fs_next_ticket, 1, __ATOMIC_ACQUIRE);
+    while (__atomic_load_n(&fs_serving, __ATOMIC_ACQUIRE) != ticket) {
         if (sched_active)
             task_sleep_ticks(1);
         else
             __asm__ volatile("pause");
     }
-    fs_owner = current;
+    __atomic_store_n(&fs_owner, self, __ATOMIC_RELEASE);
     fs_depth = 1;
 }
 
@@ -91,8 +96,8 @@ static void fs_unlock(void)
 {
     if (--fs_depth <= 0) {
         fs_depth = 0;
-        fs_owner = NULL;
-        __atomic_store_n(&fs_held, 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&fs_owner, NULL, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&fs_serving, 1, __ATOMIC_RELEASE);
     }
 }
 
@@ -397,6 +402,11 @@ static int journal_commit(struct kfs_fs *fs)
         bcache_invalidate(fs);
         goto out;
     }
+    flight_record(FLIGHT_CAT_FS, "tx_commit",
+                  current ? (int16_t)current->pid : 0,
+                  (uint64_t)journal_tx.sequence,
+                  (uint64_t)journal_tx.count,
+                  fs->bd ? fs->bd->name : "kfs");
     r = 0;
 
 out:

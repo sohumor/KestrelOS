@@ -31,6 +31,7 @@
 #include "random.h"
 #include "vm.h"
 #include "smp.h"
+#include "flight.h"
 
 struct bootinfo *boot_info;
 
@@ -55,6 +56,7 @@ static void init_launcher(void *arg)
         kprintf("init: cannot spawn /bin/init\n");
         kmon_run(NULL);
     }
+    flight_record(FLIGHT_CAT_PROC, "spawn", (int16_t)pid, 0, 0, "init");
 
     long code = uproc_waitpid(pid);
     kprintf("init: /bin/init exited (%ld)\n", code);
@@ -78,6 +80,7 @@ void kmain(uint64_t bootinfo_phys)
     serial_init();
     console_init();
     klog_init();
+    flight_init();
 
     console_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
     kprintf("\n  KestrelOS %s (x86-64)\n", KERNEL_VERSION);
@@ -161,6 +164,8 @@ void kmain(uint64_t bootinfo_phys)
 
     kthread_create(housekeeper, NULL, "housekeep");
     kthread_create(init_launcher, NULL, "launcher");
+
+    proc_mark_current_idle();
 
     /* Boot task parks; all life now happens via IRQs and the scheduler. */
     for (;;) {

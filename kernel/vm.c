@@ -9,6 +9,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "flight.h"
 
 /* tools/mkimage.py writes this header immediately after the root KFS
  * filesystem partition. Derive the starting LBA from the KFS superblock at
@@ -233,6 +234,10 @@ static int swap_out_one(struct task *avoid_task, uint64_t avoid_va)
     if (v.task == current)
         invlpg(v.va);
     pmm_free(PTE_ADDR(old));
+    flight_record(FLIGHT_CAT_VM, "swap_out",
+                  avoid_task ? (int16_t)avoid_task->pid : 0,
+                  v.va, (uint64_t)slot,
+                  avoid_task ? avoid_task->name : "");
     return 0;
 }
 
@@ -324,6 +329,8 @@ static int handle_page_fault_locked(struct task *t, uint64_t address,
         swap_free_slot(slot);
         vmm_map_page(t->pml4, page, phys,
                      PTE_U | (raw & PTE_W));
+        flight_record(FLIGHT_CAT_VM, "swap_in", (int16_t)t->pid,
+                      page, (uint64_t)slot, t->name);
         return 0;
     }
     if (pte && (*pte & PTE_P))
@@ -351,6 +358,8 @@ static int handle_page_fault_locked(struct task *t, uint64_t address,
         return -1;
     }
     vmm_map_page(t->pml4, page, phys, flags);
+    flight_record(FLIGHT_CAT_VM, "page_fault", (int16_t)t->pid,
+                  page, error, t->name);
     return 0;
 }
 

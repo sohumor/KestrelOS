@@ -13,6 +13,7 @@
 #include "uproc.h"
 #include "smp.h"
 #include "spinlock.h"
+#include "flight.h"
 
 bool sched_active;
 
@@ -327,6 +328,10 @@ void task_stop_current(void)
 
 void task_exit(int code)
 {
+    flight_record(FLIGHT_CAT_PROC, "exit", (int16_t)current->pid,
+                  (uint64_t)(long)code, (uint64_t)current->parent_pid,
+                  current->name);
+
     /* Before the address space goes away: the compositor clears its own
      * PTEs and returns the pixel frames itself. */
     wm_cleanup_task(current->pid);
@@ -561,4 +566,12 @@ void proc_init(void)
 
     irq_preempt_hook = preempt;
     sched_active = true;
+}
+
+void proc_mark_current_idle(void)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    if (current)
+        current->idle = true;
+    spin_unlock_irqrestore(&sched_lock, flags);
 }

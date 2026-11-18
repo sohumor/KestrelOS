@@ -76,6 +76,7 @@ extern bool sched_active;
 #define current (smp_current_task())
 
 void proc_init(void);
+void proc_mark_current_idle(void);
 struct task *kthread_create(void (*func)(void *), void *arg, const char *name);
 struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
                                      const char *name, int *pid_out);
