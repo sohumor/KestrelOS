@@ -105,6 +105,7 @@ typedef struct js_config {
     unsigned long max_string;     /* longest single string; default 4 MiB */
     void (*print)(void *user, const char *text);   /* console.log sink */
     double (*now_ms)(void *user);                  /* ms since Unix epoch */
+    int (*random_bytes)(void *user, uint8_t *out, unsigned long len);
     void *user;
 } js_config;
 
@@ -202,6 +203,11 @@ const void   *js_uint8array_data(js_value v, unsigned long *len);
 void         *js_uint8array_mutable_data(js_value v, unsigned long *len);
 js_value      js_uint8array_new(js_ctx *ctx, const void *data,
                                unsigned long len);
+int           js_is_uint8clampedarray(js_value v);
+const void   *js_uint8clampedarray_data(js_value v, unsigned long *len);
+void         *js_uint8clampedarray_mutable_data(js_value v, unsigned long *len);
+js_value      js_uint8clampedarray_new(js_ctx *ctx, const void *data,
+                                      unsigned long len);
 
 /* Shared URLSearchParams operations for browser-owned live URL views. */
 js_value js_urlsearchparams_new(js_ctx *ctx, const char *query,
@@ -209,6 +215,42 @@ js_value js_urlsearchparams_new(js_ctx *ctx, const char *query,
 int js_urlsearchparams_replace(js_ctx *ctx, js_value params,
                                const char *query, unsigned long len);
 int js_urlsearchparams_string(js_ctx *ctx, js_value params, js_value *out);
+
+/* Shared BufferSource / AbortSignal / Blob / FormData helpers for embedders. */
+const void *js_buffersource_data(js_value v, unsigned long *len);
+
+int        js_is_abortsignal(js_value v);
+int        js_abortsignal_aborted(js_value signal);
+js_value   js_abortsignal_reason(js_value signal);
+js_value   js_abortsignal_new(js_ctx *ctx);
+int        js_abortsignal_trigger(js_ctx *ctx, js_value signal,
+                                  js_value reason, int dispatch);
+js_object *js_abortsignal_proto(js_ctx *ctx);
+js_object *js_abortsignal_ctor(js_ctx *ctx);
+void       js_abortsignal_set_proto(js_ctx *ctx, js_object *proto);
+void       js_set_abort_hooks(js_ctx *ctx,
+                              void (*on_abort)(void *user, js_value signal),
+                              js_value (*make_event)(void *user, const char *type),
+                              void *user);
+
+typedef int (*js_blob_extract_fn)(void *user, js_value v,
+                                  const void **data, unsigned long *len,
+                                  const char **type, const char **filename);
+int        js_is_blob(js_value v);
+const void *js_blob_data(js_value v, unsigned long *len, const char **type);
+js_value   js_blob_new(js_ctx *ctx, const void *data, unsigned long len,
+                       const char *type);
+js_object *js_blob_proto(js_ctx *ctx);
+void       js_set_blob_extractor(js_ctx *ctx, js_blob_extract_fn fn, void *user);
+
+int          js_is_formdata(js_value v);
+js_value     js_formdata_new(js_ctx *ctx);
+int          js_formdata_append(js_ctx *ctx, js_value fd, js_value name,
+                                js_value value, js_value filename);
+unsigned int js_formdata_count(js_value fd);
+int          js_formdata_entry(js_value fd, unsigned int idx,
+                               const char **name, js_value *value,
+                               const char **filename);
 
 /* The global object, as a value. */
 js_value js_global(js_ctx *ctx);
@@ -673,7 +715,7 @@ int js_iter_open(js_ctx *ctx, js_value iterable, js_iter *it);
 int js_iter_next(js_ctx *ctx, js_iter *it, js_value *out, int *done);
 
 /* ---- the context ---- */
-#define JS_NPROTO 40
+#define JS_NPROTO 44
 #define JS_ARGSTACK 4096        /* js_value slots shared by all call frames */
 #define JS_MAXARGS  255
 
@@ -700,6 +742,13 @@ struct js_ctx {
     js_object    *ctor_object;
     js_object    *ctor_array;
     js_object    *ctor_regexp;
+    js_object    *ctor_abortsignal;
+
+    void (*on_abort)(void *user, js_value signal);
+    js_value (*make_abort_event)(void *user, const char *type);
+    void         *abort_hook_user;
+    js_blob_extract_fn blob_extractor;
+    void         *blob_extractor_user;
 
     js_value      exception;
     int           has_exception;
@@ -758,7 +807,8 @@ enum {
     P_DATAVIEW,
     P_TEXTENCODER, P_TEXTDECODER, P_URLSEARCHPARAMS, P_URL,
     P_WASM_MODULE, P_WASM_INSTANCE, P_MAP, P_SET, P_WEAKMAP, P_WEAKSET,
-    P_SYMBOL
+    P_SYMBOL,
+    P_ABORTCONTROLLER, P_ABORTSIGNAL, P_BLOB, P_FORMDATA
 };
 
 /* ---- growable byte buffer (malloc-backed, charged to the heap cap) ---- */
@@ -841,6 +891,7 @@ int js_async_resume(js_ctx *ctx, js_async_task *task, int state, js_value val);
 /* ---- builtins ---- */
 int  js_init_builtins(js_ctx *ctx);
 int  js_init_webapis(js_ctx *ctx);
+int  js_init_crypto(js_ctx *ctx);
 void js_run_host_finalizers(js_ctx *ctx);
 js_object *js_new_error(js_ctx *ctx, int kind, const char *msg);
 /* Number/String/Boolean/Symbol wrapper for a primitive receiver. */

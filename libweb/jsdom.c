@@ -16,7 +16,6 @@
 #endif
 #include "jsdom.h"
 #include "css.h"
-#include "hash.h"
 #include "storage.h"
 #include "url.h"
 
@@ -25,7 +24,6 @@
 #define JSDOM_STYLE_MAX 8192
 #define JSDOM_FETCH_MAX 32
 #define JSDOM_OBJECT_URL_MAX 32
-#define JSDOM_ABORT_LISTENER_MAX 16
 #define JSDOM_EVENT_LISTENER_MAX 64
 #define JSDOM_HEADERS_MAX 64
 #define JSDOM_HEADER_NAME_MAX 63
@@ -67,14 +65,10 @@ enum host_kind {
     HOST_HEADERS,
     HOST_STORAGE,
     HOST_URL,
-    HOST_ABORT_CONTROLLER,
-    HOST_ABORT_SIGNAL,
     HOST_EVENT_TARGET,
     HOST_REQUEST,
-    HOST_BLOB,
     HOST_FILE,
     HOST_FILE_READER,
-    HOST_FORMDATA,
     HOST_WEB_ITERATOR,
     HOST_MEDIA_QUERY,
     HOST_HISTORY,
@@ -89,6 +83,7 @@ enum host_kind {
     HOST_COMPUTED_STYLE,
     HOST_CANVAS_2D,
     HOST_IMAGE_DATA,
+    HOST_CANVAS_GRADIENT,
     HOST_DOM_PARSER,
     HOST_RESIZE_OBSERVER,
     HOST_INTERSECTION_OBSERVER
@@ -143,14 +138,10 @@ struct request_state {
     int keepalive;
 };
 
-struct blob_state {
+struct file_state {
     char *data;
     unsigned long length;
     char type[128];
-};
-
-struct file_state {
-    struct blob_state blob;
     char *name;
     double last_modified;
 };
@@ -165,24 +156,10 @@ struct file_reader_state {
     js_value pending_result;
 };
 
-struct form_entry {
-    char *name;
-    js_value value;
-    char *filename;
-};
-
-struct formdata_state {
-    unsigned int count;
-    struct form_entry entries[JSDOM_HEADERS_MAX];
-};
-
 enum web_iterator_kind {
     ITER_HEADERS_ENTRIES = 1,
     ITER_HEADERS_KEYS,
-    ITER_HEADERS_VALUES,
-    ITER_FORMDATA_ENTRIES,
-    ITER_FORMDATA_KEYS,
-    ITER_FORMDATA_VALUES
+    ITER_HEADERS_VALUES
 };
 
 struct web_iterator_state {
@@ -207,26 +184,6 @@ struct url_state {
     struct url parsed;
     js_value search_params;
     char params_snapshot[URL_QUERY_MAX];
-};
-
-struct abort_listener {
-    js_value callback;
-    js_value signal;
-    unsigned char capture;
-    unsigned char passive;
-};
-
-struct abort_state {
-    int refs;
-    int aborted;
-    js_value reason;
-    js_value signal;
-    js_value onabort;
-    struct abort_listener listeners[JSDOM_ABORT_LISTENER_MAX];
-    unsigned int listener_count;
-    struct abort_state *dependents[JSDOM_ABORT_LISTENER_MAX];
-    unsigned int dependent_count;
-    unsigned int dependency_depth;
 };
 
 struct mutation_registration {
@@ -288,12 +245,34 @@ struct canvas_pt {
     unsigned char kind; /* 0 = move, 1 = line, 2 = close */
 };
 
+#define JSDOM_GRADIENT_LINEAR 1
+#define JSDOM_GRADIENT_RADIAL 2
+
+struct canvas_grad_stop {
+    double offset;
+    uint32_t color;
+};
+
+struct canvas_gradient {
+    int refs;
+    int kind;
+    double x0, y0, r0;
+    double x1, y1, r1;
+    struct canvas_grad_stop *stops;
+    unsigned int stop_count;
+    unsigned int stop_cap;
+};
+
 struct canvas_2d_saved {
     double m[6]; /* a, b, c, d, e, f */
     uint32_t fill_color;
     uint32_t stroke_color;
     char fill_str[64];
     char stroke_str[64];
+    struct canvas_gradient *fill_grad;
+    struct canvas_gradient *stroke_grad;
+    js_value fill_grad_val;
+    js_value stroke_grad_val;
     double line_width;
     double global_alpha;
     char font[128];
@@ -357,6 +336,7 @@ struct jsdom {
     js_object *computed_style_proto;
     js_object *canvas_2d_proto;
     js_object *image_data_proto;
+    js_object *canvas_gradient_proto;
     js_object *dom_parser_proto;
     js_object *resize_observer_proto;
     js_object *intersection_observer_proto;
@@ -364,8 +344,6 @@ struct jsdom {
     js_object *headers_proto;
     js_object *storage_proto;
     js_object *url_proto;
-    js_object *abort_controller_proto;
-    js_object *abort_signal_proto;
     js_object *event_target_proto;
     js_object *event_proto;
     js_object *custom_event_proto;
@@ -376,10 +354,8 @@ struct jsdom {
     js_object *input_event_proto;
     js_object *pointer_event_proto;
     js_object *request_proto;
-    js_object *blob_proto;
     js_object *file_proto;
     js_object *file_reader_proto;
-    js_object *formdata_proto;
     js_object *web_iterator_proto;
     js_object *media_query_proto;
     js_object *history_proto;
@@ -424,7 +400,7 @@ struct jsdom {
         js_value args[JSDOM_TIMER_ARGS_MAX];
         unsigned long due_turn;
         unsigned int interval_turns;
-        struct abort_state *abort;
+        js_value abort_signal;
         unsigned char state;
         unsigned char repeats;
         unsigned char argc;
@@ -442,7 +418,7 @@ struct jsdom {
         char mode[16];
         char credentials[16];
         char redirect[12];
-        struct abort_state *abort;
+        js_value abort_signal;
         unsigned char state;
     } fetches[JSDOM_FETCH_MAX];
     struct file_reader_task {
@@ -577,34 +553,13 @@ static void request_release(struct request_state *request)
     free(request);
 }
 
-static void blob_release(struct blob_state *blob)
-{
-    if (!blob)
-        return;
-    free(blob->data);
-    free(blob);
-}
-
 static void file_release(struct file_state *file)
 {
     if (!file)
         return;
-    free(file->blob.data);
+    free(file->data);
     free(file->name);
     free(file);
-}
-
-static void formdata_release(struct formdata_state *form)
-{
-    unsigned int i;
-
-    if (!form)
-        return;
-    for (i = 0; i < form->count; i++) {
-        free(form->entries[i].name);
-        free(form->entries[i].filename);
-    }
-    free(form);
 }
 
 static void history_release(struct history_state *history)
@@ -618,10 +573,51 @@ static void history_release(struct history_state *history)
     free(history);
 }
 
-static void abort_release(struct abort_state *s)
+static struct canvas_gradient *canvas_grad_retain(struct canvas_gradient *g)
 {
-    if (s && --s->refs == 0)
-        free(s);
+    if (g)
+        g->refs++;
+    return g;
+}
+
+static void canvas_grad_release(struct canvas_gradient *g)
+{
+    if (!g || --g->refs > 0)
+        return;
+    free(g->stops);
+    free(g);
+}
+
+static void canvas_2d_saved_release(struct canvas_2d_saved *s)
+{
+    if (!s)
+        return;
+    canvas_grad_release(s->fill_grad);
+    canvas_grad_release(s->stroke_grad);
+    s->fill_grad = 0;
+    s->stroke_grad = 0;
+    s->fill_grad_val = js_undefined();
+    s->stroke_grad_val = js_undefined();
+}
+
+static void canvas_2d_saved_copy(struct canvas_2d_saved *dst,
+                                 const struct canvas_2d_saved *src)
+{
+    canvas_grad_retain(src->fill_grad);
+    canvas_grad_retain(src->stroke_grad);
+    canvas_2d_saved_release(dst);
+    *dst = *src;
+}
+
+static void canvas_2d_release_grads(struct canvas_2d_state *st)
+{
+    int i;
+
+    if (!st)
+        return;
+    canvas_2d_saved_release(&st->cur);
+    for (i = 0; i < st->sp; i++)
+        canvas_2d_saved_release(&st->stack[i]);
 }
 
 static void free_node_canvas(struct dom_node *n)
@@ -679,29 +675,26 @@ static void host_free(void *user, void *ptr)
     else if (h && h->kind == HOST_CANVAS_2D) {
         struct canvas_2d_state *st = (struct canvas_2d_state *)h->data;
 
-        if (st)
+        if (st) {
+            canvas_2d_release_grads(st);
             free(st->path);
+        }
         free(st);
     }
+    else if (h && h->kind == HOST_CANVAS_GRADIENT)
+        canvas_grad_release((struct canvas_gradient *)h->data);
     else if (h && h->kind == HOST_RESPONSE)
         response_release((struct response_state *)h->data);
     else if (h && h->kind == HOST_HEADERS)
         headers_release((struct headers_state *)h->data);
     else if (h && h->kind == HOST_URL)
         free(h->data);
-    else if (h && (h->kind == HOST_ABORT_CONTROLLER ||
-                   h->kind == HOST_ABORT_SIGNAL))
-        abort_release((struct abort_state *)h->data);
     else if (h && h->kind == HOST_REQUEST)
         request_release((struct request_state *)h->data);
-    else if (h && h->kind == HOST_BLOB)
-        blob_release((struct blob_state *)h->data);
     else if (h && h->kind == HOST_FILE)
         file_release((struct file_state *)h->data);
     else if (h && h->kind == HOST_FILE_READER)
         free(h->data);
-    else if (h && h->kind == HOST_FORMDATA)
-        formdata_release((struct formdata_state *)h->data);
     else if (h && h->kind == HOST_WEB_ITERATOR)
         free(h->data);
     else if (h && h->kind == HOST_HISTORY)
@@ -5774,7 +5767,7 @@ static int listener_options(js_ctx *c, js_value options,
         js_get(c, options, "signal", signal) != JS_OK)
         return JS_THROW;
     if (!js_is_undefined(*signal) && !js_is_null(*signal) &&
-        !host(*signal, HOST_ABORT_SIGNAL))
+        !js_is_abortsignal(*signal))
         return js_throw_error(c, JS_ERR_TYPE,
                               "listener signal must be an AbortSignal");
     return JS_OK;
@@ -5825,8 +5818,7 @@ static int event_listener_add(js_ctx *c, js_value target,
     if (listener_options(c, ac > 2 ? av[2] : js_undefined(),
                          &capture, &once, &passive, &signal) != JS_OK)
         return JS_THROW;
-    if (host(signal, HOST_ABORT_SIGNAL) &&
-        ((struct abort_state *)host(signal, HOST_ABORT_SIGNAL)->data)->aborted) {
+    if (js_abortsignal_aborted(signal)) {
         *r = js_undefined();
         return JS_OK;
     }
@@ -10941,306 +10933,14 @@ static int crypto_fill(unsigned char *bytes, unsigned long length)
 #endif
 }
 
-static int crypto_get_random_values(js_ctx *c, js_value t,
-                                    int ac, js_value *av, js_value *r)
+static int jsdom_random_bytes(void *user, uint8_t *out, unsigned long len)
 {
-    unsigned char *bytes;
-    unsigned long length;
-    (void)t;
-
-    if (ac < 1 || !js_is_uint8array(av[0]))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "getRandomValues requires a Uint8Array");
-    bytes = (unsigned char *)
-        js_uint8array_mutable_data(av[0], &length);
-    if (!bytes && length)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid Uint8Array storage");
-    if (length > 65536)
-        return js_throw_error(c, JS_ERR_RANGE,
-                              "getRandomValues quota exceeded");
-    if (length && crypto_fill(bytes, length) != 0)
-        return js_throw_error(c, JS_ERR_ERROR,
-                              "secure random source is unavailable");
-    *r = av[0];
-    return JS_OK;
-}
-
-static int crypto_random_uuid(js_ctx *c, js_value t,
-                              int ac, js_value *av, js_value *r)
-{
-    static const char hex[] = "0123456789abcdef";
-    unsigned char bytes[16];
-    char uuid[37];
-    unsigned int i, write = 0;
-    (void)t; (void)ac; (void)av;
-
-    if (crypto_fill(bytes, sizeof(bytes)) != 0)
-        return js_throw_error(c, JS_ERR_ERROR,
-                              "secure random source is unavailable");
-    bytes[6] = (unsigned char)((bytes[6] & 0x0f) | 0x40);
-    bytes[8] = (unsigned char)((bytes[8] & 0x3f) | 0x80);
-    for (i = 0; i < sizeof(bytes); i++) {
-        if (i == 4 || i == 6 || i == 8 || i == 10)
-            uuid[write++] = '-';
-        uuid[write++] = hex[bytes[i] >> 4];
-        uuid[write++] = hex[bytes[i] & 15];
-    }
-    uuid[write] = 0;
-    *r = js_mkstring(c, uuid, write);
-    return js_fatal(c) ? JS_THROW : JS_OK;
-}
-
-static int make_named_error(js_ctx *c, const char *error_name,
-                            const char *error_message, js_value *out);
-static int resolved_promise(js_ctx *c, js_value value, int rejected,
-                            js_value *r);
-
-static int crypto_digest_reject(js_ctx *c, const char *name,
-                                const char *message, js_value *r)
-{
-    js_value reason;
-
-    if (make_named_error(c, name, message, &reason) != JS_OK)
-        return JS_THROW;
-    return resolved_promise(c, reason, 1, r);
-}
-
-#define WEB_HASH_SHA1 100
-
-struct web_sha1_ctx {
-    uint32_t state[5];
-    uint64_t bits;
-    unsigned char block[64];
-    unsigned long used;
-};
-
-static uint32_t web_sha1_rotl(uint32_t value, unsigned int count)
-{
-    return (value << count) | (value >> (32 - count));
-}
-
-/* Legacy SHA-1 is kept local to Web Crypto. TLS never offers it. This is the
- * FIPS 180-4 80-round compression schedule written directly from the
- * specification. */
-static void web_sha1_block(struct web_sha1_ctx *hash,
-                           const unsigned char block[64])
-{
-    uint32_t words[80];
-    uint32_t a, b, c, d, e;
-    unsigned int i;
-
-    for (i = 0; i < 16; i++)
-        words[i] = ((uint32_t)block[i * 4] << 24) |
-                   ((uint32_t)block[i * 4 + 1] << 16) |
-                   ((uint32_t)block[i * 4 + 2] << 8) |
-                   (uint32_t)block[i * 4 + 3];
-    for (i = 16; i < 80; i++)
-        words[i] = web_sha1_rotl(words[i - 3] ^ words[i - 8] ^
-                                 words[i - 14] ^ words[i - 16], 1);
-    a = hash->state[0];
-    b = hash->state[1];
-    c = hash->state[2];
-    d = hash->state[3];
-    e = hash->state[4];
-    for (i = 0; i < 80; i++) {
-        uint32_t function, constant, temporary;
-
-        if (i < 20) {
-            function = (b & c) | ((~b) & d);
-            constant = 0x5a827999U;
-        } else if (i < 40) {
-            function = b ^ c ^ d;
-            constant = 0x6ed9eba1U;
-        } else if (i < 60) {
-            function = (b & c) | (b & d) | (c & d);
-            constant = 0x8f1bbcdcU;
-        } else {
-            function = b ^ c ^ d;
-            constant = 0xca62c1d6U;
-        }
-        temporary = web_sha1_rotl(a, 5) + function + e +
-                    constant + words[i];
-        e = d;
-        d = c;
-        c = web_sha1_rotl(b, 30);
-        b = a;
-        a = temporary;
-    }
-    hash->state[0] += a;
-    hash->state[1] += b;
-    hash->state[2] += c;
-    hash->state[3] += d;
-    hash->state[4] += e;
-}
-
-static void web_sha1_update(struct web_sha1_ctx *hash,
-                            const void *data, unsigned long length)
-{
-    const unsigned char *bytes = (const unsigned char *)data;
-
-    hash->bits += (uint64_t)length * 8U;
-    while (length) {
-        unsigned long available = 64 - hash->used;
-        unsigned long take = length < available ? length : available;
-
-        memcpy(hash->block + hash->used, bytes, take);
-        hash->used += take;
-        bytes += take;
-        length -= take;
-        if (hash->used == 64) {
-            web_sha1_block(hash, hash->block);
-            hash->used = 0;
-        }
-    }
-}
-
-static void web_sha1_oneshot(const void *data, unsigned long length,
-                             unsigned char output[20])
-{
-    struct web_sha1_ctx hash;
-    unsigned char padding[64], encoded_length[8];
-    uint64_t message_bits;
-    unsigned long padding_length;
-    unsigned int i;
-
-    memset(&hash, 0, sizeof(hash));
-    hash.state[0] = 0x67452301U;
-    hash.state[1] = 0xefcdab89U;
-    hash.state[2] = 0x98badcfeU;
-    hash.state[3] = 0x10325476U;
-    hash.state[4] = 0xc3d2e1f0U;
-    web_sha1_update(&hash, data, length);
-    message_bits = hash.bits;
-    memset(padding, 0, sizeof(padding));
-    padding[0] = 0x80;
-    padding_length = hash.used < 56 ? 56 - hash.used :
-                                       120 - hash.used;
-    web_sha1_update(&hash, padding, padding_length);
-    for (i = 0; i < 8; i++)
-        encoded_length[7 - i] =
-            (unsigned char)(message_bits >> (i * 8));
-    web_sha1_update(&hash, encoded_length, sizeof(encoded_length));
-    for (i = 0; i < 5; i++) {
-        output[i * 4] = (unsigned char)(hash.state[i] >> 24);
-        output[i * 4 + 1] = (unsigned char)(hash.state[i] >> 16);
-        output[i * 4 + 2] = (unsigned char)(hash.state[i] >> 8);
-        output[i * 4 + 3] = (unsigned char)hash.state[i];
-    }
-}
-
-static int crypto_digest_algorithm(js_ctx *c, js_value algorithm,
-                                   int *hash_algorithm)
-{
-    js_value name_value;
-    const char *name;
-    unsigned long length, i;
-    static const struct {
-        const char *name;
-        int algorithm;
-    } supported[] = {
-        { "sha-1", WEB_HASH_SHA1 },
-        { "sha-256", HASH_SHA256 },
-        { "sha-384", HASH_SHA384 },
-        { "sha-512", HASH_SHA512 }
-    };
-
-    if (js_is_object(algorithm)) {
-        if (js_get(c, algorithm, "name", &name_value) != JS_OK)
-            return JS_THROW;
-        algorithm = name_value;
-    }
-    if (js_to_string(c, algorithm, &name_value) != JS_OK)
-        return JS_THROW;
-    name = js_string_bytes(name_value, &length);
-    *hash_algorithm = -1;
-    for (i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
-        unsigned long j, expected_length = strlen(supported[i].name);
-        int matches = length == expected_length;
-
-        for (j = 0; matches && j < length; j++)
-            if (ci((unsigned char)name[j]) !=
-                (unsigned char)supported[i].name[j])
-                matches = 0;
-        if (matches) {
-            *hash_algorithm = supported[i].algorithm;
-            break;
-        }
-    }
-    return JS_OK;
-}
-
-static int crypto_subtle_digest(js_ctx *c, js_value t,
-                                int ac, js_value *av, js_value *r)
-{
-    const void *data;
-    unsigned long length, digest_length;
-    unsigned char digest[HASH_MAX_DIGEST];
-    js_value buffer;
-    int hash_algorithm;
-    (void)t;
-
-    if (ac < 2)
-        return crypto_digest_reject(c, "TypeError",
-                                    "digest requires algorithm and data", r);
-    if (crypto_digest_algorithm(c, av[0], &hash_algorithm) != JS_OK)
-        return JS_THROW;
-    if (hash_algorithm < 0)
-        return crypto_digest_reject(c, "NotSupportedError",
-                                    "unsupported digest algorithm", r);
-    if (js_is_arraybuffer(av[1]))
-        data = js_arraybuffer_data(av[1], &length);
-    else if (js_is_uint8array(av[1]))
-        data = js_uint8array_data(av[1], &length);
-    else
-        return crypto_digest_reject(c, "TypeError",
-                                    "digest data must be a byte buffer", r);
-    if (hash_algorithm == WEB_HASH_SHA1) {
-        digest_length = 20;
-        web_sha1_oneshot(data, length, digest);
-    } else {
-        digest_length = hash_digest_len(hash_algorithm);
-        if (!digest_length ||
-            hash_oneshot(hash_algorithm, data, length, digest) != 0)
-            return crypto_digest_reject(c, "OperationError",
-                                        "digest operation failed", r);
-    }
-    buffer = js_arraybuffer_new(c, digest, digest_length);
-    if (!js_is_arraybuffer(buffer))
-        return JS_THROW;
-    return resolved_promise(c, buffer, 0, r);
+    (void)user;
+    return crypto_fill((unsigned char *)out, len);
 }
 
 /* ------------------------------------------------------------------ */
 /* AbortController / AbortSignal                                      */
-
-static struct abort_state *abort_state_of(js_value value, int kind)
-{
-    struct hostref *h = host(value, kind);
-
-    return h ? (struct abort_state *)h->data : 0;
-}
-
-static struct abort_state *abort_state_new(struct jsdom *j)
-{
-    struct abort_state *state;
-    js_object *signal;
-
-    state = (struct abort_state *)calloc(1, sizeof(*state));
-    if (!state)
-        return 0;
-    state->refs = 1;
-    state->reason = js_undefined();
-    state->onabort = js_undefined();
-    signal = new_host_data(j, 0, HOST_ABORT_SIGNAL, state,
-                           j->abort_signal_proto);
-    if (!signal) {
-        free(state);
-        return 0;
-    }
-    state->signal = js_object_value(signal);
-    return state;
-}
 
 static int make_named_error(js_ctx *c, const char *error_name,
                             const char *error_message, js_value *out)
@@ -11282,19 +10982,20 @@ static void fetch_task_clear(struct jsdom *j, int index)
     memset(&j->fetches[index], 0, sizeof(j->fetches[index]));
 }
 
-static int abort_pending_fetches(struct jsdom *j, struct abort_state *state)
+static int abort_pending_fetches(struct jsdom *j, js_value signal)
 {
+    js_value reason = js_abortsignal_reason(signal);
     int i;
 
     for (i = 0; i < JSDOM_FETCH_MAX; i++) {
         int rc;
 
         if (j->fetches[i].state != TASK_QUEUED ||
-            j->fetches[i].abort != state)
+            !js_is_object(j->fetches[i].abort_signal) ||
+            j->fetches[i].abort_signal.u.obj != signal.u.obj)
             continue;
         j->fetches[i].state = TASK_SETTLING;
-        rc = js_promise_reject(j->ctx, j->fetches[i].promise,
-                               state->reason);
+        rc = js_promise_reject(j->ctx, j->fetches[i].promise, reason);
         fetch_task_clear(j, i);
         if (rc != JS_OK)
             return JS_THROW;
@@ -11302,341 +11003,30 @@ static int abort_pending_fetches(struct jsdom *j, struct abort_state *state)
     return JS_OK;
 }
 
-static int abort_dispatch(struct jsdom *j, struct abort_state *state)
+static void jsdom_on_abort(void *user, js_value signal)
 {
-    js_value event, result, callable, receiver;
-    struct abort_listener listeners[JSDOM_ABORT_LISTENER_MAX];
-    unsigned int count, i;
+    struct jsdom *j = (struct jsdom *)user;
 
-    if (event_make(j, j->event_proto, "abort", js_undefined(),
-                   js_undefined(), 0, &event) != JS_OK ||
-        js_set(j->ctx, event, "target", state->signal) != JS_OK ||
-        js_set(j->ctx, event, "currentTarget", state->signal) != JS_OK ||
-        js_set(j->ctx, event, "eventPhase", js_number(2)) != JS_OK)
-        return JS_THROW;
-    count = state->listener_count;
-    for (i = 0; i < count; i++)
-        listeners[i] = state->listeners[i];
-    if (js_is_function(state->onabort) &&
-        js_call(j->ctx, state->onabort, state->signal,
-                1, &event, &result) != JS_OK) {
-        if (js_fatal(j->ctx))
-            return JS_THROW;
-        if (j->print)
-            j->print(j->print_user,
-                     js_error_text(j->ctx, js_exception(j->ctx)));
-        js_clear_exception(j->ctx);
-    }
-    for (i = 0; i < count; i++) {
-        struct hostref *removal_signal =
-            host(listeners[i].signal, HOST_ABORT_SIGNAL);
-
-        if ((removal_signal &&
-             ((struct abort_state *)removal_signal->data)->aborted) ||
-            !event_callback(j->ctx, listeners[i].callback,
-                            &callable, &receiver))
-            continue;
-        if (js_set(j->ctx, event, "__inPassiveListener",
-                   js_bool(listeners[i].passive)) != JS_OK)
-            return JS_THROW;
-        if (js_call(j->ctx, callable,
-                    js_is_function(listeners[i].callback)
-                        ? state->signal : receiver,
-                    1, &event, &result) != JS_OK) {
-            js_set(j->ctx, event, "__inPassiveListener", js_bool(0));
-            if (js_fatal(j->ctx))
-                return JS_THROW;
-            if (j->print)
-                j->print(j->print_user,
-                         js_error_text(j->ctx, js_exception(j->ctx)));
-            js_clear_exception(j->ctx);
-        }
-        if (js_set(j->ctx, event, "__inPassiveListener",
-                   js_bool(0)) != JS_OK)
-            return JS_THROW;
-    }
-    if (js_set(j->ctx, event, "currentTarget", js_null()) != JS_OK ||
-        js_set(j->ctx, event, "eventPhase", js_number(0)) != JS_OK)
-        return JS_THROW;
-    return JS_OK;
+    if (j)
+        (void)abort_pending_fetches(j, signal);
 }
 
-static int abort_state_trigger(struct jsdom *j, struct abort_state *state,
-                               js_value reason, int dispatch)
+static js_value jsdom_make_abort_event(void *user, const char *type)
 {
-    unsigned int i;
+    struct jsdom *j = (struct jsdom *)user;
+    js_value ev;
 
-    if (state->aborted)
-        return JS_OK;
-    state->reason = reason;
-    state->aborted = 1;
-    if (abort_pending_fetches(j, state) != JS_OK ||
-        (dispatch && abort_dispatch(j, state) != JS_OK))
-        return JS_THROW;
-    for (i = 0; i < state->dependent_count; i++)
-        if (abort_state_trigger(j, state->dependents[i],
-                                reason, 1) != JS_OK)
-            return JS_THROW;
-    return JS_OK;
-}
-
-static int abort_controller_constructor(js_ctx *c, js_value t,
-                                        int ac, js_value *av, js_value *r)
-{
-    struct jsdom *j = binding(c);
-    struct abort_state *state;
-    js_object *controller;
-    (void)t; (void)ac; (void)av;
-
-    if (!j || !js_is_constructing(c))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "AbortController must be constructed with new");
-    state = abort_state_new(j);
-    if (!state)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    state->refs++;
-    controller = new_host_data(j, 0, HOST_ABORT_CONTROLLER, state,
-                               j->abort_controller_proto);
-    if (!controller) {
-        state->refs--;
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *r = js_object_value(controller);
-    return JS_OK;
-}
-
-static int abort_controller_signal_get(js_ctx *c, js_value t,
-                                       int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_CONTROLLER);
-    (void)ac; (void)av;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortController receiver");
-    *r = state->signal;
-    return JS_OK;
-}
-
-static int abort_controller_abort(js_ctx *c, js_value t,
-                                  int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_CONTROLLER);
-    struct hostref *controller = host(t, HOST_ABORT_CONTROLLER);
-
-    if (!state || !controller)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortController receiver");
-    if (state->aborted) {
-        *r = js_undefined();
-        return JS_OK;
-    }
-    if (ac > 0 && !js_is_undefined(av[0])) {
-        state->reason = av[0];
-    } else if (make_abort_reason(c, &state->reason) != JS_OK) {
-        return JS_THROW;
-    }
-    if (abort_state_trigger(controller->j, state, state->reason, 1) != JS_OK)
-        return JS_THROW;
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int abort_signal_aborted_get(js_ctx *c, js_value t,
-                                    int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    (void)ac; (void)av;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    *r = js_bool(state->aborted);
-    return JS_OK;
-}
-
-static int abort_signal_reason_get(js_ctx *c, js_value t,
-                                   int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    (void)ac; (void)av;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    *r = state->reason;
-    return JS_OK;
-}
-
-static int abort_signal_onabort_get(js_ctx *c, js_value t,
-                                    int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    (void)ac; (void)av;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    *r = js_is_undefined(state->onabort) ? js_null() : state->onabort;
-    return JS_OK;
-}
-
-static int abort_signal_onabort_set(js_ctx *c, js_value t,
-                                    int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    if (ac < 1 || js_is_null(av[0]) || js_is_undefined(av[0]))
-        state->onabort = js_undefined();
-    else if (js_is_function(av[0]))
-        state->onabort = av[0];
-    else
-        state->onabort = js_undefined();
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int abort_signal_throw_if_aborted(js_ctx *c, js_value t,
-                                         int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    (void)ac; (void)av;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    if (state->aborted)
-        return js_throw(c, state->reason);
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int abort_signal_add_listener(js_ctx *c, js_value t,
-                                     int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    const char *type;
-    js_value callable, receiver, signal;
-    struct hostref *signal_host;
-    unsigned int i;
-    int capture, once, passive;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    if (string_arg(c, ac, av, 0, &type) != JS_OK)
-        return JS_THROW;
-    if (strcmp(type, "abort") || ac < 2 ||
-        js_is_null(av[1]) || js_is_undefined(av[1])) {
-        *r = js_undefined();
-        return JS_OK;
-    }
-    if (!event_callback(c, av[1], &callable, &receiver))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid event listener");
-    (void)callable;
-    (void)receiver;
-    if (listener_options(c, ac > 2 ? av[2] : js_undefined(),
-                         &capture, &once, &passive, &signal) != JS_OK)
-        return JS_THROW;
-    (void)once; /* An AbortSignal dispatches its abort event only once. */
-    signal_host = host(signal, HOST_ABORT_SIGNAL);
-    if (signal_host &&
-        ((struct abort_state *)signal_host->data)->aborted) {
-        *r = js_undefined();
-        return JS_OK;
-    }
-    for (i = 0; i < state->listener_count; i++)
-        if (js_is_object(state->listeners[i].callback) &&
-            state->listeners[i].callback.u.obj == av[1].u.obj &&
-            state->listeners[i].capture == capture) {
-            *r = js_undefined();
-            return JS_OK;
-        }
-    if (state->listener_count >= JSDOM_ABORT_LISTENER_MAX)
-        return js_throw_error(c, JS_ERR_RANGE,
-                              "too many AbortSignal listeners");
-    state->listeners[state->listener_count].callback = av[1];
-    state->listeners[state->listener_count].signal = signal;
-    state->listeners[state->listener_count].capture =
-        (unsigned char)capture;
-    state->listeners[state->listener_count].passive =
-        (unsigned char)passive;
-    state->listener_count++;
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int abort_signal_remove_listener(js_ctx *c, js_value t,
-                                        int ac, js_value *av, js_value *r)
-{
-    struct abort_state *state = abort_state_of(t, HOST_ABORT_SIGNAL);
-    const char *type;
-    unsigned int i;
-    int capture;
-
-    if (!state)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "invalid AbortSignal receiver");
-    if (string_arg(c, ac, av, 0, &type) != JS_OK)
-        return JS_THROW;
-    if (listener_capture_option(c,
-                                ac > 2 ? av[2] : js_undefined(),
-                                &capture) != JS_OK)
-        return JS_THROW;
-    if (!strcmp(type, "abort") && ac > 1 && js_is_object(av[1])) {
-        for (i = 0; i < state->listener_count; i++) {
-            if (!js_is_object(state->listeners[i].callback) ||
-                state->listeners[i].callback.u.obj != av[1].u.obj ||
-                state->listeners[i].capture != capture)
-                continue;
-            for (; i + 1 < state->listener_count; i++)
-                state->listeners[i] = state->listeners[i + 1];
-            state->listener_count--;
-            break;
-        }
-    }
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int abort_signal_constructor(js_ctx *c, js_value t,
-                                    int ac, js_value *av, js_value *r)
-{
-    (void)t; (void)ac; (void)av; (void)r;
-    return js_throw_error(c, JS_ERR_TYPE, "Illegal constructor");
-}
-
-static int abort_signal_abort_static(js_ctx *c, js_value t,
-                                     int ac, js_value *av, js_value *r)
-{
-    struct jsdom *j = binding(c);
-    struct abort_state *state;
-    (void)t;
-
-    if (!j)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid browser binding");
-    state = abort_state_new(j);
-    if (!state)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    if (ac > 0 && !js_is_undefined(av[0])) {
-        state->reason = av[0];
-    } else if (make_abort_reason(c, &state->reason) != JS_OK) {
-        return JS_THROW;
-    }
-    state->aborted = 1;
-    *r = state->signal;
-    return JS_OK;
+    if (!j || event_make(j, j->event_proto, type, js_undefined(),
+                         js_undefined(), 0, &ev) != JS_OK)
+        return js_undefined();
+    return ev;
 }
 
 static int abort_signal_timeout_static(js_ctx *c, js_value t,
                                        int ac, js_value *av, js_value *r)
 {
     struct jsdom *j = binding(c);
-    struct abort_state *state;
+    js_value signal;
     double delay;
     unsigned int turns = 1;
     int slot = -1, i;
@@ -11662,78 +11052,18 @@ static int abort_signal_timeout_static(js_ctx *c, js_value t,
         }
     if (slot < 0)
         return js_throw_error(c, JS_ERR_RANGE, "too many pending timers");
-    state = abort_state_new(j);
-    if (!state)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    signal = js_abortsignal_new(c);
+    if (!js_is_abortsignal(signal))
+        return JS_THROW;
     j->timers[slot].fn = js_undefined();
-    j->timers[slot].abort = state;
+    j->timers[slot].abort_signal = signal;
     j->timers[slot].state = TASK_QUEUED;
+    j->timers[slot].repeats = 0;
+    j->timers[slot].argc = 0;
+    j->timers[slot].interval_turns = 0;
+    j->timers[slot].callback_kind = 0;
     j->timers[slot].due_turn = j->event_turn + turns;
-    *r = state->signal;
-    return JS_OK;
-}
-
-static int abort_signal_any_static(js_ctx *c, js_value t,
-                                   int ac, js_value *av, js_value *r)
-{
-    struct jsdom *j = binding(c);
-    struct abort_state *sources[JSDOM_ABORT_LISTENER_MAX];
-    struct abort_state *state, *first_aborted = 0;
-    unsigned long length, index;
-    unsigned int source_count = 0, depth = 0, i;
-    (void)t;
-
-    if (!j || ac < 1 || !js_is_array(av[0]))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "AbortSignal.any requires an array of signals");
-    length = js_array_length(av[0].u.obj);
-    if (length > JSDOM_ABORT_LISTENER_MAX)
-        return js_throw_error(c, JS_ERR_RANGE,
-                              "too many composed AbortSignals");
-    for (index = 0; index < length; index++) {
-        js_value value;
-        struct abort_state *source;
-        int duplicate = 0;
-
-        if (js_array_get(c, av[0].u.obj, index, &value) != JS_OK)
-            return JS_THROW;
-        source = abort_state_of(value, HOST_ABORT_SIGNAL);
-        if (!source)
-            return js_throw_error(c, JS_ERR_TYPE,
-                                  "AbortSignal.any input is not a signal");
-        if (!first_aborted && source->aborted)
-            first_aborted = source;
-        for (i = 0; i < source_count; i++)
-            if (sources[i] == source) {
-                duplicate = 1;
-                break;
-            }
-        if (!duplicate) {
-            sources[source_count++] = source;
-            if (source->dependency_depth > depth)
-                depth = source->dependency_depth;
-        }
-    }
-    if (source_count && depth + 1 >= JSDOM_ABORT_LISTENER_MAX)
-        return js_throw_error(c, JS_ERR_RANGE,
-                              "AbortSignal composition is too deep");
-    state = abort_state_new(j);
-    if (!state)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    state->dependency_depth = source_count ? depth + 1 : 0;
-    if (first_aborted) {
-        state->aborted = 1;
-        state->reason = first_aborted->reason;
-    } else {
-        for (i = 0; i < source_count; i++)
-            if (sources[i]->dependent_count >=
-                JSDOM_ABORT_LISTENER_MAX)
-                return js_throw_error(c, JS_ERR_RANGE,
-                                      "too many dependent AbortSignals");
-        for (i = 0; i < source_count; i++)
-            sources[i]->dependents[sources[i]->dependent_count++] = state;
-    }
-    *r = state->signal;
+    *r = signal;
     return JS_OK;
 }
 
@@ -12297,19 +11627,6 @@ static struct headers_state *headers_clone_state(
     return copy;
 }
 
-static struct blob_state *blob_state_of(js_value value)
-{
-    struct hostref *h = host(value, 0);
-
-    if (!h)
-        return 0;
-    if (h->kind == HOST_BLOB)
-        return (struct blob_state *)h->data;
-    if (h->kind == HOST_FILE)
-        return &((struct file_state *)h->data)->blob;
-    return 0;
-}
-
 static struct file_state *file_state_of(js_value value)
 {
     struct hostref *h = host(value, HOST_FILE);
@@ -12317,200 +11634,94 @@ static struct file_state *file_state_of(js_value value)
     return h ? (struct file_state *)h->data : 0;
 }
 
-static int blob_type_set(js_ctx *c, struct blob_state *blob, js_value value)
+static int jsdom_blob_info(js_value v, const void **data, unsigned long *len,
+                           const char **type, const char **fname)
+{
+    struct file_state *f = file_state_of(v);
+    const void *p;
+
+    if (f) {
+        if (data) *data = f->data ? f->data : "";
+        if (len) *len = f->length;
+        if (type) *type = f->type;
+        if (fname) *fname = f->name;
+        return 1;
+    }
+    p = js_blob_data(v, len, type);
+    if (p || js_is_blob(v)) {
+        if (data) *data = p ? p : "";
+        if (fname) *fname = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int jsdom_file_extract(void *user, js_value v, const void **data,
+                              unsigned long *len, const char **type,
+                              const char **filename)
+{
+    struct file_state *f = file_state_of(v);
+
+    (void)user;
+    if (!f)
+        return 0;
+    if (data) *data = f->data ? f->data : "";
+    if (len) *len = f->length;
+    if (type) *type = f->type;
+    if (filename) *filename = f->name;
+    return 1;
+}
+
+static int file_type_set(js_ctx *c, char dst[128], js_value value)
 {
     js_value string_value;
     const char *bytes;
     unsigned long length, i;
 
-    blob->type[0] = 0;
+    dst[0] = 0;
     if (js_is_undefined(value))
         return JS_OK;
     if (js_to_string(c, value, &string_value) != JS_OK)
         return JS_THROW;
     bytes = js_string_bytes(string_value, &length);
-    if (length >= sizeof(blob->type))
+    if (length >= 128)
         return JS_OK;
     for (i = 0; i < length; i++)
         if ((unsigned char)bytes[i] < 0x20 ||
             (unsigned char)bytes[i] > 0x7e)
             return JS_OK;
     for (i = 0; i < length; i++)
-        blob->type[i] = (char)ci((unsigned char)bytes[i]);
-    blob->type[length] = 0;
+        dst[i] = (char)ci((unsigned char)bytes[i]);
+    dst[length] = 0;
     return JS_OK;
 }
 
-static int blob_append_part(js_ctx *c, struct blob_state *blob,
+static int file_append_part(js_ctx *c, struct file_state *file,
                             js_value part)
 {
-    struct blob_state *part_blob = blob_state_of(part);
     js_value string_value;
-    const void *bytes;
-    unsigned long length;
+    const void *bytes = 0;
+    unsigned long length = 0;
     char *grown;
 
-    if (part_blob) {
-        bytes = part_blob->data;
-        length = part_blob->length;
-    } else if (js_is_arraybuffer(part)) {
-        bytes = js_arraybuffer_data(part, &length);
-    } else if (js_is_uint8array(part)) {
-        bytes = js_uint8array_data(part, &length);
-    } else {
-        if (js_to_string(c, part, &string_value) != JS_OK)
-            return JS_THROW;
-        bytes = js_string_bytes(string_value, &length);
+    if (!jsdom_blob_info(part, &bytes, &length, 0, 0)) {
+        bytes = js_buffersource_data(part, &length);
+        if (!bytes) {
+            if (js_to_string(c, part, &string_value) != JS_OK)
+                return JS_THROW;
+            bytes = js_string_bytes(string_value, &length);
+        }
     }
-    if (length > JSDOM_RESPONSE_BODY_MAX - blob->length)
-        return js_throw_error(c, JS_ERR_RANGE, "Blob is too large");
+    if (length > JSDOM_RESPONSE_BODY_MAX - file->length)
+        return js_throw_error(c, JS_ERR_RANGE, "File is too large");
     if (!length)
         return JS_OK;
-    grown = (char *)realloc(blob->data, blob->length + length);
+    grown = (char *)realloc(file->data, file->length + length);
     if (!grown)
         return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    memcpy(grown + blob->length, bytes, length);
-    blob->data = grown;
-    blob->length += length;
-    return JS_OK;
-}
-
-static int blob_constructor(js_ctx *c, js_value t,
-                            int ac, js_value *av, js_value *r)
-{
-    struct jsdom *j = binding(c);
-    struct blob_state *blob;
-    js_object *object;
-    js_value parts, type;
-    unsigned long i, count;
-    (void)t;
-
-    if (!j || !js_is_constructing(c))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "Blob must be constructed with new");
-    blob = (struct blob_state *)calloc(1, sizeof(*blob));
-    if (!blob)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    parts = ac ? av[0] : js_undefined();
-    if (!js_is_undefined(parts)) {
-        if (!js_is_array(parts)) {
-            blob_release(blob);
-            return js_throw_error(c, JS_ERR_TYPE,
-                                  "Blob parts must be an array");
-        }
-        count = js_array_length(parts.u.obj);
-        for (i = 0; i < count; i++) {
-            js_value part;
-
-            if (js_array_get(c, parts.u.obj, i, &part) != JS_OK ||
-                blob_append_part(c, blob, part) != JS_OK) {
-                blob_release(blob);
-                return JS_THROW;
-            }
-        }
-    }
-    type = js_undefined();
-    if (ac > 1 && js_is_object(av[1]) &&
-        js_get(c, av[1], "type", &type) != JS_OK) {
-        blob_release(blob);
-        return JS_THROW;
-    }
-    if (blob_type_set(c, blob, type) != JS_OK) {
-        blob_release(blob);
-        return JS_THROW;
-    }
-    object = new_host_data(j, 0, HOST_BLOB, blob, j->blob_proto);
-    if (!object) {
-        blob_release(blob);
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *r = js_object_value(object);
-    return JS_OK;
-}
-
-static int blob_size_get(js_ctx *c, js_value t,
-                         int ac, js_value *av, js_value *r)
-{
-    struct blob_state *blob = blob_state_of(t);
-    (void)c; (void)ac; (void)av;
-
-    if (!blob)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    *r = js_number((double)blob->length);
-    return JS_OK;
-}
-
-static int blob_type_get(js_ctx *c, js_value t,
-                         int ac, js_value *av, js_value *r)
-{
-    struct blob_state *blob = blob_state_of(t);
-    (void)ac; (void)av;
-
-    if (!blob)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    *r = js_mkcstring(c, blob->type);
-    return js_fatal(c) ? JS_THROW : JS_OK;
-}
-
-static int blob_slice(js_ctx *c, js_value t,
-                      int ac, js_value *av, js_value *r)
-{
-    struct hostref *blob_host = host(t, 0);
-    struct blob_state *source, *slice;
-    js_object *object;
-    double start_number = 0, end_number;
-    long start, end;
-
-    if (!blob_host ||
-        (blob_host->kind != HOST_BLOB && blob_host->kind != HOST_FILE))
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    source = blob_state_of(t);
-    end_number = (double)source->length;
-    if (ac > 0 && js_to_integer(c, av[0], &start_number) != JS_OK)
-        return JS_THROW;
-    if (ac > 1 && !js_is_undefined(av[1]) &&
-        js_to_integer(c, av[1], &end_number) != JS_OK)
-        return JS_THROW;
-    if (start_number <= -(double)source->length)
-        start = 0;
-    else if (start_number < 0)
-        start = (long)source->length + (long)start_number;
-    else if (start_number >= (double)source->length)
-        start = (long)source->length;
-    else
-        start = (long)start_number;
-    if (end_number <= -(double)source->length)
-        end = 0;
-    else if (end_number < 0)
-        end = (long)source->length + (long)end_number;
-    else if (end_number >= (double)source->length)
-        end = (long)source->length;
-    else
-        end = (long)end_number;
-    if (end < start)
-        end = start;
-    slice = (struct blob_state *)calloc(1, sizeof(*slice));
-    if (!slice)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    slice->length = (unsigned long)(end - start);
-    if (slice->length) {
-        slice->data = dup_n(source->data + start, slice->length);
-        if (!slice->data) {
-            blob_release(slice);
-            return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-        }
-    }
-    if (ac > 2 && blob_type_set(c, slice, av[2]) != JS_OK) {
-        blob_release(slice);
-        return JS_THROW;
-    }
-    object = new_host_data(blob_host->j, 0, HOST_BLOB, slice,
-                           blob_host->j->blob_proto);
-    if (!object) {
-        blob_release(slice);
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *r = js_object_value(object);
+    memcpy(grown + file->length, bytes, length);
+    file->data = grown;
+    file->length += length;
     return JS_OK;
 }
 
@@ -12539,7 +11750,7 @@ static int file_constructor(js_ctx *c, js_value t,
         js_value part;
 
         if (js_array_get(c, av[0].u.obj, i, &part) != JS_OK ||
-            blob_append_part(c, &file->blob, part) != JS_OK)
+            file_append_part(c, file, part) != JS_OK)
             goto fail;
     }
     if (js_to_string(c, av[1], &name_value) != JS_OK)
@@ -12570,7 +11781,7 @@ static int file_constructor(js_ctx *c, js_value t,
     if (js_is_object(options) &&
         js_get(c, options, "type", &value) != JS_OK)
         goto fail;
-    if (blob_type_set(c, &file->blob, value) != JS_OK)
+    if (file_type_set(c, file->type, value) != JS_OK)
         goto fail;
     if (js_is_object(options)) {
         double number;
@@ -12632,98 +11843,20 @@ static int file_relative_path_get(js_ctx *c, js_value t,
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
-static int blob_text(js_ctx *c, js_value t,
-                     int ac, js_value *av, js_value *r)
-{
-    struct blob_state *blob = blob_state_of(t);
-    js_value text;
-    (void)ac; (void)av;
-
-    if (!blob)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    text = js_mkstring(c, blob->data ? blob->data : "", blob->length);
-    if (js_fatal(c))
-        return JS_THROW;
-    return resolved_promise(c, text, 0, r);
-}
-
-static int blob_arraybuffer(js_ctx *c, js_value t,
-                            int ac, js_value *av, js_value *r)
-{
-    struct blob_state *blob = blob_state_of(t);
-    js_value buffer;
-    (void)ac; (void)av;
-
-    if (!blob)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    buffer = js_arraybuffer_new(c, blob->data, blob->length);
-    if (!js_is_arraybuffer(buffer))
-        return JS_THROW;
-    return resolved_promise(c, buffer, 0, r);
-}
-
-static int blob_bytes(js_ctx *c, js_value t,
-                      int ac, js_value *av, js_value *r)
-{
-    struct blob_state *blob = blob_state_of(t);
-    js_value bytes;
-    (void)ac; (void)av;
-
-    if (!blob)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid Blob receiver");
-    bytes = js_uint8array_new(c, blob->data, blob->length);
-    if (!js_is_uint8array(bytes))
-        return JS_THROW;
-    return resolved_promise(c, bytes, 0, r);
-}
-
-static int blob_from_bytes(js_ctx *c, struct jsdom *j,
-                           const void *data, unsigned long length,
-                           const char *type, js_value *result)
-{
-    struct blob_state *blob;
-    js_object *object;
-
-    blob = (struct blob_state *)calloc(1, sizeof(*blob));
-    if (!blob)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    blob->length = length;
-    if (length) {
-        blob->data = dup_n((const char *)data, length);
-        if (!blob->data) {
-            blob_release(blob);
-            return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-        }
-    }
-    if (type) {
-        js_value type_value = js_mkcstring(c, type);
-
-        if (js_fatal(c) ||
-            blob_type_set(c, blob, type_value) != JS_OK) {
-            blob_release(blob);
-            return JS_THROW;
-        }
-    }
-    object = new_host_data(j, 0, HOST_BLOB, blob, j->blob_proto);
-    if (!object) {
-        blob_release(blob);
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *result = js_object_value(object);
-    return JS_OK;
-}
-
 static int url_create_object_url(js_ctx *c, js_value t,
                                  int ac, js_value *av, js_value *r)
 {
     struct jsdom *j = binding(c);
-    struct blob_state *blob = ac ? blob_state_of(av[0]) : 0;
+    const void *blob_data = 0;
+    unsigned long blob_len = 0;
+    const char *blob_type = 0;
     char generated[URL_MAX + 64];
     char *url, *data;
     int slot;
     (void)t;
 
-    if (!j || !blob)
+    if (!j || !ac ||
+        !jsdom_blob_info(av[0], &blob_data, &blob_len, &blob_type, 0))
         return js_throw_error(c, JS_ERR_TYPE,
                               "createObjectURL requires a Blob");
     for (slot = 0; slot < JSDOM_OBJECT_URL_MAX; slot++)
@@ -12735,7 +11868,7 @@ static int url_create_object_url(js_ctx *c, js_value t,
     snprintf(generated, sizeof(generated), "blob:%s/%08lx",
              j->origin, ++j->object_url_counter);
     url = dup_z(generated);
-    data = dup_n(blob->data ? blob->data : "", blob->length);
+    data = dup_n(blob_data ? (const char *)blob_data : "", blob_len);
     if (!url || !data) {
         free(url);
         free(data);
@@ -12743,8 +11876,9 @@ static int url_create_object_url(js_ctx *c, js_value t,
     }
     j->object_urls[slot].url = url;
     j->object_urls[slot].data = data;
-    j->object_urls[slot].length = blob->length;
-    strcpy(j->object_urls[slot].type, blob->type);
+    j->object_urls[slot].length = blob_len;
+    snprintf(j->object_urls[slot].type, sizeof(j->object_urls[slot].type),
+             "%s", blob_type ? blob_type : "");
     *r = js_mkcstring(c, url);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
@@ -12845,20 +11979,20 @@ static int file_reader_error_get(js_ctx *c, js_value t,
     return JS_OK;
 }
 
-static int file_reader_data_url(js_ctx *c, struct blob_state *blob,
-                                js_value *r)
+static int file_reader_data_url(js_ctx *c, const char *data, unsigned long length,
+                                const char *blob_type, js_value *r)
 {
     static const char table[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const char *type = blob->type[0]
-        ? blob->type : "application/octet-stream";
+    const char *type = blob_type && blob_type[0]
+        ? blob_type : "application/octet-stream";
     unsigned long prefix_length = 5 + strlen(type) + 8;
     unsigned long encoded_length, total, i, write;
     char *output;
 
-    if (blob->length > (~0UL - 2) / 3)
+    if (length > (~0UL - 2) / 3)
         return js_throw_error(c, JS_ERR_RANGE, "FileReader input is too large");
-    encoded_length = ((blob->length + 2) / 3) * 4;
+    encoded_length = ((length + 2) / 3) * 4;
     if (prefix_length > ~0UL - encoded_length)
         return js_throw_error(c, JS_ERR_RANGE, "FileReader input is too large");
     total = prefix_length + encoded_length;
@@ -12867,18 +12001,16 @@ static int file_reader_data_url(js_ctx *c, struct blob_state *blob,
         return js_throw_error(c, JS_ERR_ERROR, "out of memory");
     write = (unsigned long)snprintf(output, prefix_length + 1,
                                     "data:%s;base64,", type);
-    for (i = 0; i < blob->length; i += 3) {
-        unsigned a = (unsigned char)blob->data[i];
-        unsigned b = i + 1 < blob->length
-            ? (unsigned char)blob->data[i + 1] : 0;
-        unsigned d = i + 2 < blob->length
-            ? (unsigned char)blob->data[i + 2] : 0;
+    for (i = 0; i < length; i += 3) {
+        unsigned a = (unsigned char)data[i];
+        unsigned b = i + 1 < length ? (unsigned char)data[i + 1] : 0;
+        unsigned d = i + 2 < length ? (unsigned char)data[i + 2] : 0;
 
         output[write++] = table[a >> 2];
         output[write++] = table[((a & 3) << 4) | (b >> 4)];
-        output[write++] = i + 1 < blob->length
+        output[write++] = i + 1 < length
             ? table[((b & 15) << 2) | (d >> 6)] : '=';
-        output[write++] = i + 2 < blob->length
+        output[write++] = i + 2 < length
             ? table[d & 63] : '=';
     }
     output[write] = 0;
@@ -12888,19 +12020,22 @@ static int file_reader_data_url(js_ctx *c, struct blob_state *blob,
 }
 
 static int file_reader_schedule(js_ctx *c, js_value t,
-                                struct blob_state *blob, int mode,
+                                js_value blob_val, int mode,
                                 js_value *r)
 {
     struct hostref *reader_host = host(t, HOST_FILE_READER);
     struct file_reader_state *reader;
     struct jsdom *j;
+    const void *data = 0;
+    unsigned long length = 0;
+    const char *blob_type = 0;
     js_value result;
     int slot;
 
     if (!reader_host)
         return js_throw_error(c, JS_ERR_TYPE,
                               "invalid FileReader receiver");
-    if (!blob)
+    if (!jsdom_blob_info(blob_val, &data, &length, &blob_type, 0))
         return js_throw_error(c, JS_ERR_TYPE,
                               "FileReader requires a Blob");
     reader = (struct file_reader_state *)reader_host->data;
@@ -12908,13 +12043,13 @@ static int file_reader_schedule(js_ctx *c, js_value t,
         return js_throw_error(c, JS_ERR_ERROR,
                               "FileReader is already loading");
     if (mode == 1)
-        result = js_arraybuffer_new(c, blob->data, blob->length);
+        result = js_arraybuffer_new(c, data, length);
     else if (mode == 3) {
-        if (file_reader_data_url(c, blob, &result) != JS_OK)
+        if (file_reader_data_url(c, (const char *)data, length,
+                                 blob_type, &result) != JS_OK)
             return JS_THROW;
     } else
-        result = js_mkstring(c, blob->data ? blob->data : "",
-                             blob->length);
+        result = js_mkstring(c, data ? (const char *)data : "", length);
     if (js_fatal(c))
         return JS_THROW;
     j = reader_host->j;
@@ -12930,7 +12065,7 @@ static int file_reader_schedule(js_ctx *c, js_value t,
     reader->generation++;
     reader->ready_state = 1;
     reader->aborted = 0;
-    reader->total = blob->length;
+    reader->total = length;
     reader->result = js_null();
     reader->error = js_null();
     reader->pending_result = result;
@@ -12944,29 +12079,25 @@ static int file_reader_schedule(js_ctx *c, js_value t,
 static int file_reader_read_text(js_ctx *c, js_value t,
                                  int ac, js_value *av, js_value *r)
 {
-    return file_reader_schedule(c, t,
-                                ac ? blob_state_of(av[0]) : 0, 0, r);
+    return file_reader_schedule(c, t, ac ? av[0] : js_undefined(), 0, r);
 }
 
 static int file_reader_read_arraybuffer(js_ctx *c, js_value t,
                                         int ac, js_value *av, js_value *r)
 {
-    return file_reader_schedule(c, t,
-                                ac ? blob_state_of(av[0]) : 0, 1, r);
+    return file_reader_schedule(c, t, ac ? av[0] : js_undefined(), 1, r);
 }
 
 static int file_reader_read_binary(js_ctx *c, js_value t,
                                    int ac, js_value *av, js_value *r)
 {
-    return file_reader_schedule(c, t,
-                                ac ? blob_state_of(av[0]) : 0, 2, r);
+    return file_reader_schedule(c, t, ac ? av[0] : js_undefined(), 2, r);
 }
 
 static int file_reader_read_data_url(js_ctx *c, js_value t,
                                      int ac, js_value *av, js_value *r)
 {
-    return file_reader_schedule(c, t,
-                                ac ? blob_state_of(av[0]) : 0, 3, r);
+    return file_reader_schedule(c, t, ac ? av[0] : js_undefined(), 3, r);
 }
 
 static int file_reader_abort(js_ctx *c, js_value t,
@@ -13017,250 +12148,6 @@ static int file_reader_dispatch(struct jsdom *j, js_value reader,
         ? -1 : 0;
 }
 
-static struct formdata_state *formdata_state_of(js_value value)
-{
-    struct hostref *h = host(value, HOST_FORMDATA);
-
-    return h ? (struct formdata_state *)h->data : 0;
-}
-
-static int formdata_append_value(js_ctx *c, struct formdata_state *form,
-                                 js_value name_value, js_value value,
-                                 js_value filename_value)
-{
-    struct form_entry *entry;
-    js_value name_string, converted;
-    struct blob_state *blob = blob_state_of(value);
-    const char *name, *filename = 0;
-
-    if (form->count >= JSDOM_HEADERS_MAX)
-        return js_throw_error(c, JS_ERR_RANGE,
-                              "too many FormData entries");
-    if (js_to_string(c, name_value, &name_string) != JS_OK)
-        return JS_THROW;
-    name = js_string_bytes(name_string, 0);
-    if (!blob) {
-        if (js_to_string(c, value, &converted) != JS_OK)
-            return JS_THROW;
-        value = converted;
-    } else if (!js_is_undefined(filename_value)) {
-        filename = js_to_cstring(c, filename_value);
-        if (!filename)
-            return JS_THROW;
-    } else {
-        struct file_state *file = file_state_of(value);
-
-        filename = file ? file->name : "blob";
-    }
-    entry = &form->entries[form->count];
-    entry->name = dup_z(name);
-    entry->filename = filename ? dup_z(filename) : 0;
-    if (!entry->name || (filename && !entry->filename)) {
-        free(entry->name);
-        free(entry->filename);
-        memset(entry, 0, sizeof(*entry));
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    entry->value = value;
-    form->count++;
-    return JS_OK;
-}
-
-static int formdata_constructor(js_ctx *c, js_value t,
-                                int ac, js_value *av, js_value *r)
-{
-    struct jsdom *j = binding(c);
-    struct formdata_state *form;
-    js_object *object;
-    (void)t; (void)av;
-
-    if (!j || !js_is_constructing(c))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "FormData must be constructed with new");
-    if (ac > 0 && !js_is_undefined(av[0]) && !js_is_null(av[0]))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "HTML form construction is not supported");
-    form = (struct formdata_state *)calloc(1, sizeof(*form));
-    if (!form)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    object = new_host_data(j, 0, HOST_FORMDATA, form, j->formdata_proto);
-    if (!object) {
-        formdata_release(form);
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *r = js_object_value(object);
-    return JS_OK;
-}
-
-static int formdata_append(js_ctx *c, js_value t,
-                           int ac, js_value *av, js_value *r)
-{
-    struct formdata_state *form = formdata_state_of(t);
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (ac < 2)
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "FormData.append requires two values");
-    if (formdata_append_value(c, form, av[0], av[1],
-                              ac > 2 ? av[2] : js_undefined()) != JS_OK)
-        return JS_THROW;
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static void formdata_remove_name(struct formdata_state *form,
-                                 const char *name)
-{
-    unsigned int read, write = 0;
-    unsigned int kept;
-
-    for (read = 0; read < form->count; read++) {
-        struct form_entry *entry = &form->entries[read];
-
-        if (!strcmp(entry->name, name)) {
-            free(entry->name);
-            free(entry->filename);
-            continue;
-        }
-        if (write != read)
-            form->entries[write] = form->entries[read];
-        write++;
-    }
-    kept = write;
-    while (write < form->count)
-        memset(&form->entries[write++], 0,
-               sizeof(form->entries[0]));
-    form->count = kept;
-}
-
-static int formdata_delete(js_ctx *c, js_value t,
-                           int ac, js_value *av, js_value *r)
-{
-    struct formdata_state *form = formdata_state_of(t);
-    const char *name;
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (string_arg(c, ac, av, 0, &name) != JS_OK)
-        return JS_THROW;
-    formdata_remove_name(form, name);
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int formdata_set(js_ctx *c, js_value t,
-                        int ac, js_value *av, js_value *r)
-{
-    struct formdata_state *form = formdata_state_of(t);
-    const char *name;
-    js_value name_string;
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (ac < 2 || js_to_string(c, av[0], &name_string) != JS_OK)
-        return ac < 2
-            ? js_throw_error(c, JS_ERR_TYPE,
-                             "FormData.set requires two values")
-            : JS_THROW;
-    name = js_string_bytes(name_string, 0);
-    formdata_remove_name(form, name);
-    if (formdata_append_value(c, form, name_string, av[1],
-                              ac > 2 ? av[2] : js_undefined()) != JS_OK)
-        return JS_THROW;
-    *r = js_undefined();
-    return JS_OK;
-}
-
-static int formdata_get_common(js_ctx *c, js_value t,
-                               int ac, js_value *av, js_value *r, int all)
-{
-    struct formdata_state *form = formdata_state_of(t);
-    const char *name;
-    js_object *values = 0;
-    unsigned int i;
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (string_arg(c, ac, av, 0, &name) != JS_OK)
-        return JS_THROW;
-    if (all) {
-        values = js_new_array(c);
-        if (!values)
-            return JS_THROW;
-    }
-    for (i = 0; i < form->count; i++) {
-        if (strcmp(form->entries[i].name, name))
-            continue;
-        if (!all) {
-            *r = form->entries[i].value;
-            return JS_OK;
-        }
-        if (js_array_push(c, values, form->entries[i].value) != JS_OK)
-            return JS_THROW;
-    }
-    *r = all ? js_object_value(values) : js_null();
-    return JS_OK;
-}
-
-static int formdata_get(js_ctx *c, js_value t,
-                        int ac, js_value *av, js_value *r)
-{
-    return formdata_get_common(c, t, ac, av, r, 0);
-}
-
-static int formdata_get_all(js_ctx *c, js_value t,
-                            int ac, js_value *av, js_value *r)
-{
-    return formdata_get_common(c, t, ac, av, r, 1);
-}
-
-static int formdata_has(js_ctx *c, js_value t,
-                        int ac, js_value *av, js_value *r)
-{
-    struct formdata_state *form = formdata_state_of(t);
-    const char *name;
-    unsigned int i;
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (string_arg(c, ac, av, 0, &name) != JS_OK)
-        return JS_THROW;
-    for (i = 0; i < form->count; i++)
-        if (!strcmp(form->entries[i].name, name)) {
-            *r = js_bool(1);
-            return JS_OK;
-        }
-    *r = js_bool(0);
-    return JS_OK;
-}
-
-static int formdata_for_each(js_ctx *c, js_value t,
-                             int ac, js_value *av, js_value *r)
-{
-    struct formdata_state *form = formdata_state_of(t);
-    unsigned int i;
-
-    if (!form)
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    if (ac < 1 || !js_is_function(av[0]))
-        return js_throw_error(c, JS_ERR_TYPE,
-                              "FormData.forEach requires a callback");
-    for (i = 0; i < form->count; i++) {
-        js_value args[3], ignored;
-
-        args[0] = form->entries[i].value;
-        args[1] = js_mkcstring(c, form->entries[i].name);
-        args[2] = t;
-        if (js_fatal(c) ||
-            js_call(c, av[0], ac > 1 ? av[1] : js_undefined(),
-                    3, args, &ignored) != JS_OK)
-            return JS_THROW;
-    }
-    *r = js_undefined();
-    return JS_OK;
-}
-
 static int web_iterator_result(js_ctx *c, js_value value, int done,
                                js_value *r)
 {
@@ -13306,64 +12193,36 @@ static int web_iterator_next(js_ctx *c, js_value t,
 {
     struct hostref *iterator_host = host(t, HOST_WEB_ITERATOR);
     struct web_iterator_state *iterator;
+    struct headers_state *headers;
+    struct header_entry *entry;
     js_value value;
     (void)ac; (void)av;
 
     if (!iterator_host)
         return js_throw_error(c, JS_ERR_TYPE, "invalid iterator receiver");
     iterator = (struct web_iterator_state *)iterator_host->data;
-    if (iterator->kind >= ITER_HEADERS_ENTRIES &&
-        iterator->kind <= ITER_HEADERS_VALUES) {
-        struct headers_state *headers =
-            headers_state_of(iterator->collection);
-        struct header_entry *entry;
+    headers = headers_state_of(iterator->collection);
+    if (!headers || iterator->kind < ITER_HEADERS_ENTRIES ||
+        iterator->kind > ITER_HEADERS_VALUES)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "Headers iterator source is invalid");
+    if (iterator->index >= headers->count)
+        return web_iterator_result(c, js_undefined(), 1, r);
+    entry = &headers->entries[iterator->index++];
+    if (iterator->kind == ITER_HEADERS_KEYS)
+        value = js_mkcstring(c, entry->name);
+    else if (iterator->kind == ITER_HEADERS_VALUES)
+        value = js_mkcstring(c, entry->value);
+    else {
+        js_object *pair = js_new_array(c);
 
-        if (!headers)
-            return js_throw_error(c, JS_ERR_TYPE,
-                                  "Headers iterator source is invalid");
-        if (iterator->index >= headers->count)
-            return web_iterator_result(c, js_undefined(), 1, r);
-        entry = &headers->entries[iterator->index++];
-        if (iterator->kind == ITER_HEADERS_KEYS)
-            value = js_mkcstring(c, entry->name);
-        else if (iterator->kind == ITER_HEADERS_VALUES)
-            value = js_mkcstring(c, entry->value);
-        else {
-            js_object *pair = js_new_array(c);
-
-            if (!pair ||
-                js_array_push(c, pair,
-                              js_mkcstring(c, entry->name)) != JS_OK ||
-                js_array_push(c, pair,
-                              js_mkcstring(c, entry->value)) != JS_OK)
-                return JS_THROW;
-            value = js_object_value(pair);
-        }
-    } else {
-        struct formdata_state *form =
-            formdata_state_of(iterator->collection);
-        struct form_entry *entry;
-
-        if (!form)
-            return js_throw_error(c, JS_ERR_TYPE,
-                                  "FormData iterator source is invalid");
-        if (iterator->index >= form->count)
-            return web_iterator_result(c, js_undefined(), 1, r);
-        entry = &form->entries[iterator->index++];
-        if (iterator->kind == ITER_FORMDATA_KEYS)
-            value = js_mkcstring(c, entry->name);
-        else if (iterator->kind == ITER_FORMDATA_VALUES)
-            value = entry->value;
-        else {
-            js_object *pair = js_new_array(c);
-
-            if (!pair ||
-                js_array_push(c, pair,
-                              js_mkcstring(c, entry->name)) != JS_OK ||
-                js_array_push(c, pair, entry->value) != JS_OK)
-                return JS_THROW;
-            value = js_object_value(pair);
-        }
+        if (!pair ||
+            js_array_push(c, pair,
+                          js_mkcstring(c, entry->name)) != JS_OK ||
+            js_array_push(c, pair,
+                          js_mkcstring(c, entry->value)) != JS_OK)
+            return JS_THROW;
+        value = js_object_value(pair);
     }
     if (js_fatal(c))
         return JS_THROW;
@@ -13395,33 +12254,6 @@ static int headers_values(js_ctx *c, js_value t,
     if (!headers_state_of(t))
         return js_throw_error(c, JS_ERR_TYPE, "invalid Headers receiver");
     return web_iterator_new(c, t, ITER_HEADERS_VALUES, r);
-}
-
-static int formdata_entries(js_ctx *c, js_value t,
-                            int ac, js_value *av, js_value *r)
-{
-    (void)ac; (void)av;
-    if (!formdata_state_of(t))
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    return web_iterator_new(c, t, ITER_FORMDATA_ENTRIES, r);
-}
-
-static int formdata_keys(js_ctx *c, js_value t,
-                         int ac, js_value *av, js_value *r)
-{
-    (void)ac; (void)av;
-    if (!formdata_state_of(t))
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    return web_iterator_new(c, t, ITER_FORMDATA_KEYS, r);
-}
-
-static int formdata_values(js_ctx *c, js_value t,
-                           int ac, js_value *av, js_value *r)
-{
-    (void)ac; (void)av;
-    if (!formdata_state_of(t))
-        return js_throw_error(c, JS_ERR_TYPE, "invalid FormData receiver");
-    return web_iterator_new(c, t, ITER_FORMDATA_VALUES, r);
 }
 
 struct form_buffer {
@@ -13485,50 +12317,56 @@ static int form_buffer_quoted(js_ctx *c, struct form_buffer *buffer,
     return JS_OK;
 }
 
-static int formdata_encode(js_ctx *c, struct formdata_state *form,
+static int formdata_encode(js_ctx *c, js_value form,
                            char **data, unsigned long *length,
                            char content_type[128])
 {
     static unsigned int boundary_counter;
     struct form_buffer buffer;
     char boundary[64];
-    unsigned int i;
+    unsigned int i, count;
 
     memset(&buffer, 0, sizeof(buffer));
     snprintf(boundary, sizeof(boundary),
              "----KestrelFormBoundary%08x", ++boundary_counter);
     snprintf(content_type, 128, "multipart/form-data; boundary=%s",
              boundary);
-    for (i = 0; i < form->count; i++) {
-        struct form_entry *entry = &form->entries[i];
-        struct blob_state *blob = blob_state_of(entry->value);
+    count = js_formdata_count(form);
+    for (i = 0; i < count; i++) {
+        const char *name = 0, *filename = 0;
+        js_value val = js_undefined();
+        const void *bdata = 0;
+        unsigned long blen = 0;
+        const char *btype = 0, *bfname = 0;
         const char *bytes;
         unsigned long value_length;
 
+        if (!js_formdata_entry(form, i, &name, &val, &filename))
+            continue;
         if (form_buffer_string(c, &buffer, "--") != JS_OK ||
             form_buffer_string(c, &buffer, boundary) != JS_OK ||
             form_buffer_string(c, &buffer,
                                "\r\nContent-Disposition: form-data; name=\"")
                 != JS_OK ||
-            form_buffer_quoted(c, &buffer, entry->name) != JS_OK ||
+            form_buffer_quoted(c, &buffer, name) != JS_OK ||
             form_buffer_string(c, &buffer, "\"") != JS_OK)
             goto fail;
-        if (blob) {
+        if (jsdom_blob_info(val, &bdata, &blen, &btype, &bfname)) {
+            const char *eff_name = filename ? filename
+                                            : (bfname ? bfname : "blob");
+            const char *eff_type = (btype && btype[0])
+                ? btype : "application/octet-stream";
+
             if (form_buffer_string(c, &buffer, "; filename=\"") != JS_OK ||
-                form_buffer_quoted(c, &buffer,
-                                   entry->filename ? entry->filename :
-                                                     "blob") != JS_OK ||
+                form_buffer_quoted(c, &buffer, eff_name) != JS_OK ||
                 form_buffer_string(c, &buffer, "\"\r\nContent-Type: ") !=
                     JS_OK ||
-                form_buffer_string(c, &buffer,
-                                   blob->type[0] ? blob->type :
-                                                   "application/octet-stream")
-                    != JS_OK)
+                form_buffer_string(c, &buffer, eff_type) != JS_OK)
                 goto fail;
-            bytes = blob->data;
-            value_length = blob->length;
+            bytes = bdata ? (const char *)bdata : "";
+            value_length = blen;
         } else {
-            bytes = js_string_bytes(entry->value, &value_length);
+            bytes = js_string_bytes(val, &value_length);
         }
         if (form_buffer_string(c, &buffer, "\r\n\r\n") != JS_OK ||
             form_buffer_put(c, &buffer, bytes, value_length) != JS_OK ||
@@ -13614,11 +12452,10 @@ static int response_build(js_ctx *c, struct jsdom *j,
         goto fail;
     }
     if (body_present) {
-        struct blob_state *blob = blob_state_of(body_value);
-        struct formdata_state *form = formdata_state_of(body_value);
+        const char *btype = 0;
 
-        if (form) {
-            if (formdata_encode(c, form, &body, &body_length,
+        if (js_is_formdata(body_value)) {
+            if (formdata_encode(c, body_value, &body, &body_length,
                                 generated_content_type) != JS_OK)
                 goto fail;
             body_bytes = body;
@@ -13633,16 +12470,13 @@ static int response_build(js_ctx *c, struct jsdom *j,
             if (!default_content_type)
                 default_content_type =
                     "application/x-www-form-urlencoded;charset=UTF-8";
-        } else if (blob) {
-            body_bytes = blob->data;
-            body_length = blob->length;
-            if (!default_content_type && blob->type[0])
-                default_content_type = blob->type;
-        } else if (js_is_arraybuffer(body_value))
-            body_bytes = js_arraybuffer_data(body_value, &body_length);
-        else if (js_is_uint8array(body_value))
-            body_bytes = js_uint8array_data(body_value, &body_length);
-        else {
+        } else if (jsdom_blob_info(body_value, &body_bytes, &body_length,
+                                   &btype, 0)) {
+            if (!default_content_type && btype && btype[0])
+                default_content_type = btype;
+        } else if ((body_bytes = js_buffersource_data(body_value,
+                                                      &body_length)) != 0) {
+        } else {
             if (js_to_string(c, body_value, &string_value) != JS_OK)
                 goto fail;
             body_bytes = js_string_bytes(string_value, &body_length);
@@ -14063,13 +12897,13 @@ static int formdata_from_urlencoded(js_ctx *c, struct jsdom *j,
                                     unsigned long body_length,
                                     js_value *r)
 {
-    struct formdata_state *form;
-    js_object *object;
+    js_value form;
     unsigned long start = 0;
+    (void)j;
 
-    form = (struct formdata_state *)calloc(1, sizeof(*form));
-    if (!form)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    form = js_formdata_new(c);
+    if (!js_is_formdata(form))
+        return JS_THROW;
     while (start < body_length) {
         unsigned long end = start, equals, name_length;
         js_value name, value;
@@ -14090,20 +12924,12 @@ static int formdata_from_urlencoded(js_ctx *c, struct jsdom *j,
                             equals < end ? body + equals + 1 : "",
                             equals < end ? end - equals - 1 : 0,
                             &value, 0) != JS_OK ||
-            formdata_append_value(c, form, name, value,
-                                  js_undefined()) != JS_OK) {
-            formdata_release(form);
+            js_formdata_append(c, form, name, value,
+                               js_undefined()) != JS_OK)
             return JS_THROW;
-        }
         start = end + (end < body_length);
     }
-    object = new_host_data(j, 0, HOST_FORMDATA, form,
-                           j->formdata_proto);
-    if (!object) {
-        formdata_release(form);
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
-    }
-    *r = js_object_value(object);
+    *r = form;
     return JS_OK;
 }
 
@@ -14322,17 +13148,17 @@ static int formdata_from_multipart(js_ctx *c, struct jsdom *j,
                                    unsigned long body_length,
                                    js_value *r)
 {
-    struct formdata_state *form;
-    js_object *object;
+    js_value form;
     char boundary[71];
     unsigned long boundary_length = 0, cursor = 0;
+    (void)j;
 
     if (multipart_boundary(c, content_type, boundary,
                            &boundary_length) != JS_OK)
         return JS_THROW;
-    form = (struct formdata_state *)calloc(1, sizeof(*form));
-    if (!form)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    form = js_formdata_new(c);
+    if (!js_is_formdata(form))
+        return JS_THROW;
     for (;;) {
         unsigned long headers_start, headers_end, content_start;
         unsigned long delimiter, line;
@@ -14458,22 +13284,15 @@ static int formdata_from_multipart(js_ctx *c, struct jsdom *j,
             if (js_fatal(c))
                 goto fail;
         }
-        if (formdata_append_value(c, form, name_value, value,
-                                  js_undefined()) != JS_OK)
+        if (js_formdata_append(c, form, name_value, value,
+                               js_undefined()) != JS_OK)
             goto fail;
         cursor = delimiter + 2;
     }
-    object = new_host_data(j, 0, HOST_FORMDATA, form,
-                           j->formdata_proto);
-    if (!object) {
-        js_throw_error(c, JS_ERR_ERROR, "out of memory");
-        goto fail;
-    }
-    *r = js_object_value(object);
+    *r = form;
     return JS_OK;
 
 fail:
-    formdata_release(form);
     return JS_THROW;
 }
 
@@ -14510,11 +13329,11 @@ static int response_blob(js_ctx *c, js_value t, int ac,
         return js_throw_error(c, JS_ERR_TYPE,
                               "Response body has already been consumed");
     response->body_used = 1;
-    if (blob_from_bytes(c, response_host->j,
-                        response->body, response->body_len,
-                        headers_value(response->headers, "content-type"),
-                        &blob) != JS_OK)
-        return JS_THROW;
+    blob = js_blob_new(c, response->body, response->body_len,
+                       headers_value(response->headers, "content-type"));
+    if (!js_is_blob(blob))
+        return js_fatal(c) ? JS_THROW
+                           : js_throw_error(c, JS_ERR_ERROR, "out of memory");
     return resolved_promise(c, blob, 0, r);
 }
 
@@ -14670,23 +13489,22 @@ static int request_method_set(js_ctx *c, struct request_state *request,
 static int request_body_set(js_ctx *c, struct request_state *request,
                             js_value value)
 {
-    struct blob_state *blob = blob_state_of(value);
-    struct formdata_state *form = formdata_state_of(value);
     js_value string_value;
-    const void *bytes;
-    unsigned long length;
+    const void *bytes = 0;
+    const char *blob_type = 0;
+    unsigned long length = 0;
     char *copy;
-    int is_text = 0;
+    int is_text = 0, is_blob = 0;
 
     free(request->body);
     request->body = 0;
     request->body_len = 0;
     if (js_is_undefined(value) || js_is_null(value))
         return JS_OK;
-    if (form) {
+    if (js_is_formdata(value)) {
         char generated_content_type[128];
 
-        if (formdata_encode(c, form, &request->body,
+        if (formdata_encode(c, value, &request->body,
                             &request->body_len,
                             generated_content_type) != JS_OK)
             return JS_THROW;
@@ -14700,14 +13518,10 @@ static int request_body_set(js_ctx *c, struct request_state *request,
         if (js_urlsearchparams_string(c, value, &string_value) != JS_OK)
             return JS_THROW;
         bytes = js_string_bytes(string_value, &length);
-    } else if (blob) {
-        bytes = blob->data;
-        length = blob->length;
-    } else if (js_is_arraybuffer(value))
-        bytes = js_arraybuffer_data(value, &length);
-    else if (js_is_uint8array(value))
-        bytes = js_uint8array_data(value, &length);
-    else {
+    } else if (jsdom_blob_info(value, &bytes, &length, &blob_type, 0)) {
+        is_blob = 1;
+    } else if ((bytes = js_buffersource_data(value, &length)) != 0) {
+    } else {
         if (js_to_string(c, value, &string_value) != JS_OK)
             return JS_THROW;
         bytes = js_string_bytes(string_value, &length);
@@ -14726,10 +13540,10 @@ static int request_body_set(js_ctx *c, struct request_state *request,
                       "application/x-www-form-urlencoded;charset=UTF-8",
                       0) != JS_OK)
         return JS_THROW;
-    if (blob && blob->type[0] &&
+    if (is_blob && blob_type && blob_type[0] &&
         !headers_contains_name(request->headers, "content-type") &&
         headers_store(c, request->headers, "content-type",
-                      blob->type, 0) != JS_OK)
+                      blob_type, 0) != JS_OK)
         return JS_THROW;
     if (is_text &&
         !headers_contains_name(request->headers, "content-type") &&
@@ -14993,7 +13807,7 @@ static int request_state_init(js_ctx *c, struct jsdom *j,
         if (js_get(c, av[1], "signal", &value) != JS_OK)
             goto fail;
         if (!js_is_undefined(value) && !js_is_null(value)) {
-            if (!host(value, HOST_ABORT_SIGNAL)) {
+            if (!js_is_abortsignal(value)) {
                 js_throw_error(c, JS_ERR_TYPE,
                                "Request signal is not an AbortSignal");
                 goto fail;
@@ -15002,13 +13816,11 @@ static int request_state_init(js_ctx *c, struct jsdom *j,
         }
     }
     if (!js_is_object(request->signal)) {
-        struct abort_state *abort = abort_state_new(j);
+        js_value sig = js_abortsignal_new(c);
 
-        if (!abort) {
-            js_throw_error(c, JS_ERR_ERROR, "out of memory");
+        if (!js_is_abortsignal(sig))
             goto fail;
-        }
-        request->signal = abort->signal;
+        request->signal = sig;
     }
     if (request->body &&
         (!strcmp(request->method, "GET") ||
@@ -15294,11 +14106,11 @@ static int request_blob(js_ctx *c, js_value t,
         return js_throw_error(c, JS_ERR_TYPE,
                               "Request body has already been consumed");
     request->body_used = 1;
-    if (blob_from_bytes(c, request_host->j,
-                        request->body, request->body_len,
-                        headers_value(request->headers, "content-type"),
-                        &blob) != JS_OK)
-        return JS_THROW;
+    blob = js_blob_new(c, request->body, request->body_len,
+                       headers_value(request->headers, "content-type"));
+    if (!js_is_blob(blob))
+        return js_fatal(c) ? JS_THROW
+                           : js_throw_error(c, JS_ERR_ERROR, "out of memory");
     return resolved_promise(c, blob, 0, r);
 }
 
@@ -15361,7 +14173,7 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
     unsigned long body_len = 0;
     struct headers_state *request_headers;
     struct request_state policy;
-    struct abort_state *abort = 0;
+    js_value abort_signal = js_undefined();
     int slot = -1, i;
     js_value promise;
     (void)t;
@@ -15372,8 +14184,6 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
     request_metadata_defaults(&policy);
     source_request = request_state_of(av[0]);
     if (source_request) {
-        struct hostref *signal_host;
-
         if (source_request->body_used)
             return js_throw_error(c, JS_ERR_TYPE,
                                   "used Request body cannot be fetched");
@@ -15386,9 +14196,7 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
             ? dup_n(source_request->body, source_request->body_len) : 0;
         body_len = source_request->body_len;
         request_headers = headers_clone_state(c, source_request->headers);
-        signal_host = host(source_request->signal, HOST_ABORT_SIGNAL);
-        abort = signal_host
-            ? (struct abort_state *)signal_host->data : 0;
+        abort_signal = source_request->signal;
         request_metadata_copy(&policy, source_request);
         if (!method || !request_headers ||
             (source_request->body && !body)) {
@@ -15454,9 +14262,8 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
             return JS_THROW;
         }
         if (!js_is_undefined(v)) {
-            struct blob_state *blob_value = blob_state_of(v);
-            struct formdata_state *form_value = formdata_state_of(v);
-            const void *bytes;
+            const void *bytes = 0;
+            const char *btype = 0;
 
             free(body);
             body = 0;
@@ -15464,8 +14271,8 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
             body_content_type = 0;
             if (js_is_null(v))
                 goto body_done;
-            if (form_value) {
-                if (formdata_encode(c, form_value, &body, &body_len,
+            if (js_is_formdata(v)) {
+                if (formdata_encode(c, v, &body, &body_len,
                                     generated_body_content_type) != JS_OK) {
                     headers_release(request_headers);
                     free(method);
@@ -15482,15 +14289,10 @@ static int global_fetch(js_ctx *c, js_value t, int ac, js_value *av,
                 bytes = js_string_bytes(sv, &body_len);
                 body_content_type =
                     "application/x-www-form-urlencoded;charset=UTF-8";
-            } else if (blob_value) {
-                bytes = blob_value->data;
-                body_len = blob_value->length;
-                if (blob_value->type[0])
-                    body_content_type = blob_value->type;
-            } else if (js_is_arraybuffer(v)) {
-                bytes = js_arraybuffer_data(v, &body_len);
-            } else if (js_is_uint8array(v)) {
-                bytes = js_uint8array_data(v, &body_len);
+            } else if (jsdom_blob_info(v, &bytes, &body_len, &btype, 0)) {
+                if (btype && btype[0])
+                    body_content_type = btype;
+            } else if ((bytes = js_buffersource_data(v, &body_len)) != 0) {
             } else if (js_to_string(c, v, &sv) == JS_OK) {
                 bytes = js_string_bytes(sv, &body_len);
                 body_content_type = "text/plain;charset=UTF-8";
@@ -15520,16 +14322,14 @@ body_done:
             return JS_THROW;
         }
         if (!js_is_undefined(v) && !js_is_null(v)) {
-            struct hostref *signal = host(v, HOST_ABORT_SIGNAL);
-
-            if (!signal) {
+            if (!js_is_abortsignal(v)) {
                 headers_release(request_headers);
                 free(body);
                 free(method);
                 return js_throw_error(c, JS_ERR_TYPE,
                                       "fetch signal is not an AbortSignal");
             }
-            abort = (struct abort_state *)signal->data;
+            abort_signal = v;
         }
         if (js_get(c, av[1], "headers", &v) != JS_OK) {
             headers_release(request_headers);
@@ -15605,7 +14405,7 @@ body_done:
         return JS_THROW;
     }
     headers_release(request_headers);
-    if (abort && abort->aborted) {
+    if (js_abortsignal_aborted(abort_signal)) {
         promise = js_promise_new(c);
         free(content_type);
         free(accept);
@@ -15615,7 +14415,7 @@ body_done:
         if (!js_is_promise(promise))
             return JS_THROW;
         *r = promise;
-        return js_promise_reject(c, promise, abort->reason);
+        return js_promise_reject(c, promise, js_abortsignal_reason(abort_signal));
     }
     for (i = 0; i < JSDOM_FETCH_MAX; i++)
         if (j->fetches[i].state == TASK_FREE) {
@@ -15659,7 +14459,7 @@ body_done:
     strcpy(j->fetches[slot].mode, policy.mode);
     strcpy(j->fetches[slot].credentials, policy.credentials);
     strcpy(j->fetches[slot].redirect, policy.redirect);
-    j->fetches[slot].abort = abort;
+    j->fetches[slot].abort_signal = abort_signal;
     j->fetches[slot].state = TASK_QUEUED;
     if (source_request && source_request->body)
         source_request->body_used = 1;
@@ -16249,8 +15049,10 @@ static void canvas_2d_reset_state(struct canvas_2d_state *st)
 {
     if (!st)
         return;
+    canvas_2d_release_grads(st);
     st->sp = 0;
     st->path_n = 0;
+    memset(&st->cur, 0, sizeof(st->cur));
     st->cur.m[0] = 1.0; st->cur.m[1] = 0.0;
     st->cur.m[2] = 0.0; st->cur.m[3] = 1.0;
     st->cur.m[4] = 0.0; st->cur.m[5] = 0.0;
@@ -16258,6 +15060,8 @@ static void canvas_2d_reset_state(struct canvas_2d_state *st)
     st->cur.stroke_color = 0xFF000000u;
     strcpy(st->cur.fill_str, "#000000");
     strcpy(st->cur.stroke_str, "#000000");
+    st->cur.fill_grad_val = js_undefined();
+    st->cur.stroke_grad_val = js_undefined();
     st->cur.line_width = 1.0;
     st->cur.global_alpha = 1.0;
     strcpy(st->cur.font, "10px sans-serif");
@@ -16733,10 +15537,172 @@ static void canvas_clear_px(struct dom_canvas *cv, int x, int y)
     cv->alpha[idx] = 0;
 }
 
+struct canvas_paint {
+    int is_clear;
+    uint8_t sr, sg, sb, sa;
+    const struct canvas_gradient *grad;
+    double inv_m[6];
+    int inv_ok;
+    double global_alpha;
+};
+
+static void canvas_paint_init(struct canvas_paint *p,
+                              const struct canvas_2d_saved *cur,
+                              int is_stroke, int is_clear)
+{
+    memset(p, 0, sizeof(*p));
+    p->is_clear = is_clear;
+    if (is_clear) {
+        p->sa = 255u;
+        return;
+    }
+    p->global_alpha = cur->global_alpha;
+    p->grad = is_stroke ? cur->stroke_grad : cur->fill_grad;
+    if (p->grad) {
+        double det = cur->m[0] * cur->m[3] - cur->m[1] * cur->m[2];
+        if (jsd_fabs(det) > 1e-12) {
+            double inv_det = 1.0 / det;
+            p->inv_m[0] =  cur->m[3] * inv_det;
+            p->inv_m[1] = -cur->m[1] * inv_det;
+            p->inv_m[2] = -cur->m[2] * inv_det;
+            p->inv_m[3] =  cur->m[0] * inv_det;
+            p->inv_m[4] = (cur->m[2] * cur->m[5] - cur->m[3] * cur->m[4]) * inv_det;
+            p->inv_m[5] = (cur->m[1] * cur->m[4] - cur->m[0] * cur->m[5]) * inv_det;
+            p->inv_ok = 1;
+        }
+        p->sa = (p->grad->stop_count > 0 && p->global_alpha > 0.0) ? 255u : 0u;
+    } else {
+        uint32_t col = is_stroke ? cur->stroke_color : cur->fill_color;
+        p->sr = (uint8_t)CSS_COLOR_R(col);
+        p->sg = (uint8_t)CSS_COLOR_G(col);
+        p->sb = (uint8_t)CSS_COLOR_B(col);
+        p->sa = canvas_effective_alpha(col, p->global_alpha);
+    }
+}
+
+static int canvas_eval_gradient(const struct canvas_gradient *g,
+                                double lx, double ly, double global_alpha,
+                                uint8_t *sr, uint8_t *sg, uint8_t *sb,
+                                uint8_t *sa)
+{
+    double t = 0.0, u = 0.0;
+    uint32_t col0, col1;
+
+    if (!g || !g->stop_count || global_alpha <= 0.0)
+        return 0;
+    if (g->kind == JSDOM_GRADIENT_LINEAR) {
+        double dx = g->x1 - g->x0, dy = g->y1 - g->y0;
+        double len2 = dx * dx + dy * dy;
+
+        if (len2 <= 1e-18)
+            return 0;
+        t = ((lx - g->x0) * dx + (ly - g->y0) * dy) / len2;
+    } else {
+        double dx = g->x1 - g->x0, dy = g->y1 - g->y0, dr = g->r1 - g->r0;
+        double ox = lx - g->x0, oy = ly - g->y0;
+        double a, hb, cq;
+
+        if (jsd_fabs(dx) < 1e-12 && jsd_fabs(dy) < 1e-12 &&
+            jsd_fabs(dr) < 1e-12)
+            return 0;
+        a = dx * dx + dy * dy - dr * dr;
+        hb = -(ox * dx + oy * dy + g->r0 * dr);
+        cq = ox * ox + oy * oy - g->r0 * g->r0;
+        if (jsd_fabs(a) < 1e-12) {
+            if (jsd_fabs(hb) < 1e-12)
+                return 0;
+            t = -cq / (2.0 * hb);
+            if (g->r0 + t * dr < -1e-9)
+                return 0;
+        } else {
+            double disc = hb * hb - a * cq;
+            double sq, t1, t2, tmax, tmin;
+
+            if (disc < 0.0)
+                return 0;
+            sq = jsd_sqrt(disc);
+            t1 = (-hb + sq) / a;
+            t2 = (-hb - sq) / a;
+            tmax = t1 > t2 ? t1 : t2;
+            tmin = t1 > t2 ? t2 : t1;
+            if (g->r0 + tmax * dr >= -1e-9)
+                t = tmax;
+            else if (g->r0 + tmin * dr >= -1e-9)
+                t = tmin;
+            else
+                return 0;
+        }
+    }
+    if (t < 0.0) t = 0.0;
+    if (t > 1.0) t = 1.0;
+    if (t <= g->stops[0].offset) {
+        col0 = col1 = g->stops[0].color;
+    } else if (t >= g->stops[g->stop_count - 1].offset) {
+        col0 = col1 = g->stops[g->stop_count - 1].color;
+    } else {
+        unsigned int idx = 0;
+
+        while (idx + 1 < g->stop_count && g->stops[idx + 1].offset <= t)
+            idx++;
+        if (idx + 1 >= g->stop_count) {
+            col0 = col1 = g->stops[g->stop_count - 1].color;
+        } else {
+            double o0 = g->stops[idx].offset;
+            double o1 = g->stops[idx + 1].offset;
+            double span = o1 - o0;
+
+            col0 = g->stops[idx].color;
+            col1 = g->stops[idx + 1].color;
+            u = span > 1e-12 ? (t - o0) / span : 0.0;
+        }
+    }
+    *sr = (uint8_t)jsd_clamp_u8((double)CSS_COLOR_R(col0) +
+                                u * ((double)CSS_COLOR_R(col1) -
+                                     (double)CSS_COLOR_R(col0)));
+    *sg = (uint8_t)jsd_clamp_u8((double)CSS_COLOR_G(col0) +
+                                u * ((double)CSS_COLOR_G(col1) -
+                                     (double)CSS_COLOR_G(col0)));
+    *sb = (uint8_t)jsd_clamp_u8((double)CSS_COLOR_B(col0) +
+                                u * ((double)CSS_COLOR_B(col1) -
+                                     (double)CSS_COLOR_B(col0)));
+    {
+        double a0 = (double)CSS_COLOR_A(col0);
+        double a1 = (double)CSS_COLOR_A(col1);
+        *sa = (uint8_t)jsd_clamp_u8((a0 + u * (a1 - a0)) * global_alpha);
+    }
+    return *sa != 0;
+}
+
+static void canvas_blend_paint_px(struct dom_canvas *cv, int x, int y,
+                                  const struct canvas_paint *p)
+{
+    uint8_t sr, sg, sb, sa;
+
+    if (p->is_clear) {
+        canvas_clear_px(cv, x, y);
+        return;
+    }
+    if (!p->grad) {
+        canvas_blend_px(cv, x, y, p->sr, p->sg, p->sb, p->sa);
+        return;
+    }
+    if (!p->inv_ok)
+        return;
+    {
+        double px = (double)x + 0.5, py = (double)y + 0.5;
+        double lx = p->inv_m[0] * px + p->inv_m[2] * py + p->inv_m[4];
+        double ly = p->inv_m[1] * px + p->inv_m[3] * py + p->inv_m[5];
+
+        if (!canvas_eval_gradient(p->grad, lx, ly, p->global_alpha,
+                                  &sr, &sg, &sb, &sa))
+            return;
+        canvas_blend_px(cv, x, y, sr, sg, sb, sa);
+    }
+}
+
 static int canvas_rasterize_poly(struct dom_canvas *cv,
                                  const struct canvas_pt *pts, unsigned int npts,
-                                 uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa,
-                                 int is_clear)
+                                 const struct canvas_paint *p)
 {
     double miny = 1e9, maxy = -1e9;
     unsigned int i, sp_start = 0, edge_count = 0;
@@ -16744,7 +15710,7 @@ static int canvas_rasterize_poly(struct dom_canvas *cv,
     struct { double x0, y0, x1, y1; } *edges;
     double xs[512];
 
-    if (!cv || !cv->w || !cv->h || npts < 3 || (!is_clear && sa == 0))
+    if (!cv || !cv->w || !cv->h || npts < 3 || (!p->is_clear && p->sa == 0))
         return 0;
     edges = malloc(sizeof(*edges) * npts);
     if (!edges)
@@ -16808,10 +15774,8 @@ static int canvas_rasterize_poly(struct dom_canvas *cv,
 
             if (x0 < 0) x0 = 0;
             if (x1 >= (int)cv->w) x1 = (int)cv->w - 1;
-            for (px = x0; px <= x1; px++) {
-                if (is_clear) canvas_clear_px(cv, px, py);
-                else canvas_blend_px(cv, px, py, sr, sg, sb, sa);
-            }
+            for (px = x0; px <= x1; px++)
+                canvas_blend_paint_px(cv, px, py, p);
         }
     }
     free(edges);
@@ -16820,13 +15784,12 @@ static int canvas_rasterize_poly(struct dom_canvas *cv,
 
 static void canvas_draw_segment(struct dom_canvas *cv,
                                 double x0, double y0, double x1, double y1,
-                                double lw, uint8_t sr, uint8_t sg, uint8_t sb,
-                                uint8_t sa)
+                                double lw, const struct canvas_paint *p)
 {
     double half_w, dx, dy, len2, r2;
     int ix0, iy0, ix1, iy1, px, py;
 
-    if (!cv || !cv->w || !cv->h || sa == 0)
+    if (!cv || !cv->w || !cv->h || p->sa == 0)
         return;
     if (lw <= 1.2) {
         int bx0 = (int)jsd_floor(x0), by0 = (int)jsd_floor(y0);
@@ -16838,7 +15801,7 @@ static void canvas_draw_segment(struct dom_canvas *cv,
         int err = adx - ady, steps = 0;
 
         while (steps++ < 16384) {
-            canvas_blend_px(cv, bx0, by0, sr, sg, sb, sa);
+            canvas_blend_paint_px(cv, bx0, by0, p);
             if (bx0 == bx1 && by0 == by1)
                 break;
             {
@@ -16874,7 +15837,7 @@ static void canvas_draw_segment(struct dom_canvas *cv,
             projy = y0 + t * dy;
             d2 = (cx - projx) * (cx - projx) + (cy - projy) * (cy - projy);
             if (d2 <= r2)
-                canvas_blend_px(cv, px, py, sr, sg, sb, sa);
+                canvas_blend_paint_px(cv, px, py, p);
         }
     }
 }
@@ -16936,8 +15899,11 @@ static int ctx2d_save(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
     if (!st)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal CanvasRenderingContext2D receiver");
-    if (st->sp < JSDOM_CANVAS_STACK_MAX)
-        st->stack[st->sp++] = st->cur;
+    if (st->sp < JSDOM_CANVAS_STACK_MAX) {
+        memset(&st->stack[st->sp], 0, sizeof(st->stack[st->sp]));
+        canvas_2d_saved_copy(&st->stack[st->sp], &st->cur);
+        st->sp++;
+    }
     *r = js_undefined();
     return JS_OK;
 }
@@ -16951,8 +15917,11 @@ static int ctx2d_restore(js_ctx *c, js_value t, int ac, js_value *av,
     if (!st)
         return js_throw_error(c, JS_ERR_TYPE,
                               "illegal CanvasRenderingContext2D receiver");
-    if (st->sp > 0)
-        st->cur = st->stack[--st->sp];
+    if (st->sp > 0) {
+        st->sp--;
+        canvas_2d_saved_copy(&st->cur, &st->stack[st->sp]);
+        canvas_2d_saved_release(&st->stack[st->sp]);
+    }
     *r = js_undefined();
     return JS_OK;
 }
@@ -17085,56 +16054,211 @@ static int ctx2d_reset_transform(js_ctx *c, js_value t, int ac, js_value *av,
     return ctx2d_set_transform(c, t, 0, av, r);
 }
 
-static int ctx2d_fill_style_get(js_ctx *c, js_value t,
-                                int ac, js_value *av, js_value *r)
+static int ctx2d_style_get(js_ctx *c, js_value t, int is_stroke, js_value *r)
 {
     struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
-    (void)ac; (void)av;
-    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
-    *r = js_mkcstring(c, st->cur.fill_str);
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (is_stroke ? st->cur.stroke_grad != 0 : st->cur.fill_grad != 0) {
+        *r = is_stroke ? st->cur.stroke_grad_val : st->cur.fill_grad_val;
+        return JS_OK;
+    }
+    *r = js_mkcstring(c, is_stroke ? st->cur.stroke_str : st->cur.fill_str);
     return js_fatal(c) ? JS_THROW : JS_OK;
 }
 
-static int ctx2d_fill_style_set(js_ctx *c, js_value t,
-                                int ac, js_value *av, js_value *r)
+static int ctx2d_style_set(js_ctx *c, js_value t, int is_stroke,
+                           int ac, js_value *av, js_value *r)
 {
     struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
+    struct hostref *gh;
     const char *s;
     uint32_t col;
+    struct canvas_gradient **gslot;
+    js_value *vslot;
+    uint32_t *cslot;
+    char *strslot;
+    unsigned long strsz;
 
-    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
-    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    gslot = is_stroke ? &st->cur.stroke_grad : &st->cur.fill_grad;
+    vslot = is_stroke ? &st->cur.stroke_grad_val : &st->cur.fill_grad_val;
+    cslot = is_stroke ? &st->cur.stroke_color : &st->cur.fill_color;
+    strslot = is_stroke ? st->cur.stroke_str : st->cur.fill_str;
+    strsz = is_stroke ? sizeof(st->cur.stroke_str) : sizeof(st->cur.fill_str);
+    if (ac > 0 && (gh = host(av[0], HOST_CANVAS_GRADIENT)) != 0) {
+        struct canvas_gradient *g = (struct canvas_gradient *)gh->data;
+        canvas_grad_retain(g);
+        canvas_grad_release(*gslot);
+        *gslot = g;
+        *vslot = av[0];
+        *r = js_undefined();
+        return JS_OK;
+    }
+    if (string_arg(c, ac, av, 0, &s) != JS_OK)
+        return JS_THROW;
     if (jsdom_parse_color(s, &col)) {
-        st->cur.fill_color = col;
-        canvas_fmt_color(col, st->cur.fill_str, sizeof(st->cur.fill_str));
+        canvas_grad_release(*gslot);
+        *gslot = 0;
+        *vslot = js_undefined();
+        *cslot = col;
+        canvas_fmt_color(col, strslot, strsz);
     }
     *r = js_undefined();
     return JS_OK;
 }
 
+static int ctx2d_fill_style_get(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    (void)ac; (void)av;
+    return ctx2d_style_get(c, t, 0, r);
+}
+
+static int ctx2d_fill_style_set(js_ctx *c, js_value t,
+                                int ac, js_value *av, js_value *r)
+{
+    return ctx2d_style_set(c, t, 0, ac, av, r);
+}
+
 static int ctx2d_stroke_style_get(js_ctx *c, js_value t,
                                   int ac, js_value *av, js_value *r)
 {
-    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
     (void)ac; (void)av;
-    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
-    *r = js_mkcstring(c, st->cur.stroke_str);
-    return js_fatal(c) ? JS_THROW : JS_OK;
+    return ctx2d_style_get(c, t, 1, r);
 }
 
 static int ctx2d_stroke_style_set(js_ctx *c, js_value t,
                                   int ac, js_value *av, js_value *r)
 {
-    struct canvas_2d_state *st = ctx2d_of(t, 0, 0);
-    const char *s;
-    uint32_t col;
+    return ctx2d_style_set(c, t, 1, ac, av, r);
+}
 
-    if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
-    if (string_arg(c, ac, av, 0, &s) != JS_OK) return JS_THROW;
-    if (jsdom_parse_color(s, &col)) {
-        st->cur.stroke_color = col;
-        canvas_fmt_color(col, st->cur.stroke_str, sizeof(st->cur.stroke_str));
+static int ctx2d_gradient_new(js_ctx *c, struct jsdom *j, int kind,
+                              double x0, double y0, double r0,
+                              double x1, double y1, double r1, js_value *r)
+{
+    struct canvas_gradient *g;
+    js_object *obj;
+
+    g = (struct canvas_gradient *)calloc(1, sizeof(*g));
+    if (!g)
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+    g->refs = 1;
+    g->kind = kind;
+    g->x0 = x0; g->y0 = y0; g->r0 = r0;
+    g->x1 = x1; g->y1 = y1; g->r1 = r1;
+    obj = new_host_data(j, 0, HOST_CANVAS_GRADIENT, g,
+                        j->canvas_gradient_proto);
+    if (!obj) {
+        canvas_grad_release(g);
+        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
     }
+    *r = js_object_value(obj);
+    return JS_OK;
+}
+
+static int ctx2d_create_linear_gradient(js_ctx *c, js_value t,
+                                        int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, 0);
+    double v[4];
+    int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac < 4)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "createLinearGradient requires 4 arguments");
+    for (i = 0; i < 4; i++) {
+        if (js_to_number(c, av[i], &v[i]) != JS_OK)
+            return JS_THROW;
+        if (!jsd_isfinite(v[i]))
+            return js_throw_error(c, JS_ERR_TYPE,
+                                  "non-finite gradient coordinate");
+    }
+    return ctx2d_gradient_new(c, h->j, JSDOM_GRADIENT_LINEAR,
+                              v[0], v[1], 0.0, v[2], v[3], 0.0, r);
+}
+
+static int ctx2d_create_radial_gradient(js_ctx *c, js_value t,
+                                        int ac, js_value *av, js_value *r)
+{
+    struct hostref *h = 0;
+    struct canvas_2d_state *st = ctx2d_of(t, &h, 0);
+    double v[6];
+    int i;
+
+    if (!st)
+        return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
+    if (ac < 6)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "createRadialGradient requires 6 arguments");
+    for (i = 0; i < 6; i++) {
+        if (js_to_number(c, av[i], &v[i]) != JS_OK)
+            return JS_THROW;
+        if (!jsd_isfinite(v[i]))
+            return js_throw_error(c, JS_ERR_TYPE,
+                                  "non-finite gradient coordinate");
+    }
+    if (v[2] < 0.0 || v[5] < 0.0)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "radial gradient radius must be non-negative");
+    return ctx2d_gradient_new(c, h->j, JSDOM_GRADIENT_RADIAL,
+                              v[0], v[1], v[2], v[3], v[4], v[5], r);
+}
+
+static int canvas_gradient_add_color_stop(js_ctx *c, js_value t,
+                                          int ac, js_value *av, js_value *r)
+{
+    struct hostref *gh = host(t, HOST_CANVAS_GRADIENT);
+    struct canvas_gradient *g;
+    double offset;
+    const char *color_str;
+    uint32_t col;
+    unsigned int pos;
+
+    if (!gh || !gh->data)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "illegal CanvasGradient receiver");
+    g = (struct canvas_gradient *)gh->data;
+    if (ac < 2)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "addColorStop requires offset and color");
+    if (js_to_number(c, av[0], &offset) != JS_OK)
+        return JS_THROW;
+    if (!jsd_isfinite(offset) || offset < 0.0 || offset > 1.0)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "color stop offset must be in [0, 1]");
+    if (string_arg(c, ac, av, 1, &color_str) != JS_OK)
+        return JS_THROW;
+    if (!jsdom_parse_color(color_str, &col))
+        return throw_dom_exception(c, "SyntaxError",
+                                   "invalid color stop value");
+    if (g->stop_count >= 256u)
+        return js_throw_error(c, JS_ERR_RANGE, "too many gradient color stops");
+    if (g->stop_count >= g->stop_cap) {
+        unsigned int ncap = g->stop_cap ? g->stop_cap * 2u : 8u;
+        struct canvas_grad_stop *ns;
+
+        ns = (struct canvas_grad_stop *)realloc(
+            g->stops, (unsigned long)ncap * sizeof(*ns));
+        if (!ns)
+            return js_throw_error(c, JS_ERR_ERROR, "out of memory");
+        g->stops = ns;
+        g->stop_cap = ncap;
+    }
+    pos = g->stop_count;
+    while (pos > 0 && g->stops[pos - 1].offset > offset) {
+        g->stops[pos] = g->stops[pos - 1];
+        pos--;
+    }
+    g->stops[pos].offset = offset;
+    g->stops[pos].color = col;
+    g->stop_count++;
     *r = js_undefined();
     return JS_OK;
 }
@@ -17291,13 +16415,12 @@ static int ctx2d_text_baseline_set(js_ctx *c, js_value t,
 static void ctx2d_fill_transformed_rect(struct dom_canvas *cv,
                                         const struct canvas_2d_saved *cur,
                                         double x, double y, double w, double h,
-                                        uint8_t sr, uint8_t sg, uint8_t sb,
-                                        uint8_t sa, int is_clear)
+                                        const struct canvas_paint *p)
 {
     struct canvas_pt pts[4];
     double x0, y0, x1, y1;
 
-    if (!cv || !cv->w || !cv->h)
+    if (!cv || !cv->w || !cv->h || (!p->is_clear && p->sa == 0))
         return;
     if (w < 0.0) { x += w; w = -w; }
     if (h < 0.0) { y += h; h = -h; }
@@ -17320,17 +16443,15 @@ static void ctx2d_fill_transformed_rect(struct dom_canvas *cv,
         if (ix1 >= (int)cv->w) ix1 = (int)cv->w - 1;
         if (iy1 >= (int)cv->h) iy1 = (int)cv->h - 1;
         for (py = iy0; py <= iy1; py++)
-            for (px = ix0; px <= ix1; px++) {
-                if (is_clear) canvas_clear_px(cv, px, py);
-                else canvas_blend_px(cv, px, py, sr, sg, sb, sa);
-            }
+            for (px = ix0; px <= ix1; px++)
+                canvas_blend_paint_px(cv, px, py, p);
         return;
     }
     canvas_xform(cur, x, y, &pts[0].x, &pts[0].y); pts[0].kind = 0;
     canvas_xform(cur, x + w, y, &pts[1].x, &pts[1].y); pts[1].kind = 1;
     canvas_xform(cur, x + w, y + h, &pts[2].x, &pts[2].y); pts[2].kind = 1;
     canvas_xform(cur, x, y + h, &pts[3].x, &pts[3].y); pts[3].kind = 1;
-    canvas_rasterize_poly(cv, pts, 4, sr, sg, sb, sa, is_clear);
+    canvas_rasterize_poly(cv, pts, 4, p);
 }
 
 static int ctx2d_rect_op(js_ctx *c, js_value t, int ac, js_value *av,
@@ -17339,6 +16460,7 @@ static int ctx2d_rect_op(js_ctx *c, js_value t, int ac, js_value *av,
     struct hostref *h = 0;
     struct dom_canvas *cv = 0;
     struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    struct canvas_paint paint;
     double x, y, w, hbox;
     int i, ok = 1;
 
@@ -17356,22 +16478,12 @@ static int ctx2d_rect_op(js_ctx *c, js_value t, int ac, js_value *av,
         return JS_OK;
     }
     if (mode == 0 || mode == 2) {
-        uint8_t sa = mode == 0
-            ? canvas_effective_alpha(st->cur.fill_color, st->cur.global_alpha)
-            : 255u;
-        ctx2d_fill_transformed_rect(cv, &st->cur, x, y, w, hbox,
-                                    (uint8_t)CSS_COLOR_R(st->cur.fill_color),
-                                    (uint8_t)CSS_COLOR_G(st->cur.fill_color),
-                                    (uint8_t)CSS_COLOR_B(st->cur.fill_color),
-                                    sa, mode == 2);
+        canvas_paint_init(&paint, &st->cur, 0, mode == 2);
+        ctx2d_fill_transformed_rect(cv, &st->cur, x, y, w, hbox, &paint);
     } else {
         double p[4][2];
-        uint8_t sa = canvas_effective_alpha(st->cur.stroke_color,
-                                            st->cur.global_alpha);
-        uint8_t sr = (uint8_t)CSS_COLOR_R(st->cur.stroke_color);
-        uint8_t sg = (uint8_t)CSS_COLOR_G(st->cur.stroke_color);
-        uint8_t sb = (uint8_t)CSS_COLOR_B(st->cur.stroke_color);
 
+        canvas_paint_init(&paint, &st->cur, 1, 0);
         canvas_xform(&st->cur, x, y, &p[0][0], &p[0][1]);
         canvas_xform(&st->cur, x + w, y, &p[1][0], &p[1][1]);
         canvas_xform(&st->cur, x + w, y + hbox, &p[2][0], &p[2][1]);
@@ -17379,7 +16491,7 @@ static int ctx2d_rect_op(js_ctx *c, js_value t, int ac, js_value *av,
         for (i = 0; i < 4; i++)
             canvas_draw_segment(cv, p[i][0], p[i][1],
                                 p[(i + 1) & 3][0], p[(i + 1) & 3][1],
-                                st->cur.line_width, sr, sg, sb, sa);
+                                st->cur.line_width, &paint);
     }
     mark_dom_dirty(h->j);
     *r = js_undefined();
@@ -17621,17 +16733,13 @@ static int ctx2d_fill(js_ctx *c, js_value t, int ac, js_value *av, js_value *r)
     struct hostref *h = 0;
     struct dom_canvas *cv = 0;
     struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
-    uint8_t sa;
+    struct canvas_paint paint;
     (void)ac; (void)av;
 
     if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
     if (cv && st->path_n >= 3) {
-        sa = canvas_effective_alpha(st->cur.fill_color, st->cur.global_alpha);
-        if (canvas_rasterize_poly(cv, st->path, st->path_n,
-                                  (uint8_t)CSS_COLOR_R(st->cur.fill_color),
-                                  (uint8_t)CSS_COLOR_G(st->cur.fill_color),
-                                  (uint8_t)CSS_COLOR_B(st->cur.fill_color),
-                                  sa, 0))
+        canvas_paint_init(&paint, &st->cur, 0, 0);
+        if (canvas_rasterize_poly(cv, st->path, st->path_n, &paint))
             mark_dom_dirty(h->j);
     }
     *r = js_undefined();
@@ -17644,22 +16752,19 @@ static int ctx2d_stroke(js_ctx *c, js_value t, int ac, js_value *av,
     struct hostref *h = 0;
     struct dom_canvas *cv = 0;
     struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    struct canvas_paint paint;
     unsigned int i;
-    uint8_t sa, sr, sg, sb;
     (void)ac; (void)av;
 
     if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
     if (cv && st->path_n >= 2) {
-        sa = canvas_effective_alpha(st->cur.stroke_color, st->cur.global_alpha);
-        sr = (uint8_t)CSS_COLOR_R(st->cur.stroke_color);
-        sg = (uint8_t)CSS_COLOR_G(st->cur.stroke_color);
-        sb = (uint8_t)CSS_COLOR_B(st->cur.stroke_color);
+        canvas_paint_init(&paint, &st->cur, 1, 0);
         for (i = 1; i < st->path_n; i++) {
             if (st->path[i].kind == 0)
                 continue;
             canvas_draw_segment(cv, st->path[i - 1].x, st->path[i - 1].y,
                                 st->path[i].x, st->path[i].y,
-                                st->cur.line_width, sr, sg, sb, sa);
+                                st->cur.line_width, &paint);
         }
         mark_dom_dirty(h->j);
     }
@@ -17673,12 +16778,11 @@ static int ctx2d_draw_text_op(js_ctx *c, js_value t, int ac, js_value *av,
     struct hostref *h = 0;
     struct dom_canvas *cv = 0;
     struct canvas_2d_state *st = ctx2d_of(t, &h, &cv);
+    struct canvas_paint paint;
     const char *text;
     double x, y, scale, total_w, ox, oy;
     int rx, ry;
     unsigned long len, ci;
-    uint32_t col;
-    uint8_t sa, sr, sg, sb;
 
     if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
     if (ac < 3 || string_arg(c, ac, av, 0, &text) != JS_OK)
@@ -17703,11 +16807,7 @@ static int ctx2d_draw_text_op(js_ctx *c, js_value t, int ac, js_value *av,
     else if (st->cur.text_baseline == 3) oy = y - 7.0 * scale;
     else oy = y - 6.0 * scale;
 
-    col = is_stroke ? st->cur.stroke_color : st->cur.fill_color;
-    sa = canvas_effective_alpha(col, st->cur.global_alpha);
-    sr = (uint8_t)CSS_COLOR_R(col);
-    sg = (uint8_t)CSS_COLOR_G(col);
-    sb = (uint8_t)CSS_COLOR_B(col);
+    canvas_paint_init(&paint, &st->cur, is_stroke, 0);
 
     for (ci = 0; ci < len; ci++) {
         unsigned char ch = (unsigned char)text[ci];
@@ -17732,7 +16832,7 @@ static int ctx2d_draw_text_op(js_ctx *c, js_value t, int ac, js_value *av,
                     cv, &st->cur,
                     ox + ((double)ci * 6.0 + (double)gx) * scale,
                     oy + (double)gy * scale,
-                    scale, scale, sr, sg, sb, sa, 0);
+                    scale, scale, &paint);
             }
         }
     }
@@ -17769,22 +16869,45 @@ static int ctx2d_measure_text(js_ctx *c, js_value t, int ac, js_value *av,
     return JS_OK;
 }
 
-static int make_image_data_obj(js_ctx *c, struct jsdom *j,
-                               unsigned int w, unsigned int hpx,
-                               const uint8_t *src_rgba, js_value *out)
+static int image_data_dims(js_ctx *c, double dw, double dh,
+                           unsigned int *ow, unsigned int *oh)
+{
+    unsigned int w, h;
+
+    if (!jsd_isfinite(dw) || !jsd_isfinite(dh) || dw < 1.0 || dh < 1.0 ||
+        dw > (double)JSDOM_CANVAS_MAX_DIM ||
+        dh > (double)JSDOM_CANVAS_MAX_DIM)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "invalid ImageData dimensions");
+    w = (unsigned int)dw;
+    h = (unsigned int)dh;
+    if (w == 0 || h == 0 || w > JSDOM_CANVAS_MAX_PIXELS / h)
+        return throw_dom_exception(c, "IndexSizeError",
+                                   "invalid ImageData dimensions");
+    *ow = w;
+    *oh = h;
+    return JS_OK;
+}
+
+static int make_image_data_obj_buf(js_ctx *c, struct jsdom *j,
+                                   unsigned int w, unsigned int hpx,
+                                   const uint8_t *src_rgba, js_value buf_arr,
+                                   js_value *out)
 {
     js_object *obj;
-    js_value u8;
+    js_value u8 = buf_arr;
     unsigned long byte_len;
 
     if (w == 0 || hpx == 0 || w > JSDOM_CANVAS_MAX_DIM ||
         hpx > JSDOM_CANVAS_MAX_DIM || w > JSDOM_CANVAS_MAX_PIXELS / hpx)
         return throw_dom_exception(c, "IndexSizeError",
                                    "invalid ImageData dimensions");
-    byte_len = (unsigned long)w * (unsigned long)hpx * 4ul;
-    u8 = js_uint8array_new(c, src_rgba, byte_len);
-    if (js_fatal(c) || js_is_undefined(u8))
-        return JS_THROW;
+    if (js_is_undefined(u8)) {
+        byte_len = (unsigned long)w * (unsigned long)hpx * 4ul;
+        u8 = js_uint8clampedarray_new(c, src_rgba, byte_len);
+        if (js_fatal(c) || js_is_undefined(u8))
+            return JS_THROW;
+    }
     obj = new_host(j, 0, HOST_IMAGE_DATA, j->image_data_proto);
     if (!obj)
         return JS_THROW;
@@ -17796,12 +16919,76 @@ static int make_image_data_obj(js_ctx *c, struct jsdom *j,
     return JS_OK;
 }
 
+static int make_image_data_obj(js_ctx *c, struct jsdom *j,
+                               unsigned int w, unsigned int hpx,
+                               const uint8_t *src_rgba, js_value *out)
+{
+    return make_image_data_obj_buf(c, j, w, hpx, src_rgba, js_undefined(), out);
+}
+
+static int image_data_constructor(js_ctx *c, js_value t,
+                                  int ac, js_value *av, js_value *r)
+{
+    struct jsdom *j = binding(c);
+    double dw, dh;
+    unsigned int w = 0, h = 0;
+    (void)t;
+
+    if (!j || !js_is_constructing(c))
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "ImageData must be constructed with new");
+    if (ac < 2)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "ImageData requires at least 2 arguments");
+    if (js_is_object(av[0])) {
+        unsigned long dlen = 0, pixels, req_h;
+
+        if (!js_is_uint8clampedarray(av[0]))
+            return js_throw_error(c, JS_ERR_TYPE,
+                                  "ImageData data must be a Uint8ClampedArray");
+        (void)js_uint8clampedarray_data(av[0], &dlen);
+        if (dlen == 0 || (dlen % 4ul) != 0)
+            return throw_dom_exception(c, "InvalidStateError",
+                                       "ImageData data length must be a positive multiple of 4");
+        if (js_to_number(c, av[1], &dw) != JS_OK)
+            return JS_THROW;
+        if (!jsd_isfinite(dw) || dw < 1.0 || dw > (double)JSDOM_CANVAS_MAX_DIM)
+            return throw_dom_exception(c, "IndexSizeError",
+                                       "invalid ImageData width");
+        w = (unsigned int)dw;
+        pixels = dlen / 4ul;
+        if (w == 0 || (pixels % (unsigned long)w) != 0)
+            return throw_dom_exception(c, "IndexSizeError",
+                                       "ImageData buffer length does not match width");
+        req_h = pixels / (unsigned long)w;
+        if (ac >= 3 && !js_is_undefined(av[2]) && !js_is_object(av[2])) {
+            if (js_to_number(c, av[2], &dh) != JS_OK)
+                return JS_THROW;
+            if (!jsd_isfinite(dh) || dh < 1.0 ||
+                dh > (double)JSDOM_CANVAS_MAX_DIM ||
+                (unsigned long)(unsigned int)dh != req_h)
+                return throw_dom_exception(c, "IndexSizeError",
+                                           "ImageData height does not match buffer length");
+        }
+        if (image_data_dims(c, (double)w, (double)req_h, &w, &h) != JS_OK)
+            return JS_THROW;
+        return make_image_data_obj_buf(c, j, w, h, 0, av[0], r);
+    }
+    if (js_to_number(c, av[0], &dw) != JS_OK ||
+        js_to_number(c, av[1], &dh) != JS_OK)
+        return JS_THROW;
+    if (image_data_dims(c, dw, dh, &w, &h) != JS_OK)
+        return JS_THROW;
+    return make_image_data_obj(c, j, w, h, 0, r);
+}
+
 static int ctx2d_create_image_data(js_ctx *c, js_value t,
                                    int ac, js_value *av, js_value *r)
 {
     struct hostref *h = 0;
     struct canvas_2d_state *st = ctx2d_of(t, &h, 0);
     double w, hbox;
+    unsigned int wu = 0, hu = 0;
 
     if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
     if (ac >= 1 && js_is_object(av[0])) {
@@ -17820,10 +17007,9 @@ static int ctx2d_create_image_data(js_ctx *c, js_value t,
                                  "createImageData requires dimensions")
                 : JS_THROW;
     }
-    if (!jsd_isfinite(w) || !jsd_isfinite(hbox) || w < 1.0 || hbox < 1.0)
-        return throw_dom_exception(c, "IndexSizeError",
-                                   "invalid ImageData dimensions");
-    return make_image_data_obj(c, h->j, (unsigned int)w, (unsigned int)hbox, 0, r);
+    if (image_data_dims(c, w, hbox, &wu, &hu) != JS_OK)
+        return JS_THROW;
+    return make_image_data_obj(c, h->j, wu, hu, 0, r);
 }
 
 static int ctx2d_get_image_data(js_ctx *c, js_value t,
@@ -17897,12 +17083,15 @@ static int ctx2d_put_image_data(js_ctx *c, js_value t,
     double dw, dh, ddx, ddy;
     const uint8_t *src;
     unsigned long dlen = 0, need;
-    int iw, ih, dx, dy, ix, iy;
+    int iw, ih, dx, dy, sx0 = 0, sy0 = 0, sx1, sy1, ix, iy;
 
     if (!st) return js_throw_error(c, JS_ERR_TYPE, "illegal ctx2d");
     if (ac < 3 || !js_is_object(av[0]))
         return js_throw_error(c, JS_ERR_TYPE,
                               "putImageData requires ImageData and dx, dy");
+    if (ac > 3 && ac < 7)
+        return js_throw_error(c, JS_ERR_TYPE,
+                              "putImageData requires 3 or 7 arguments");
     if (js_get(c, av[0], "width", &vw) != JS_OK ||
         js_get(c, av[0], "height", &vh) != JS_OK ||
         js_get(c, av[0], "data", &vdata) != JS_OK ||
@@ -17911,7 +17100,12 @@ static int ctx2d_put_image_data(js_ctx *c, js_value t,
         js_to_number(c, av[1], &ddx) != JS_OK ||
         js_to_number(c, av[2], &ddy) != JS_OK)
         return JS_THROW;
-    src = (const uint8_t *)js_uint8array_data(vdata, &dlen);
+    src = (const uint8_t *)js_uint8clampedarray_data(vdata, &dlen);
+    if (!src && js_is_uint8array(vdata))
+        src = (const uint8_t *)js_uint8array_data(vdata, &dlen);
+    if (!jsd_isfinite(dw) || !jsd_isfinite(dh) || dw < 1.0 || dh < 1.0 ||
+        dw > (double)JSDOM_CANVAS_MAX_DIM || dh > (double)JSDOM_CANVAS_MAX_DIM)
+        return js_throw_error(c, JS_ERR_TYPE, "invalid ImageData");
     iw = (int)dw;
     ih = (int)dh;
     if (!src || iw <= 0 || ih <= 0)
@@ -17919,14 +17113,39 @@ static int ctx2d_put_image_data(js_ctx *c, js_value t,
     need = (unsigned long)iw * (unsigned long)ih * 4ul;
     if (dlen < need)
         return js_throw_error(c, JS_ERR_RANGE, "ImageData buffer too small");
+    sx1 = iw;
+    sy1 = ih;
+    if (ac >= 7) {
+        double dsx, dsy, dsw, dsh;
+
+        if (js_to_number(c, av[3], &dsx) != JS_OK ||
+            js_to_number(c, av[4], &dsy) != JS_OK ||
+            js_to_number(c, av[5], &dsw) != JS_OK ||
+            js_to_number(c, av[6], &dsh) != JS_OK)
+            return JS_THROW;
+        if (!jsd_isfinite(ddx) || !jsd_isfinite(ddy) ||
+            !jsd_isfinite(dsx) || !jsd_isfinite(dsy) ||
+            !jsd_isfinite(dsw) || !jsd_isfinite(dsh))
+            return js_throw_error(c, JS_ERR_TYPE, "non-finite putImageData arg");
+        if (dsw < 0.0) { dsx += dsw; dsw = -dsw; }
+        if (dsh < 0.0) { dsy += dsh; dsh = -dsh; }
+        sx0 = (int)jsd_floor(dsx);
+        sy0 = (int)jsd_floor(dsy);
+        sx1 = sx0 + (int)jsd_floor(dsw);
+        sy1 = sy0 + (int)jsd_floor(dsh);
+        if (sx0 < 0) sx0 = 0;
+        if (sy0 < 0) sy0 = 0;
+        if (sx1 > iw) sx1 = iw;
+        if (sy1 > ih) sy1 = ih;
+    }
     if (cv && cv->px && cv->alpha) {
         dx = (int)jsd_floor(ddx);
         dy = (int)jsd_floor(ddy);
-        for (iy = 0; iy < ih; iy++) {
+        for (iy = sy0; iy < sy1; iy++) {
             int cy = dy + iy;
             if (cy < 0 || cy >= cv->h)
                 continue;
-            for (ix = 0; ix < iw; ix++) {
+            for (ix = sx0; ix < sx1; ix++) {
                 int cx = dx + ix;
                 unsigned long si, di;
 
@@ -19508,20 +18727,6 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->url_proto, "toString", url_to_string, 0);
     FUN(j->url_proto, "toJSON", url_to_string, 0);
 
-    ACC(j->abort_controller_proto, "signal",
-        abort_controller_signal_get, 0);
-    FUN(j->abort_controller_proto, "abort", abort_controller_abort, 1);
-    ACC(j->abort_signal_proto, "aborted", abort_signal_aborted_get, 0);
-    ACC(j->abort_signal_proto, "reason", abort_signal_reason_get, 0);
-    ACC(j->abort_signal_proto, "onabort",
-        abort_signal_onabort_get, abort_signal_onabort_set);
-    FUN(j->abort_signal_proto, "throwIfAborted",
-        abort_signal_throw_if_aborted, 0);
-    FUN(j->abort_signal_proto, "addEventListener",
-        abort_signal_add_listener, 2);
-    FUN(j->abort_signal_proto, "removeEventListener",
-        abort_signal_remove_listener, 2);
-
     FUN(j->class_proto, "add", class_add, 1);
     FUN(j->class_proto, "remove", class_remove, 1);
     FUN(j->class_proto, "toggle", class_toggle, 1);
@@ -19609,6 +18814,12 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->canvas_2d_proto, "createImageData", ctx2d_create_image_data, 2);
     FUN(j->canvas_2d_proto, "getImageData", ctx2d_get_image_data, 4);
     FUN(j->canvas_2d_proto, "putImageData", ctx2d_put_image_data, 3);
+    FUN(j->canvas_2d_proto, "createLinearGradient",
+        ctx2d_create_linear_gradient, 4);
+    FUN(j->canvas_2d_proto, "createRadialGradient",
+        ctx2d_create_radial_gradient, 6);
+    FUN(j->canvas_gradient_proto, "addColorStop",
+        canvas_gradient_add_color_stop, 2);
 
     FUN(j->dom_parser_proto, "parseFromString",
         dom_parser_parse_from_string, 2);
@@ -19668,12 +18879,6 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->request_proto, "blob", request_blob, 0);
     FUN(j->request_proto, "bytes", request_bytes, 0);
     FUN(j->request_proto, "formData", request_formdata, 0);
-    ACC(j->blob_proto, "size", blob_size_get, 0);
-    ACC(j->blob_proto, "type", blob_type_get, 0);
-    FUN(j->blob_proto, "slice", blob_slice, 3);
-    FUN(j->blob_proto, "text", blob_text, 0);
-    FUN(j->blob_proto, "arrayBuffer", blob_arraybuffer, 0);
-    FUN(j->blob_proto, "bytes", blob_bytes, 0);
     ACC(j->file_proto, "name", file_name_get, 0);
     ACC(j->file_proto, "lastModified", file_last_modified_get, 0);
     ACC(j->file_proto, "webkitRelativePath", file_relative_path_get, 0);
@@ -19688,16 +18893,6 @@ static int define_other_protos(struct jsdom *j)
     FUN(j->file_reader_proto, "readAsDataURL",
         file_reader_read_data_url, 1);
     FUN(j->file_reader_proto, "abort", file_reader_abort, 0);
-    FUN(j->formdata_proto, "append", formdata_append, 2);
-    FUN(j->formdata_proto, "set", formdata_set, 2);
-    FUN(j->formdata_proto, "delete", formdata_delete, 1);
-    FUN(j->formdata_proto, "get", formdata_get, 1);
-    FUN(j->formdata_proto, "getAll", formdata_get_all, 1);
-    FUN(j->formdata_proto, "has", formdata_has, 1);
-    FUN(j->formdata_proto, "forEach", formdata_for_each, 1);
-    FUN(j->formdata_proto, "entries", formdata_entries, 0);
-    FUN(j->formdata_proto, "keys", formdata_keys, 0);
-    FUN(j->formdata_proto, "values", formdata_values, 0);
     FUN(j->headers_proto, "get", headers_get, 1);
     FUN(j->headers_proto, "has", headers_has, 1);
     FUN(j->headers_proto, "append", headers_append_method, 2);
@@ -19727,14 +18922,13 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     js_config jc;
     js_object *docobj, *locobj, *navobj, *clipboardobj, *screenobj, *perfobj;
     js_object *url_ctor;
-    js_object *abort_controller_ctor, *abort_signal_ctor;
     js_object *event_target_ctor, *event_ctor, *custom_event_ctor;
     js_object *ui_event_ctor, *mouse_event_ctor, *keyboard_event_ctor;
     js_object *focus_event_ctor, *input_event_ctor, *pointer_event_ctor;
     js_object *node_ctor, *character_data_ctor, *text_ctor, *comment_ctor;
     js_object *element_ctor, *html_element_ctor, *svg_element_ctor;
     js_object *html_canvas_ctor, *html_template_ctor, *canvas_2d_ctor;
-    js_object *image_data_ctor, *dom_parser_ctor;
+    js_object *image_data_ctor, *canvas_gradient_ctor, *dom_parser_ctor;
     js_object *resize_observer_ctor, *intersection_observer_ctor;
     js_object *fragment_ctor, *document_ctor;
     js_object *html_document_ctor;
@@ -19743,10 +18937,9 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     js_object *attr_ctor, *named_node_map_ctor;
     js_object *node_iterator_ctor, *tree_walker_ctor, *node_filter;
     js_object *range_ctor, *selection_ctor;
-    js_object *headers_ctor, *response_ctor, *request_ctor, *blob_ctor;
+    js_object *headers_ctor, *response_ctor, *request_ctor;
     js_object *file_ctor, *file_reader_ctor;
-    js_object *formdata_ctor;
-    js_object *localobj, *sessionobj, *cryptoobj, *subtleobj, *languages;
+    js_object *localobj, *sessionobj, *languages;
     js_object *orientation;
     js_object *historyobj;
     js_object *selection_object;
@@ -19812,6 +19005,7 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     js_config_default(&jc);
     jc.user = j;
     jc.print = js_print;
+    jc.random_bytes = jsdom_random_bytes;
     if (cfg && cfg->max_heap) jc.max_heap = cfg->max_heap;
     if (cfg && cfg->max_steps) jc.max_steps = cfg->max_steps;
     j->ctx = js_new(&jc);
@@ -19822,6 +19016,9 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (js_host_finalizer(j->ctx, JSDOM_TAG, host_free) != 0)
         goto fail;
     j->event_target_proto = js_new_object(j->ctx);
+    js_abortsignal_set_proto(j->ctx, j->event_target_proto);
+    js_set_abort_hooks(j->ctx, jsdom_on_abort, jsdom_make_abort_event, j);
+    js_set_blob_extractor(j->ctx, jsdom_file_extract, j);
     j->node_proto = js_new_object_proto(j->ctx, j->event_target_proto);
     j->character_data_proto =
         js_new_object_proto(j->ctx, j->node_proto);
@@ -19848,16 +19045,15 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->computed_style_proto = js_new_object(j->ctx);
     j->canvas_2d_proto = js_new_object(j->ctx);
     j->image_data_proto = js_new_object(j->ctx);
+    j->canvas_gradient_proto = js_new_object(j->ctx);
     j->dom_parser_proto = js_new_object(j->ctx);
     j->resize_observer_proto = js_new_object(j->ctx);
     j->intersection_observer_proto = js_new_object(j->ctx);
     j->response_proto = js_new_object(j->ctx);
     j->request_proto = js_new_object(j->ctx);
-    j->blob_proto = js_new_object(j->ctx);
-    j->file_proto = js_new_object_proto(j->ctx, j->blob_proto);
+    j->file_proto = js_new_object_proto(j->ctx, js_blob_proto(j->ctx));
     j->file_reader_proto =
         js_new_object_proto(j->ctx, j->event_target_proto);
-    j->formdata_proto = js_new_object(j->ctx);
     j->web_iterator_proto = js_new_object(j->ctx);
     j->media_query_proto =
         js_new_object_proto(j->ctx, j->event_target_proto);
@@ -19874,9 +19070,6 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     j->headers_proto = js_new_object(j->ctx);
     j->storage_proto = js_new_object(j->ctx);
     j->url_proto = js_new_object(j->ctx);
-    j->abort_controller_proto = js_new_object(j->ctx);
-    j->abort_signal_proto = js_new_object_proto(j->ctx,
-                                                 j->event_target_proto);
     j->event_proto = js_new_object(j->ctx);
     j->custom_event_proto = js_new_object_proto(j->ctx, j->event_proto);
     j->ui_event_proto = js_new_object_proto(j->ctx, j->event_proto);
@@ -19898,11 +19091,12 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         !j->html_document_proto ||
         !j->location_proto ||
         !j->class_proto || !j->style_proto || !j->computed_style_proto ||
-        !j->canvas_2d_proto || !j->image_data_proto || !j->dom_parser_proto ||
+        !j->canvas_2d_proto || !j->image_data_proto ||
+        !j->canvas_gradient_proto || !j->dom_parser_proto ||
         !j->resize_observer_proto || !j->intersection_observer_proto ||
         !j->response_proto ||
-        !j->request_proto || !j->blob_proto || !j->file_proto ||
-        !j->file_reader_proto || !j->formdata_proto ||
+        !j->request_proto || !j->file_proto ||
+        !j->file_reader_proto ||
         !j->web_iterator_proto || !j->media_query_proto ||
         !j->history_proto || !j->mutation_observer_proto ||
         !j->mutation_record_proto || !j->dom_exception_proto ||
@@ -19911,11 +19105,11 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         !j->range_proto || !j->selection_proto ||
         !j->headers_proto ||
         !j->storage_proto || !j->url_proto ||
-        !j->abort_controller_proto || !j->abort_signal_proto ||
         !j->event_proto || !j->custom_event_proto || !j->ui_event_proto ||
         !j->mouse_event_proto || !j->keyboard_event_proto ||
         !j->focus_event_proto || !j->input_event_proto ||
         !j->pointer_event_proto ||
+        !js_abortsignal_ctor(j->ctx) || !js_blob_proto(j->ctx) ||
         !define_node_proto(j) || !define_other_protos(j))
         goto fail;
 
@@ -19927,21 +19121,9 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         js_define_native(j->ctx, url_ctor, "createObjectURL",
                          url_create_object_url, 1) != JS_OK ||
         js_define_native(j->ctx, url_ctor, "revokeObjectURL",
-                         url_revoke_object_url, 1) != JS_OK)
-        goto fail;
-    abort_controller_ctor = js_new_native_constructor(
-        j->ctx, abort_controller_constructor, "AbortController", 0,
-        j->abort_controller_proto);
-    abort_signal_ctor = js_new_native_constructor(
-        j->ctx, abort_signal_constructor, "AbortSignal", 0,
-        j->abort_signal_proto);
-    if (!abort_controller_ctor || !abort_signal_ctor ||
-        js_define_native(j->ctx, abort_signal_ctor, "abort",
-                         abort_signal_abort_static, 1) != JS_OK ||
-        js_define_native(j->ctx, abort_signal_ctor, "timeout",
-                         abort_signal_timeout_static, 1) != JS_OK ||
-        js_define_native(j->ctx, abort_signal_ctor, "any",
-                         abort_signal_any_static, 1) != JS_OK)
+                         url_revoke_object_url, 1) != JS_OK ||
+        js_define_native(j->ctx, js_abortsignal_ctor(j->ctx), "timeout",
+                         abort_signal_timeout_static, 1) != JS_OK)
         goto fail;
     event_target_ctor = js_new_native_constructor(
         j->ctx, event_target_constructor, "EventTarget", 0,
@@ -19970,8 +19152,11 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         j->ctx, illegal_dom_constructor, "CanvasRenderingContext2D", 0,
         j->canvas_2d_proto);
     image_data_ctor = js_new_native_constructor(
-        j->ctx, illegal_dom_constructor, "ImageData", 0,
+        j->ctx, image_data_constructor, "ImageData", 2,
         j->image_data_proto);
+    canvas_gradient_ctor = js_new_native_constructor(
+        j->ctx, illegal_dom_constructor, "CanvasGradient", 0,
+        j->canvas_gradient_proto);
     dom_parser_ctor = js_new_native_constructor(
         j->ctx, dom_parser_constructor, "DOMParser", 0, j->dom_parser_proto);
     resize_observer_ctor = js_new_native_constructor(
@@ -20045,7 +19230,7 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         !text_ctor || !comment_ctor || !element_ctor || !fragment_ctor ||
         !html_element_ctor || !svg_element_ctor ||
         !html_canvas_ctor || !html_template_ctor || !canvas_2d_ctor ||
-        !image_data_ctor || !dom_parser_ctor ||
+        !image_data_ctor || !canvas_gradient_ctor || !dom_parser_ctor ||
         !resize_observer_ctor || !intersection_observer_ctor ||
         !document_ctor || !html_document_ctor ||
         !mutation_observer_ctor || !mutation_record_ctor ||
@@ -20074,17 +19259,13 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         j->ctx, response_constructor, "Response", 0, j->response_proto);
     request_ctor = js_new_native_constructor(
         j->ctx, request_constructor, "Request", 1, j->request_proto);
-    blob_ctor = js_new_native_constructor(
-        j->ctx, blob_constructor, "Blob", 0, j->blob_proto);
     file_ctor = js_new_native_constructor(
         j->ctx, file_constructor, "File", 2, j->file_proto);
     file_reader_ctor = js_new_native_constructor(
         j->ctx, file_reader_constructor, "FileReader", 0,
         j->file_reader_proto);
-    formdata_ctor = js_new_native_constructor(
-        j->ctx, formdata_constructor, "FormData", 0, j->formdata_proto);
-    if (!headers_ctor || !response_ctor || !request_ctor || !blob_ctor ||
-        !file_ctor || !file_reader_ctor || !formdata_ctor ||
+    if (!headers_ctor || !response_ctor || !request_ctor ||
+        !file_ctor || !file_reader_ctor ||
         js_define_native(j->ctx, response_ctor, "json",
                          response_json_static, 1) != JS_OK ||
         js_define_native(j->ctx, response_ctor, "redirect",
@@ -20124,8 +19305,6 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     screenobj = js_new_object(j->ctx);
     orientation = js_new_object(j->ctx);
     perfobj = js_new_object(j->ctx);
-    cryptoobj = js_new_object(j->ctx);
-    subtleobj = js_new_object(j->ctx);
     localobj = new_host_data(j, 0, HOST_STORAGE, j->local_storage,
                              j->storage_proto);
     sessionobj = new_host_data(j, 0, HOST_STORAGE, j->session_storage,
@@ -20150,17 +19329,7 @@ struct jsdom *jsdom_new(struct dom_document *doc,
         !navobj || !clipboardobj || !languages ||
         !orientation ||
         !screenobj || !perfobj ||
-        !cryptoobj || !subtleobj ||
         !localobj || !sessionobj || !historyobj)
-        goto fail;
-    if (js_define_native(j->ctx, cryptoobj, "getRandomValues",
-                         crypto_get_random_values, 1) != JS_OK ||
-        js_define_native(j->ctx, cryptoobj, "randomUUID",
-                         crypto_random_uuid, 0) != JS_OK ||
-        js_define_native(j->ctx, subtleobj, "digest",
-                         crypto_subtle_digest, 2) != JS_OK ||
-        js_set(j->ctx, js_object_value(cryptoobj), "subtle",
-               js_object_value(subtleobj)) != JS_OK)
         goto fail;
     if (js_array_push(j->ctx, languages,
                       js_mkcstring(j->ctx, "en-US")) != JS_OK ||
@@ -20325,10 +19494,6 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                js_object_value(sessionobj)) != JS_OK ||
         js_set(j->ctx, global, "URL",
                js_object_value(url_ctor)) != JS_OK ||
-        js_set(j->ctx, global, "AbortController",
-               js_object_value(abort_controller_ctor)) != JS_OK ||
-        js_set(j->ctx, global, "AbortSignal",
-               js_object_value(abort_signal_ctor)) != JS_OK ||
         js_set(j->ctx, global, "EventTarget",
                js_object_value(event_target_ctor)) != JS_OK ||
         js_set(j->ctx, global, "Node",
@@ -20351,6 +19516,8 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                js_object_value(canvas_2d_ctor)) != JS_OK ||
         js_set(j->ctx, global, "ImageData",
                js_object_value(image_data_ctor)) != JS_OK ||
+        js_set(j->ctx, global, "CanvasGradient",
+               js_object_value(canvas_gradient_ctor)) != JS_OK ||
         js_set(j->ctx, global, "DOMParser",
                js_object_value(dom_parser_ctor)) != JS_OK ||
         js_set(j->ctx, global, "ResizeObserver",
@@ -20407,20 +19574,14 @@ struct jsdom *jsdom_new(struct dom_document *doc,
                js_object_value(response_ctor)) != JS_OK ||
         js_set(j->ctx, global, "Request",
                js_object_value(request_ctor)) != JS_OK ||
-        js_set(j->ctx, global, "Blob",
-               js_object_value(blob_ctor)) != JS_OK ||
         js_set(j->ctx, global, "File",
                js_object_value(file_ctor)) != JS_OK ||
         js_set(j->ctx, global, "FileReader",
                js_object_value(file_reader_ctor)) != JS_OK ||
-        js_set(j->ctx, global, "FormData",
-               js_object_value(formdata_ctor)) != JS_OK ||
         js_set(j->ctx, global, "navigator", js_object_value(navobj)) != JS_OK ||
         js_set(j->ctx, global, "history",
                js_object_value(historyobj)) != JS_OK ||
         js_set(j->ctx, global, "screen", js_object_value(screenobj)) != JS_OK ||
-        js_set(j->ctx, global, "crypto",
-               js_object_value(cryptoobj)) != JS_OK ||
         js_set(j->ctx, global, "performance", js_object_value(perfobj)) != JS_OK)
         goto fail;
     return j;
@@ -20515,7 +19676,6 @@ static int dispatch_listeners(struct jsdom *j, js_value tv, js_value event,
     for (i = 0; i < count; i++) {
         js_value once_value = js_bool(0), passive_value = js_bool(0);
         js_value signal = js_undefined();
-        struct hostref *signal_host;
         int entry_capture;
 
         if (js_array_get(j->ctx, listeners.u.obj, i, &entry) != JS_OK)
@@ -20532,9 +19692,7 @@ static int dispatch_listeners(struct jsdom *j, js_value tv, js_value event,
              js_get(j->ctx, entry, "passive", &passive_value) != JS_OK ||
              js_get(j->ctx, entry, "signal", &signal) != JS_OK))
             return 0;
-        signal_host = host(signal, HOST_ABORT_SIGNAL);
-        if (signal_host &&
-            ((struct abort_state *)signal_host->data)->aborted) {
+        if (js_abortsignal_aborted(signal)) {
             if (js_set_value(j->ctx, listeners, js_number((double)i),
                              js_undefined()) != JS_OK)
                 return 0;
@@ -20932,9 +20090,9 @@ static int pump_fetch(struct jsdom *j, int i)
     if (!j || i < 0 || i >= JSDOM_FETCH_MAX ||
         j->fetches[i].state != TASK_QUEUED)
         return 0;
-    if (j->fetches[i].abort && j->fetches[i].abort->aborted) {
+    if (js_abortsignal_aborted(j->fetches[i].abort_signal)) {
         rc = js_promise_reject(j->ctx, j->fetches[i].promise,
-                               j->fetches[i].abort->reason);
+                               js_abortsignal_reason(j->fetches[i].abort_signal));
         fetch_task_clear(j, i);
         return rc == JS_OK ? 1 : -1;
     }
@@ -21342,14 +20500,14 @@ int jsdom_pump(struct jsdom *j, char *err, unsigned long errsz)
         if (task->state != TASK_QUEUED ||
             task->due_turn > j->event_turn)
             continue;
-        if (task->abort) {
-            struct abort_state *state = task->abort;
+        if (js_is_abortsignal(task->abort_signal)) {
+            js_value signal = task->abort_signal;
             js_value reason;
 
             task->state = TASK_RUNNING;
-            if (!state->aborted) {
+            if (!js_abortsignal_aborted(signal)) {
                 if (make_timeout_reason(j->ctx, &reason) != JS_OK ||
-                    abort_state_trigger(j, state, reason, 1) != JS_OK)
+                    js_abortsignal_trigger(j->ctx, signal, reason, 1) != JS_OK)
                     goto fail;
             }
             memset(task, 0, sizeof(*task));

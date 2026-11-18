@@ -15,6 +15,37 @@
 #define TEXTDEC_IGNORE_BOM  0x02u
 #define URLPARAMS_MAX_PAIRS 1024u
 #define URLPARAMS_MAX_INPUT (1024UL * 1024UL)
+#define WEBAPI_BLOB_MAX     (4UL * 1024UL * 1024UL)
+#define WEBAPI_ABORT_MAX    256u
+#define WEBAPI_ABORT_DEPTH  16u
+#define WEBAPI_FORM_MAX     1024u
+
+#define WEBAPI_TAG_ABORT_CTRL 0x4a534143U
+#define WEBAPI_TAG_ABORT_SIG  0x4a534153U
+#define WEBAPI_TAG_BLOB       0x4a53424cU
+#define WEBAPI_TAG_FORMDATA   0x4a534644U
+
+const void *js_buffersource_data(js_value v, unsigned long *len)
+{
+    if (js_is_arraybuffer(v)) {
+        const void *p = js_arraybuffer_data(v, len);
+        return p ? p : "";
+    }
+    if (js_is_typedarray(v) || js_is_dataview(v)) {
+        js_object *view = v.u.obj;
+        if (!view->view_buffer || !view->view_buffer->buffer ||
+            !view->byte_length) {
+            if (len) *len = 0;
+            return "";
+        }
+        if (len)
+            *len = view->byte_length;
+        return view->view_buffer->buffer + view->byte_offset;
+    }
+    if (len)
+        *len = 0;
+    return 0;
+}
 
 static js_value web_arg(int argc, js_value *argv, int index)
 {
@@ -2471,13 +2502,1446 @@ static int url_to_string(js_ctx *ctx, js_value this_value, int argc,
     return url_href_get(ctx, this_value, argc, argv, out);
 }
 
+int js_is_uint8clampedarray(js_value v)
+{
+    return v.type == JS_OBJECT &&
+           v.u.obj->cls == JS_CLASS_UINT8CLAMPEDARRAY;
+}
+
+const void *js_uint8clampedarray_data(js_value v, unsigned long *len)
+{
+    js_object *o;
+
+    if (!js_is_uint8clampedarray(v)) {
+        if (len)
+            *len = 0;
+        return 0;
+    }
+    o = v.u.obj;
+    if (len)
+        *len = o->byte_length;
+    if (!o->view_buffer || !o->view_buffer->buffer)
+        return 0;
+    return o->view_buffer->buffer + o->byte_offset;
+}
+
+void *js_uint8clampedarray_mutable_data(js_value v, unsigned long *len)
+{
+    return (void *)js_uint8clampedarray_data(v, len);
+}
+
+js_value js_uint8clampedarray_new(js_ctx *ctx, const void *data,
+                                  unsigned long len)
+{
+    return js_typedarray_new(ctx, JS_CLASS_UINT8CLAMPEDARRAY, data, len);
+}
+
+/* ================================================================== */
+/* Shared iterator / error / event helpers                             */
+/* ================================================================== */
+
+static int web_set_tostring_tag(js_ctx *ctx, js_object *proto, const char *tag)
+{
+    if (ctx->sym_tostringtag.type != JS_SYMBOL)
+        return 1;
+    return js_define_symbol_prop(ctx, proto, ctx->sym_tostringtag,
+                                 js_mkcstring(ctx, tag), JS_P_CONFIG) == JS_OK;
+}
+
+static int web_resolved_promise(js_ctx *ctx, js_value val, js_value *out)
+{
+    js_value p = js_promise_new(ctx);
+
+    if (!js_is_promise(p))
+        return JS_THROW;
+    if (js_promise_resolve(ctx, p, val) != JS_OK)
+        return JS_THROW;
+    *out = p;
+    return JS_OK;
+}
+
+static int web_make_named_error(js_ctx *ctx, const char *name, const char *msg,
+                                js_value *out)
+{
+    js_object *e = js_new_error(ctx, JS_ERR_ERROR, msg);
+
+    if (!e)
+        return JS_THROW;
+    if (js_define(ctx, e, "name", js_mkcstring(ctx, name)) != JS_OK)
+        return JS_THROW;
+    *out = js_object_value(e);
+    return JS_OK;
+}
+
+/* ================================================================== */
+/* AbortController / AbortSignal                                       */
+/* ================================================================== */
+
+struct js_abort_state {
+    int        aborted;
+    uint32_t   dep_depth;
+    js_value   reason;
+    js_value   signal;
+    js_value   onabort;
+    js_object *listeners;
+    js_object *dependents;
+};
+
+static struct js_abort_state *abort_state_of(js_value v)
+{
+    return (struct js_abort_state *)js_host_ptr(v, WEBAPI_TAG_ABORT_SIG);
+}
+
+static struct js_abort_state *abort_ctrl_of(js_value v)
+{
+    return (struct js_abort_state *)js_host_ptr(v, WEBAPI_TAG_ABORT_CTRL);
+}
+
+int js_is_abortsignal(js_value v)
+{
+    return abort_state_of(v) != 0;
+}
+
+int js_abortsignal_aborted(js_value signal)
+{
+    struct js_abort_state *st = abort_state_of(signal);
+    return st ? st->aborted : 0;
+}
+
+js_value js_abortsignal_reason(js_value signal)
+{
+    struct js_abort_state *st = abort_state_of(signal);
+    return st ? st->reason : js_undefined();
+}
+
+js_object *js_abortsignal_proto(js_ctx *ctx)
+{
+    return ctx ? ctx->proto[P_ABORTSIGNAL] : 0;
+}
+
+js_object *js_abortsignal_ctor(js_ctx *ctx)
+{
+    return ctx ? ctx->ctor_abortsignal : 0;
+}
+
+void js_abortsignal_set_proto(js_ctx *ctx, js_object *proto)
+{
+    if (ctx && ctx->proto[P_ABORTSIGNAL] && proto)
+        ctx->proto[P_ABORTSIGNAL]->proto = proto;
+}
+
+void js_set_abort_hooks(js_ctx *ctx,
+                        void (*on_abort)(void *user, js_value signal),
+                        js_value (*make_event)(void *user, const char *type),
+                        void *user)
+{
+    if (!ctx)
+        return;
+    ctx->on_abort = on_abort;
+    ctx->make_abort_event = make_event;
+    ctx->abort_hook_user = user;
+}
+
+js_value js_abortsignal_new(js_ctx *ctx)
+{
+    struct js_abort_state *st;
+    js_object *sig;
+
+    st = (struct js_abort_state *)js_alloc(ctx, sizeof(*st));
+    if (!st)
+        return js_undefined();
+    st->reason = js_undefined();
+    st->onabort = js_undefined();
+    sig = js_new_host(ctx, st, WEBAPI_TAG_ABORT_SIG, ctx->proto[P_ABORTSIGNAL]);
+    if (!sig)
+        return js_undefined();
+    st->signal = js_object_value(sig);
+    return st->signal;
+}
+
+static int abort_event_callback(js_ctx *ctx, js_value cb,
+                                js_value *callable, js_value *receiver)
+{
+    if (js_is_function(cb)) {
+        *callable = cb;
+        *receiver = js_undefined();
+        return 1;
+    }
+    if (!js_is_object(cb) ||
+        js_get(ctx, cb, "handleEvent", callable) != JS_OK ||
+        !js_is_function(*callable))
+        return 0;
+    *receiver = cb;
+    return 1;
+}
+
+static int abort_listener_options(js_ctx *ctx, js_value opts,
+                                  int *capture, int *passive, js_value *sig)
+{
+    js_value v;
+
+    *capture = 0;
+    *passive = 0;
+    *sig = js_undefined();
+    if (js_is_bool(opts)) {
+        *capture = js_to_boolean(opts);
+        return JS_OK;
+    }
+    if (opts.type != JS_OBJECT)
+        return JS_OK;
+    if (web_option_bool(ctx, opts, "capture", 0, capture) != JS_OK ||
+        web_option_bool(ctx, opts, "passive", 0, passive) != JS_OK)
+        return JS_THROW;
+    if (js_get(ctx, opts, "signal", &v) != JS_OK)
+        return JS_THROW;
+    if (!js_is_undefined(v) && !js_is_null(v)) {
+        if (!js_is_abortsignal(v))
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "listener signal must be an AbortSignal");
+        *sig = v;
+    }
+    return JS_OK;
+}
+
+static int abort_make_event(js_ctx *ctx, js_value signal, js_value *out)
+{
+    js_value ev = js_undefined();
+
+    if (ctx->make_abort_event) {
+        ev = ctx->make_abort_event(ctx->abort_hook_user, "abort");
+        if (js_fatal(ctx))
+            return JS_THROW;
+    }
+    if (!js_is_object(ev)) {
+        js_object *eo = js_new_object(ctx);
+        if (!eo)
+            return JS_THROW;
+        ev = js_object_value(eo);
+        if (js_set(ctx, ev, "type", js_mkcstring(ctx, "abort")) != JS_OK ||
+            js_set(ctx, ev, "bubbles", js_bool(0)) != JS_OK ||
+            js_set(ctx, ev, "cancelable", js_bool(0)) != JS_OK ||
+            js_set(ctx, ev, "defaultPrevented", js_bool(0)) != JS_OK)
+            return JS_THROW;
+    }
+    if (js_set(ctx, ev, "target", signal) != JS_OK ||
+        js_set(ctx, ev, "currentTarget", signal) != JS_OK ||
+        js_set(ctx, ev, "eventPhase", js_number(2)) != JS_OK)
+        return JS_THROW;
+    *out = ev;
+    return JS_OK;
+}
+
+static void abort_report_exception(js_ctx *ctx)
+{
+    if (ctx->cfg.print)
+        ctx->cfg.print(ctx->cfg.user, js_error_text(ctx, js_exception(ctx)));
+    js_clear_exception(ctx);
+}
+
+static int abort_dispatch(js_ctx *ctx, struct js_abort_state *st)
+{
+    js_value ev, res, callable, receiver;
+    unsigned long i, count;
+    js_value *snap = 0;
+
+    if (abort_make_event(ctx, st->signal, &ev) != JS_OK)
+        return JS_THROW;
+    count = st->listeners ? st->listeners->elen : 0;
+    if (count) {
+        snap = (js_value *)js_alloc(ctx, count * sizeof(js_value));
+        if (!snap)
+            return JS_THROW;
+        for (i = 0; i < count; i++)
+            snap[i] = st->listeners->elems[i];
+    }
+    if (js_is_function(st->onabort) &&
+        js_call(ctx, st->onabort, st->signal, 1, &ev, &res) != JS_OK) {
+        if (js_fatal(ctx))
+            return JS_THROW;
+        abort_report_exception(ctx);
+    }
+    for (i = 0; i < count; i++) {
+        js_value entry = snap[i], cb, rsig, passv;
+
+        if (!js_is_object(entry) ||
+            js_get(ctx, entry, "callback", &cb) != JS_OK ||
+            js_get(ctx, entry, "signal", &rsig) != JS_OK ||
+            js_get(ctx, entry, "passive", &passv) != JS_OK)
+            return JS_THROW;
+        if (js_abortsignal_aborted(rsig) ||
+            !abort_event_callback(ctx, cb, &callable, &receiver))
+            continue;
+        if (js_set(ctx, ev, "__inPassiveListener",
+                   js_bool(js_to_boolean(passv))) != JS_OK)
+            return JS_THROW;
+        if (js_call(ctx, callable,
+                    js_is_function(cb) ? st->signal : receiver,
+                    1, &ev, &res) != JS_OK) {
+            js_set(ctx, ev, "__inPassiveListener", js_bool(0));
+            if (js_fatal(ctx))
+                return JS_THROW;
+            abort_report_exception(ctx);
+        }
+        if (js_set(ctx, ev, "__inPassiveListener", js_bool(0)) != JS_OK)
+            return JS_THROW;
+    }
+    if (js_set(ctx, ev, "currentTarget", js_null()) != JS_OK ||
+        js_set(ctx, ev, "eventPhase", js_number(0)) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+int js_abortsignal_trigger(js_ctx *ctx, js_value signal,
+                           js_value reason, int dispatch)
+{
+    struct js_abort_state *st = abort_state_of(signal);
+    unsigned long i, n;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal");
+    if (st->aborted)
+        return JS_OK;
+    st->reason = reason;
+    st->aborted = 1;
+    if (ctx->on_abort)
+        ctx->on_abort(ctx->abort_hook_user, st->signal);
+    if (dispatch && abort_dispatch(ctx, st) != JS_OK)
+        return JS_THROW;
+    n = st->dependents ? st->dependents->elen : 0;
+    for (i = 0; i < n; i++) {
+        if (js_abortsignal_trigger(ctx, st->dependents->elems[i],
+                                   reason, 1) != JS_OK)
+            return JS_THROW;
+    }
+    return JS_OK;
+}
+
+static int abort_controller_ctor(js_ctx *ctx, js_value this_val,
+                                 int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st;
+    js_value sig;
+    js_object *ctrl;
+
+    (void)this_val; (void)argc; (void)argv;
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "AbortController must be constructed with new");
+    sig = js_abortsignal_new(ctx);
+    st = abort_state_of(sig);
+    if (!st)
+        return JS_THROW;
+    ctrl = js_new_host(ctx, st, WEBAPI_TAG_ABORT_CTRL,
+                       ctx->proto[P_ABORTCONTROLLER]);
+    if (!ctrl)
+        return JS_THROW;
+    *out = js_object_value(ctrl);
+    return JS_OK;
+}
+
+static int abort_controller_signal_get(js_ctx *ctx, js_value this_val,
+                                       int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_ctrl_of(this_val);
+
+    (void)argc; (void)argv;
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid AbortController receiver");
+    *out = st->signal;
+    return JS_OK;
+}
+
+static int abort_controller_abort(js_ctx *ctx, js_value this_val,
+                                  int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_ctrl_of(this_val);
+    js_value reason;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "invalid AbortController receiver");
+    if (st->aborted) {
+        *out = js_undefined();
+        return JS_OK;
+    }
+    if (argc > 0 && !js_is_undefined(argv[0]))
+        reason = argv[0];
+    else if (web_make_named_error(ctx, "AbortError",
+                                  "The operation was aborted",
+                                  &reason) != JS_OK)
+        return JS_THROW;
+    if (js_abortsignal_trigger(ctx, st->signal, reason, 1) != JS_OK)
+        return JS_THROW;
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int abort_signal_ctor(js_ctx *ctx, js_value this_val,
+                             int argc, js_value *argv, js_value *out)
+{
+    (void)this_val; (void)argc; (void)argv; (void)out;
+    return js_throw_error(ctx, JS_ERR_TYPE, "Illegal constructor");
+}
+
+static int abort_signal_aborted_get(js_ctx *ctx, js_value this_val,
+                                    int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+
+    (void)argc; (void)argv;
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    *out = js_bool(st->aborted);
+    return JS_OK;
+}
+
+static int abort_signal_reason_get(js_ctx *ctx, js_value this_val,
+                                   int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+
+    (void)argc; (void)argv;
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    *out = st->reason;
+    return JS_OK;
+}
+
+static int abort_signal_onabort_get(js_ctx *ctx, js_value this_val,
+                                    int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+
+    (void)argc; (void)argv;
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    *out = js_is_undefined(st->onabort) ? js_null() : st->onabort;
+    return JS_OK;
+}
+
+static int abort_signal_onabort_set(js_ctx *ctx, js_value this_val,
+                                    int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    if (argc > 0 && js_is_function(argv[0]))
+        st->onabort = argv[0];
+    else
+        st->onabort = js_undefined();
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int abort_signal_throw_if_aborted(js_ctx *ctx, js_value this_val,
+                                         int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+
+    (void)argc; (void)argv;
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    if (st->aborted)
+        return js_throw(ctx, st->reason);
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int abort_signal_add_listener(js_ctx *ctx, js_value this_val,
+                                     int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+    const char *type;
+    js_value callable, receiver, rsig;
+    js_object *entry;
+    int capture, passive;
+    unsigned long i;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    type = js_to_cstring(ctx, web_arg(argc, argv, 0));
+    if (!type)
+        return JS_THROW;
+    if (strcmp(type, "abort") != 0 || argc < 2 ||
+        js_is_null(argv[1]) || js_is_undefined(argv[1])) {
+        *out = js_undefined();
+        return JS_OK;
+    }
+    if (!abort_event_callback(ctx, argv[1], &callable, &receiver))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid event listener");
+    if (abort_listener_options(ctx, web_arg(argc, argv, 2),
+                               &capture, &passive, &rsig) != JS_OK)
+        return JS_THROW;
+    if (js_abortsignal_aborted(rsig)) {
+        *out = js_undefined();
+        return JS_OK;
+    }
+    if (!st->listeners) {
+        st->listeners = js_new_array(ctx);
+        if (!st->listeners)
+            return JS_THROW;
+    }
+    for (i = 0; i < st->listeners->elen; i++) {
+        js_value ecb, ecap;
+        if (js_get(ctx, st->listeners->elems[i], "callback", &ecb) != JS_OK ||
+            js_get(ctx, st->listeners->elems[i], "capture", &ecap) != JS_OK)
+            return JS_THROW;
+        if (js_is_object(ecb) && js_is_object(argv[1]) &&
+            ecb.u.obj == argv[1].u.obj && js_to_boolean(ecap) == capture) {
+            *out = js_undefined();
+            return JS_OK;
+        }
+    }
+    if (st->listeners->elen >= WEBAPI_ABORT_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "too many AbortSignal listeners");
+    entry = js_new_object(ctx);
+    if (!entry ||
+        js_define(ctx, entry, "callback", argv[1]) != JS_OK ||
+        js_define(ctx, entry, "signal", rsig) != JS_OK ||
+        js_define(ctx, entry, "capture", js_bool(capture)) != JS_OK ||
+        js_define(ctx, entry, "passive", js_bool(passive)) != JS_OK ||
+        js_array_push(ctx, st->listeners, js_object_value(entry)) != JS_OK)
+        return JS_THROW;
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int abort_signal_remove_listener(js_ctx *ctx, js_value this_val,
+                                        int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *st = abort_state_of(this_val);
+    const char *type;
+    int capture = 0;
+    unsigned long i;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid AbortSignal receiver");
+    type = js_to_cstring(ctx, web_arg(argc, argv, 0));
+    if (!type)
+        return JS_THROW;
+    if (argc > 2) {
+        if (js_is_bool(argv[2]))
+            capture = js_to_boolean(argv[2]);
+        else if (argv[2].type == JS_OBJECT &&
+                 web_option_bool(ctx, argv[2], "capture", 0, &capture) != JS_OK)
+            return JS_THROW;
+    }
+    if (strcmp(type, "abort") == 0 && argc > 1 && js_is_object(argv[1]) &&
+        st->listeners) {
+        for (i = 0; i < st->listeners->elen; i++) {
+            js_value ecb, ecap;
+            if (js_get(ctx, st->listeners->elems[i], "callback", &ecb) != JS_OK ||
+                js_get(ctx, st->listeners->elems[i], "capture", &ecap) != JS_OK)
+                return JS_THROW;
+            if (js_is_object(ecb) && ecb.u.obj == argv[1].u.obj &&
+                js_to_boolean(ecap) == capture) {
+                memmove(st->listeners->elems + i,
+                        st->listeners->elems + i + 1,
+                        (unsigned long)(st->listeners->elen - i - 1) *
+                        sizeof(*st->listeners->elems));
+                st->listeners->elen--;
+                break;
+            }
+        }
+    }
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int abort_signal_abort_static(js_ctx *ctx, js_value this_val,
+                                     int argc, js_value *argv, js_value *out)
+{
+    js_value sig = js_abortsignal_new(ctx), reason;
+    struct js_abort_state *st = abort_state_of(sig);
+
+    (void)this_val;
+    if (!st)
+        return JS_THROW;
+    if (argc > 0 && !js_is_undefined(argv[0]))
+        reason = argv[0];
+    else if (web_make_named_error(ctx, "AbortError",
+                                  "The operation was aborted",
+                                  &reason) != JS_OK)
+        return JS_THROW;
+    st->reason = reason;
+    st->aborted = 1;
+    *out = sig;
+    return JS_OK;
+}
+
+static int abort_signal_any_static(js_ctx *ctx, js_value this_val,
+                                   int argc, js_value *argv, js_value *out)
+{
+    struct js_abort_state *sources[WEBAPI_ABORT_DEPTH];
+    struct js_abort_state *st, *first_aborted = 0;
+    unsigned long len, idx;
+    unsigned int src_count = 0, max_depth = 0, i;
+    js_value sig;
+
+    (void)this_val;
+    if (argc < 1 || !js_is_array(argv[0]))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "AbortSignal.any requires an array of signals");
+    len = js_array_length(argv[0].u.obj);
+    if (len > WEBAPI_ABORT_DEPTH)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "too many composed AbortSignals");
+    for (idx = 0; idx < len; idx++) {
+        js_value item;
+        struct js_abort_state *src;
+        int dup = 0;
+
+        if (js_array_get(ctx, argv[0].u.obj, idx, &item) != JS_OK)
+            return JS_THROW;
+        src = abort_state_of(item);
+        if (!src)
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "AbortSignal.any input is not a signal");
+        if (!first_aborted && src->aborted)
+            first_aborted = src;
+        for (i = 0; i < src_count; i++) {
+            if (sources[i] == src) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            sources[src_count++] = src;
+            if (src->dep_depth > max_depth)
+                max_depth = src->dep_depth;
+        }
+    }
+    if (src_count && max_depth + 1 >= WEBAPI_ABORT_DEPTH)
+        return js_throw_error(ctx, JS_ERR_RANGE,
+                              "AbortSignal composition is too deep");
+    sig = js_abortsignal_new(ctx);
+    st = abort_state_of(sig);
+    if (!st)
+        return JS_THROW;
+    st->dep_depth = src_count ? max_depth + 1 : 0;
+    if (first_aborted) {
+        st->aborted = 1;
+        st->reason = first_aborted->reason;
+    } else {
+        for (i = 0; i < src_count; i++) {
+            if (!sources[i]->dependents) {
+                sources[i]->dependents = js_new_array(ctx);
+                if (!sources[i]->dependents)
+                    return JS_THROW;
+            }
+            if (sources[i]->dependents->elen >= WEBAPI_ABORT_MAX)
+                return js_throw_error(ctx, JS_ERR_RANGE,
+                                      "too many dependent AbortSignals");
+            if (js_array_push(ctx, sources[i]->dependents, sig) != JS_OK)
+                return JS_THROW;
+        }
+    }
+    *out = sig;
+    return JS_OK;
+}
+
+/* ================================================================== */
+/* Blob                                                                */
+/* ================================================================== */
+
+struct js_blob_state {
+    js_object     *buf;
+    unsigned long  offset;
+    unsigned long  length;
+    char           type[128];
+};
+
+static struct js_blob_state *blob_state_of(js_value v)
+{
+    return (struct js_blob_state *)js_host_ptr(v, WEBAPI_TAG_BLOB);
+}
+
+int js_is_blob(js_value v)
+{
+    return blob_state_of(v) != 0;
+}
+
+const void *js_blob_data(js_value v, unsigned long *len, const char **type)
+{
+    struct js_blob_state *st = blob_state_of(v);
+
+    if (!st) {
+        if (len) *len = 0;
+        if (type) *type = 0;
+        return 0;
+    }
+    if (len) *len = st->length;
+    if (type) *type = st->type;
+    return st->buf->buffer + st->offset;
+}
+
+js_object *js_blob_proto(js_ctx *ctx)
+{
+    return ctx ? ctx->proto[P_BLOB] : 0;
+}
+
+void js_set_blob_extractor(js_ctx *ctx, js_blob_extract_fn fn, void *user)
+{
+    if (!ctx)
+        return;
+    ctx->blob_extractor = fn;
+    ctx->blob_extractor_user = user;
+}
+
+static int blob_set_type(js_ctx *ctx, char dst[128], js_value type_val)
+{
+    js_value sv;
+    const char *s;
+    unsigned long len, i;
+
+    dst[0] = 0;
+    if (js_is_undefined(type_val))
+        return JS_OK;
+    if (js_to_string(ctx, type_val, &sv) != JS_OK)
+        return JS_THROW;
+    s = js_string_bytes(sv, &len);
+    if (len >= 128)
+        return JS_OK;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c > 0x7e)
+            return JS_OK;
+    }
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char)(c + ('a' - 'A'));
+        dst[i] = (char)c;
+    }
+    dst[len] = 0;
+    return JS_OK;
+}
+
+js_value js_blob_new(js_ctx *ctx, const void *data, unsigned long len,
+                     const char *type)
+{
+    struct js_blob_state *st;
+    js_value ab;
+    js_object *obj;
+
+    ab = js_arraybuffer_new(ctx, data, len);
+    if (!js_is_arraybuffer(ab))
+        return js_undefined();
+    st = (struct js_blob_state *)js_alloc(ctx, sizeof(*st));
+    if (!st)
+        return js_undefined();
+    st->buf = ab.u.obj;
+    st->offset = 0;
+    st->length = len;
+    if (type && *type) {
+        js_value tv = js_mkcstring(ctx, type);
+        if (js_fatal(ctx) || blob_set_type(ctx, st->type, tv) != JS_OK)
+            return js_undefined();
+    }
+    obj = js_new_host(ctx, st, WEBAPI_TAG_BLOB, ctx->proto[P_BLOB]);
+    return obj ? js_object_value(obj) : js_undefined();
+}
+
+static int blob_extract_bytes(js_ctx *ctx, js_value v,
+                              const void **data, unsigned long *len,
+                              const char **type, const char **filename,
+                              int *is_blob_like)
+{
+    struct js_blob_state *st = blob_state_of(v);
+
+    if (st) {
+        *data = st->buf->buffer + st->offset;
+        *len = st->length;
+        if (type) *type = st->type;
+        if (filename) *filename = 0;
+        if (is_blob_like) *is_blob_like = 1;
+        return 1;
+    }
+    if (ctx->blob_extractor &&
+        ctx->blob_extractor(ctx->blob_extractor_user, v, data, len,
+                            type, filename)) {
+        if (is_blob_like) *is_blob_like = 1;
+        return 1;
+    }
+    if (is_blob_like) *is_blob_like = 0;
+    return 0;
+}
+
+static int blob_append_part(js_ctx *ctx, js_sbuf *sb, js_value part)
+{
+    const void *bytes = 0;
+    unsigned long len = 0;
+    int blob_like = 0;
+
+    if (!blob_extract_bytes(ctx, part, &bytes, &len, 0, 0, &blob_like)) {
+        bytes = js_buffersource_data(part, &len);
+        if (!bytes) {
+            js_value sv;
+            if (js_to_string(ctx, part, &sv) != JS_OK)
+                return JS_THROW;
+            bytes = js_string_bytes(sv, &len);
+        }
+    }
+    if (len > WEBAPI_BLOB_MAX || sb->n > WEBAPI_BLOB_MAX - len)
+        return js_throw_error(ctx, JS_ERR_RANGE, "Blob is too large");
+    if (!len)
+        return JS_OK;
+    return js_sb_put(sb, (const char *)bytes, len);
+}
+
+static int blob_ctor(js_ctx *ctx, js_value this_val,
+                     int argc, js_value *argv, js_value *out)
+{
+    js_value parts = web_arg(argc, argv, 0);
+    js_value opts = web_arg(argc, argv, 1);
+    js_value type_val = js_undefined();
+    js_sbuf sb;
+    struct js_blob_state *st;
+    js_value ab;
+    js_object *obj;
+
+    (void)this_val;
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "Blob must be constructed with new");
+    js_sb_init(&sb, ctx);
+    if (!js_is_undefined(parts)) {
+        if (js_is_array(parts)) {
+            unsigned long i, count = js_array_length(parts.u.obj);
+            for (i = 0; i < count; i++) {
+                js_value item;
+                if (js_array_get(ctx, parts.u.obj, i, &item) != JS_OK ||
+                    blob_append_part(ctx, &sb, item) != JS_OK) {
+                    js_sb_free(&sb);
+                    return JS_THROW;
+                }
+            }
+        } else if (parts.type == JS_OBJECT && ctx->sym_iterator_key) {
+            js_iter it;
+            js_value iter_fn = js_undefined();
+            if (js_wrap_get_key(ctx, parts, ctx->sym_iterator_key, 1,
+                                &iter_fn) != JS_OK) {
+                js_sb_free(&sb);
+                return JS_THROW;
+            }
+            if (iter_fn.type == JS_UNDEFINED) {
+                js_sb_free(&sb);
+                return js_throw_error(ctx, JS_ERR_TYPE,
+                                      "Blob parts must be iterable");
+            }
+            if (js_iter_open(ctx, parts, &it) != JS_OK) {
+                js_sb_free(&sb);
+                return JS_THROW;
+            }
+            for (;;) {
+                js_value item;
+                int done = 0;
+                if (js_step(ctx) != JS_OK ||
+                    js_iter_next(ctx, &it, &item, &done) != JS_OK) {
+                    js_sb_free(&sb);
+                    return JS_THROW;
+                }
+                if (done)
+                    break;
+                if (blob_append_part(ctx, &sb, item) != JS_OK) {
+                    js_sb_free(&sb);
+                    return JS_THROW;
+                }
+            }
+        } else {
+            js_sb_free(&sb);
+            return js_throw_error(ctx, JS_ERR_TYPE,
+                                  "Blob parts must be iterable");
+        }
+    }
+    if (opts.type == JS_OBJECT &&
+        js_get(ctx, opts, "type", &type_val) != JS_OK) {
+        js_sb_free(&sb);
+        return JS_THROW;
+    }
+    ab = js_arraybuffer_new(ctx, sb.p, sb.n);
+    js_sb_free(&sb);
+    if (!js_is_arraybuffer(ab))
+        return JS_THROW;
+    st = (struct js_blob_state *)js_alloc(ctx, sizeof(*st));
+    if (!st)
+        return JS_THROW;
+    st->buf = ab.u.obj;
+    st->offset = 0;
+    st->length = st->buf->byte_length;
+    if (blob_set_type(ctx, st->type, type_val) != JS_OK)
+        return JS_THROW;
+    obj = js_new_host(ctx, st, WEBAPI_TAG_BLOB, ctx->proto[P_BLOB]);
+    if (!obj)
+        return JS_THROW;
+    *out = js_object_value(obj);
+    return JS_OK;
+}
+
+static int blob_read_this(js_ctx *ctx, js_value this_val,
+                          const void **data, unsigned long *len,
+                          const char **type)
+{
+    int is_blob_like = 0;
+
+    if (!blob_extract_bytes(ctx, this_val, data, len, type, 0, &is_blob_like) ||
+        !is_blob_like) {
+        js_throw_error(ctx, JS_ERR_TYPE, "invalid Blob receiver");
+        return 0;
+    }
+    return 1;
+}
+
+static int blob_size_get(js_ctx *ctx, js_value this_val,
+                         int argc, js_value *argv, js_value *out)
+{
+    const void *data;
+    unsigned long len = 0;
+
+    (void)argc; (void)argv;
+    if (!blob_read_this(ctx, this_val, &data, &len, 0))
+        return JS_THROW;
+    *out = js_number((double)len);
+    return JS_OK;
+}
+
+static int blob_type_get(js_ctx *ctx, js_value this_val,
+                         int argc, js_value *argv, js_value *out)
+{
+    const void *data;
+    unsigned long len = 0;
+    const char *type = "";
+
+    (void)argc; (void)argv;
+    if (!blob_read_this(ctx, this_val, &data, &len, &type))
+        return JS_THROW;
+    *out = js_mkcstring(ctx, type ? type : "");
+    return js_fatal(ctx) ? JS_THROW : JS_OK;
+}
+
+static int blob_slice(js_ctx *ctx, js_value this_val,
+                      int argc, js_value *argv, js_value *out)
+{
+    struct js_blob_state *src = blob_state_of(this_val);
+    const void *data = 0;
+    unsigned long len = 0;
+    double start_d = 0.0, end_d;
+    long start, end;
+
+    if (!src) {
+        if (!blob_read_this(ctx, this_val, &data, &len, 0))
+            return JS_THROW;
+    } else {
+        len = src->length;
+    }
+    end_d = (double)len;
+    if (argc > 0 && js_to_integer(ctx, argv[0], &start_d) != JS_OK)
+        return JS_THROW;
+    if (argc > 1 && !js_is_undefined(argv[1]) &&
+        js_to_integer(ctx, argv[1], &end_d) != JS_OK)
+        return JS_THROW;
+    if (start_d <= -(double)len)
+        start = 0;
+    else if (start_d < 0.0)
+        start = (long)len + (long)start_d;
+    else if (start_d >= (double)len)
+        start = (long)len;
+    else
+        start = (long)start_d;
+    if (end_d <= -(double)len)
+        end = 0;
+    else if (end_d < 0.0)
+        end = (long)len + (long)end_d;
+    else if (end_d >= (double)len)
+        end = (long)len;
+    else
+        end = (long)end_d;
+    if (end < start)
+        end = start;
+    if (src) {
+        struct js_blob_state *sl =
+            (struct js_blob_state *)js_alloc(ctx, sizeof(*sl));
+        js_object *obj;
+        if (!sl)
+            return JS_THROW;
+        sl->buf = src->buf;
+        sl->offset = src->offset + (unsigned long)start;
+        sl->length = (unsigned long)(end - start);
+        if (argc > 2 && blob_set_type(ctx, sl->type, argv[2]) != JS_OK)
+            return JS_THROW;
+        obj = js_new_host(ctx, sl, WEBAPI_TAG_BLOB, ctx->proto[P_BLOB]);
+        if (!obj)
+            return JS_THROW;
+        *out = js_object_value(obj);
+        return JS_OK;
+    } else {
+        const char *ctype = 0;
+        js_value blob;
+        if (argc > 2 && !js_is_undefined(argv[2])) {
+            ctype = js_to_cstring(ctx, argv[2]);
+            if (!ctype)
+                return JS_THROW;
+        }
+        blob = js_blob_new(ctx, (const char *)data + start,
+                           (unsigned long)(end - start), ctype);
+        if (!js_is_blob(blob))
+            return JS_THROW;
+        *out = blob;
+        return JS_OK;
+    }
+}
+
+static int blob_text(js_ctx *ctx, js_value this_val,
+                     int argc, js_value *argv, js_value *out)
+{
+    const void *data;
+    unsigned long len = 0;
+    js_value text;
+
+    (void)argc; (void)argv;
+    if (!blob_read_this(ctx, this_val, &data, &len, 0))
+        return JS_THROW;
+    text = js_mkstring(ctx, data ? (const char *)data : "", len);
+    if (js_fatal(ctx))
+        return JS_THROW;
+    return web_resolved_promise(ctx, text, out);
+}
+
+static int blob_arraybuffer(js_ctx *ctx, js_value this_val,
+                            int argc, js_value *argv, js_value *out)
+{
+    const void *data;
+    unsigned long len = 0;
+    js_value ab;
+
+    (void)argc; (void)argv;
+    if (!blob_read_this(ctx, this_val, &data, &len, 0))
+        return JS_THROW;
+    ab = js_arraybuffer_new(ctx, data, len);
+    if (!js_is_arraybuffer(ab))
+        return JS_THROW;
+    return web_resolved_promise(ctx, ab, out);
+}
+
+static int blob_bytes(js_ctx *ctx, js_value this_val,
+                      int argc, js_value *argv, js_value *out)
+{
+    const void *data;
+    unsigned long len = 0;
+    js_value u8;
+
+    (void)argc; (void)argv;
+    if (!blob_read_this(ctx, this_val, &data, &len, 0))
+        return JS_THROW;
+    u8 = js_uint8array_new(ctx, data, len);
+    if (!js_is_uint8array(u8))
+        return JS_THROW;
+    return web_resolved_promise(ctx, u8, out);
+}
+
+/* ================================================================== */
+/* FormData                                                            */
+/* ================================================================== */
+
+struct js_formdata_state {
+    js_object *list; /* [name, value, filename_or_null, ...] */
+};
+
+static struct js_formdata_state *formdata_state_of(js_value v)
+{
+    return (struct js_formdata_state *)js_host_ptr(v, WEBAPI_TAG_FORMDATA);
+}
+
+int js_is_formdata(js_value v)
+{
+    return formdata_state_of(v) != 0;
+}
+
+js_value js_formdata_new(js_ctx *ctx)
+{
+    struct js_formdata_state *st;
+    js_object *obj;
+
+    st = (struct js_formdata_state *)js_alloc(ctx, sizeof(*st));
+    if (!st)
+        return js_undefined();
+    st->list = js_new_array(ctx);
+    if (!st->list)
+        return js_undefined();
+    obj = js_new_host(ctx, st, WEBAPI_TAG_FORMDATA, ctx->proto[P_FORMDATA]);
+    return obj ? js_object_value(obj) : js_undefined();
+}
+
+int js_formdata_append(js_ctx *ctx, js_value fd, js_value name_val,
+                       js_value value, js_value filename_val)
+{
+    struct js_formdata_state *st = formdata_state_of(fd);
+    js_value name_str, stored_val, fname_val = js_null();
+    const void *bdata = 0;
+    unsigned long blen = 0;
+    const char *btype = 0, *ext_fname = 0;
+    int blob_like = 0;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (st->list->elen / 3 >= WEBAPI_FORM_MAX)
+        return js_throw_error(ctx, JS_ERR_RANGE, "too many FormData entries");
+    if (js_to_string(ctx, name_val, &name_str) != JS_OK)
+        return JS_THROW;
+    if (blob_extract_bytes(ctx, value, &bdata, &blen, &btype, &ext_fname,
+                           &blob_like) && blob_like) {
+        stored_val = value;
+        if (!js_is_undefined(filename_val)) {
+            if (js_to_string(ctx, filename_val, &fname_val) != JS_OK)
+                return JS_THROW;
+        } else {
+            fname_val = js_mkcstring(ctx, ext_fname ? ext_fname : "blob");
+            if (js_fatal(ctx))
+                return JS_THROW;
+        }
+    } else {
+        if (js_to_string(ctx, value, &stored_val) != JS_OK)
+            return JS_THROW;
+    }
+    if (js_array_push(ctx, st->list, name_str) != JS_OK ||
+        js_array_push(ctx, st->list, stored_val) != JS_OK ||
+        js_array_push(ctx, st->list, fname_val) != JS_OK)
+        return JS_THROW;
+    return JS_OK;
+}
+
+unsigned int js_formdata_count(js_value fd)
+{
+    struct js_formdata_state *st = formdata_state_of(fd);
+    return st ? (unsigned int)(st->list->elen / 3) : 0u;
+}
+
+int js_formdata_entry(js_value fd, unsigned int idx,
+                      const char **name, js_value *value,
+                      const char **filename)
+{
+    struct js_formdata_state *st = formdata_state_of(fd);
+    unsigned long base = (unsigned long)idx * 3ul;
+
+    if (!st || base + 2 >= st->list->elen)
+        return 0;
+    if (name)
+        *name = js_string_bytes(st->list->elems[base], 0);
+    if (value)
+        *value = st->list->elems[base + 1];
+    if (filename) {
+        js_value fv = st->list->elems[base + 2];
+        *filename = fv.type == JS_STRING ? js_string_bytes(fv, 0) : 0;
+    }
+    return 1;
+}
+
+static int formdata_ctor(js_ctx *ctx, js_value this_val,
+                         int argc, js_value *argv, js_value *out)
+{
+    js_value fd;
+
+    (void)this_val;
+    if (!ctx->new_target)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData must be constructed with new");
+    if (argc > 0 && !js_is_undefined(argv[0]) && !js_is_null(argv[0]))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "HTML form construction is not supported");
+    fd = js_formdata_new(ctx);
+    if (!js_is_formdata(fd))
+        return JS_THROW;
+    *out = fd;
+    return JS_OK;
+}
+
+static void formdata_remove_all(js_object *list, js_string *key)
+{
+    uint32_t r = 0, w = 0;
+
+    while (r + 2 < list->elen) {
+        if (!js_str_eq(list->elems[r].u.str, key)) {
+            if (w != r) {
+                list->elems[w] = list->elems[r];
+                list->elems[w + 1] = list->elems[r + 1];
+                list->elems[w + 2] = list->elems[r + 2];
+            }
+            w += 3;
+        }
+        r += 3;
+    }
+    list->elen = w;
+}
+
+static int formdata_append_method(js_ctx *ctx, js_value this_val,
+                                  int argc, js_value *argv, js_value *out)
+{
+    if (!formdata_state_of(this_val))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (argc < 2)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData.append requires two values");
+    if (js_formdata_append(ctx, this_val, argv[0], argv[1],
+                           web_arg(argc, argv, 2)) != JS_OK)
+        return JS_THROW;
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int formdata_set_method(js_ctx *ctx, js_value this_val,
+                               int argc, js_value *argv, js_value *out)
+{
+    struct js_formdata_state *st = formdata_state_of(this_val);
+    js_value name_str;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (argc < 2)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData.set requires two values");
+    if (js_to_string(ctx, argv[0], &name_str) != JS_OK)
+        return JS_THROW;
+    formdata_remove_all(st->list, name_str.u.str);
+    if (js_formdata_append(ctx, this_val, name_str, argv[1],
+                           web_arg(argc, argv, 2)) != JS_OK)
+        return JS_THROW;
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int formdata_delete_method(js_ctx *ctx, js_value this_val,
+                                  int argc, js_value *argv, js_value *out)
+{
+    struct js_formdata_state *st = formdata_state_of(this_val);
+    js_value name_str;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData.delete requires a name");
+    if (js_to_string(ctx, argv[0], &name_str) != JS_OK)
+        return JS_THROW;
+    formdata_remove_all(st->list, name_str.u.str);
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int formdata_get_common(js_ctx *ctx, js_value this_val,
+                               int argc, js_value *argv, js_value *out, int all)
+{
+    struct js_formdata_state *st = formdata_state_of(this_val);
+    js_value name_str;
+    js_object *arr = 0;
+    uint32_t i;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData getter requires a name");
+    if (js_to_string(ctx, argv[0], &name_str) != JS_OK)
+        return JS_THROW;
+    if (all) {
+        arr = js_new_array(ctx);
+        if (!arr)
+            return JS_THROW;
+    }
+    for (i = 0; i + 2 < st->list->elen; i += 3) {
+        if (!js_str_eq(st->list->elems[i].u.str, name_str.u.str))
+            continue;
+        if (!all) {
+            *out = st->list->elems[i + 1];
+            return JS_OK;
+        }
+        if (js_array_push(ctx, arr, st->list->elems[i + 1]) != JS_OK)
+            return JS_THROW;
+    }
+    *out = all ? js_object_value(arr) : js_null();
+    return JS_OK;
+}
+
+static int formdata_get_method(js_ctx *ctx, js_value this_val,
+                               int argc, js_value *argv, js_value *out)
+{
+    return formdata_get_common(ctx, this_val, argc, argv, out, 0);
+}
+
+static int formdata_get_all_method(js_ctx *ctx, js_value this_val,
+                                   int argc, js_value *argv, js_value *out)
+{
+    return formdata_get_common(ctx, this_val, argc, argv, out, 1);
+}
+
+static int formdata_has_method(js_ctx *ctx, js_value this_val,
+                               int argc, js_value *argv, js_value *out)
+{
+    struct js_formdata_state *st = formdata_state_of(this_val);
+    js_value name_str;
+    uint32_t i;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (argc < 1)
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData.has requires a name");
+    if (js_to_string(ctx, argv[0], &name_str) != JS_OK)
+        return JS_THROW;
+    for (i = 0; i + 2 < st->list->elen; i += 3) {
+        if (js_str_eq(st->list->elems[i].u.str, name_str.u.str)) {
+            *out = js_bool(1);
+            return JS_OK;
+        }
+    }
+    *out = js_bool(0);
+    return JS_OK;
+}
+
+static int formdata_for_each_method(js_ctx *ctx, js_value this_val,
+                                    int argc, js_value *argv, js_value *out)
+{
+    struct js_formdata_state *st = formdata_state_of(this_val);
+    js_value cb = web_arg(argc, argv, 0);
+    js_value recv = web_arg(argc, argv, 1);
+    uint32_t at = 0, turns = 0;
+
+    if (!st)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    if (!js_is_function(cb))
+        return js_throw_error(ctx, JS_ERR_TYPE,
+                              "FormData.forEach requires a callback");
+    while (at + 2 < st->list->elen && turns++ < WEBAPI_FORM_MAX) {
+        js_value args[3], ignored;
+        args[0] = st->list->elems[at + 1];
+        args[1] = st->list->elems[at];
+        args[2] = this_val;
+        if (js_call(ctx, cb, recv, 3, args, &ignored) != JS_OK)
+            return JS_THROW;
+        at += 3;
+    }
+    *out = js_undefined();
+    return JS_OK;
+}
+
+static int formdata_iterator_next(js_ctx *ctx, js_value this_val,
+                                  int argc, js_value *argv, js_value *out)
+{
+    js_value src_val, idx_val, kind_val;
+    struct js_formdata_state *st;
+    js_object *res;
+    unsigned long idx;
+    int kind;
+
+    (void)argc; (void)argv;
+    if (this_val.type != JS_OBJECT ||
+        js_get(ctx, this_val, "__form", &src_val) != JS_OK ||
+        js_get(ctx, this_val, "__index", &idx_val) != JS_OK ||
+        js_get(ctx, this_val, "__kind", &kind_val) != JS_OK ||
+        !(st = formdata_state_of(src_val)) ||
+        idx_val.type != JS_NUMBER || kind_val.type != JS_NUMBER)
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData iterator");
+    idx = idx_val.u.num < 0 ? 0 : (unsigned long)idx_val.u.num;
+    kind = (int)kind_val.u.num;
+    res = js_new_object(ctx);
+    if (!res)
+        return JS_THROW;
+    if (idx * 3 + 2 >= st->list->elen) {
+        if (js_define_enum(ctx, res, "value", js_undefined()) != JS_OK ||
+            js_define_enum(ctx, res, "done", js_bool(1)) != JS_OK)
+            return JS_THROW;
+    } else {
+        js_value k = st->list->elems[idx * 3];
+        js_value v = st->list->elems[idx * 3 + 1];
+        js_value item;
+
+        if (kind == 0) {
+            item = k;
+        } else if (kind == 1) {
+            item = v;
+        } else {
+            js_object *pair = js_new_array(ctx);
+            if (!pair ||
+                js_array_push(ctx, pair, k) != JS_OK ||
+                js_array_push(ctx, pair, v) != JS_OK)
+                return JS_THROW;
+            item = js_object_value(pair);
+        }
+        if (js_define_enum(ctx, res, "value", item) != JS_OK ||
+            js_define_enum(ctx, res, "done", js_bool(0)) != JS_OK ||
+            js_set(ctx, this_val, "__index",
+                   js_number((double)(idx + 1))) != JS_OK)
+            return JS_THROW;
+    }
+    *out = js_object_value(res);
+    return JS_OK;
+}
+
+static int formdata_iterator(js_ctx *ctx, js_value this_val,
+                             js_value *out, int kind)
+{
+    js_object *it;
+
+    if (!formdata_state_of(this_val))
+        return js_throw_error(ctx, JS_ERR_TYPE, "invalid FormData receiver");
+    it = js_new_object(ctx);
+    if (!it ||
+        js_define(ctx, it, "__form", this_val) != JS_OK ||
+        js_define(ctx, it, "__index", js_number(0)) != JS_OK ||
+        js_define(ctx, it, "__kind", js_number(kind)) != JS_OK ||
+        js_define_native(ctx, it, "next", formdata_iterator_next, 0) != JS_OK)
+        return JS_THROW;
+    if (ctx->sym_iterator.type == JS_SYMBOL) {
+        js_object *self_fn = js_new_native(ctx, urlparams_iter_self,
+                                           "[Symbol.iterator]", 0);
+        if (!self_fn ||
+            js_define_symbol_prop(ctx, it, ctx->sym_iterator,
+                                  js_object_value(self_fn),
+                                  JS_P_HIDDEN) != JS_OK)
+            return JS_THROW;
+    }
+    *out = js_object_value(it);
+    return JS_OK;
+}
+
+static int formdata_keys_method(js_ctx *ctx, js_value this_val,
+                                int argc, js_value *argv, js_value *out)
+{
+    (void)argc; (void)argv;
+    return formdata_iterator(ctx, this_val, out, 0);
+}
+
+static int formdata_values_method(js_ctx *ctx, js_value this_val,
+                                  int argc, js_value *argv, js_value *out)
+{
+    (void)argc; (void)argv;
+    return formdata_iterator(ctx, this_val, out, 1);
+}
+
+static int formdata_entries_method(js_ctx *ctx, js_value this_val,
+                                   int argc, js_value *argv, js_value *out)
+{
+    (void)argc; (void)argv;
+    return formdata_iterator(ctx, this_val, out, 2);
+}
+
 /* ================================================================== */
 /* Registration                                                        */
 /* ================================================================== */
 
 int js_init_webapis(js_ctx *ctx)
 {
-    js_object *proto, *url_ctor_obj;
+    js_object *proto, *url_ctor_obj, *sig_ctor_obj, *fd_entries_fn;
+
+    ctx->proto[P_ABORTCONTROLLER] = js_new_object(ctx);
+    ctx->proto[P_ABORTSIGNAL] = js_new_object(ctx);
+    ctx->proto[P_BLOB] = js_new_object(ctx);
+    ctx->proto[P_FORMDATA] = js_new_object(ctx);
+    if (!ctx->proto[P_ABORTCONTROLLER] || !ctx->proto[P_ABORTSIGNAL] ||
+        !ctx->proto[P_BLOB] || !ctx->proto[P_FORMDATA])
+        return 0;
 
     proto = ctx->proto[P_TEXTENCODER];
     if (js_define_accessor(ctx, proto, "encoding",
@@ -2559,6 +4023,75 @@ int js_init_webapis(js_ctx *ctx)
     url_ctor_obj = web_constructor(ctx, url_ctor, "URL", 1, proto);
     if (!url_ctor_obj ||
         !web_method(ctx, url_ctor_obj, "canParse", url_can_parse, 1))
+        return 0;
+
+    proto = ctx->proto[P_ABORTCONTROLLER];
+    if (!web_set_tostring_tag(ctx, proto, "AbortController") ||
+        js_define_accessor(ctx, proto, "signal",
+                           abort_controller_signal_get, 0, 0) != JS_OK ||
+        !web_method(ctx, proto, "abort", abort_controller_abort, 1) ||
+        !web_constructor(ctx, abort_controller_ctor, "AbortController", 0, proto))
+        return 0;
+
+    proto = ctx->proto[P_ABORTSIGNAL];
+    if (!web_set_tostring_tag(ctx, proto, "AbortSignal") ||
+        js_define_accessor(ctx, proto, "aborted",
+                           abort_signal_aborted_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, proto, "reason",
+                           abort_signal_reason_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, proto, "onabort",
+                           abort_signal_onabort_get,
+                           abort_signal_onabort_set, 0) != JS_OK ||
+        !web_method(ctx, proto, "throwIfAborted",
+                    abort_signal_throw_if_aborted, 0) ||
+        !web_method(ctx, proto, "addEventListener",
+                    abort_signal_add_listener, 2) ||
+        !web_method(ctx, proto, "removeEventListener",
+                    abort_signal_remove_listener, 2))
+        return 0;
+    sig_ctor_obj = web_constructor(ctx, abort_signal_ctor, "AbortSignal", 0,
+                                   proto);
+    if (!sig_ctor_obj ||
+        !web_method(ctx, sig_ctor_obj, "abort", abort_signal_abort_static, 1) ||
+        !web_method(ctx, sig_ctor_obj, "any", abort_signal_any_static, 1))
+        return 0;
+    ctx->ctor_abortsignal = sig_ctor_obj;
+
+    proto = ctx->proto[P_BLOB];
+    if (!web_set_tostring_tag(ctx, proto, "Blob") ||
+        js_define_accessor(ctx, proto, "size", blob_size_get, 0, 0) != JS_OK ||
+        js_define_accessor(ctx, proto, "type", blob_type_get, 0, 0) != JS_OK ||
+        !web_method(ctx, proto, "slice", blob_slice, 3) ||
+        !web_method(ctx, proto, "text", blob_text, 0) ||
+        !web_method(ctx, proto, "arrayBuffer", blob_arraybuffer, 0) ||
+        !web_method(ctx, proto, "bytes", blob_bytes, 0) ||
+        !web_constructor(ctx, blob_ctor, "Blob", 0, proto))
+        return 0;
+
+    proto = ctx->proto[P_FORMDATA];
+    if (!web_set_tostring_tag(ctx, proto, "FormData") ||
+        !web_method(ctx, proto, "append", formdata_append_method, 2) ||
+        !web_method(ctx, proto, "set", formdata_set_method, 2) ||
+        !web_method(ctx, proto, "delete", formdata_delete_method, 1) ||
+        !web_method(ctx, proto, "get", formdata_get_method, 1) ||
+        !web_method(ctx, proto, "getAll", formdata_get_all_method, 1) ||
+        !web_method(ctx, proto, "has", formdata_has_method, 1) ||
+        !web_method(ctx, proto, "forEach", formdata_for_each_method, 1) ||
+        !web_method(ctx, proto, "keys", formdata_keys_method, 0) ||
+        !web_method(ctx, proto, "values", formdata_values_method, 0) ||
+        !web_constructor(ctx, formdata_ctor, "FormData", 0, proto))
+        return 0;
+    fd_entries_fn = js_new_native(ctx, formdata_entries_method, "entries", 0);
+    if (!fd_entries_fn ||
+        js_define(ctx, proto, "entries",
+                  js_object_value(fd_entries_fn)) != JS_OK ||
+        (ctx->sym_iterator.type == JS_SYMBOL &&
+         js_define_symbol_prop(ctx, proto, ctx->sym_iterator,
+                               js_object_value(fd_entries_fn),
+                               JS_P_HIDDEN) != JS_OK))
+        return 0;
+
+    if (!js_init_crypto(ctx))
         return 0;
     return 1;
 }

@@ -447,6 +447,338 @@ static void test_wave5b_features(void)
     }
 }
 
+static int w8_fetch_calls;
+static char w8_last_url[256];
+static char w8_last_method[16];
+static char w8_last_ct[128];
+static char w8_last_body[2048];
+static unsigned long w8_last_body_len;
+
+static int w8_fetch_sink(void *user, const char *url, const char *method,
+                         const void *body, unsigned long body_len,
+                         const char *content_type, const char *accept,
+                         const char *extra_headers,
+                         const char *mode, const char *credentials,
+                         const char *redirect,
+                         struct jsdom_fetch_response *out,
+                         char *err, unsigned long errsz)
+{
+    static const char ok_json[] = "{\"ok\":true}";
+    unsigned long copy_n;
+    (void)user; (void)accept; (void)extra_headers;
+    (void)mode; (void)credentials; (void)redirect; (void)err; (void)errsz;
+
+    w8_fetch_calls++;
+    snprintf(w8_last_url, sizeof(w8_last_url), "%s", url ? url : "");
+    snprintf(w8_last_method, sizeof(w8_last_method), "%s", method ? method : "");
+    snprintf(w8_last_ct, sizeof(w8_last_ct), "%s",
+             content_type ? content_type : "");
+    w8_last_body_len = body_len;
+    copy_n = body_len < sizeof(w8_last_body) - 1
+        ? body_len : sizeof(w8_last_body) - 1;
+    if (body && copy_n)
+        memcpy(w8_last_body, body, copy_n);
+    w8_last_body[copy_n] = 0;
+    memset(out, 0, sizeof(*out));
+    out->status = 200;
+    out->status_text = copy_text("OK");
+    out->url = copy_text(url ? url : "");
+    out->content_type = copy_text("application/json");
+    out->body = copy_text(ok_json);
+    out->body_len = sizeof(ok_json) - 1;
+    return (out->status_text && out->url && out->content_type && out->body)
+        ? 0 : -1;
+}
+
+static void test_wave8b_features(void)
+{
+    static const char html[] =
+        "<!doctype html><html><body>"
+        "<button id='btn'>Go</button>"
+        "<canvas id='c1' width='12' height='12'></canvas>"
+        "<canvas id='c2' width='24' height='24'></canvas>"
+        "<canvas id='c3' width='12' height='12'></canvas>"
+        "</body></html>";
+    struct dom_document *doc;
+    struct jsdom_config cfg;
+    struct jsdom *j;
+    struct dom_node *c1, *c2, *c3;
+    char err[256];
+    uint32_t px;
+    uint8_t al;
+
+    w8_fetch_calls = 0;
+    w8_last_url[0] = 0;
+    w8_last_method[0] = 0;
+    w8_last_ct[0] = 0;
+    w8_last_body[0] = 0;
+    w8_last_body_len = 0;
+
+    doc = html_parse_document(html, sizeof(html) - 1);
+    CHECK(doc != 0, "w8b document parses");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.url = "https://w8b.example/app";
+    cfg.fetch = w8_fetch_sink;
+    j = jsdom_new(doc, &cfg);
+    CHECK(j != 0, "w8b jsdom binds");
+
+    /* 1. Web Crypto in jsdom (TypedArrays, UUID, subtle.digest) */
+    CHECK(jsdom_eval(j,
+          "var taTypes = [new Int8Array(4), new Uint8ClampedArray(4), "
+          "  new Int16Array(2), new Uint16Array(2), new Int32Array(1), new Uint32Array(1)];"
+          "for (var ti = 0; ti < taTypes.length; ti++) {"
+          "  if (crypto.getRandomValues(taTypes[ti]) !== taTypes[ti]) throw Error('ta');"
+          "}"
+          "var badF = 0;"
+          "try{crypto.getRandomValues(new Float32Array(1));}catch(e){if(e instanceof TypeError)badF++;}"
+          "try{crypto.getRandomValues(new Float64Array(1));}catch(e){if(e instanceof TypeError)badF++;}"
+          "try{crypto.getRandomValues(new DataView(new ArrayBuffer(4)));}catch(e){if(e instanceof TypeError)badF++;}"
+          "try{crypto.getRandomValues(new Uint8Array(65537));}catch(e){if(e instanceof RangeError)badF++;}"
+          "if(badF!==4) throw Error('badF='+badF);"
+          "var u = crypto.randomUUID();"
+          "if(!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u))"
+          "  throw Error('uuid='+u);"
+          "function toHex(ab){return Array.from(new Uint8Array(ab),x=>(x<16?'0':'')+x.toString(16)).join('');}"
+          "Promise.all(["
+          "  crypto.subtle.digest('SHA-1', new Uint8ClampedArray([97,98,99])),"
+          "  crypto.subtle.digest({name:'sha-256'}, new DataView(new Uint8Array([0,97,98,99,0]).buffer,1,3)),"
+          "  crypto.subtle.digest('sha384', new TextEncoder().encode('abc')),"
+          "  crypto.subtle.digest('SHA-512', new TextEncoder().encode('abc'))"
+          "]).then(ds=>{"
+          "  var ok = toHex(ds[0])==='a9993e364706816aba3e25717850c26c9cd0d89d' &&"
+          "    toHex(ds[1])==='ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' &&"
+          "    ds[2].byteLength===48 && ds[3].byteLength===64;"
+          "  document.body.setAttribute('data-crypto', ok?'ok':'bad');"
+          "});"
+          "crypto.subtle.digest('MD5', new Uint8Array(1)).then("
+          "  ()=>document.body.setAttribute('data-crypto-err','no'),"
+          "  e=>document.body.setAttribute('data-crypto-err', e.name));",
+          "w8b-crypto.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b Web Crypto TypedArrays + UUID + digest");
+    CHECK(jsdom_pump(j, err, sizeof(err)) >= 0,
+          err[0] ? err : "w8b crypto promise pump");
+    CHECK(dom_get_attr(doc->body, "data-crypto") &&
+          !strcmp(dom_get_attr(doc->body, "data-crypto"), "ok"),
+          "w8b crypto.subtle.digest settles SHA-1/256/384/512");
+    CHECK(dom_get_attr(doc->body, "data-crypto-err") &&
+          !strcmp(dom_get_attr(doc->body, "data-crypto-err"), "NotSupportedError"),
+          "w8b crypto.subtle.digest rejects MD5 with NotSupportedError");
+
+    /* 2. AbortController / AbortSignal DOM + fetch cancellation */
+    CHECK(jsdom_eval(j,
+          "var preCtrl = new AbortController();"
+          "if(!(preCtrl.signal instanceof EventTarget)) throw Error('EventTarget');"
+          "var evType = '', evInst = false;"
+          "preCtrl.signal.addEventListener('abort', e=>{ evType=e.type; evInst=(e instanceof Event); });"
+          "preCtrl.abort();"
+          "if(evType!=='abort' || !evInst || preCtrl.signal.reason.name!=='AbortError')"
+          "  throw Error('pre abort event');"
+          "fetch('/never-pre', { signal: preCtrl.signal }).then("
+          "  ()=>document.body.setAttribute('data-ab-pre','resolved'),"
+          "  e=>document.body.setAttribute('data-ab-pre', e.name));"
+          "var midCtrl = new AbortController();"
+          "fetch('/never-mid', { signal: midCtrl.signal }).then("
+          "  ()=>document.body.setAttribute('data-ab-mid','resolved'),"
+          "  e=>document.body.setAttribute('data-ab-mid', String(e)));"
+          "midCtrl.abort('cancelled-before-pump');"
+          "var btn = document.getElementById('btn');"
+          "var btnCtrl = new AbortController(), btnHits = 0;"
+          "btn.addEventListener('click', ()=>{ btnHits++; }, { signal: btnCtrl.signal });"
+          "btn.dispatchEvent(new Event('click'));"
+          "btnCtrl.abort();"
+          "btn.dispatchEvent(new Event('click'));"
+          "if(btnHits!==1) throw Error('btnHits='+btnHits);"
+          "var toSig = AbortSignal.timeout(0);"
+          "toSig.addEventListener('abort', ()=>document.body.setAttribute('data-ab-to', toSig.reason.name));",
+          "w8b-abort.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b AbortController/Signal DOM & fetch cancellation");
+    CHECK(jsdom_pump(j, err, sizeof(err)) > 0,
+          err[0] ? err : "w8b abort pump");
+    CHECK(w8_fetch_calls == 0,
+          "w8b pre-aborted & mid-aborted fetch never call host fetch");
+    CHECK(dom_get_attr(doc->body, "data-ab-pre") &&
+          !strcmp(dom_get_attr(doc->body, "data-ab-pre"), "AbortError"),
+          "w8b pre-aborted fetch rejects with AbortError");
+    CHECK(dom_get_attr(doc->body, "data-ab-mid") &&
+          !strcmp(dom_get_attr(doc->body, "data-ab-mid"), "cancelled-before-pump"),
+          "w8b mid-aborted fetch rejects with custom abort reason");
+    CHECK(dom_get_attr(doc->body, "data-ab-to") &&
+          !strcmp(dom_get_attr(doc->body, "data-ab-to"), "TimeoutError"),
+          "w8b AbortSignal.timeout(0) fires TimeoutError");
+
+    /* 3. Blob / File / FormData / fetch(POST, FormData & URLSearchParams) */
+    CHECK(jsdom_eval(j,
+          "var f = new File(['AB', new Uint16Array([0x4443])], 'a.bin', {type:'Application/Octet-Stream'});"
+          "var sl = f.slice(1, 3, 'Text/Plain');"
+          "var bMixed = new Blob([f, new Blob(['!']), new DataView(new Uint8Array([63]).buffer)], {type:'Text/Plain'});"
+          "if(!(f instanceof Blob) || !(sl instanceof Blob) || (sl instanceof File) ||"
+          "   f.size!==4 || sl.size!==2 || bMixed.size!==6)"
+          "  throw Error('File/Blob mismatch');"
+          "bMixed.text().then(t=>document.body.setAttribute('data-bmix', t));"
+          "var fd = new FormData();"
+          "fd.append('field', 'hello');"
+          "fd.append('up', f);"
+          "var iterKeys = []; for (var p of fd) iterKeys.push(p[0]);"
+          "if(iterKeys.join(',')!=='field,up') throw Error('fd iter');"
+          "fetch('/submit-fd', { method:'POST', body: fd }).then(r=>r.json()).then(d=>{"
+          "  document.body.setAttribute('data-fd-fetch', d.ok ? 'ok' : 'bad');"
+          "});",
+          "w8b-formdata-fetch.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b Blob/File inheritance & fetch(FormData) POST");
+    CHECK(jsdom_pump(j, err, sizeof(err)) > 0,
+          err[0] ? err : "w8b fetch(FormData) pump");
+    CHECK(w8_fetch_calls == 1 &&
+          !strcmp(w8_last_method, "POST") &&
+          !strncmp(w8_last_ct, "multipart/form-data; boundary=", 30) &&
+          strstr(w8_last_body, "name=\"field\"") &&
+          strstr(w8_last_body, "hello") &&
+          strstr(w8_last_body, "name=\"up\"; filename=\"a.bin\"") &&
+          strstr(w8_last_body, "ABCD"),
+          "w8b host fetch receives multipart FormData POST body & header");
+    CHECK(dom_get_attr(doc->body, "data-bmix") &&
+          !strcmp(dom_get_attr(doc->body, "data-bmix"), "ABCD!?") &&
+          dom_get_attr(doc->body, "data-fd-fetch") &&
+          !strcmp(dom_get_attr(doc->body, "data-fd-fetch"), "ok"),
+          "w8b Blob reads File+DataView & fetch(FormData) resolves");
+
+    /* Verify URLSearchParams POST body serialization via fetch */
+    CHECK(jsdom_eval(j,
+          "fetch('/submit-urlenc', { method:'POST', body: new URLSearchParams({k:'v a'}) });",
+          "w8b-urlenc.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b fetch(URLSearchParams) queues");
+    CHECK(jsdom_pump(j, err, sizeof(err)) > 0,
+          err[0] ? err : "w8b fetch(URLSearchParams) pump");
+    CHECK(w8_fetch_calls == 2 &&
+          !strcmp(w8_last_ct, "application/x-www-form-urlencoded;charset=UTF-8") &&
+          !strcmp(w8_last_body, "k=v+a"),
+          "w8b fetch(URLSearchParams) sends form-urlencoded body");
+
+    /* 4. ImageData constructor, Uint8ClampedArray & CanvasGradient */
+    CHECK(jsdom_eval(j,
+          "var im0 = new ImageData(4, 3);"
+          "if(!(im0 instanceof ImageData) || im0.width!==4 || im0.height!==3 ||"
+          "   !(im0.data instanceof Uint8ClampedArray) || im0.data.length!==48)"
+          "  throw Error('ImageData(w,h)');"
+          "im0.data[0] = 300; im0.data[1] = -9;"
+          "if(im0.data[0]!==255 || im0.data[1]!==0) throw Error('clamped');"
+          "var rawCl = new Uint8ClampedArray([10,20,30,255, 200,100,50,255]);"
+          "var im1 = new ImageData(rawCl, 2);"
+          "if(im1.width!==2 || im1.height!==1 || im1.data!==rawCl) throw Error('ImageData(arr,w)');"
+          "var im2 = new ImageData(rawCl, 2, 1);"
+          "if(im2.height!==1) throw Error('ImageData(arr,w,h)');"
+          "var errCount = 0;"
+          "try{new ImageData(new Uint8Array(8), 2);}catch(e){if(e instanceof TypeError)errCount++;}"
+          "try{new ImageData(new Uint8ClampedArray(5), 1);}catch(e){if(e.name==='InvalidStateError')errCount++;}"
+          "try{new ImageData(rawCl, 3);}catch(e){if(e.name==='IndexSizeError')errCount++;}"
+          "try{new ImageData(0, 4);}catch(e){if(e.name==='IndexSizeError')errCount++;}"
+          "try{new CanvasGradient();}catch(e){if(e instanceof TypeError)errCount++;}"
+          "if(errCount!==5) throw Error('im errs='+errCount);"
+          "var ctx1 = document.getElementById('c1').getContext('2d');"
+          "if(!(ctx1.createImageData(2,2).data instanceof Uint8ClampedArray))"
+          "  throw Error('createImageData Uint8ClampedArray');"
+          "ctx1.fillStyle = '#010203'; ctx1.fillRect(0, 0, 12, 12);"
+          "if(!(ctx1.getImageData(0,0,2,2).data instanceof Uint8ClampedArray))"
+          "  throw Error('getImageData Uint8ClampedArray');"
+          "ctx1.putImageData(im1, 2, 2);"
+          "ctx1.putImageData(im1, 4, 4, 1, 0, 1, 1);",
+          "w8b-imagedata.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b ImageData constructor, clamping, dirty-rect putImageData");
+    c1 = dom_get_element_by_id(doc, "c1");
+    CHECK(c1 && c1->canvas && c1->canvas->px &&
+          c1->canvas->px[2 * 12 + 2] == 0x0a141eu &&
+          c1->canvas->px[2 * 12 + 3] == 0xc86432u,
+          "w8b putImageData copies RGBA pixel bytes via Uint8ClampedArray");
+    CHECK(c1 && c1->canvas &&
+          c1->canvas->px[4 * 12 + 4] == 0x010203u &&
+          c1->canvas->px[4 * 12 + 5] == 0xc86432u,
+          "w8b putImageData dirty-rect only modifies dirty slice pixel");
+
+    /* Linear & Radial Gradients + save/restore + strokeStyle + errors */
+    CHECK(jsdom_eval(j,
+          "var ctx1 = document.getElementById('c1').getContext('2d');"
+          "var lg = ctx1.createLinearGradient(0, 0, 10, 0);"
+          "if(!(lg instanceof CanvasGradient)) throw Error('CanvasGradient');"
+          "lg.addColorStop(0, '#ff0000');"
+          "lg.addColorStop(1, '#0000ff');"
+          "var gErr = 0;"
+          "try{ctx1.createRadialGradient(0,0,-1,0,0,5);}catch(e){if(e.name==='IndexSizeError')gErr++;}"
+          "try{lg.addColorStop(-0.1,'#000');}catch(e){if(e.name==='IndexSizeError')gErr++;}"
+          "try{lg.addColorStop(1.1,'#000');}catch(e){if(e.name==='IndexSizeError')gErr++;}"
+          "try{lg.addColorStop(0.5,'notacolor');}catch(e){if(e.name==='SyntaxError')gErr++;}"
+          "if(gErr!==4) throw Error('gErr='+gErr);"
+          "ctx1.fillStyle = lg;"
+          "if(ctx1.fillStyle !== lg) throw Error('fillStyle get');"
+          "ctx1.save();"
+          "ctx1.fillStyle = '#00ff00';"
+          "ctx1.fillRect(0, 8, 2, 2);"
+          "ctx1.restore();"
+          "if(ctx1.fillStyle !== lg) throw Error('restore fillStyle');"
+          "ctx1.fillRect(0, 0, 10, 2);"
+          "ctx1.strokeStyle = lg;"
+          "ctx1.lineWidth = 2;"
+          "ctx1.beginPath(); ctx1.moveTo(0, 5); ctx1.lineTo(10, 5); ctx1.stroke();"
+          "var ctx2 = document.getElementById('c2').getContext('2d');"
+          "var rg = ctx2.createRadialGradient(12, 12, 0, 12, 12, 10);"
+          "rg.addColorStop(0, '#ffffff');"
+          "rg.addColorStop(1, '#000000');"
+          "ctx2.fillStyle = rg;"
+          "ctx2.fillRect(0, 0, 24, 24);"
+          "var ctx3 = document.getElementById('c3').getContext('2d');"
+          "var tg = ctx3.createLinearGradient(0, 0, 6, 0);"
+          "tg.addColorStop(0, '#00ff00'); tg.addColorStop(1, '#0000ff');"
+          "ctx3.globalAlpha = 0.5;"
+          "ctx3.translate(4, 0);"
+          "ctx3.fillStyle = tg;"
+          "ctx3.fillRect(0, 0, 6, 4);",
+          "w8b-gradients.js", err, sizeof(err)) == 0,
+          err[0] ? err : "w8b linear & radial CanvasGradient rendering + save/restore");
+
+    c1 = dom_get_element_by_id(doc, "c1");
+    CHECK(c1 && c1->canvas &&
+          ((c1->canvas->px[0] >> 16) & 0xffu) > 220u &&
+          (c1->canvas->px[0] & 0xffu) < 35u,
+          "w8b linear gradient left stop is red");
+    px = c1 && c1->canvas ? c1->canvas->px[5] : 0u;
+    CHECK(c1 && c1->canvas &&
+          ((px >> 16) & 0xffu) > 90u && ((px >> 16) & 0xffu) < 170u &&
+          (px & 0xffu) > 90u && (px & 0xffu) < 170u,
+          "w8b linear gradient midpoint interpolates red->blue");
+    px = c1 && c1->canvas ? c1->canvas->px[9] : 0u;
+    CHECK(c1 && c1->canvas &&
+          (px & 0xffu) > 220u && ((px >> 16) & 0xffu) < 35u,
+          "w8b linear gradient right stop is blue after restore()");
+    CHECK(c1 && c1->canvas && c1->canvas->px[8 * 12] == 0x00ff00u,
+          "w8b solid fill inside save/restore remains independent");
+    CHECK(c1 && c1->canvas &&
+          ((c1->canvas->px[5 * 12] >> 16) & 0xffu) > 220u &&
+          (c1->canvas->px[5 * 12 + 9] & 0xffu) > 220u,
+          "w8b strokeStyle gradient interpolates across path stroke");
+
+    c2 = dom_get_element_by_id(doc, "c2");
+    px = c2 && c2->canvas ? c2->canvas->px[12 * 24 + 12] : 0u;
+    CHECK(c2 && c2->canvas &&
+          ((px >> 16) & 0xffu) > 225u &&
+          ((px >> 8) & 0xffu) > 225u &&
+          (px & 0xffu) > 225u,
+          "w8b radial gradient center stop is white");
+    px = c2 && c2->canvas ? c2->canvas->px[12 * 24 + 2] : 0u;
+    CHECK(c2 && c2->canvas &&
+          ((px >> 16) & 0xffu) < 25u &&
+          ((px >> 8) & 0xffu) < 25u &&
+          (px & 0xffu) < 25u,
+          "w8b radial gradient outer stop is dark");
+
+    c3 = dom_get_element_by_id(doc, "c3");
+    px = c3 && c3->canvas ? c3->canvas->px[4] : 0u;
+    al = c3 && c3->canvas ? c3->canvas->alpha[4] : 0u;
+    CHECK(c3 && c3->canvas &&
+          ((px >> 8) & 0xffu) > 210u && al >= 120u && al <= 135u,
+          "w8b translated gradient + globalAlpha scales alpha and shifts stops");
+
+    jsdom_free(j);
+    dom_document_free(doc);
+}
+
 int main(void)
 {
     static const char html[] =
@@ -2558,6 +2890,7 @@ int main(void)
     web_storage_free(session_store);
     web_storage_free(local_store);
     test_wave5b_features();
+    test_wave8b_features();
     printf("%d passed, %d failed\n", checks - failures, failures);
     return failures ? 1 : 0;
 }

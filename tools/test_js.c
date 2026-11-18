@@ -879,6 +879,33 @@ static const tcase cases[] = {
 { "structuredClone(Symbol('s'))", "!DataCloneError" },
 { "structuredClone({ fn: function(){} })", "!DataCloneError" },
 
+/* ---- Wave 8B: Web Crypto, AbortController/Signal, Blob, FormData ---- */
+{ "const u = crypto.randomUUID(); const u2 = crypto.randomUUID(); [/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(u), u !== u2, Object.prototype.toString.call(crypto), Object.prototype.toString.call(crypto.subtle)].join(',')", "true,true,[object Crypto],[object SubtleCrypto]" },
+{ "const a1 = new Uint8Array(4); const a2 = new Uint8ClampedArray(4); const a3 = new Int16Array(2); const a4 = new Uint32Array(2); const a5 = new Uint8Array(0); [crypto.getRandomValues(a1) === a1, crypto.getRandomValues(a2) === a2, crypto.getRandomValues(a3) === a3, crypto.getRandomValues(a4) === a4, crypto.getRandomValues(a5).length].join(',')", "true,true,true,true,0" },
+{ "crypto.getRandomValues(new Float32Array(2))", "!TypeError" },
+{ "crypto.getRandomValues(new Float64Array(2))", "!TypeError" },
+{ "crypto.getRandomValues(new DataView(new ArrayBuffer(4)))", "!TypeError" },
+{ "crypto.getRandomValues(new ArrayBuffer(4))", "!TypeError" },
+{ "crypto.getRandomValues({})", "!TypeError" },
+{ "crypto.getRandomValues()", "!TypeError" },
+{ "crypto.getRandomValues(new Uint8Array(65537))", "!RangeError" },
+{ "crypto.getRandomValues(new Uint32Array(16385))", "!RangeError" },
+{ "const ac = new AbortController(); const log = []; ac.signal.onabort = e => log.push('on:' + e.type + ':' + (e.target === ac.signal)); const fn = e => log.push('ev:' + ac.signal.reason); ac.signal.addEventListener('abort', fn); ac.abort('halt'); ac.abort('ignored'); [ac.signal instanceof AbortSignal, ac.signal.aborted, ac.signal.reason, log.join(',')].join('|')", "true|true|halt|on:abort:true,ev:halt" },
+{ "const ac = new AbortController(); ac.abort(); [ac.signal.aborted, ac.signal.reason instanceof Error, ac.signal.reason.name].join(',')", "true,true,AbortError" },
+{ "const ac = new AbortController(); ac.abort(); ac.signal.throwIfAborted()", "!AbortError" },
+{ "const ac = new AbortController(); ac.abort('my-why'); try { ac.signal.throwIfAborted(); 'ok'; } catch (e) { e; }", "my-why" },
+{ "const outer = new AbortController(); const ac = new AbortController(); let hits = 0; const fn = () => hits++; ac.signal.addEventListener('abort', () => hits++, { signal: outer.signal }); ac.signal.addEventListener('abort', fn); ac.signal.removeEventListener('abort', fn); outer.abort(); ac.abort(); hits", "0" },
+{ "const s = AbortSignal.abort('done'); [s instanceof AbortSignal, s.aborted, s.reason, AbortSignal.abort().reason.name].join(',')", "true,true,done,AbortError" },
+{ "const c1 = new AbortController(); const c2 = new AbortController(); const comb = AbortSignal.any([c1.signal, c2.signal]); const pre = AbortSignal.any([c1.signal, AbortSignal.abort('early')]); let hits = 0; comb.addEventListener('abort', () => hits++); c2.abort('second'); c1.abort('first'); [comb.aborted, comb.reason, hits, pre.aborted, pre.reason].join(',')", "true,second,1,true,early" },
+{ "AbortSignal()", "!TypeError" },
+{ "new AbortSignal()", "!TypeError" },
+{ "AbortController()", "!TypeError" },
+{ "const dv = new DataView(new Uint8Array([97, 98, 99, 100]).buffer, 1, 2); const b1 = new Blob(['hi ', new Int16Array([0x2121]), dv], { type: 'TEXT/PLAIN;Charset=Utf-8' }); const b2 = b1.slice(1, -1, 'Application/JSON'); const b3 = new Blob(); [b1 instanceof Blob, b1.size, b1.type, b2.size, b2.type, b3.size, b3.type, b1.slice(0, 1, 'bad\\ntype').type].join('|')", "true|7|text/plain;charset=utf-8|5|application/json|0||" },
+{ "Blob()", "!TypeError" },
+{ "new Blob(123)", "!TypeError" },
+{ "const fd = new FormData(); fd.append('a', '1'); fd.append('a', '2'); const bl = new Blob(['xy'], { type: 'text/plain' }); fd.append('f', bl, 'doc.txt'); fd.set('a', '3'); const ks = []; const vs = []; for (const [k, v] of fd) { ks.push(k); vs.push(v === bl ? 'BLOB' : v); } let cbLog = ''; fd.forEach(function(v, k, p){ cbLog += this.tag + k + '=' + (v === bl ? 'B' : v) + ';'; }, { tag: '@' }); [fd instanceof FormData, fd.has('a'), fd.get('a'), fd.getAll('a').join(','), fd.get('missing') === null, ks.join(','), vs.join(','), cbLog].join('|')", "true|true|3|3|true|f,a|BLOB,3|@f=B;@a=3;" },
+{ "FormData()", "!TypeError" },
+
 { 0, 0 }
 };
 
@@ -1294,6 +1321,17 @@ static const struct { const char *src; const char *want; } async_cases[] = {
 { "async function f(){ return Promise.reject(new RangeError('rejected')); } f()", "!RangeError" },
 { "async function f(){ try { try { await __laterReject(new TypeError('inner')); } catch (e) { await __later(1); throw e; } } catch (outer) { return 'outer:' + outer.name; } } f()", "outer:TypeError" },
 { "async function f({a = 1}, ...r) { return a + await __later(r.length); } f({}, 10, 20)", "3" },
+
+/* ---- Wave 8B async: Web Crypto subtle.digest & Blob readers ---- */
+{ "async function hex(ab){ return Array.from(new Uint8Array(ab), b => (b < 16 ? '0' : '') + b.toString(16)).join(''); } (async () => [await hex(await crypto.subtle.digest('SHA-1', new Uint8Array(0))), await hex(await crypto.subtle.digest('sha1', new TextEncoder().encode('abc')))].join(','))()", "da39a3ee5e6b4b0d3255bfef95601890afd80709,a9993e364706816aba3e25717850c26c9cd0d89d" },
+{ "async function hex(ab){ return Array.from(new Uint8Array(ab), b => (b < 16 ? '0' : '') + b.toString(16)).join(''); } (async () => [await hex(await crypto.subtle.digest('SHA-256', new ArrayBuffer(0))), await hex(await crypto.subtle.digest({ name: 'sha256' }, new Uint8ClampedArray([97, 98, 99])))].join(','))()", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855,ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" },
+{ "async function hex(ab){ return Array.from(new Uint8Array(ab), b => (b < 16 ? '0' : '') + b.toString(16)).join(''); } (async () => { const raw = new Uint8Array([120, 97, 98, 99, 121]); const dv = new DataView(raw.buffer, 1, 3); const ab = await crypto.subtle.digest('SHA-384', dv); return (ab instanceof ArrayBuffer) + ':' + ab.byteLength + ':' + await hex(ab); })()", "true:48:cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7" },
+{ "async function hex(ab){ return Array.from(new Uint8Array(ab), b => (b < 16 ? '0' : '') + b.toString(16)).join(''); } (async () => { const ab = await crypto.subtle.digest({ name: 'Sha-512' }, new TextEncoder().encode('abc')); return ab.byteLength + ':' + await hex(ab); })()", "64:ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f" },
+{ "crypto.subtle.digest('MD5', new Uint8Array(1))", "!NotSupportedError" },
+{ "crypto.subtle.digest('SHA-256')", "!TypeError" },
+{ "crypto.subtle.digest('SHA-256', 'plain-string')", "!TypeError" },
+{ "(async () => { const b = new Blob(['Hello ', new Uint8Array([87, 111]), new Blob(['rld'])]); const s = b.slice(3, -1); const ab = await s.arrayBuffer(); const u8 = await s.bytes(); return [await b.text(), await s.text(), ab instanceof ArrayBuffer, ab.byteLength, u8 instanceof Uint8Array, new TextDecoder().decode(u8)].join('|'); })()", "Hello World|lo Worl|true|7|true|lo Worl" },
+
 { 0, 0 }
 };
 
@@ -1359,6 +1397,44 @@ static void run_async_one(const char *src, char *out, unsigned long n)
 
 /* ------------------------------------------------------------------ */
 
+static int stub_random_bytes(void *user, uint8_t *out, unsigned long len)
+{
+    unsigned long i;
+    uint8_t base = user ? *(const uint8_t *)user : 0;
+
+    for (i = 0; i < len; i++)
+        out[i] = (uint8_t)(base + i);
+    return 0;
+}
+
+static int check_random_hook(void)
+{
+    js_config cfg;
+    js_ctx *ctx;
+    js_value r;
+    uint8_t seed = 0x42;
+    char out[256];
+    int fails = 0;
+
+    js_config_default(&cfg);
+    cfg.user = &seed;
+    cfg.random_bytes = stub_random_bytes;
+    ctx = js_new(&cfg);
+    if (!ctx) return 1;
+    render(ctx,
+           js_eval(ctx,
+                   "const a = crypto.getRandomValues(new Uint8Array(4));"
+                   "crypto.randomUUID() + '|' + Array.from(a).join(',')",
+                   "rng_hook", &r),
+           r, out, sizeof(out));
+    if (strcmp(out, "42434445-4647-4849-8a4b-4c4d4e4f5051|66,67,68,69") != 0) {
+        printf("FAIL [random_hook] got: %s\n", out);
+        fails++;
+    }
+    js_free(ctx);
+    return fails;
+}
+
 int main(int argc, char **argv)
 {
     int i, pass = 0, fail = 0, verbose = 0;
@@ -1419,6 +1495,10 @@ int main(int argc, char **argv)
                    i, async_cases[i].src, async_cases[i].want, out);
         }
     }
+    if (check_random_hook() == 0)
+        pass++;
+    else
+        fail++;
     printf("\n%d/%d passed, %d failed\n", pass, pass + fail, fail);
     return fail ? 1 : 0;
 }
