@@ -3,7 +3,7 @@
  * Every routine writes straight into the window's pixel buffer and clips
  * to win->clip (which gui_clip keeps inside the window), so no caller can
  * scribble past the buffer no matter what coordinates it computes. The
- * pixel format is 0x00RRGGBB, one uint32_t per pixel, win->w per row.
+ * pixel format is 0x00RRGGBB, one uint32_t per pixel.
  */
 
 #include "gui.h"
@@ -18,6 +18,40 @@ const uint8_t *gui_glyph(unsigned char c)
 }
 
 /* ------------------------------------------------------------- clipping */
+
+static int pixel_stride(const gui_window *win)
+{
+    return win->row_stride ? win->row_stride : win->w;
+}
+
+static uint32_t *pixel_row(const gui_window *win, int y)
+{
+    return win->px + (long)y * pixel_stride(win);
+}
+
+int gui_paint_view(gui_window *out, const gui_window *parent, gui_rc region)
+{
+    if (!out || !parent || out == parent || !parent->px ||
+        region.x < 0 || region.y < 0 || region.w <= 0 || region.h <= 0)
+        return -1;
+    int64_t right = (int64_t)region.x + region.w;
+    int64_t bottom = (int64_t)region.y + region.h;
+    gui_rc clip = parent->clip;
+    if (right > parent->w || bottom > parent->h ||
+        region.x < clip.x || region.y < clip.y ||
+        right > (int64_t)clip.x + clip.w ||
+        bottom > (int64_t)clip.y + clip.h)
+        return -1;
+
+    *out = (gui_window) {
+        .w = region.w,
+        .h = region.h,
+        .px = pixel_row(parent, region.y) + region.x,
+        .clip = gui_mkrc(0, 0, region.w, region.h),
+        .row_stride = pixel_stride(parent),
+    };
+    return 0;
+}
 
 static int usable(gui_window *win)
 {
@@ -128,7 +162,7 @@ static void span(gui_window *win, int x, int y, int w, uint32_t color)
         x1 = win->clip.x + win->clip.w;
     if (x1 <= x)
         return;
-    row = win->px + (long)y * win->w;
+    row = pixel_row(win, y);
     while (x < x1)
         row[x++] = color;
 }
@@ -156,7 +190,7 @@ static void span_alpha(gui_window *win, int x, int y, int w, uint32_t color,
         x1 = win->clip.x + win->clip.w;
     if (x1 <= x)
         return;
-    row = win->px + (long)y * win->w;
+    row = pixel_row(win, y);
     while (x < x1) {
         row[x] = blend_rgb(row[x], color, alpha);
         x++;
@@ -180,7 +214,7 @@ void gui_pixel(gui_window *win, int x, int y, uint32_t color)
         return;
     if (y < win->clip.y || y >= win->clip.y + win->clip.h)
         return;
-    win->px[(long)y * win->w + x] = color;
+    pixel_row(win, y)[x] = color;
 }
 
 void gui_blend_pixel(gui_window *win, int x, int y, uint32_t color,
@@ -194,7 +228,7 @@ void gui_blend_pixel(gui_window *win, int x, int y, uint32_t color,
         return;
     if (y < win->clip.y || y >= win->clip.y + win->clip.h)
         return;
-    p = &win->px[(long)y * win->w + x];
+    p = &pixel_row(win, y)[x];
     *p = (alpha == 255) ? (color & 0xFFFFFFu) : blend_rgb(*p, color, alpha);
 }
 
@@ -202,7 +236,7 @@ uint32_t gui_peek(gui_window *win, int x, int y)
 {
     if (!win || !win->px || x < 0 || y < 0 || x >= win->w || y >= win->h)
         return 0;
-    return win->px[(long)y * win->w + x];
+    return pixel_row(win, y)[x];
 }
 
 void gui_rect(gui_window *win, int x, int y, int w, int h, uint32_t color)
@@ -1029,7 +1063,7 @@ void gui_bitmap(gui_window *win, int x, int y, int bw, int bh,
         if (x1 > win->clip.x + win->clip.w)
             x1 = win->clip.x + win->clip.w;
         for (col = x0; col < x1; col++, sx++)
-            win->px[(long)py * win->w + col] = sr[sx];
+            pixel_row(win, py)[col] = sr[sx];
     }
 }
 
@@ -1046,8 +1080,8 @@ void gui_scroll_up(gui_window *win, int rows, uint32_t bg)
         return;
     }
     for (y = c.y; y < c.y + c.h - rows; y++)
-        memmove(win->px + (long)y * win->w + c.x,
-                win->px + (long)(y + rows) * win->w + c.x,
+        memmove(pixel_row(win, y) + c.x,
+                pixel_row(win, y + rows) + c.x,
                 (unsigned long)c.w * sizeof(uint32_t));
     gui_rect(win, c.x, c.y + c.h - rows, c.w, rows, bg);
 }
