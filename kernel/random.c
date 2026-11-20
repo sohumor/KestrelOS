@@ -25,6 +25,7 @@ static bool crng_seeded;
 static uint64_t timing_last[ENTROPY_SOURCE_MAX];
 static uint64_t timing_delta[ENTROPY_SOURCE_MAX];
 static spinlock_t random_lock = SPINLOCK_INIT;
+static struct task_event_channel entropy_ready_event;
 
 static uint64_t read_tsc(void)
 {
@@ -78,7 +79,10 @@ static void pool_mix_locked(enum entropy_source source, const void *data,
 
     if (credit > ENTROPY_MAX_BITS - credited_bits)
         credit = ENTROPY_MAX_BITS - credited_bits;
+    bool was_ready = credited_bits >= ENTROPY_READY_BITS;
     credited_bits += credit;
+    if (!was_ready && credited_bits >= ENTROPY_READY_BITS)
+        task_event_notify(&entropy_ready_event, 1);
 }
 
 void entropy_pool_add(enum entropy_source source, const void *data, size_t len,
@@ -314,18 +318,22 @@ int random_get_bytes(void *buf, size_t len, unsigned flags)
 
     if ((!buf && len) || (flags & ~(RANDOM_NONBLOCK | RANDOM_STRONG)))
         return -1;
-    while (!random_ready()) {
-        if (flags & RANDOM_NONBLOCK)
+    uint64_t irq = spin_lock_irqsave(&random_lock);
+    while (credited_bits < ENTROPY_READY_BITS) {
+        if ((flags & RANDOM_NONBLOCK) || !sched_active) {
+            spin_unlock_irqrestore(&random_lock, irq);
             return -1;
-        if (!sched_active)
-            return -1;
-        task_sleep_ticks(1);
+        }
+        /* A pending kill must not trigger random_u32()'s early-boot
+         * fallback on a running scheduler. */
+        if (task_event_wait_locked(&entropy_ready_event, 1, UINT64_MAX,
+                                   &random_lock, irq) < 0)
+            task_sleep_ticks(1);
+        irq = spin_lock_irqsave(&random_lock);
     }
-    if (len) {
-        uint64_t irq = spin_lock_irqsave(&random_lock);
+    if (len)
         crng_generate_locked(out, len);
-        spin_unlock_irqrestore(&random_lock, irq);
-    }
+    spin_unlock_irqrestore(&random_lock, irq);
     return 0;
 }
 
