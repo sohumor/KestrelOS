@@ -15869,6 +15869,7 @@ static int ctx2d_num_arg(js_ctx *c, int ac, js_value *av, int idx, double *out)
 {
     double v;
 
+    *out = 0.0;
     if (idx >= ac)
         return 0;
     if (js_to_number(c, av[idx], &v) != JS_OK)
