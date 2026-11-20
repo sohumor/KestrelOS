@@ -117,6 +117,7 @@ Numbers, argument registers in order (rdi, rsi, rdx, r10).
 | 64 | `SYS_SIGPROCMASK` | how, mask, old mask | 0 / -1 |
 | 65 | `SYS_SIGRETURN` | internal restorer | restores interrupted frame |
 | 66 | `SYS_CPUINFO` | `struct k_cpuinfo *` | 0 / -1 |
+| 83 | `SYS_HANGAR` | op, a, b, c (`K_HANGAR_PARK`/`LIST`/`THUMB`/`RESUME`/`DISCARD`) | bay / pid / 0 / -1 |
 | 90 | `SYS_MISSION_SPAWN` | path, argv, `const struct k_mission_grant *`, optional `u32 *mission_id` | pid / -1 |
 | 91 | `SYS_MISSION_CTL` | mission id, op, arg | 0 / -1 |
 | 92 | `SYS_MISSION_INFO` | live index, `struct k_mission_info *` | 0 / -1 at end |
@@ -128,7 +129,8 @@ participating in Alt-Tab. `KEY_MISSION` (0x90, Ctrl+M) is routed to the desktop.
 ### Mission grants
 
 See [missions.md](missions.md) for enforcement and lifetime rules. Numbers
-78–82 are reserved for IPv6; mission calls use 90–92.
+78–82 are reserved for IPv6; Hangar park/resume multiplexes through 83 and
+mission calls use 90–92.
 
 `k_mission_grant` contains `app[24]`, `title[48]`, `cap_mask`, `path_count`,
 `net_mode`, `host_count`, `device_bits`, `ipc_bits`, a zero `reserved` field,

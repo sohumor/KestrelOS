@@ -106,7 +106,8 @@
 #define SYS_PARCEL_LIST 75 /* (index, struct k_parcel_info*) -> 0/-1 */
 #define SYS_WM_THEME    76 /* (const struct k_wm_theme*) -> 0/-1 */
 #define SYS_WIN_RESIZE  77 /* (wid, new_w, new_h) -> 0/-1 */
-#define SYS_HANGAR      78 /* (op, a, b, c): park/resume, see K_HANGAR_* */
+/* 78..82 stay reserved for IPv6 (see docs/ABI.md); Hangar takes 83. */
+#define SYS_HANGAR      83 /* (op, a, b, c): park/resume, see K_HANGAR_* */
 #define SYS_MISSION_SPAWN 90 /* (path, argv, const struct k_mission_grant*, u32 *id_or_NULL) -> pid/-1 */
 #define SYS_MISSION_CTL   91 /* (id, op, arg) -> 0/-1 */
 #define SYS_MISSION_INFO  92 /* (index, struct k_mission_info*) -> 0/-1 */
