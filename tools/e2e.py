@@ -449,7 +449,22 @@ def _marker_handler(marker):
                 return
             content_type = "text/html; charset=us-ascii"
             response = body
-            if path == "/compat":
+            if path == "/protected-inputs":
+                response = (
+                    "<!doctype html><html><body><h1>Protected text inputs</h1>"
+                    "<p>Disabled (must stay DISABLED)</p>"
+                    "<input id=d disabled value=DISABLED>"
+                    "<p>Readonly (must stay READONLY)</p>"
+                    "<form action=/readonly-submit>"
+                    "<input id=r name=r readonly value=READONLY></form>"
+                    "<p>Editable control</p><input id=e value=EDIT>"
+                    "<p><button onclick=\"fetch('/input-check/'+"
+                    "document.getElementById('d').value+'/'+"
+                    "document.getElementById('r').value+'/'+"
+                    "document.getElementById('e').value)\">Check values</button></p>"
+                    "</body></html>"
+                ).encode("ascii")
+            elif path == "/compat":
                 response = (
                     "<!doctype html><html><head>"
                     "<title>Kestrel compatibility fixture</title>"
@@ -2671,6 +2686,66 @@ def _validate_tls_negative_block(block, attempt):
         % attempt)
 
 
+def t_browser_protected_inputs(h):
+    """Exercise the GUI key path, not the text-mode renderer."""
+    monitor = socket.create_connection(("127.0.0.1", h.monitor_port))
+    monitor.settimeout(2)
+
+    def cmd(command):
+        monitor.sendall((command + "\n").encode("ascii"))
+        time.sleep(0.15)
+        monitor.recv(65536)
+
+    def click(x, y):
+        for _ in range(12):
+            cmd("mouse_move -200 -200")
+        cx = cy = 0
+        while (cx, cy) != (x, y):
+            dx = max(-100, min(100, int((x - cx) * 2 / 3)))
+            dy = max(-100, min(100, int((y - cy) * 2 / 3)))
+            dx = dx or (1 if x > cx else -1) if x != cx else 0
+            dy = dy or (1 if y > cy else -1) if y != cy else 0
+            cmd("mouse_move %d %d" % (dx, dy))
+            cx += int(dx * 3 / 2)
+            cy += int(dy * 3 / 2)
+        cmd("mouse_button 1")
+        cmd("mouse_button 0")
+
+    try:
+        h.send("/bin/desktop &")
+        time.sleep(3)
+        url = browser_fixtures.http_url.replace("/plain", "/protected-inputs")
+        h.send("/bin/browser %s &" % url)
+        time.sleep(6)
+        shot = os.environ.get("E2E_INPUT_SCREENSHOT")
+        if shot:
+            cmd("screendump %s.loaded.ppm" % shot)
+        for x, y in [(100, 239), (100, 317), (100, 395)]:
+            click(x, y)
+            for key in ("x", "backspace", "x", "ctrl-c", "ctrl-v"):
+                cmd("sendkey " + key)
+        if shot:
+            cmd("screendump %s.ppm" % shot)
+        click(90, 436)
+        time.sleep(3)
+        with browser_fixtures.http._get_count_lock:
+            paths = [p for p in browser_fixtures.http._path_counts
+                     if p.startswith("/input-check/")]
+        print("  protected input values: %r" % paths)
+        if paths != ["/input-check/DISABLED/READONLY/EDITxEDITx"]:
+            raise TimeoutError("protected values changed or GUI editing did not execute")
+        submissions = browser_fixtures.http.path_count("/readonly-submit")
+        click(100, 317)
+        cmd("sendkey ret")
+        time.sleep(3)
+        if browser_fixtures.http.path_count("/readonly-submit") != submissions + 1:
+            raise TimeoutError("Enter in readonly input did not submit its form")
+        print("  readonly input Enter submitted its form")
+    finally:
+        cmd("sendkey ctrl-q")
+        monitor.close()
+
+
 def t_browser_text(h):
     """The browser pipeline, run over a styled local page in text mode.
 
@@ -3166,6 +3241,7 @@ TESTS = [
     ("service-list", t_service_list),
     ("service-lifecycle", t_service_lifecycle),
     ("permissions", t_permissions),
+    ("browser-protected-inputs", t_browser_protected_inputs),
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
@@ -3504,6 +3580,13 @@ def main():
             return 1
 
     h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    if any(name == "browser-protected-inputs" for name, _ in tests):
+        with socket.socket() as port:
+            port.bind(("127.0.0.1", 0))
+            h.monitor_port = port.getsockname()[1]
+        h.cmd.extend(["-monitor", "tcp:127.0.0.1:%d,server=on,wait=off"
+                      % h.monitor_port, "-m", "512M", "-device",
+                      "VGA,vgamem_mb=32"])
     h.disk = args.disk
     try:
         h.start()
