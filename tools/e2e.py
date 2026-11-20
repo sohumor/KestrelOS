@@ -3108,6 +3108,40 @@ def t_curl_https(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def t_telnet_peer_reset(h):
+    """An idle connection survives receive timeouts, but not a peer reset."""
+    for reset in (True, False):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(NET_TIMEOUT)
+            port = listener.getsockname()[1]
+            h.send("telnet %s %d; echo TELNET-STATUS-$?" % (QEMU_HOST, port))
+            with listener.accept()[0] as peer:
+                h.expect('connected. ctrl-D or "quit" to close.')
+                # Keep the socket idle across several receive slices before
+                # proving the client still receives data.
+                time.sleep(0.5)
+                peer.sendall(b"TELNET-IDLE-DATA-OK\n")
+                h.expect("\nTELNET-IDLE-DATA-OK\n")
+                if reset:
+                    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    struct.pack("ii", 1, 0))
+            print("  peer sent %s after idle/data check" %
+                  ("RST" if reset else "FIN"))
+            block = h.capture_until(r"(?m)^TELNET-STATUS-\d+\n",
+                                    timeout=10, regex=True)
+            print(block.strip())
+            message = ("telnet: receive failed, connection closed" if reset
+                       else "telnet: connection closed by peer")
+            status = 1 if reset else 0
+            if message not in block or not re.search(
+                    r"(?m)^TELNET-STATUS-%d$" % status, block):
+                raise TimeoutError("telnet did not report %s with status %d"
+                                   % (message, status))
+            wait_prompt(h)
+
+
 def t_tcp_curl(h):
     """A real TCP fetch. SKIPs like the other network tests: the host may
     have no route out, and that is not a KestrelOS bug."""
@@ -3255,6 +3289,7 @@ TESTS = [
     ("kpkg-verify", t_kpkg_verify),
     ("lsmod", t_lsmod),
     ("tcp-curl", t_tcp_curl),
+    ("telnet-peer-reset", t_telnet_peer_reset),
 ]
 
 # boot + login + a prompt: the least that proves the machine came up.

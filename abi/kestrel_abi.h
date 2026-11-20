@@ -72,7 +72,7 @@
 /* --- TCP --- */
 #define SYS_TCP_CONNECT 48 /* (ip_be, port, timeout_ms) -> handle/-1 */
 #define SYS_TCP_SEND    49 /* (handle, buf, len) -> sent/-1 */
-#define SYS_TCP_RECV    50 /* (handle, buf, max, timeout_ms) -> n, 0 = closed */
+#define SYS_TCP_RECV    50 /* (handle, buf, max, timeout_ms) -> n, 0 = closed, -1 = error, -2 = timeout */
 #define SYS_TCP_CLOSE   51 /* (handle) -> 0/-1 */
 #define SYS_SYNC        52 /* () -> flush filesystem caches */
 
