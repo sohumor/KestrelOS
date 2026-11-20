@@ -45,7 +45,7 @@ static int shared_irq_probe(void)
 
 late_initcall(shared_irq_probe);
 
-static unsigned remover_cpu, callback_cpu, hits;
+static unsigned remover_cpu, callback_cpu, hits, hits_at_removal;
 static bool remover_ready, in_callback, removing, callback_leaving, removed;
 static bool overlapped, quiesced;
 
@@ -91,6 +91,7 @@ static void cross_cpu_remove(void *arg)
         __atomic_store_n(&removing, true, __ATOMIC_RELEASE);
         quiesced = irq_unsubscribe(0, blocking_irq, NULL) == 0 &&
                   __atomic_load_n(&callback_leaving, __ATOMIC_ACQUIRE);
+        hits_at_removal = __atomic_load_n(&hits, __ATOMIC_RELAXED);
     }
     __atomic_store_n(&removed, true, __ATOMIC_RELEASE);
     sti();
@@ -121,14 +122,20 @@ void __wrap_smp_start_aps(void)
     for (unsigned i = 0; i < 100 &&
          !__atomic_load_n(&removed, __ATOMIC_ACQUIRE); i++)
         task_sleep_ticks(1);
-    task_sleep_ticks(3);
-
-    if (!__atomic_load_n(&removed, __ATOMIC_ACQUIRE) || !quiesced ||
-        !overlapped || callback_cpu == remover_cpu ||
-        __atomic_load_n(&hits, __ATOMIC_RELAXED) != 1) {
-        kprintf("FAIL cross-CPU IRQ removal\n");
+    if (!__atomic_load_n(&removed, __ATOMIC_ACQUIRE)) {
+        kprintf("FAIL cross-CPU IRQ removal: remover did not return\n");
         return;
     }
-    kprintf("PASS cross-CPU IRQ removal: CPU %u waited for callback on CPU %u\n",
-            remover_cpu, callback_cpu);
+    task_sleep_ticks(3);
+
+    unsigned final_hits = __atomic_load_n(&hits, __ATOMIC_RELAXED);
+    if (!quiesced || !overlapped || callback_cpu == remover_cpu ||
+        !hits_at_removal || final_hits != hits_at_removal) {
+        kprintf("FAIL cross-CPU IRQ removal: overlapped=%d quiesced=%d hits=%u->%u CPUs=%u/%u\n",
+                overlapped, quiesced, hits_at_removal, final_hits,
+                callback_cpu, remover_cpu);
+        return;
+    }
+    kprintf("PASS cross-CPU IRQ removal: CPU %u waited for CPU %u (%u callbacks at removal)\n",
+            remover_cpu, callback_cpu, hits_at_removal);
 }
