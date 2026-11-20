@@ -69,6 +69,7 @@ struct task {
     int affinity;                /* -1 = any CPU; idle tasks are pinned */
     bool idle;
     uint64_t cap_mask;
+    int mission_id;
     char unveil_prefix[64];
 };
 
@@ -80,6 +81,10 @@ void proc_mark_current_idle(void);
 struct task *kthread_create(void (*func)(void *), void *arg, const char *name);
 struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
                                      const char *name, int *pid_out);
+struct task *kthread_create_mission(void (*func)(void *), void *arg,
+                                   const char *name, int *pid_out, int mission_id);
+void proc_mission_ctl(int id, uint64_t drop, int end);
+void proc_mission_pids(struct k_mission_info *out);
 struct task *proc_prepare_cpu(unsigned cpu, uint64_t *stack_top);
 void schedule(void);
 void yield(void);

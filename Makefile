@@ -99,7 +99,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
-        test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
+        test-random test-mission test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -345,6 +345,11 @@ test-net: test-tcp test-checksum
 test-random:
 	sh tools/run-random-tests.sh
 
+test-mission:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Ikernel/include -Iabi kernel/mission_core.c tools/test_mission.c -o $(BUILD)/host-tests/test_mission
+	$(BUILD)/host-tests/test_mission
+
 test-jpeg-prog:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
@@ -401,6 +406,7 @@ help:
 	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
 	@echo "  make test-net   run host TCP + network checksum tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
+	@echo "  make test-mission  run mission grant and enforcement core tests"
 	@echo "  make test-gui-host   run libgui raster regression tests"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
 	@echo "  make test-kfs-boot-recovery   boot a committed journal through recovery"

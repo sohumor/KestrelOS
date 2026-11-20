@@ -14,6 +14,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "flight.h"
+#include "mission.h"
 
 bool sched_active;
 
@@ -365,6 +366,8 @@ void task_exit(int code)
 
     uint64_t flags = irq_save();
     spin_lock(&sched_lock);
+    mission_put(current->mission_id);
+    current->mission_id = 0;
     current->state = TASK_ZOMBIE;
     current->cpu = -1;
     current->exit_code = code;
@@ -381,8 +384,8 @@ void task_exit_from_bootstrap(int code)
     task_exit(code);
 }
 
-struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
-                                     const char *name, int *pid_out)
+struct task *kthread_create_mission(void (*func)(void *), void *arg,
+                                   const char *name, int *pid_out, int mission_id)
 {
     struct task *t = kzalloc(sizeof(*t));
     if (!t)
@@ -433,6 +436,8 @@ struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
 
     uint64_t f = irq_save();
     spin_lock(&sched_lock);
+    t->mission_id = mission_id;
+    mission_inherit(t, current);
     t->pid = next_pid++;
     t->allnext = all_tasks;
     all_tasks = t;
@@ -441,6 +446,40 @@ struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
         *pid_out = t->pid;
     spin_unlock_irqrestore(&sched_lock, f);
     return t;
+}
+
+struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
+                                     const char *name, int *pid_out)
+{
+    return kthread_create_mission(func, arg, name, pid_out, 0);
+}
+
+void proc_mission_ctl(int id, uint64_t drop, int end)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *t = all_tasks; t; t = t->allnext) {
+        if (t->mission_id != id || t->state == TASK_ZOMBIE) continue;
+        __atomic_fetch_and(&t->cap_mask, ~drop, __ATOMIC_SEQ_CST);
+        if (end) {
+            t->kill_pending = 1;
+            if (t->state == TASK_SLEEPING || t->state == TASK_STOPPED) {
+                t->state = TASK_RUNNABLE;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
+void proc_mission_pids(struct k_mission_info *out)
+{
+    out->task_count = out->pid_count = 0;
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *t = all_tasks; t; t = t->allnext) {
+        if (t->mission_id != (int)out->id || t->state == TASK_ZOMBIE) continue;
+        out->task_count++;
+        if (out->pid_count < K_MISSION_PIDS) out->pids[out->pid_count++] = t->pid;
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
 }
 
 struct task *kthread_create(void (*func)(void *), void *arg, const char *name)

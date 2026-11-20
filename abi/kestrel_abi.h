@@ -106,6 +106,9 @@
 #define SYS_PARCEL_LIST 75 /* (index, struct k_parcel_info*) -> 0/-1 */
 #define SYS_WM_THEME    76 /* (const struct k_wm_theme*) -> 0/-1 */
 #define SYS_WIN_RESIZE  77 /* (wid, new_w, new_h) -> 0/-1 */
+#define SYS_MISSION_SPAWN 90 /* (path, argv, const struct k_mission_grant*) -> pid/-1 */
+#define SYS_MISSION_CTL   91 /* (id, op, arg) -> 0/-1 */
+#define SYS_MISSION_INFO  92 /* (index, struct k_mission_info*) -> 0/-1 */
 
 /* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
  * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
@@ -457,7 +460,8 @@ struct k_spawn_caps {
 #define K_TOPIC_FS     0x08U
 #define K_TOPIC_NET    0x10U
 #define K_TOPIC_PARCEL 0x20U
-#define K_TOPIC_ALL    0x3FU
+#define K_TOPIC_MISSION 0x40U
+#define K_TOPIC_ALL    0x7FU
 
 #define K_PULSE_PROC_SPAWN  1
 #define K_PULSE_PROC_EXIT   2
@@ -469,6 +473,75 @@ struct k_spawn_caps {
 #define K_PULSE_FS_CHANGE   8
 #define K_PULSE_NET_CHANGE  9
 #define K_PULSE_PARCEL_NEW  10
+#define K_PULSE_MISSION_START  11
+#define K_PULSE_MISSION_USE    12
+#define K_PULSE_MISSION_DENY   13
+#define K_PULSE_MISSION_REVOKE 14
+#define K_PULSE_MISSION_END    15
+
+#define K_MISSION_MAX 16
+#define K_MISSION_PATHS 8
+#define K_MISSION_HOSTS 4
+#define K_MISSION_PIDS 32
+#define K_MISSION_READ 1U
+#define K_MISSION_WRITE 2U
+#define K_MISSION_NET_NONE 0U
+#define K_MISSION_NET_ANY 1U
+#define K_MISSION_NET_HOSTS 2U
+#define K_MISSION_IPC_TALON  1U
+#define K_MISSION_IPC_PULSE  2U
+#define K_MISSION_IPC_SIGNAL 4U
+#define K_MISSION_IPC_PIPE   8U
+#define K_MISSION_IPC_ALL    15U
+enum k_mission_channel {
+    K_MISSION_FS_READ, K_MISSION_FS_WRITE, K_MISSION_NET,
+    K_MISSION_DISPLAY, K_MISSION_SPAWN, K_MISSION_IPC,
+    K_MISSION_AUDIO, K_MISSION_CAMERA, K_MISSION_INPUT, K_MISSION_RANDOM,
+    K_MISSION_CHANNELS
+};
+#define K_MISSION_DEVICE_AUDIO  1U
+#define K_MISSION_DEVICE_CAMERA 2U
+#define K_MISSION_DEVICE_INPUT  4U
+#define K_MISSION_DEVICE_RANDOM 8U
+#define K_MISSION_REVOKE_CAP  1
+#define K_MISSION_REVOKE_PATH 2
+#define K_MISSION_REVOKE_HOST 3
+#define K_MISSION_END         4
+
+struct k_mission_path {
+    char prefix[64];
+    uint32_t mode;
+    uint32_t revoked;
+};
+struct k_mission_host {
+    uint32_t ip_be;
+    uint32_t revoked;
+};
+struct k_mission_grant {
+    char app[24];
+    char title[48];
+    uint64_t cap_mask;
+    uint32_t path_count;
+    uint32_t net_mode;
+    uint32_t host_count;
+    uint32_t device_bits;
+    uint32_t ipc_bits;
+    uint32_t reserved;
+    struct k_mission_path paths[K_MISSION_PATHS];
+    struct k_mission_host hosts[K_MISSION_HOSTS];
+};
+struct k_mission_counter {
+    uint64_t uses, denies, last_use_tick, last_deny_tick;
+};
+struct k_mission_info {
+    uint32_t id, owner_uid;
+    struct k_mission_grant grant;
+    uint64_t revoked; /* channel bitmap */
+    struct k_mission_counter counters[K_MISSION_CHANNELS];
+    char last_deny[40];
+    uint32_t task_count, pid_count;
+    int32_t pids[K_MISSION_PIDS]; /* truncated at K_MISSION_PIDS */
+};
 
 struct k_pulse {
     uint64_t seq;

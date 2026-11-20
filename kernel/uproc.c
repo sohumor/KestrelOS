@@ -11,6 +11,7 @@
 #include "kestrel_abi.h"
 #include "spinlock.h"
 #include "pulse.h"
+#include "mission.h"
 
 extern void enter_usermode(uint64_t entry, uint64_t user_rsp,
                            uint64_t argc, uint64_t argv)
@@ -29,6 +30,7 @@ struct uproc_pkg {
     struct file *fds[K_SPAWN_CAPS_MAX_FDS];
     int has_cap_mask;
     uint64_t cap_mask;
+    int mission_id;
 };
 
 /* copy_str_from_user's "no NUL within max" result; the destination still
@@ -334,7 +336,11 @@ static void user_task_thunk(void *arg)
     argc = pkg->argc;
 
     if (pkg->has_cap_mask) {
-        current->cap_mask = pkg->cap_mask;
+        if (current->mission_id)
+            __atomic_fetch_and(&current->cap_mask, pkg->cap_mask, __ATOMIC_SEQ_CST);
+        else
+            current->cap_mask = pkg->cap_mask;
+        mission_limit_current();
         if (current->uid != 0)
             current->cap_mask &= ~KCAP_ADMIN;
     }
@@ -379,7 +385,7 @@ static int spawn_pkg(struct uproc_pkg *pkg)
     /* The scheduler publishes the PID through pid_out before it releases
      * its cross-CPU run-queue lock. The child may complete immediately
      * after publication without leaving us to dereference a freed task. */
-    t = kthread_create_with_pid(user_task_thunk, pkg, name, &pid);
+    t = kthread_create_mission(user_task_thunk, pkg, name, &pid, pkg->mission_id);
     if (!t) {
         free_pkg(pkg);
         return -1;
@@ -615,4 +621,18 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
 fail:
     free_pkg(pkg);
     return -1;
+}
+
+int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
+                                 const struct k_mission_grant *grant)
+{
+    if (!spawn_user_allowed()) return -1;
+    struct uproc_pkg *pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg) return -1;
+    int id = mission_create(grant, pkg->path);
+    if (id < 0) { free_pkg(pkg); return -1; }
+    pkg->mission_id = id;
+    int pid = spawn_pkg(pkg);
+    mission_put(id);
+    return pid;
 }

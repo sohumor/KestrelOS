@@ -10,6 +10,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "mission.h"
 
 /* The VFS. All paths are absolute.
  *
@@ -216,11 +217,13 @@ static int unveil_canon_path(const char *path, char *out, size_t outsz)
     return 0;
 }
 
-static int unveil_allows(const char *path)
+static int unveil_allows(const char *path, int write)
 {
     char canon[256];
     char prefix[64];
 
+    if (!mission_path(path, write))
+        return 0;
     if (!current || current->unveil_prefix[0] == '\0')
         return 1;
     if (unveil_canon_path(current->unveil_prefix, prefix, sizeof(prefix)) < 0)
@@ -273,7 +276,11 @@ struct file *vfs_open(const char *path, int flags)
     struct mount *m;
     struct file *f;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0))
+        return NULL;
+    if (current && current->mission_id && vfs_flags_allow_read(flags) &&
+        (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
+        !unveil_allows(path, 0))
         return NULL;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->open == NULL)
@@ -291,7 +298,7 @@ int vfs_stat(const char *path, struct k_stat *st)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || st == NULL || !unveil_allows(path))
+    if (path == NULL || st == NULL || !unveil_allows(path, 0))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->stat == NULL)
@@ -304,7 +311,7 @@ int vfs_readdir(const char *path, int index, struct k_dirent *de)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || de == NULL || index < 0 || !unveil_allows(path))
+    if (path == NULL || de == NULL || index < 0 || !unveil_allows(path, 0))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->readdir == NULL)
@@ -317,7 +324,7 @@ int vfs_unlink(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->unlink == NULL)
@@ -330,7 +337,7 @@ int vfs_mkdir(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->mkdir == NULL)
@@ -345,7 +352,7 @@ int vfs_rename(const char *oldpath, const char *newpath)
 
     if (oldpath == NULL || newpath == NULL)
         return -1;
-    if (!unveil_allows(oldpath) || !unveil_allows(newpath))
+    if (!unveil_allows(oldpath, 1) || !unveil_allows(newpath, 1))
         return -1;
     oldm = mount_resolve(oldpath, &oldrel);
     newm = mount_resolve(newpath, &newrel);
@@ -361,7 +368,7 @@ int vfs_chmod(const char *path, uint32_t mode)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chmod == NULL)
@@ -374,7 +381,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chown == NULL)
@@ -389,7 +396,7 @@ int vfs_exec_ok(const char *path)
 {
     struct k_stat st;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 0))
         return 0;
     if (vfs_stat(path, &st) < 0 || st.is_dir)
         return 0;
