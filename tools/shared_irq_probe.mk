@@ -4,7 +4,7 @@ $(PROBE_DIR)/shared_irq_probe.o: tools/shared_irq_probe.c
 shared_irq_probe_objs := $(KERNEL_OBJS) $(PROBE_DIR)/shared_irq_probe.o
 
 $(PROBE_DIR)/kernel.elf: $(shared_irq_probe_objs) kernel/linker.ld
-	$(LD) $(LDFLAGS) -T kernel/linker.ld -o $@ $(shared_irq_probe_objs)
+	$(LD) $(LDFLAGS) --wrap=smp_start_aps -T kernel/linker.ld -o $@ $(shared_irq_probe_objs)
 
 $(PROBE_DIR)/kernel.bin: $(PROBE_DIR)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
