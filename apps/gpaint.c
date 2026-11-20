@@ -9,6 +9,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,7 +64,7 @@ static int shape_filled = 0;
 static int last_x = -1, last_y = -1;
 static int shape_drag = 0, shape_x0 = 0, shape_y0 = 0, shape_x1 = 0, shape_y1 = 0;
 
-static char g_cwd[MAX_PATH] = "/";
+static char g_cwd[MAX_PATH];
 static char status[128];
 static char namebuf[MAX_PATH] = "/paint.kpx";
 static gui_textbox_state namebox;
@@ -836,6 +837,7 @@ int main(int argc, char **argv)
     namebox.len = (int)strlen(namebuf);
     namebox.caret = namebox.len;
 
+    snprintf(g_cwd, sizeof(g_cwd), "%s", kestrel_startup_cwd());
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             snprintf(g_cwd, sizeof(g_cwd), "%s", argv[i] + 6);

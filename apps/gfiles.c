@@ -13,6 +13,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -874,7 +875,7 @@ int main(int argc, char **argv)
     inputbox.buf = inputbuf;
     inputbox.cap = sizeof(inputbuf);
 
-    const char *cwd_opt = "/";
+    const char *cwd_opt = kestrel_startup_cwd();
     const char *dir_opt = 0;
 
     for (i = 1; i < argc; i++) {

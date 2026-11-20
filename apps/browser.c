@@ -15,6 +15,9 @@
  */
 
 #include <kestrel.h>
+#ifndef JS_HOST
+#include <kestrel_cwd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9015,6 +9018,9 @@ int main(int argc, char **argv)
     int text = 0, cols = TEXT_COLS, links = 0, verbose = 0;
     int i, rc, allow_restore = 0;
 
+#ifndef JS_HOST
+    g_cwd = kestrel_startup_cwd();
+#endif
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             g_cwd = argv[i] + 6;
