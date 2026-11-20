@@ -4,10 +4,9 @@
  * minimal shell it grew out of lives on as /bin/minsh, the fallback.
  * Core behavior: the prompt "kestrel:<cwd>$ ", whitespace tokenizing
  * with double-quote grouping (max 16 tokens), the builtins cd, pwd,
- * exit, help, history, clear, which and set, the "--cwd=<cwd>" argument
- * both honored at startup and forwarded to every child, the
- * "sh: command not found: <name>" diagnostic and the "[exit N]" report
- * for a non-zero child status.
+ * exit, help, history, clear, which and set, passing the startup cwd to
+ * children through spawn_caps(), and reporting missing commands and
+ * non-zero child status.
  *
  * Features:
  *   - line editor: insert, backspace, delete, ctrl-U/ctrl-K kill,
@@ -26,6 +25,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1146,7 +1146,7 @@ static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
                                 int out_fd_stage, int *status_out)
 {
     char path[MAX_PATH];
-    char cwdarg[MAX_PATH + 8];
+    char cwdarg[SPAWN_ARG_MAX];
     char *sargv[SPAWN_MAX_ARGS + 1];
     struct k_spawn_caps caps;
     int i, pid, argn = 0;
@@ -1172,16 +1172,19 @@ static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
     for (i = 0; i < st->ntok; i++)
         sargv[argn++] = st->tok[i];
 
-    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
-    if (strlen(cwdarg) < SPAWN_ARG_MAX) {
-        sargv[argn++] = cwdarg;
+    memset(&caps, 0, sizeof(caps));
+    if (strlen(cwd) + sizeof("--cwd=") <= SPAWN_ARG_MAX) {
+        strcpy(caps.cwd, cwd);
+        if (argn > 0 && strncmp(sargv[argn - 1], "--cwd=", 6) == 0) {
+            memcpy(cwdarg, "--cwd=", 6);
+            strcpy(cwdarg + 6, cwd);
+            sargv[argn++] = cwdarg;
+        }
     } else {
         printf("sh: cwd too long to pass on; %s will resolve against /\n",
                st->tok[0]);
     }
     sargv[argn] = 0;
-
-    memset(&caps, 0, sizeof(caps));
     caps.fds[0].child_fd = 0;
     caps.fds[0].parent_fd = in_fd;
     caps.fds[1].child_fd = 1;
@@ -1481,6 +1484,7 @@ int main(int argc, char **argv)
     int force_interactive = 0;
     int i;
 
+    apply_cwd_arg(kestrel_startup_cwd());
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             apply_cwd_arg(argv[i] + 6);

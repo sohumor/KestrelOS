@@ -25,9 +25,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3
+      - name: Check build parity
+        run: python3 tools/check_build_parity.py
       - name: Build
-        # Ubuntu's amd64v3 compiler default exceeds QEMU's baseline CPU.
-        run: make -j$(nproc) CC="gcc -march=x86-64" 2>&1 | tee build.log
+        run: make -j$(nproc) 2>&1 | tee build.log
       # The harness does not select KVM; QEMU defaults to portable TCG.
       - name: Boot smoke test
         timeout-minutes: 3

@@ -317,7 +317,7 @@ re-enables interrupts immediately because syscalls may block.
 | 0 | `SYS_EXIT` | `code` | does not return |
 | 1 | `SYS_WRITE` | `fd, buf, len` | bytes written; fd 1/2 = console |
 | 2 | `SYS_READ` | `fd, buf, len` | bytes read; fd 0 = console, blocks |
-| 3 | `SYS_OPEN` | `path, flags` | fd |
+| 3 | `SYS_OPEN` | `path, flags, exclude_fd` (third arg used only with `O_DISTINCT`) | fd / -1 / `K_OPEN_SAME_FILE` |
 | 4 | `SYS_CLOSE` | `fd` | 0 / -1 |
 | 5 | `SYS_SPAWN` | `path, argv` | pid |
 | 6 | `SYS_WAITPID` | `pid` | exit code, blocks |
