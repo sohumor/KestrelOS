@@ -105,7 +105,7 @@ static unsigned long ring_put(struct pipe *p, const uint8_t *src,
     return done;
 }
 
-long pipe_read_ex(struct file *f, void *buf, unsigned long n, int blocking)
+long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
 {
     struct pipe *p;
     unsigned long got;
@@ -137,11 +137,6 @@ long pipe_read_ex(struct file *f, void *buf, unsigned long n, int blocking)
          * because the pipe holds no lock of its own. */
         task_sleep_ticks(1);
     }
-}
-
-long pipe_read(struct file *f, void *buf, unsigned long n)
-{
-    return pipe_read_ex(f, buf, n, 1);
 }
 
 long pipe_write(struct file *f, const void *buf, unsigned long n)

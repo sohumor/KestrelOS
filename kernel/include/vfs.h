@@ -49,6 +49,8 @@ struct file *vfs_open(const char *path, int flags);
 struct file *vfs_file_dup(struct file *f);
 void vfs_close(struct file *f);
 long vfs_read(struct file *f, void *buf, unsigned long n);
+long vfs_read_ex(struct file *f, void *buf, unsigned long n, int blocking,
+                 int *read_once);
 long vfs_write(struct file *f, const void *buf, unsigned long n);
 long vfs_seek(struct file *f, long off, int whence);
 int  vfs_stat(const char *path, struct k_stat *st);

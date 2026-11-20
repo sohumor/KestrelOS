@@ -2102,6 +2102,12 @@ def t_pipe(h):
     have_pipes = True
 
 
+def t_pipe_read(h):
+    h.send("sigtest --pipe-read")
+    h.expect("sigtest: pipe read modes + interruption + EOF verified")
+    wait_prompt(h)
+
+
 def t_dev(h):
     """/dev: the devfs mount, an immediate-EOF device and an empty dump.
 
@@ -2880,6 +2886,7 @@ TESTS = [
     ("id", t_id),
     ("redirect", t_redirect),
     ("pipe", t_pipe),
+    ("pipe-read", t_pipe_read),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
