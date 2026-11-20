@@ -253,7 +253,10 @@
           <p>Live CSS Grid, Flexbox, calc(), SVG, ES6 class/async, Canvas 2D &amp; localStorage demo.</p>
         </div>
       </div>
-      <a class="back-link" href="/doc/home.html">Back to /doc/home.html</a>
+      <div class="flex-row">
+        <a class="back-link" href="/doc/flightdeck.html">Flight Deck SPA</a>
+        <a class="back-link" href="/doc/home.html">Back to Home</a>
+      </div>
     </header>
 
     <main class="grid-deck">
@@ -299,6 +302,21 @@
             <p class="sub" id="dom-summary" style="margin-top: 8px; margin-bottom: 0;">Inspecting style metrics...</p>
           </div>
         </div>
+      </section>
+
+      <section class="card wide-card">
+        <h2>Web Crypto SHA-256 &amp; ImageData Micro-Widget</h2>
+        <p class="sub">Live crypto.subtle.digest('SHA-256') and direct Uint8ClampedArray ImageData synthesis.</p>
+        <p class="sub"><a href="/doc/flightdeck.html">Open Flight Deck Diagnostics</a></p>
+        <div class="flex-row" style="margin-bottom: 10px;">
+          <canvas id="micro-imagedata" width="96" height="32" style="border: 1px solid var(--line); border-radius: 6px; background-color: #091322;"></canvas>
+          <span class="pill pill-ready" id="micro-pixel-pill">ImageData: pending...</span>
+        </div>
+        <div class="flex-row" style="margin-bottom: 10px;">
+          <input type="text" id="micro-sha-input" value="KestrelOS" aria-label="Text to SHA-256 digest">
+          <button type="button" id="btn-micro-sha">Digest SHA-256</button>
+        </div>
+        <div class="stat-box" id="micro-sha-out">SHA-256 pending...</div>
       </section>
 
       <section class="card wide-card">
@@ -547,6 +565,52 @@
     onClick("btn-clear-notes", () => {
       notes = [];
       renderNotes();
+    });
+
+    const renderMicroImageData = () => {
+      const cv = document.getElementById("micro-imagedata");
+      const pill = document.getElementById("micro-pixel-pill");
+      if (!cv || !cv.getContext) return;
+      const ctx = cv.getContext("2d");
+      const img = ctx.createImageData(96, 32);
+      const px = img.data;
+      for (let y = 0; y < 32; y++) {
+        for (let x = 0; x < 96; x++) {
+          const off = (y * 96 + x) * 4;
+          px[off] = (x * 2 + y * 3) & 255;
+          px[off + 1] = 110 + y * 4;
+          px[off + 2] = 240 - x * 2;
+          px[off + 3] = 255;
+        }
+      }
+      ctx.putImageData(img, 0, 0);
+      const check = ctx.getImageData(12, 8, 1, 1);
+      if (pill) {
+        pill.textContent = `ImageData RGBA: (${check.data[0]},${check.data[1]},${check.data[2]},${check.data[3]})`;
+      }
+    };
+
+    const runMicroSha = async (text) => {
+      const out = document.getElementById("micro-sha-out");
+      try {
+        const bytes = new TextEncoder().encode(text);
+        const buf = await crypto.subtle.digest("SHA-256", bytes);
+        const u8 = new Uint8Array(buf);
+        let hex = "";
+        for (let i = 0; i < u8.length; i++) {
+          hex += u8[i].toString(16).padStart(2, "0");
+        }
+        if (out) out.textContent = `SHA-256("${text}") = ${hex}`;
+      } catch (e) {
+        if (out) out.textContent = `SHA-256 error: ${e && e.message ? e.message : e}`;
+      }
+    };
+
+    renderMicroImageData();
+    runMicroSha("KestrelOS");
+    onClick("btn-micro-sha", () => {
+      const inp = document.getElementById("micro-sha-input");
+      runMicroSha(inp ? String(inp.value || "") : "");
     });
   </script>
 </body>

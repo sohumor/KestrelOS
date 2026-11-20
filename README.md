@@ -44,26 +44,31 @@ with a full direct map, per-process address spaces, lazy executable/heap/stack
 faults, dynamic raw swap sizing derived from the KFS superblock (`SWAP_MAX_PAGES` =
 4096), and a kernel heap.
 
-**Processes** — ACPI/xAPIC SMP startup and preemptive scheduling across up to
-16 CPUs, kernel threads, ring-3 processes with per-task FPU state and
-credentials, monotonic process sandboxing and capability masks (`SYS_SPAWN_CAPS`,
-`SYS_SANDBOX`), Kernel Pulses event telemetry (`SYS_PULSE_POLL`), Talon typed
-clipboard parcels (`SYS_PARCEL_*`), traditional signals, static and dynamically
-linked ELF64 programs, pipes, I/O redirection, process control, and a 78-call
-syscall interface (`0..77`).
+**Processes** — ACPI/xAPIC SMP startup (`proc_mark_current_idle()` for per-CPU
+idle accounting) and preemptive scheduling across up to 16 CPUs, kernel threads,
+ring-3 processes with per-task FPU state and credentials, monotonic process
+sandboxing and capability masks (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`), Kernel Pulses
+event telemetry (`SYS_PULSE_POLL`), Talon typed clipboard parcels
+(`SYS_PARCEL_*`), Avionics Flight Recorder (`/dev/flight` `@krec` + `/bin/flight`),
+Aerie kernel `@krec` introspection tables (`/dev/procs`, `/dev/caps`,
+`/dev/parcels`), traditional signals, static and dynamically linked ELF64
+programs, pipes, I/O redirection, process control, and a 78-call syscall
+interface (`0..77`).
 
 **Storage** — an ATA driver and **KFS v3** (`KFS3`), a custom filesystem with a
-checksummed 33-block full-data and metadata redo journal, atomic cross-directory
-`rename`, indirect blocks, and per-file ownership, permissions and timestamps,
-enforced by the VFS against each task's credentials. Plus `/dev` with real
-device files.
+checksummed 33-block full-data and metadata redo journal, recursive FIFO ticket
+`fs_lock` serialization across SMP CPUs, atomic cross-directory `rename`,
+indirect blocks, and per-file ownership, permissions and timestamps, enforced by
+the VFS against each task's credentials. Plus `/dev` with block/character
+devices and live `@krec` kernel table views.
 
 **Networking** — PCI enumeration, two NIC drivers (RTL8139 and Intel e1000)
 behind a common interface, DHCP configuration with static QEMU fallback, and a
-from-scratch stack: Ethernet, ARP, IPv4, ICMP, UDP, DNS, and **TCP with
-out-of-order reassembly and selective acknowledgements (SACK)**, with persistent
-HTTP/1.1 Keep-Alive connection pooling and verified TLS 1.3 HTTPS clients on
-top (128-SAN X.509 parsing).
+from-scratch stack: Ethernet, ARP, IPv4, ICMP, UDP, a **DNS TTL cache**, and
+**TCP with out-of-order reassembly and selective acknowledgements (SACK)**, with
+persistent HTTP/1.1 Keep-Alive connection pooling and verified TLS 1.3 HTTPS
+clients on top (128-SAN X.509 parsing), plus live `/dev/sockets`, `/dev/net`,
+`/dev/arp`, and `/dev/dns` `@krec` telemetry consumed by `/bin/netstat`.
 
 **Desktop** — the Avionics kernel compositor where each window's pixel buffer is
 mapped into the owning process, featuring 4 workspaces (`Alt+1..4`), window
@@ -76,32 +81,50 @@ sparklines, Talon clipboard integration, and `gui_editor`. The Avionics shell
 **Kestrel Perch** (`Super` launcher and live evaluator), **Talon Visual Shelf**
 (`Ctrl+T`), **Quick Control** (`Ctrl+Q`), and applications including Browser,
 Terminal, Notes (`notes`), Sight (`sight`), Files (`gfiles`), Paint (`gpaint`),
-System Monitor (`sysmon`), Calculator (`gcalc`), Clock (`gclock`), Settings, and
-About. `Alt-Tab` switches tasks and `Alt-F4` closes the focused window.
+System Monitor (`sysmon`, with a live **Flight Deck** tab over `/dev/flight`,
+`/dev/sockets`, `/dev/caps`, and `/dev/parcels`), Calculator (`gcalc`), Clock
+(`gclock`), Settings, and About. `Alt-Tab` switches tasks and `Alt-F4` closes
+the focused window.
 
 **Browser** — verified TLS 1.3 HTTPS, persistent cookies/cache/origin storage,
-linked/imported CSS (`--custom-props`, `var()`, `calc()`/`min()`/`max()`/`clamp()`,
-`light-dark()`, `color-scheme`, `@media` ranges/`prefers-color-scheme`/`scripting`,
-CSS Grid, full Flexbox wrap/shrink/basis/baseline, `position: sticky`, `opacity`,
-AA `border-radius`, `box-shadow`, `linear-gradient()`), baseline and progressive
-(`SOF2`) JPEG/PNG/GIF/BMP decoding, multi-subpath inline SVG (`M/L/H/V/C/S/Q/T/Z`,
+tab favicons (16-entry LRU cache), `Ctrl-U` `view-source:`, per-tab zoom
+(`90%`/`100%`/`125%`/`150%`), `/home/.browser_session` save/restore, clickable
+`<details>`/`<summary>` and `<dialog open>`, linked/imported CSS (`--custom-props`,
+`var()`, `calc()`/`min()`/`max()`/`clamp()`, `light-dark()`, `color-scheme`,
+`@media` ranges/`prefers-color-scheme`/`scripting`, CSS Grid with
+`grid-template-rows`, full Flexbox wrap/shrink/basis/baseline/`align-self`/`order`,
+`aspect-ratio`, `object-fit`, `outline`, `text-overflow: ellipsis`, `word-break`/
+`overflow-wrap`/`letter-spacing`, 2D `transform` `translate`/`scale`, `position:
+sticky`, `opacity`, AA `border-radius`, `box-shadow`, `linear-gradient()`),
+baseline and progressive (`SOF2`) JPEG, PNG, GIF, BMP, `.ico`/`.cur` (PNG +
+1/4/8/24/32-bpp DIB), standalone SVG rasterizer, QOI, and Netpbm (`P1`–`P6`)
+decoding (`libimg`), multi-subpath inline SVG (`M/L/H/V/C/S/Q/T/Z`,
 `currentColor`, `viewBox`, `preserveAspectRatio`), software `<canvas>` 2D with
-PNG `toDataURL()`, and an ES6+ runtime (`libjs`) with real block-scoped
-`let`/`const` (TDZ and per-iteration closures), `class`/`extends`/`super`,
-`async`/`await`, template/tagged literals, destructuring, spread/rest, `for..of`
-and `Symbol`, `?.`/`??`/`**`, `Promise`/fetch/`AbortController`, `Map`/`Set`/
-`WeakMap`/`WeakSet`, `DOMParser`, `<template>`, `getComputedStyle()`,
+`CanvasGradient` (`createLinearGradient`/`createRadialGradient`), `ImageData`
+(`createImageData`/`getImageData`/`putImageData`), and PNG `toDataURL()`, and
+an ES6+ runtime (`libjs`) with real block-scoped `let`/`const` (TDZ and
+per-iteration closures), `class`/`extends`/`super`, `async`/`await`,
+template/tagged literals, destructuring, spread/rest, `for..of` and `Symbol`,
+`?.`/`??`/`**`, `Promise`/fetch/`AbortController`/`AbortSignal`, `Blob`/`FormData`,
+full TypedArrays (`Int8Array` through `Float64Array`, including `Uint8ClampedArray`)
++ `DataView`, WHATWG `URL` + `URL.canParse()`, `structuredClone()` (with cycle
+preservation), ES2022/2023 helpers (`Object.hasOwn`, `.at()`, `findLast`/
+`findLastIndex`, `toReversed`/`toSorted`/`toSpliced`/`with`, `RegExp.prototype.flags`),
+`crypto.{getRandomValues,randomUUID,subtle.digest}` (SHA-1/256/384/512),
+`Map`/`Set`/`WeakMap`/`WeakSet`, `DOMParser`, `<template>`, `getComputedStyle()`,
 `ResizeObserver`/`IntersectionObserver`, `getBoundingClientRect()`,
 `scrollTo`/`scrollBy`, `navigator.clipboard`, two-way `dataset`, live `classList`,
-a small i32 WebAssembly core, and bounded static/dynamic `import()`.
+a small i32 WebAssembly core, and bounded static/dynamic `import()`. Local
+offline showcase pages live at `/doc/home.html`, `/doc/playground.html`, and
+`/doc/flightdeck.html`.
 
 **System** — multi-user logins with salted iterated SHA-256 password hashes
 (written from the specification), a non-blocking readiness-polling `init`
 supervisor with hard dependencies, restart policies and backoff, a `.kpkg`
 package manager with dependency resolution and integrity verification, an `@krec`
 typed structured record library (`-r` shell pipelines across `ls`, `ps`, `df`,
-`dmesg`, `lsdev`, `lsmod`, `netstat`, `service`, `talon`, `inspect`),
-`where`/`sortby`/`pick` filters, standalone `/bin/kjs`, and 89 userspace programs
+`dmesg`, `lsdev`, `lsmod`, `netstat`, `service`, `talon`, `inspect`, `flight`),
+`where`/`sortby`/`pick` filters, standalone `/bin/kjs`, and 90 userspace programs
 in `apps/`. Kernel randomness uses RDSEED/RDRAND and interrupt timing inputs, a
 SHA-256 mixing pool, and a ChaCha20 CSPRNG exposed through `getrandom()`,
 `/dev/random`, and `/dev/urandom`.
@@ -113,7 +136,7 @@ NASM + QEMU, **Linux/WSL2**, and **macOS** cross-toolchains):
 
 ```bash
 python3 tools/build.py all       # build OS image, host C unit suites, fsck, & E2E
-python3 tools/build.py test-host # build & run the 12 host C suites + KFS checks
+python3 tools/build.py test-host # build & run the 13 host C suites + KFS checks
 python3 tools/build.py e2e       # headless QEMU E2E suite over serial/TCP
 ```
 
@@ -160,7 +183,7 @@ libgui/    Avionics 2.0 userspace GUI toolkit + gui_editor
 libweb/    HTML5 parser, DOM, CSS engine, layout, paint, Canvas/Web APIs
 libjs/     ES6+ JavaScript engine
 libtls/    TLS 1.3 client, X.509 validator, ChaCha20/SHA-2/AES-GCM
-libimg/    PNG, BMP, GIF, baseline/progressive JPEG decoders
+libimg/    PNG, BMP, GIF, baseline/progressive JPEG, ICO/CUR, SVG, QOI, Netpbm decoders
 libz/      deflate/inflate, CRC32, Adler32
 apps/      userspace programs (each becomes /bin/<name>)
 modules/   loadable kernel modules
@@ -208,12 +231,14 @@ than live bindings, literal-string `import()` is eagerly resolved rather than
 truly on demand, and computed `import()` or top-level `await` are not supported
 (`import.meta.url` is supported, and resolves to the document URL for inline
 modules). Inline SVG supports multi-subpath paths (`M/L/H/V/C/S/Q/T/Z`),
-`currentColor`, `viewBox`, and `preserveAspectRatio`, but elliptical arc (`A/a`)
-curves are straight segments and SVG transforms, filter effects, and vector
-gradients are absent. Generators, `Proxy`, `eval()`, `Function()`, typed arrays
-beyond `Uint8Array`, tracing GC, downloadable webfonts, audio/video codecs,
-HTTP/2, and HTTP/3 are not implemented. HTTPS currently carries HTTP/1.1 over
-verified TLS 1.3.
+`currentColor`, `viewBox`, and `preserveAspectRatio`, while standalone SVG
+images (`<img>` / `data:image/svg+xml`) go through `libimg`'s fixed-point SVG
+rasterizer (`transform` and `A/a` arcs supported; inline `<svg>` vector
+gradients, filter effects, and CSS-style inline SVG transforms remain absent).
+Generators, `Proxy`, `eval()`, `Function()`, `BigInt64Array`/`BigUint64Array`,
+`SharedArrayBuffer`/`Atomics`, tracing GC, downloadable webfonts, audio/video
+codecs, HTTP/2, and HTTP/3 are not implemented. HTTPS currently carries HTTP/1.1
+over verified TLS 1.3.
 
 **This cannot run Chrome, and never will.** Chrome needs the Linux syscall ABI,
 glibc, X11 or Wayland, GPU drivers and a JIT — far more work than this entire
