@@ -6,6 +6,7 @@
 #include "netdev.h"
 #include "rtl8139.h"
 #include "e1000.h"
+#include "virtio_net.h"
 #include "net.h"
 #include "dhcp.h"
 #include "tcp.h"
@@ -496,7 +497,7 @@ void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
 void net_init(void)
 {
     pci_init();
-    if (!rtl8139_init() && !e1000_init()) {
+    if (!rtl8139_init() && !e1000_init() && !virtio_net_init()) {
         kprintf("net: no NIC found, networking disabled\n");
         return;
     }

@@ -492,6 +492,8 @@ def run_host_tests(tc):
         common += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
 
     suites = [
+        ("test_virtio_ring", [r("kernel/virtio_ring.c"), r("kernel/virtio_net_core.c"), r("tools/test_virtio_ring.c")],
+         ["-Ikernel/include"]),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
@@ -641,6 +643,7 @@ def generate_compile_commands(tc):
             add_entry(rel, "pkgobj/%s/%s.o" % (pkg, prog), ucflags)
 
     host_suites = [
+        ("tools/test_virtio_ring.c", ["-Ikernel/include"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),

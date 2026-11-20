@@ -345,6 +345,12 @@ test-net: test-tcp test-checksum
 test-random:
 	sh tools/run-random-tests.sh
 
+.PHONY: test-virtio
+test-virtio:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -Ikernel/include kernel/virtio_ring.c kernel/virtio_net_core.c tools/test_virtio_ring.c -o $(BUILD)/host-tests/test_virtio_ring
+	$(BUILD)/host-tests/test_virtio_ring
+
 test-jpeg-prog:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
