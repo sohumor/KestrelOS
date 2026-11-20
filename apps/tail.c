@@ -103,6 +103,9 @@ static void tail_fd(int fd, int tty, int nlines)
     long total = 0;
     int i, first, count;
 
+    if (nlines == 0)
+        return;
+
     lr_init(&r, fd, tty);
     while (lr_line(&r, &line, &cap)) {
         free(ring[total % nlines]);
@@ -137,7 +140,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             nlines = atoi(argv[++i]);
-            if (nlines < 1)
+            if (nlines < 0)
                 nlines = 1;
             if (nlines > MAX_LINES)
                 nlines = MAX_LINES;
