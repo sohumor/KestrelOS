@@ -11,7 +11,7 @@ GDB_FLAGS ?=
 AR      ?= ar
 
 IS_CLANG := $(findstring clang,$(shell $(CC) --version 2>/dev/null))
-TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,)
+TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,) -march=x86-64 -mtune=generic
 KREG_FLAGS   := $(if $(IS_CLANG),-mgeneral-regs-only,-mno-mmx -mno-sse -mno-sse2)
 LD_NOWARN_RWX := $(if $(shell $(LD) --help 2>&1 | grep -F -- '--no-warn-rwx-segments'),--no-warn-rwx-segments,)
 

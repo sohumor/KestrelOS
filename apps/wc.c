@@ -1,7 +1,7 @@
 /* wc.c - count lines, words and bytes.
  *
  * usage: wc [-l] [-w] [-c] [file...]
- * With no file the console (fd 0) is read until ctrl-D.
+ * With no file stdin is read; ctrl-D ends terminal input.
  */
 
 #include <kestrel.h>
@@ -49,6 +49,17 @@ static int is_space(char c)
 {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' ||
            c == '\f';
+}
+
+static int stdin_is_tty(void)
+{
+    int d = dup2_(0, 3);
+
+    if (d >= 0) {
+        close(d);
+        return 0;
+    }
+    return 1;
 }
 
 /* Count one open stream. Returns 0 on success. */
@@ -122,7 +133,7 @@ int main(int argc, char **argv)
 
     if (files == 0) {
         struct counts c = { 0, 0, 0 };
-        rc = count_fd(0, 1, &c);
+        rc = count_fd(0, stdin_is_tty(), &c);
         report(&c, want_l, want_w, want_c, 0);
         return rc;
     }
