@@ -106,6 +106,7 @@ __attribute__((noreturn)) void task_exit(int code);
 void task_wake_sleepers(void);
 void task_signal_wake(struct task *t, bool resume_stopped);
 bool task_exists(int pid);
+bool task_is_child(int parent_pid, int pid);
 int task_psinfo(uint64_t index, struct k_psinfo *out);
 int task_child_pids(int parent_pid, int *out, int max);
 bool task_address_space_matches(int pid, uint64_t *pml4);
