@@ -1,6 +1,7 @@
 /* sysmon.c - Avionics Telemetry & Kernel Pulse Monitor. */
 
 #include <kestrel.h>
+#include <kestrel_flight.h>
 #include <krec.h>
 #include <stdio.h>
 #include <string.h>
@@ -180,15 +181,8 @@ static void refresh_flight_events(void)
     if (fd < 0)
         return;
 
-    int c_tick = krec_find_col(&fd_ks, "tick");
-    int c_cpu = krec_find_col(&fd_ks, "cpu");
-    int c_pid = krec_find_col(&fd_ks, "pid");
-    int c_cat = krec_find_col(&fd_ks, "cat");
-    int c_event = krec_find_col(&fd_ks, "event");
-    int c_arg0 = krec_find_col(&fd_ks, "arg0");
-    int c_detail = krec_find_col(&fd_ks, "detail");
-    if (c_tick < 0 || c_cpu < 0 || c_pid < 0 || c_cat < 0 ||
-        c_event < 0 || c_arg0 < 0 || c_detail < 0) {
+    struct flight_record_columns cols;
+    if (flight_record_bind(&fd_ks, &cols) < 0) {
         close(fd);
         return;
     }
@@ -197,20 +191,17 @@ static void refresh_flight_events(void)
     while (count < FD_MAX_EVENTS &&
            krec_next(&fd_kr, fd_kline, sizeof(fd_kline), fd_kfields,
                      KREC_MAX_COLS) == 1) {
-        uint64_t tick = 0;
-        int64_t cpu = 0, pid = 0;
-        if (krec_parse_u64(fd_kfields[c_tick], &tick) < 0 ||
-            krec_parse_i64(fd_kfields[c_cpu], &cpu) < 0 ||
-            krec_parse_i64(fd_kfields[c_pid], &pid) < 0)
+        struct flight_record_view record;
+        if (flight_record_decode(&cols, fd_kfields, &record) < 0)
             continue;
         struct fd_event_row *r = &fd_events[count++];
-        r->tick = tick;
-        r->cpu = (int)cpu;
-        r->pid = (int)pid;
-        fd_copy_str(r->cat, sizeof(r->cat), fd_kfields[c_cat]);
-        fd_copy_str(r->event, sizeof(r->event), fd_kfields[c_event]);
-        fd_copy_str(r->arg0, sizeof(r->arg0), fd_kfields[c_arg0]);
-        fd_copy_str(r->detail, sizeof(r->detail), fd_kfields[c_detail]);
+        r->tick = record.tick;
+        r->cpu = record.cpu;
+        r->pid = record.pid;
+        fd_copy_str(r->cat, sizeof(r->cat), record.cat);
+        fd_copy_str(r->event, sizeof(r->event), record.event);
+        fd_copy_str(r->arg0, sizeof(r->arg0), record.arg0);
+        fd_copy_str(r->detail, sizeof(r->detail), record.detail);
     }
     close(fd);
     nfd_events = count;
