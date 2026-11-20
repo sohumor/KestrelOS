@@ -19,8 +19,8 @@
  * The framebuffer path keeps a per-row dirty column range so an ordinary
  * putc rasterises and flushes a single 8x16 cell; a full-screen flush at
  * 1024x768 moves 3 MiB and would be far too slow per character. Scrolling
- * shifts the shadow buffer by one text row with a memmove and repaints
- * only the new bottom line.
+ * compares adjacent cell rows and repaints only the spans that change,
+ * without moving pixels or flushing unchanged screen areas.
  */
 
 #define VGA_WIDTH  80
@@ -273,39 +273,11 @@ void console_init(void)
 static void scroll(void)
 {
     if (fb_mode) {
-        /* The shadow buffer has to agree with the grid before its pixels
-         * are shifted, and the old block cursor must not be dragged
-         * along with them. When the compositor owns the framebuffer, keep
-         * updating the cell grid without touching fb_back(). */
-        if (!wm_active()) {
-            if (drawn_row >= 0) {
-                mark(drawn_row, drawn_col);
-                drawn_row = -1;
-            }
-            paint_dirty(false);
-        } else {
-            drawn_row = -1;
-        }
-
-        memmove(cell_ch[0], cell_ch[1],
-                (size_t)(con_h - 1) * CON_MAX_COLS);
-        memmove(cell_at[0], cell_at[1],
-                (size_t)(con_h - 1) * CON_MAX_COLS);
-        for (int c = 0; c < con_w; c++) {
-            cell_ch[con_h - 1][c] = ' ';
-            cell_at[con_h - 1][c] = color;
-        }
-
-        if (!wm_active()) {
-            uint32_t *b = fb_back();
-            if (b) {
-                size_t stride = fb_width();
-                memmove(b, b + stride * FONT_H,
-                        stride * (size_t)(con_h - 1) * FONT_H * sizeof(uint32_t));
-            }
-        }
-        mark_row(con_h - 1);
-        full_flush = true;
+        for (int r = 0; r < con_h - 1; r++)
+            for (int c = 0; c < con_w; c++)
+                cell_put(r, c, cell_ch[r + 1][c], cell_at[r + 1][c]);
+        for (int c = 0; c < con_w; c++)
+            cell_put(con_h - 1, c, ' ', color);
     } else {
         memmove((void *)vga, (void *)(vga + VGA_WIDTH),
                 (VGA_HEIGHT - 1) * VGA_WIDTH * 2);
