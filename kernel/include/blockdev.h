@@ -17,7 +17,8 @@
  *
  * Registration owns no memory: the caller supplies a `struct blockdev`
  * with static (or otherwise permanent) storage and the registry keeps
- * the pointer. */
+ * the pointer. A loadable driver publishes only after fallible
+ * initialization and unregisters before freeing its backing storage. */
 
 #define BLOCKDEV_NAME_MAX 16
 #define BLOCKDEV_MAX      8
@@ -38,8 +39,14 @@ struct blockdev {
 int  blockdev_register(struct blockdev *bd);
 void blockdev_unregister(struct blockdev *bd);
 
-/* Look one up by name, or NULL. */
+/* Borrow a device by name, or NULL. The caller must guarantee its lifetime. */
 struct blockdev *blockdev_find(const char *name);
+
+/* Look up a device and pin its owning module before returning it.
+ * Returns NULL if the name is absent or the owner cannot be pinned.
+ * Built-in devices have permanent storage and need no module reference. */
+struct blockdev *blockdev_acquire(const char *name);
+void blockdev_release(struct blockdev *bd);
 
 /* Enumerate: index 0, 1, 2 ... until it returns -1. Indices are stable
  * only for as long as nothing registers or unregisters. */
