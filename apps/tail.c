@@ -1,8 +1,7 @@
 /* tail.c - print the last lines of a file.
  *
  * usage: tail [-n N] [file...]   (default 10 lines, stdin if no file)
- * The last N lines are kept in a fixed ring buffer, so memory use is
- * bounded no matter how large the input is.
+ * The last N lines are kept in a ring buffer.
  */
 
 #include <kestrel.h>
@@ -12,12 +11,10 @@
 
 #define MAX_PATH  256
 #define BUFSZ     512
-#define LINESZ    512
 #define MAX_LINES 128
 #define CTRL_D    4
 
 static const char *g_cwd = "/";
-static char g_ring[MAX_LINES][LINESZ];
 
 /* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
 static int strip_cwd_arg(int argc, char **argv)
@@ -61,12 +58,23 @@ static void lr_init(struct lreader *r, int fd, int tty)
     r->tty = tty;
 }
 
-static int lr_line(struct lreader *r, char *out, int outsz)
+static int lr_line(struct lreader *r, char **out, unsigned long *cap)
 {
-    int n = 0, got = 0;
+    unsigned long n = 0;
+    int got = 0;
 
     for (;;) {
         char c;
+        if (n + 1 >= *cap) {
+            unsigned long size = *cap ? *cap * 2 : BUFSZ;
+            char *p = size > *cap ? realloc(*out, size) : 0;
+            if (!p) {
+                printf("tail: out of memory\n");
+                exit(1);
+            }
+            *out = p;
+            *cap = size;
+        }
         if (r->pos >= r->len) {
             long g = read(r->fd, r->buf, sizeof(r->buf));
             if (g <= 0)
@@ -80,36 +88,41 @@ static int lr_line(struct lreader *r, char *out, int outsz)
         got = 1;
         if (c == '\n')
             break;
-        if (n < outsz - 1)
-            out[n++] = c;
+        (*out)[n++] = c;
     }
-    out[n] = '\0';
+    (*out)[n] = '\0';
     return got;
 }
 
 static void tail_fd(int fd, int tty, int nlines)
 {
     struct lreader r;
-    char line[LINESZ];
+    char *line = 0;
+    char *ring[MAX_LINES] = {0};
+    unsigned long cap = 0;
     long total = 0;
     int i, first, count;
 
     if (nlines == 0)
         return;
 
-    /* Read into a scratch buffer: lr_line terminates "out" even on the
-     * final call that returns 0 at EOF, so writing straight into the
-     * ring would blank the oldest slot we are about to print. */
     lr_init(&r, fd, tty);
-    while (lr_line(&r, line, LINESZ)) {
-        memcpy(g_ring[total % nlines], line, strlen(line) + 1);
+    while (lr_line(&r, &line, &cap)) {
+        free(ring[total % nlines]);
+        ring[total % nlines] = line;
+        line = 0;
+        cap = 0;
         total++;
     }
+    free(line);
 
     count = (int)(total < nlines ? total : nlines);
     first = (int)(total - count);
-    for (i = 0; i < count; i++)
-        printf("%s\n", g_ring[(first + i) % nlines]);
+    for (i = 0; i < count; i++) {
+        char *p = ring[(first + i) % nlines];
+        printf("%s\n", p);
+        free(p);
+    }
 }
 
 int main(int argc, char **argv)
