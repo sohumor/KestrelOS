@@ -30,6 +30,7 @@ import base64
 import collections
 import http.client
 import http.server
+import json
 import os
 import re
 import shutil
@@ -464,6 +465,22 @@ def _marker_handler(marker):
                     "document.getElementById('e').value)\">Check values</button></p>"
                     "</body></html>"
                 ).encode("ascii")
+            elif path == "/button-types":
+                response = (
+                    "<!doctype html><html><body>"
+                    "<h1>Button type regression</h1>"
+                    "<form action='/button-submitted'>"
+                    "<input name=field value=preserved style='position:absolute;left:20px;top:80px'>"
+                    "<button type=button style='position:absolute;left:20px;top:130px;width:180px;height:40px'>Plain button</button>"
+                    "<button type=reset style='position:absolute;left:220px;top:130px;width:180px;height:40px'>Reset button</button>"
+                    "<button type=submit style='position:absolute;left:20px;top:190px;width:180px;height:40px'>Submit button</button>"
+                    "<button style='position:absolute;left:220px;top:190px;width:180px;height:40px'>Missing type</button>"
+                    "<button type='' style='position:absolute;left:420px;top:190px;width:180px;height:40px'>Empty type</button>"
+                    "<button type=invalid style='position:absolute;left:620px;top:190px;width:180px;height:40px'>Invalid type</button>"
+                    "</form></body></html>"
+                ).encode('ascii')
+            elif path == "/button-submitted":
+                response = b"<html><body><h1>FORM SUBMITTED</h1></body></html>"
             elif path == "/compat":
                 response = (
                     "<!doctype html><html><head>"
@@ -2746,6 +2763,96 @@ def t_browser_protected_inputs(h):
         monitor.close()
 
 
+def t_browser_button_types(h):
+    """Real pointer clicks must not submit non-submit form buttons."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    with tempfile.TemporaryDirectory(prefix="kestrel-buttons-") as tmp:
+        monitor = os.path.join(tmp, "qmp")
+        vm = Harness(qemu_command("e1000", 2) +
+                     ["-qmp", "unix:%s,server=on,wait=off" % monitor])
+        vm.start()
+        try:
+            t_boot(vm)
+            t_login(vm)
+            t_prompt(vm)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(monitor)
+            stream = sock.makefile("rwb", buffering=0)
+            json.loads(stream.readline())
+
+            def qmp(command, arguments=None):
+                stream.write((json.dumps({"execute": command,
+                                          "arguments": arguments or {}}) + "\n").encode())
+                while True:
+                    reply = json.loads(stream.readline())
+                    if "error" in reply:
+                        raise TimeoutError(str(reply))
+                    if "return" in reply:
+                        return reply["return"]
+
+            qmp("qmp_capabilities")
+            url = browser_fixtures.http_url.rsplit('/', 1)[0]
+            before = browser_fixtures.http.path_count("/button-types")
+            vm.send("browser %s/button-types" % url)
+            deadline = time.monotonic() + NET_TIMEOUT
+            while browser_fixtures.http.path_count("/button-types") == before:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("button fixture was not loaded")
+                time.sleep(0.1)
+            time.sleep(2)
+
+            pointer = [0, 0]
+
+            def click(x, y):
+                if pointer == [0, 0]:
+                    for _ in range(30):
+                        qmp("input-send-event", {"events": [
+                            {"type": "rel", "data": {"axis": "x", "value": -100}},
+                            {"type": "rel", "data": {"axis": "y", "value": -100}}]})
+                        time.sleep(0.04)
+                dx, dy = (x - pointer[0]) * 2 // 3, (y - pointer[1]) * 2 // 3
+                while dx or dy:
+                    sx, sy = max(-80, min(80, dx)), max(-80, min(80, dy))
+                    qmp("input-send-event", {"events": [
+                        {"type": "rel", "data": {"axis": "x", "value": sx}},
+                        {"type": "rel", "data": {"axis": "y", "value": sy}}]})
+                    dx, dy = dx - sx, dy - sy
+                    time.sleep(0.04)
+                pointer[:] = [x, y]
+                time.sleep(0.2)
+                qmp("input-send-event", {"events": [
+                    {"type": "btn", "data": {"button": "left", "down": True}}]})
+                time.sleep(0.2)
+                qmp("input-send-event", {"events": [
+                    {"type": "btn", "data": {"button": "left", "down": False}}]})
+                time.sleep(1)
+
+            submitted = browser_fixtures.http.path_count("/button-submitted")
+            click(140, 290)
+            screenshot = os.environ.get("E2E_BUTTON_SCREENSHOT")
+            if screenshot:
+                qmp("screendump", {"filename": os.path.abspath(screenshot)})
+            if browser_fixtures.http.path_count("/button-submitted") != submitted:
+                raise TimeoutError("type=button submitted the form")
+            click(340, 290)
+            if browser_fixtures.http.path_count("/button-submitted") != submitted:
+                raise TimeoutError("type=reset submitted the form")
+            click(140, 350)
+            if browser_fixtures.http.path_count("/button-submitted") != submitted + 1:
+                raise TimeoutError("type=submit did not submit the form")
+            for x, kind in ((340, "missing"), (540, "empty"), (740, "invalid")):
+                click(65, 80)
+                submitted = browser_fixtures.http.path_count("/button-submitted")
+                click(x, 350)
+                if browser_fixtures.http.path_count("/button-submitted") != submitted + 1:
+                    raise TimeoutError("%s button type did not default to submit" % kind)
+            stream.close()
+            sock.close()
+        finally:
+            vm.kill()
+
+
 def t_browser_text(h):
     """The browser pipeline, run over a styled local page in text mode.
 
@@ -3243,6 +3350,7 @@ TESTS = [
     ("permissions", t_permissions),
     ("browser-protected-inputs", t_browser_protected_inputs),
     ("browser-text", t_browser_text),
+    ("browser-button-types", t_browser_button_types),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
     ("browser-web-compat", t_browser_web_compat),
