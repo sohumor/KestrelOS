@@ -19,6 +19,29 @@ Everything here is verified against the sources in this repository:
 
 ## Prerequisites
 
+### QEMU test exit status
+
+`python3 tools/e2e.py --smoke` (also `make smoke` and
+`python3 tools/build.py smoke`) uses TCG and checks boot readiness, login
+and the shell prompt over serial, then sends `halt` and requires QEMU
+exit **33** for success. Panic at any stage fails immediately with exit **35**.
+Timeouts still bound guests that hang without reporting a result.
+
+The harness supplies `-device isa-debug-exit,iobase=0xf4,iosize=0x04`
+and `-fw_cfg name=opt/kestrel-test,string=2`. The custom BIOS boot protocol
+has no kernel command line, so the kernel reads this runtime option from
+QEMU's fw_cfg directory. Value `1` exits successfully at readiness; value
+`2` keeps running for interactive tests and reports success on `halt`.
+Both modes report panic/fatal kernel exceptions as exit **35**. Other
+exit statuses are errors. Serial assertions still validate test content;
+both smoke and the full suite request `halt` after their assertions and check exit 33.
+Normal boots without the option are unchanged. No new userspace syscall
+is needed: the existing privileged halt path reports completion.
+
+The guest writes `0x10` (success) or `0x11` (failure) to port `0xf4`;
+QEMU returns `(value << 1) | 1`. The debug-exit device alone does not
+enable test mode.
+
 The build is a Linux build. On Windows use **WSL2 with Ubuntu**; the
 repository can live on the Windows filesystem and be built from
 `/mnt/c/...`.
@@ -87,7 +110,7 @@ Useful targets (`make help` prints the same list):
 | `make debug`       | headless QEMU, paused, GDB stub on port 1234           |
 | `make gdb`         | load kernel symbols and attach to the debug VM        |
 | `make test`        | full end-to-end suite in headless QEMU                |
-| `make smoke`       | boot-only quick check                                 |
+| `make smoke`       | boot, login, shell prompt and guest exit status        |
 | `make fsck`        | validate and list `build/fs.img`                      |
 | `make screenshot`  | capture the VGA console to a PNG                      |
 | `make vm-images`   | run `tools/mkvm.sh` (VDI / VMDK / zip)                |
@@ -269,7 +292,7 @@ Bochs has no RTL8139 either, so networking is unavailable there too.
 
 ```sh
 make test           # equivalent to: python3 tools/e2e.py
-make smoke          # boot + shell prompt only
+make smoke          # boot + login + shell prompt + guest exit status
 python3 tools/e2e.py --list      # list test names
 python3 tools/e2e.py --selftest  # check the harness itself, no image needed
 ```

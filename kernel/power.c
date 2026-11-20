@@ -3,6 +3,7 @@
 #include "interrupts.h"
 #include "serial.h"
 #include "io.h"
+#include "testmode.h"
 
 /* Reboot and shutdown. There is no ACPI implementation here, so we go
  * through the small set of pokes that real chipsets and the emulators we
@@ -82,6 +83,7 @@ void power_reboot(void)
 
 void power_halt(void)
 {
+    testmode_exit(TEST_EXIT_SUCCESS);
     kprintf("power: system halted, it is now safe to turn off the machine\n");
     serial_write("power: system halted\n");
 
