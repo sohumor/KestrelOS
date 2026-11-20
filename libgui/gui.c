@@ -528,7 +528,7 @@ gui_window *gui_open(const char *title, int x, int y, int w, int h,
 
 void gui_close(gui_window *win)
 {
-    if (!win)
+    if (!win || win->row_stride)
         return;
     /* Always ask the compositor to drop it, even when win->open was
      * already cleared by KEV_CLOSE: the close box is a request, and the
@@ -560,7 +560,7 @@ int gui_move(gui_window *win, int x, int y)
 
 void gui_window_resized(gui_window *win, int w, int h)
 {
-    if (!win || w <= 0 || h <= 0)
+    if (!win || win->row_stride || w <= 0 || h <= 0)
         return;
     win->w = w;
     win->h = h;

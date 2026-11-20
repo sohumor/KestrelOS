@@ -38,6 +38,53 @@ static int changed_pixels(const uint32_t *pixels, uint32_t bg)
     return changed;
 }
 
+static void test_paint_views(void)
+{
+    uint32_t backing[8 * 6];
+    const uint32_t image[] = { 1, 2, 0, 3, 4, 0 };
+    gui_window root = {
+        .w = 8, .h = 6, .px = backing, .open = 1,
+        .clip = { 1, 1, 6, 4 },
+    };
+    gui_window pane = { 0 }, inset;
+
+    for (unsigned i = 0; i < sizeof(backing) / sizeof(*backing); i++)
+        backing[i] = GUARD;
+    assert(gui_paint_view(&pane, &root, gui_mkrc(0, 1, 3, 3)) == -1);
+    assert(pane.px == NULL);
+    assert(gui_paint_view(&pane, &root, gui_mkrc(2, 1, 4, 4)) == 0);
+    assert(!pane.open && pane.px == &backing[10]);
+    gui_clear(&pane, BG);
+
+    gui_clip(&pane, gui_mkrc(1, 0, 3, 4));
+    assert(gui_paint_view(&inset, &pane, gui_mkrc(0, 0, 2, 3)) == -1);
+    assert(gui_paint_view(&inset, &pane, gui_mkrc(1, 1, 2, 3)) == 0);
+    gui_clip(&inset, gui_mkrc(0, 0, 1, 1));
+    gui_unclip(&inset);
+    gui_bitmap(&inset, 0, 1, 2, 2, image, 3);
+    gui_scroll_up(&inset, 1, BG);
+    gui_blend_pixel(&inset, 1, 2, 0xFFFFFF, 255);
+    gui_pixel(&inset, 2, 0, 0);
+    gui_pixel(&inset, 0, -1, 0);
+    assert(gui_peek(&inset, 0, 0) == 1);
+    assert(gui_peek(&inset, 1, 1) == 4);
+    assert(gui_peek(&inset, 1, 2) == 0xFFFFFF);
+
+    for (int y = 0; y < root.h; y++) {
+        for (int x = 0; x < root.w; x++) {
+            uint32_t expected = GUARD;
+            if (x >= 2 && x < 6 && y >= 1 && y < 5)
+                expected = BG;
+            if (x >= 3 && x < 5 && y >= 2 && y < 4)
+                expected = image[(y - 2) * 3 + (x - 3)];
+            if (x == 4 && y == 4)
+                expected = 0xFFFFFF;
+            assert(backing[y * root.w + x] == expected);
+        }
+    }
+    puts("gui paint views: nested bounds and backing stride ok");
+}
+
 int main(void)
 {
     uint32_t storage[W * H + 2];
@@ -76,6 +123,7 @@ int main(void)
     assert(gui_mix(0x000000, 0xFFFFFF, 128) == 0x7F7F7F);
     assert(gui_shade(0x808080, 25) == 0x9F9F9F);
 
+    test_paint_views();
     puts("gui primitives: ok");
     return 0;
 }

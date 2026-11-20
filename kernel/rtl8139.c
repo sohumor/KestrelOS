@@ -3,6 +3,7 @@
 #include "string.h"
 #include "random.h"
 #include "pci.h"
+#include "device.h"
 #include "pmm.h"
 #include "interrupts.h"
 #include "proc.h"
@@ -17,9 +18,6 @@
  * set, so a frame crossing the 8K boundary continues linearly and never
  * needs to be reassembled). TX uses the 4 round-robin descriptors.
  */
-
-#define RTL_VENDOR 0x10EC
-#define RTL_DEVICE 0x8139
 
 #define REG_IDR0     0x00   /* MAC address, 6 bytes */
 #define REG_TSD0     0x10   /* TX status/command, 4 x u32 */
@@ -115,21 +113,28 @@ static void rtl_irq(struct regs *r)
     spin_unlock_irqrestore(&rx_lock, f);
 }
 
+static int rtl8139_send(const void *frame, int len);
+static void rtl8139_poll(void);
+
 static struct netdev rtl_netdev = {
     .name = "rtl8139",
     .send = rtl8139_send,
     .poll = rtl8139_poll,
 };
 
-bool rtl8139_init(void)
+static int rtl8139_probe(struct device *dev)
 {
+    const struct pci_devinfo *pd = dev->bus_data;
     struct pci_dev d;
+    static bool attempted;
 
-    if (!pci_find(RTL_VENDOR, RTL_DEVICE, &d))
-        return false;
+    if (attempted)
+        return -1;
+    attempted = true;
+    pci_devinfo_to_pci_dev(pd, &d);
     if (!(d.bar0 & 1)) {
         kprintf("rtl8139: BAR0 is not an I/O BAR, skipping\n");
-        return false;
+        return -1;
     }
     io_base = (uint16_t)(d.bar0 & 0xFFFC);
     pci_enable_bus_master(&d);
@@ -142,7 +147,7 @@ bool rtl8139_init(void)
         ;
     if (spin == 0) {
         kprintf("rtl8139: reset timed out\n");
-        return false;
+        return -1;
     }
 
     for (int i = 0; i < 6; i++)
@@ -154,7 +159,7 @@ bool rtl8139_init(void)
     tx_phys = pmm_alloc_contig(TX_NDESC);
     if (!rx_phys || !tx_phys) {
         kprintf("rtl8139: out of contiguous memory for DMA buffers\n");
-        return false;
+        return -1;
     }
     rx_buf = P2V(rx_phys);
     rx_pos = 0;
@@ -181,22 +186,30 @@ bool rtl8139_init(void)
     present = true;
     memcpy(rtl_netdev.mac, mac, 6);
     netdev_register(&rtl_netdev);
+    dev->drv_data = &rtl_netdev;
     kprintf("rtl8139: io 0x%x irq %d mac %02x:%02x:%02x:%02x:%02x:%02x\n",
             io_base, irq, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return true;
+    return 0;
 }
 
-bool rtl8139_present(void)
+static const struct pci_device_id rtl8139_ids[] = {
+    { 0x10EC, 0x8139 },
+    { 0, 0 },
+};
+
+bool rtl8139_init(void)
 {
-    return present;
+    static struct driver driver = {
+        .name = "rtl8139",
+        .probe = rtl8139_probe,
+        .match_table = rtl8139_ids,
+    };
+
+    driver.bus = bus_find("pci");
+    return driver.bus && driver_register(&driver) > 0;
 }
 
-const uint8_t *rtl8139_mac(void)
-{
-    return mac;
-}
-
-int rtl8139_send(const void *frame, int len)
+static int rtl8139_send(const void *frame, int len)
 {
     if (!present || len <= 0 || len > TX_MAX_LEN)
         return -1;
@@ -236,7 +249,7 @@ int rtl8139_send(const void *frame, int len)
     return 0;
 }
 
-void rtl8139_poll(void)
+static void rtl8139_poll(void)
 {
     if (!present)
         return;

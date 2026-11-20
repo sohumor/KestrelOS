@@ -68,17 +68,22 @@ static void pci_dev_name(char *dst, uint8_t bus, uint8_t slot, uint8_t fn)
     dst[11] = '\0';
 }
 
-static void add_function(uint8_t bus, uint8_t slot, uint8_t fn)
+static bool add_function(uint8_t bus, uint8_t slot, uint8_t fn)
 {
     uint32_t id = pci_read32(bus, slot, fn, 0x00);
 
     if ((uint16_t)id == 0xFFFF)
-        return;
+        return false;
+
+    uint32_t cls = pci_read32(bus, slot, fn, 0x08);
+    kprintf("pci: %02x:%02x.%x vendor %04x device %04x class %02x.%02x\n",
+            bus, slot, fn, (uint16_t)id, (uint16_t)(id >> 16),
+            cls >> 24, (cls >> 16) & 0xFF);
 
     if (pci_ndevs >= PCI_MAX_FUNCS) {
         kprintf("bus_pci: more than %d functions, ignoring the rest\n",
                 PCI_MAX_FUNCS);
-        return;
+        return true;
     }
 
     /* Claim the slot before registering: device_register() may probe, and
@@ -87,7 +92,6 @@ static void add_function(uint8_t bus, uint8_t slot, uint8_t fn)
     int idx = pci_ndevs++;
     struct pci_devinfo *pd = &pci_info[idx];
     struct device *dev = &pci_devs[idx];
-    uint32_t cls = pci_read32(bus, slot, fn, 0x08);
 
     pd->bus        = bus;
     pd->slot       = slot;
@@ -108,21 +112,15 @@ static void add_function(uint8_t bus, uint8_t slot, uint8_t fn)
 
     if (device_register(dev) < 0)
         pci_ndevs = idx;        /* give the slot back */
+    return true;
 }
 
 static int pci_bus_enumerate(void)
 {
-    /* kernel/pci.c still owns the scan that prints one line per function
-     * and backs pci_find(); it is idempotent, so calling it here keeps the
-     * familiar boot log without scanning the bus twice for anyone else. */
-    pci_init();
-
     for (int bus = 0; bus < 256; bus++) {
         for (int slot = 0; slot < 32; slot++) {
-            if ((pci_read32((uint8_t)bus, (uint8_t)slot, 0, 0) & 0xFFFF)
-                == 0xFFFF)
+            if (!add_function((uint8_t)bus, (uint8_t)slot, 0))
                 continue;
-            add_function((uint8_t)bus, (uint8_t)slot, 0);
             /* Header type bit 7 => multifunction device. */
             if (pci_read8((uint8_t)bus, (uint8_t)slot, 0, 0x0E) & 0x80)
                 for (int fn = 1; fn < 8; fn++)
@@ -130,6 +128,7 @@ static int pci_bus_enumerate(void)
         }
     }
 
+    kprintf("pci: %d device function(s) found\n", pci_ndevs);
     kprintf("bus_pci: %d device(s) on the pci bus\n", pci_ndevs);
     return pci_ndevs;
 }
@@ -155,6 +154,32 @@ void pci_devinfo_to_pci_dev(const struct pci_devinfo *pd, struct pci_dev *out)
     out->device   = pd->device;
     out->bar0     = pd->bar0;
     out->irq_line = pd->irq_line;
+}
+
+bool pci_find(uint16_t vendor, uint16_t device, struct pci_dev *out)
+{
+    for (int i = 0; i < pci_ndevs; i++) {
+        const struct pci_devinfo *pd = &pci_info[i];
+        if (pd->vendor == vendor && pd->device == device) {
+            pci_devinfo_to_pci_dev(pd, out);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool pci_find_class(uint8_t cls, uint8_t subclass, uint8_t progif,
+                    struct pci_dev *out)
+{
+    for (int i = 0; i < pci_ndevs; i++) {
+        const struct pci_devinfo *pd = &pci_info[i];
+        if (pd->class_code == cls && pd->subclass == subclass &&
+            pd->prog_if == progif) {
+            pci_devinfo_to_pci_dev(pd, out);
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ---- init ------------------------------------------------------------ */

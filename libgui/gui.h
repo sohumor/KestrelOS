@@ -115,11 +115,12 @@ typedef struct gui_rc {
 typedef struct gui_window {
     uint32_t wid;        /* compositor window id                    */
     int w, h;            /* client size actually granted            */
-    uint32_t *px;        /* w*h pixels, tightly packed, row-major   */
+    uint32_t *px;        /* first pixel, row-major                  */
     int open;            /* 0 once closed or the compositor is gone */
     gui_rc clip;         /* current clip rectangle, window coords   */
     gui_rc clip_stack[GUI_CLIP_STACK_MAX];
     int clip_depth;
+    int row_stride;     /* pixels per row for a paint view, else 0  */
 } gui_window;
 
 static inline gui_rc gui_mkrc(int x, int y, int w, int h)
@@ -143,6 +144,13 @@ int gui_screen(int *w, int *h);
 gui_window *gui_open(const char *title, int x, int y, int w, int h,
                      unsigned flags);
 void gui_close(gui_window *win);
+
+/* Borrow a rectangle wholly inside parent's current clip and bounds.
+ * On success, out is a caller-owned draw target with origin (0, 0), not
+ * a compositor window. On failure, out is unchanged. Recreate views
+ * after resizing the backing window; discard them before closing it.
+ * Only the backing window publishes pixels or receives events. */
+int gui_paint_view(gui_window *out, const gui_window *parent, gui_rc region);
 
 /* Publish the pixel buffer. Returns 0, or -1 if the window is gone
  * (which also clears win->open, so event loops fall out). */
