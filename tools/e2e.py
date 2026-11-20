@@ -2013,6 +2013,45 @@ def t_tail(h):
     wait_prompt(h)
 
 
+def t_text_long_lines(h):
+    line = "a" * 510 + "BOUNDARY" + "b" * 1600 + "LATE-MARKER"
+    body = "\n" + line + "\nshort\n" + line
+    h.send("writefile /long-lines.txt")
+    h.expect("writefile: type text, finish with ctrl-D\n")
+    for start in range(0, len(body), 64):
+        chunk = body[start:start + 64]
+        h.send_raw(chunk)
+        h.expect(chunk)
+    h.send_raw("\x04")
+    h.expect("wrote %d bytes" % len(body))
+    wait_prompt(h)
+
+    failures = []
+    cases = [
+        ("head -n 4", body + "\n"),
+        ("head -n 2", "\n" + line + "\n"),
+        ("tail -n 2", "short\n" + line + "\n"),
+        ("grep -n LATE-MARKER", "2:" + line + "\n4:" + line + "\n"),
+        ("grep -i boundary", line + "\n" + line + "\n"),
+        ("grep absent", ""),
+    ]
+    for command, expected in cases:
+        h.send(command + " /long-lines.txt")
+        output = h.capture_until(SHELL_PROMPT, regex=True)
+        actual = output.split("\n", 1)[1]
+        actual = re.sub(r"^elf: [^\n]*\n", "", actual)
+        actual = re.sub(SHELL_PROMPT + r"$", "", actual)
+        actual = re.sub(r"\[exit 1\]\n$", "", actual)
+        if actual != expected:
+            print("FAIL long-lines: %s (expected %d bytes, got %d)" %
+                  (command, len(expected), len(actual)))
+            failures.append(command)
+    h.send("rm /long-lines.txt")
+    wait_prompt(h)
+    if failures:
+        raise TimeoutError("long-line output mismatch: " + ", ".join(failures))
+
+
 def t_tree(h):
     h.send("tree /etc")
     h.expect(r"\d+ director(y|ies), \d+ files?", regex=True,
@@ -2939,6 +2978,7 @@ TESTS = [
     ("grep", t_grep),
     ("head", t_head),
     ("tail", t_tail),
+    ("text-long-lines", t_text_long_lines),
     ("tree", t_tree),
     ("du", t_du),
     ("find", t_find),
