@@ -180,7 +180,9 @@ def build_all(tc):
     ])
     cfg = parse_config_mk(b("config.mk"))
 
-    target_flags = ["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []
+    target_flags = (["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []) + [
+        "-march=x86-64", "-mtune=generic",
+    ]
     kreg_flags = ["-mgeneral-regs-only"] if tc["is_clang"] else ["-mno-mmx", "-mno-sse", "-mno-sse2"]
     ldflags = ["-nostdlib", "-z", "max-page-size=0x1000"]
     if tc["has_nowarn_rwx"]:
@@ -548,6 +550,8 @@ def run_host_tests(tc):
         run_cmd([sys.executable, r("tools/kfsck.py"), b("fs.img")])
     print("=== Running test_kfs_journal.py ===")
     run_cmd([sys.executable, r("tools/test_kfs_journal.py")])
+    print("=== Running test_kfs_readdir.py ===")
+    run_cmd([sys.executable, r("tools/test_kfs_readdir.py"), "--cc", tc["cc"]])
 
 
 def generate_compile_commands(tc):
@@ -561,7 +565,9 @@ def generate_compile_commands(tc):
     ])
     cfg = parse_config_mk(b("config.mk"))
 
-    target_flags = ["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []
+    target_flags = (["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []) + [
+        "-march=x86-64", "-mtune=generic",
+    ]
     kreg_flags = ["-mgeneral-regs-only"] if tc["is_clang"] else ["-mno-mmx", "-mno-sse", "-mno-sse2"]
     cflags = target_flags + [
         "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",

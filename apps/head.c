@@ -10,7 +10,6 @@
 
 #define MAX_PATH 256
 #define BUFSZ    512
-#define LINESZ   512
 #define CTRL_D   4
 
 static const char *g_cwd = "/";
@@ -57,14 +56,24 @@ static void lr_init(struct lreader *r, int fd, int tty)
     r->tty = tty;
 }
 
-/* Read one line (newline stripped) into out. Returns 1, or 0 at EOF.
- * Lines longer than outsz-1 are truncated; the rest is discarded. */
-static int lr_line(struct lreader *r, char *out, int outsz)
+/* Read one line (newline stripped), growing out as needed. */
+static int lr_line(struct lreader *r, char **out, unsigned long *cap)
 {
-    int n = 0, got = 0;
+    unsigned long n = 0;
+    int got = 0;
 
     for (;;) {
         char c;
+        if (n + 1 >= *cap) {
+            unsigned long size = *cap ? *cap * 2 : BUFSZ;
+            char *p = size > *cap ? realloc(*out, size) : 0;
+            if (!p) {
+                printf("head: out of memory\n");
+                exit(1);
+            }
+            *out = p;
+            *cap = size;
+        }
         if (r->pos >= r->len) {
             long g = read(r->fd, r->buf, sizeof(r->buf));
             if (g <= 0)
@@ -78,25 +87,26 @@ static int lr_line(struct lreader *r, char *out, int outsz)
         got = 1;
         if (c == '\n')
             break;
-        if (n < outsz - 1)
-            out[n++] = c;
+        (*out)[n++] = c;
     }
-    out[n] = '\0';
+    (*out)[n] = '\0';
     return got;
 }
 
 static void head_fd(int fd, int tty, int nlines)
 {
     struct lreader r;
-    char line[LINESZ];
+    char *line = 0;
+    unsigned long cap = 0;
     int i;
 
     lr_init(&r, fd, tty);
     for (i = 0; i < nlines; i++) {
-        if (!lr_line(&r, line, sizeof(line)))
+        if (!lr_line(&r, &line, &cap))
             break;
         printf("%s\n", line);
     }
+    free(line);
 }
 
 int main(int argc, char **argv)

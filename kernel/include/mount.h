@@ -20,6 +20,7 @@
 struct blockdev;
 struct file;
 struct mount;
+struct open_guard;
 
 #define FS_TYPE_NAME_MAX  16
 #define MOUNT_PATH_MAX    64
@@ -51,7 +52,8 @@ struct fs_statfs {
  * and frees the struct file (or the larger allocation it is embedded
  * in). The VFS does the reference counting and never frees a handle. */
 struct fs_ops {
-    struct file *(*open)(struct mount *m, const char *path, int flags);
+    struct file *(*open)(struct mount *m, const char *path, int flags,
+                         struct open_guard *guard);
     void (*close)(struct file *f);
     long (*read)(struct file *f, void *buf, unsigned long n, int blocking);
     int read_once;              /* do not retry even after a full chunk */
