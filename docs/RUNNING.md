@@ -130,6 +130,11 @@ Both launchers pass any additional arguments straight through to QEMU,
 so e.g. `sh run-qemu.sh -- -monitor telnet:127.0.0.1:4444,server,nowait`
 works.
 
+On Linux, `run-qemu.sh` and `tools/e2e.py` try KVM when `/dev/kvm` is
+readable and writable and fall back to TCG if KVM is unavailable. To force
+software emulation, use `sh run-qemu.sh -- -accel tcg` or
+`python3 tools/e2e.py --accel tcg`.
+
 Notes on the flags:
 
 - `-serial stdio` attaches the serial console to your terminal. The

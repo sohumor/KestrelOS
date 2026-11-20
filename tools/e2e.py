@@ -82,9 +82,14 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus):
+def qemu_command(nic, cpus, accel="auto"):
+    if accel == "auto":
+        accel = "tcg"
+        if sys.platform == "linux" and os.access("/dev/kvm", os.R_OK | os.W_OK):
+            accel = "kvm:tcg"
     return [
         find_qemu(),
+        "-machine", "accel=" + accel,
         "-drive", "file=build/os.img,format=raw",
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
@@ -3150,6 +3155,8 @@ def main():
                     help="emulated NIC to test (default: rtl8139)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
+    ap.add_argument("--accel", choices=["auto", "kvm", "tcg"], default="auto",
+                    help="QEMU accelerator (default: try KVM, fall back to TCG)")
     args = ap.parse_args()
     if args.cpus < 1 or args.cpus > 16:
         ap.error("--cpus must be between 1 and 16")
@@ -3190,7 +3197,7 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus))
+    h = Harness(qemu_command(args.nic, args.cpus, args.accel))
     try:
         h.start()
     except FileNotFoundError:
