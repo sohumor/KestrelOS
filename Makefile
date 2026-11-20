@@ -11,7 +11,7 @@ GDB_FLAGS ?=
 AR      ?= ar
 
 IS_CLANG := $(findstring clang,$(shell $(CC) --version 2>/dev/null))
-TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,)
+TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,) -march=x86-64 -mtune=generic
 KREG_FLAGS   := $(if $(IS_CLANG),-mgeneral-regs-only,-mno-mmx -mno-sse -mno-sse2)
 LD_NOWARN_RWX := $(if $(shell $(LD) --help 2>&1 | grep -F -- '--no-warn-rwx-segments'),--no-warn-rwx-segments,)
 
@@ -100,7 +100,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
 
 .PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
         test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
-        test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
+        test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
 all: $(BUILD)/os.img
@@ -369,10 +369,13 @@ test-gui-host:
 test-kfs-journal:
 	$(PY) tools/test_kfs_journal.py
 
+test-kfs-readdir:
+	$(PY) tools/test_kfs_readdir.py --cc "$(CC)"
+
 test-kfs-boot-recovery: all
 	$(PY) tools/test_kfs_boot_recovery.py
 
-test-kfs: test-kfs-journal test-kfs-boot-recovery
+test-kfs: test-kfs-readdir test-kfs-journal test-kfs-boot-recovery
 
 smoke: all
 	$(PY) tools/e2e.py --smoke
@@ -403,8 +406,9 @@ help:
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-gui-host   run libgui raster regression tests"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
+	@echo "  make test-kfs-readdir   run KFS indexed enumeration regression and benchmark"
 	@echo "  make test-kfs-boot-recovery   boot a committed journal through recovery"
-	@echo "  make test-kfs   run both KFS recovery suites"
+	@echo "  make test-kfs   run KFS enumeration and recovery suites"
 	@echo "  make smoke      boot-only quick check"
 	@echo "  make smoke-e1000   boot-only check with the Intel NIC"
 	@echo "  make fsck       validate + list the generated KFS image"
