@@ -228,6 +228,23 @@ no path that loads a partially bound module.
 - `insmod` and `rmmod` are serialised by a single flag, never held across
   a module's own `init` or `exit`.
 
+### Versioned service tables
+
+A module can publish a static operation table with
+`MODULE_SERVICE(version, table)`. Give the table a shared C type and use a
+nonzero version; change the version whenever its layout or semantics change.
+A consumer calls `module_service_acquire(&ref, provider_name, version,
+sizeof(table_type))` with a zero-initialized `struct module_service_ref`.
+Only a live provider with the exact version and size matches. The consumer
+can cast `ref.ops` to the shared type and call it without importing the
+provider's implementation symbols.
+
+The reference pins the provider: `rmmod` refuses until the consumer calls
+`module_service_release(&ref)`. Do not copy a reference or retain the
+operation table after release. Release it in the consumer's exit hook and
+on any init failure after acquisition. Existing modules need no declaration
+change.
+
 ---
 
 ## 6. Tools
