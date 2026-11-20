@@ -58,8 +58,26 @@ _Static_assert(sizeof(struct kfs_journal_header) <= KFS_BLOCK_SIZE,
                "kfs journal header must fit one block");
 
 #define KFS_MAX_MOUNTS 4
+#define KFS_DIR_CURSORS 16
 
 static struct kfs_fs instances[KFS_MAX_MOUNTS];
+
+/* The VFS supplies an ordinal, not an open directory handle. Keep bounded
+ * resume hints; collisions and nonsequential requests simply rescan. The
+ * whole-driver lock protects these alongside the directory data. */
+static struct {
+    struct kfs_fs *fs;
+    uint32_t ino;
+    uint32_t off;
+    int index;
+} dir_cursor[KFS_DIR_CURSORS];
+
+static void dir_cursor_invalidate(struct kfs_fs *fs)
+{
+    for (unsigned i = 0; i < KFS_DIR_CURSORS; i++)
+        if (fs == NULL || dir_cursor[i].fs == fs)
+            dir_cursor[i].fs = NULL;
+}
 
 /* Whole-driver recursive FIFO ticket mutex. `fs_owner` allows recursive
  * re-entry when a public entry point reaches another one (unlink ->
@@ -192,6 +210,7 @@ static struct bcache_slot *bcache_victim(void)
  * whose cached copy can no longer be trusted). NULL drops everything. */
 static void bcache_invalidate(struct kfs_fs *fs)
 {
+    dir_cursor_invalidate(fs);
     for (int i = 0; i < BCACHE_SLOTS; i++)
         if (fs == NULL || bcache[i].fs == fs)
             bcache[i].fs = NULL;
@@ -299,6 +318,7 @@ static int journal_begin(struct kfs_fs *fs)
 {
     if (journal_tx.active)
         return -1;
+    dir_cursor_invalidate(fs);
     journal_tx.fs = fs;
     journal_tx.active = 1;
     journal_tx.failed = 0;
@@ -328,8 +348,10 @@ static void journal_abort(void)
 
 static int journal_stage(struct kfs_fs *fs, uint32_t blk, const void *buf)
 {
-    if (!journal_tx.active || journal_tx.fs != fs)
+    if (!journal_tx.active || journal_tx.fs != fs) {
+        dir_cursor_invalidate(fs);
         return bwrite(fs, blk, buf);
+    }
 
     for (uint32_t i = 0; i < journal_tx.count; i++) {
         if (journal_tx.entry[i].blk == blk) {
@@ -1179,7 +1201,15 @@ static int readdir_locked(struct kfs_fs *fs, uint32_t ino, int index,
     if (iget(fs, ino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return -1;
     int seen = 0;
-    for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
+    unsigned slot = ino % KFS_DIR_CURSORS;
+    uint32_t off = 0;
+    if (!journal_tx.active && dir_cursor[slot].fs == fs &&
+        dir_cursor[slot].ino == ino && dir_cursor[slot].index == index) {
+        seen = index;
+        off = dir_cursor[slot].off;
+    }
+    dir_cursor[slot].fs = NULL;
+    for (; off + sizeof(de) <= ip.size; off += sizeof(de)) {
         if (readi(fs, ino, off, &de, sizeof(de)) != sizeof(de))
             return -1;
         de.name[sizeof(de.name) - 1] = '\0';   /* on-disk name may be junk */
@@ -1187,6 +1217,12 @@ static int readdir_locked(struct kfs_fs *fs, uint32_t ino, int index,
             continue;
         if (seen == index) {
             memcpy(out, &de, sizeof(de));
+            if (!journal_tx.active) {
+                dir_cursor[slot].fs = fs;
+                dir_cursor[slot].ino = ino;
+                dir_cursor[slot].index = index + 1;
+                dir_cursor[slot].off = off + sizeof(de);
+            }
             return 0;
         }
         seen++;
@@ -1418,6 +1454,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
     part_lba = (uint64_t)KFS_PART_LBA * KFS_SECTOR_SIZE / bd->block_size;
 
     fs_lock();
+    bcache_invalidate(fs);
     ok = try_offset(fs, 0, 0);
     if (!ok && part_lba != 0)
         ok = try_offset(fs, part_lba, 0);
