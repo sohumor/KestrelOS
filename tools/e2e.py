@@ -2295,6 +2295,16 @@ def t_pipe_read(h):
     wait_prompt(h)
 
 
+def t_waitpid_children(h):
+    h.send("waittest")
+    h.expect("waittest: stranger live wait=-1")
+    h.expect("waittest: parent live wait=73")
+    h.expect("waittest: stranger exited wait=-1")
+    h.expect("waittest: parent exited wait=73")
+    h.expect("waittest: PASS")
+    wait_prompt(h)
+
+
 def t_pipe_lifetime(h):
     h.send("sigtest --pipe-lifetime")
     h.expect("sigtest: pipe dup + spawn + peer close verified")
@@ -3154,6 +3164,7 @@ TESTS = [
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
+    ("waitpid-children", t_waitpid_children),
     ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),

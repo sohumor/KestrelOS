@@ -46,6 +46,15 @@ bool task_exists(int pid)
     return found;
 }
 
+bool task_is_child(int parent_pid, int pid)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    struct task *t = task_find_locked(pid);
+    bool found = t && t->parent_pid == parent_pid && t->pid != parent_pid;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return found;
+}
+
 int task_child_pids(int parent_pid, int *out, int max)
 {
     if (!out || max <= 0)
