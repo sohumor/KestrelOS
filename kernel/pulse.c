@@ -12,6 +12,7 @@
 static struct k_pulse pulse_ring[PULSE_RING_SIZE];
 static uint64_t next_seq = 1;
 static spinlock_t pulse_lock = SPINLOCK_INIT;
+static struct task_event_channel pulse_channel;
 
 void pulse_emit(uint32_t topic, uint32_t kind, uint32_t arg0, uint32_t arg1,
                 const char *tag)
@@ -30,16 +31,16 @@ void pulse_emit(uint32_t topic, uint32_t kind, uint32_t arg0, uint32_t arg1,
         for (size_t i = 0; i + 1 < sizeof(p->tag) && tag[i]; i++)
             p->tag[i] = tag[i];
     }
+    task_event_notify(&pulse_channel, topic);
     spin_unlock_irqrestore(&pulse_lock, f);
     flight_record(FLIGHT_CAT_PULSE, "pulse_emit",
                   current ? (int16_t)current->pid : 0,
                   (uint64_t)kind, (uint64_t)topic, tag ? tag : "");
 }
 
-static uint32_t pulse_drain(struct k_pulse_query *q, struct k_pulse *out,
-                            uint32_t limit)
+static uint32_t pulse_drain_locked(struct k_pulse_query *q, struct k_pulse *out,
+                                   uint32_t limit)
 {
-    uint64_t f = spin_lock_irqsave(&pulse_lock);
     uint64_t latest = next_seq - 1;
     uint32_t count = 0;
 
@@ -62,7 +63,6 @@ static uint32_t pulse_drain(struct k_pulse_query *q, struct k_pulse *out,
     else
         q->seq = latest;
 
-    spin_unlock_irqrestore(&pulse_lock, f);
     return count;
 }
 
@@ -77,9 +77,12 @@ long pulse_poll(struct k_pulse_query *q, struct k_pulse *out)
     if (limit > 0 && !out)
         return -1;
 
-    uint32_t count = pulse_drain(q, out, limit);
-    if (count > 0 || limit == 0 || q->timeout_ms == 0)
+    uint64_t f = spin_lock_irqsave(&pulse_lock);
+    uint32_t count = pulse_drain_locked(q, out, limit);
+    if (count > 0 || limit == 0 || q->timeout_ms == 0) {
+        spin_unlock_irqrestore(&pulse_lock, f);
         return (long)count;
+    }
 
     uint64_t timeout_ms = q->timeout_ms;
     if (timeout_ms > (1ULL << 40))
@@ -89,16 +92,15 @@ long pulse_poll(struct k_pulse_query *q, struct k_pulse *out)
         ticks = 1;
     uint64_t deadline = timer_ticks() + ticks;
 
-    for (;;) {
-        if (current && current->kill_pending)
+    while (timer_ticks() < deadline) {
+        if (task_event_wait_locked(&pulse_channel, q->topic_mask, deadline,
+                                   &pulse_lock, f) < 0)
             return -1;
-        if (timer_ticks() >= deadline)
-            return 0;
-        task_sleep_ticks(1);
-        if (current && current->kill_pending)
-            return -1;
-        count = pulse_drain(q, out, limit);
+        f = spin_lock_irqsave(&pulse_lock);
+        count = pulse_drain_locked(q, out, limit);
         if (count > 0)
-            return (long)count;
+            break;
     }
+    spin_unlock_irqrestore(&pulse_lock, f);
+    return (long)count;
 }
