@@ -82,7 +82,7 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus, disk="ata", monitor_port=None):
+def qemu_command(nic, cpus, disk="ata"):
     storage = (["-machine", "q35", "-drive",
                 "if=none,id=d0,file=build/os.img,format=raw",
                 "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
@@ -104,11 +104,7 @@ def qemu_command(nic, cpus, disk="ata", monitor_port=None):
         "-smp", str(cpus),
         "-device", "%s,netdev=n0" % QEMU_NICS[nic],
         "-netdev", "user,id=n0",
-    ] + ([] if monitor_port is None else [
-        # The human monitor injects PS/2 mouse and keyboard input for
-        # tests that drive the GUI.
-        "-monitor", "tcp:127.0.0.1:%d,server=on,wait=off" % monitor_port,
-    ])
+    ]
 
 
 DEFAULT_TIMEOUT = 20
@@ -203,6 +199,16 @@ class Harness:
                 return True
         return False
 
+    def _qemu_args(self):
+        if self.monitor_port is None:
+            return list(self.cmd)
+        # The human monitor injects PS/2 mouse and keyboard input for tests
+        # that drive the GUI. It stays out of self.cmd so tests that boot a
+        # second guest from it do not try to bind the same port.
+        return self.cmd + [
+            "-monitor",
+            "tcp:127.0.0.1:%d,server=on,wait=off" % self.monitor_port]
+
     def start(self):
         if self._use_win_tcp_serial():
             # Windows QEMU char-win-stdio drops characters after the first
@@ -211,7 +217,7 @@ class Harness:
             srv.bind(("127.0.0.1", 0))
             srv.listen(1)
             port = srv.getsockname()[1]
-            cmd = list(self.cmd)
+            cmd = self._qemu_args()
             for i in range(len(cmd) - 1):
                 if cmd[i] == "-serial" and cmd[i + 1] == "stdio":
                     cmd[i + 1] = "tcp:127.0.0.1:%d" % port
@@ -231,7 +237,7 @@ class Harness:
                 srv.close()
         else:
             self.proc = subprocess.Popen(
-                self.cmd,
+                self._qemu_args(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -3674,7 +3680,7 @@ def main():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         monitor_port = probe.getsockname()[1]
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk, monitor_port))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
     h.disk = args.disk
     h.monitor_port = monitor_port
     try:
