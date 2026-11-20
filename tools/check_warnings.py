@@ -39,7 +39,7 @@ def main():
     baseline = int((ROOT / BASELINE).read_text().strip())
     if baseline < 0:
         parser.error("warning baseline must be nonnegative")
-    if args.base_ref:
+    if args.base_ref and args.base_ref.strip("0"):
         entry = subprocess.check_output(
             ["git", "ls-tree", args.base_ref, "--", BASELINE], cwd=ROOT, text=True)
         if entry:
