@@ -334,6 +334,33 @@ Bochs has no RTL8139 either, so networking is unavailable there too.
 
 ## Running the tests
 
+On slow TCG/CI runners, set `KESTREL_E2E_TIMEOUT_SCALE` to a finite positive
+multiplier (default `1`). It scales every guest serial wait, including
+explicit per-test overrides, boot/login, network/package tests, QEMU serial
+connection setup, monitor connections and guest exit waits. For example:
+
+```sh
+KESTREL_E2E_TIMEOUT_SCALE=10 python3 tools/e2e.py --only ls-bin
+KESTREL_E2E_TIMEOUT_SCALE=10 make smoke
+KESTREL_E2E_TIMEOUT_SCALE=10 python3 tools/build.py smoke
+```
+
+Both build entry points inherit the same environment variable; no extra
+flags are needed. The 20-second default guest wait becomes 200 seconds at
+scale 10. Serial waits use that timeout as an **idle limit**, reset whenever
+raw serial bytes arrive (including partial lines and ANSI escapes). Thus
+slow commands that keep producing output can complete without configuring
+the environment variable. Each serial assertion also has a hard cap of
+**10 times its scaled idle limit**, measured from the start of that wait,
+so endless output cannot keep a broken test alive indefinitely. A silent
+guest still times out after the idle limit. Guest failure/EOF is reported
+immediately. Connection and guest-exit waits retain absolute deadlines.
+Host fixture HTTP/TLS behavior (including `/compat`) and forced process
+cleanup deadlines are deliberately unchanged. Invalid scales are rejected
+before starting QEMU. Choose a scale appropriate to the runner; no automatic
+boot calibration is used because boot speed need not predict directory or
+network test speed.
+
 ```sh
 make test           # equivalent to: python3 tools/e2e.py
 make smoke          # boot + login + shell prompt + guest exit status

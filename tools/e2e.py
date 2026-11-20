@@ -30,6 +30,7 @@ import base64
 import collections
 import http.client
 import http.server
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+from unittest import mock
 
 def find_qemu():
     env_q = os.environ.get("QEMU")
@@ -119,6 +121,21 @@ PKG_TIMEOUT = 90
 # handshake to the outside world still has to be given time to fail.
 NET_TIMEOUT = 45
 TAIL_LINES = 40
+SERIAL_HARD_TIMEOUT_FACTOR = 10
+
+
+def timeout_scale(value):
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("KESTREL_E2E_TIMEOUT_SCALE must be a finite positive number") from None
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("KESTREL_E2E_TIMEOUT_SCALE must be a finite positive number")
+    return scale
+
+
+def guest_timeout(seconds):
+    return seconds * timeout_scale(os.environ.get("KESTREL_E2E_TIMEOUT_SCALE", "1"))
 
 # QEMU user networking exposes the host-side slirp endpoint here.  Browser
 # transport tests bind ephemeral host ports and reach them through this IP.
@@ -169,6 +186,7 @@ class Harness:
         self._partial = ""
         self._esc = ""                # half of an escape sequence, held back
         self.eof = False
+        self._last_serial = 0
 
     def _use_win_tcp_serial(self):
         if sys.platform != "win32":
@@ -198,7 +216,7 @@ class Harness:
                 stderr=subprocess.STDOUT,
             )
             try:
-                srv.settimeout(15.0)
+                srv.settimeout(guest_timeout(15.0))
                 conn, _ = srv.accept()
                 conn.settimeout(None)
                 self._sock = conn
@@ -228,6 +246,9 @@ class Harness:
                 chunk = self.proc.stdout.read1(4096)
             if not chunk:
                 break
+            with self.cond:
+                self._last_serial = time.monotonic()
+                self.cond.notify_all()
             raw = self._esc + chunk.decode("utf-8", errors="replace")
             m = ANSI_TAIL_RE.search(raw)
             if m:
@@ -258,6 +279,11 @@ class Harness:
             self.eof = True
             self.cond.notify_all()
 
+    def _serial_remaining(self, started, idle_limit):
+        idle_deadline = max(started, self._last_serial) + idle_limit
+        hard_deadline = started + idle_limit * SERIAL_HARD_TIMEOUT_FACTOR
+        return min(idle_deadline, hard_deadline) - time.monotonic()
+
     def expect(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
         """Wait until pattern appears in output; consume through match.
 
@@ -266,7 +292,8 @@ class Harness:
         TimeoutError on timeout/EOF.
         """
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -274,7 +301,7 @@ class Harness:
                 if m:
                     self.buf = self.buf[m.end():]
                     return m if regex else m.group(0)
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout waiting for %r (eof=%s)" % (pattern, self.eof))
@@ -284,7 +311,8 @@ class Harness:
         """Wait for any of several patterns; returns the matching pattern."""
         rxs = [(p, re.compile(p if regex else re.escape(p)))
                for p in patterns]
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -296,7 +324,7 @@ class Harness:
                 if best:
                     self.buf = self.buf[best[1].end():]
                     return best[0]
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout waiting for any of %r (eof=%s)"
@@ -306,7 +334,8 @@ class Harness:
     def capture_until(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
         """Consume through pattern and return the complete consumed block."""
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -315,7 +344,7 @@ class Harness:
                     block = self.buf[:m.end()]
                     self.buf = self.buf[m.end():]
                     return block
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout capturing through %r (eof=%s)"
@@ -333,7 +362,7 @@ class Harness:
 
     def wait_exit(self, timeout=BOOT_TIMEOUT):
         try:
-            code = self.proc.wait(timeout=timeout)
+            code = self.proc.wait(timeout=guest_timeout(timeout))
         except subprocess.TimeoutExpired:
             raise TimeoutError("timeout waiting for QEMU debug-exit") from None
         if code == 35:
@@ -2316,7 +2345,7 @@ def t_elf_banner_quiet(h):
     with tempfile.TemporaryDirectory() as tmp, socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
-        listener.settimeout(BOOT_TIMEOUT)
+        listener.settimeout(guest_timeout(BOOT_TIMEOUT))
         port = listener.getsockname()[1]
         cmd = h.cmd + [
             "-monitor", "tcp:127.0.0.1:%d" % port]
@@ -2325,7 +2354,7 @@ def t_elf_banner_quiet(h):
         try:
             monitor, _ = listener.accept()
             with monitor:
-                monitor.settimeout(DEFAULT_TIMEOUT)
+                monitor.settimeout(guest_timeout(DEFAULT_TIMEOUT))
 
                 def monitor_prompt():
                     reply = b""
@@ -3224,6 +3253,71 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    with mock.patch.dict(os.environ, {"KESTREL_E2E_TIMEOUT_SCALE": "1"}):
+        for method in ("expect", "expect_any", "capture_until"):
+            for case in ("progress", "silent", "hard-cap"):
+                body = {
+                    "progress": ("for _ in range(5):\n"
+                                 " time.sleep(0.1); print('\\x1b[0m', end='', flush=True)\n"
+                                 "print('done', flush=True)\n"),
+                    "silent": "time.sleep(30)\n",
+                    "hard-cap": ("while True:\n"
+                                 " time.sleep(0.02); print('.', end='', flush=True)\n"),
+                }[case]
+                child = ("import sys,time\nprint('ready', flush=True)\n"
+                         "sys.stdin.readline()\n" + body)
+                h = Harness([sys.executable, "-u", "-c", child])
+                h.start()
+                try:
+                    h.expect("ready", timeout=5)
+                    h.send("go")
+                    started = time.monotonic()
+                    idle_limit = 0.05 if case == "hard-cap" else 0.2
+                    pattern = ["done"] if method == "expect_any" else "done"
+                    try:
+                        getattr(h, method)(pattern, timeout=idle_limit)
+                    except TimeoutError:
+                        if case == "progress":
+                            raise
+                    else:
+                        if case != "progress":
+                            raise AssertionError("unbounded serial wait")
+                    elapsed = time.monotonic() - started
+                    expected = idle_limit * (SERIAL_HARD_TIMEOUT_FACTOR
+                                             if case == "hard-cap" else 1)
+                    if case != "progress" and not expected * 0.9 <= elapsed < expected + 1:
+                        raise AssertionError("%s %s expired at %.3fs" %
+                                             (method, case, elapsed))
+                    print("PASS selftest: %s %s %.3fs" % (method, case, elapsed))
+                finally:
+                    h.kill()
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert guest_timeout(20) == 20
+    for invalid in ("", "0", "-1", "nan", "inf", "invalid"):
+        try:
+            timeout_scale(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("accepted invalid timeout scale %r" % invalid)
+    with mock.patch.dict(os.environ, {"KESTREL_E2E_TIMEOUT_SCALE": "10"}):
+        assert guest_timeout(0) == 0
+        assert guest_timeout(20) == 200
+        for method in ("expect", "expect_any", "capture_until", "wait_exit"):
+            child = ("import sys,time; sys.stdin.readline(); time.sleep(0.15); "
+                     "print('scaled-ready', flush=True); sys.exit(33)")
+            h = Harness([sys.executable, "-u", "-c", child])
+            h.start()
+            try:
+                h.send("go")
+                if method == "wait_exit":
+                    h.wait_exit(timeout=0.05)
+                else:
+                    pattern = ["scaled-ready"] if method == "expect_any" else "scaled-ready"
+                    getattr(h, method)(pattern, timeout=0.05)
+            finally:
+                h.kill()
+    print("PASS selftest: timeout scale default, validation and all guest waits")
     for code in (33, 35, 0):
         h = Harness([sys.executable, "-c", "raise SystemExit(%d)" % code])
         h.start()
@@ -3464,6 +3558,12 @@ def main():
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
     args = ap.parse_args()
+    try:
+        scale = timeout_scale(os.environ.get("KESTREL_E2E_TIMEOUT_SCALE", "1"))
+    except ValueError as e:
+        ap.error(str(e))
+    if scale != 1:
+        print("guest timeout scale: %g" % scale)
     if args.cpus < 1 or args.cpus > 16:
         ap.error("--cpus must be between 1 and 16")
 
