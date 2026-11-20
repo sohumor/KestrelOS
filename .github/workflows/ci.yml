@@ -26,8 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3
       - name: Build
-        # Ubuntu's amd64v3 compiler default exceeds QEMU's baseline CPU.
-        run: make -j$(nproc) CC="gcc -march=x86-64" 2>&1 | tee build.log
+        run: make -j$(nproc) 2>&1 | tee build.log
       - name: Check artifact size budgets
         run: python3 tools/check_sizes.py
       # The harness does not select KVM; QEMU defaults to portable TCG.
