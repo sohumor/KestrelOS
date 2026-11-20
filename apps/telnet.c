@@ -28,9 +28,9 @@
 
 /* --- raw TCP syscalls (see abi/kestrel_abi.h) --- */
 
-static int t_connect(uint32_t ip_be, int port, int timeout_ms)
+static int t_connect(const struct net_addr *a, int port, int timeout_ms)
 {
-    return (int)syscall(SYS_TCP_CONNECT, (long)ip_be, port, timeout_ms, 0);
+    return net_tcp_connect(a, port, timeout_ms);
 }
 
 static long t_send(int h, const void *buf, unsigned long len)
@@ -88,12 +88,12 @@ int main(int argc, char **argv)
     const char *host = 0;
     int port = 0, crlf = 1;
     int i, h;
-    uint32_t ip;
+    struct net_addr addr;
     struct k_netinfo ni;
     char line[LINE_MAX];
     int llen = 0;
     char rx[RX_MAX];
-    char ipbuf[16];
+    char ipbuf[48];
     long got;
 
     for (i = 1; i < argc; i++) {
@@ -122,22 +122,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ip = ip_aton(host);
-    if (ip == 0 && dns_resolve(host, &ip) != 0) {
+    if (net_resolve(host, NET_AF_ANY, &addr) != 0) {
         printf("telnet: cannot resolve %s\n", host);
         return 1;
     }
-    if (ip == 0) {
-        printf("telnet: invalid address %s\n", host);
-        return 1;
-    }
+    net_addr_str(&addr, ipbuf, sizeof ipbuf);
 
-    printf("connecting to %s (%s) port %d ...\n", host, ip_ntoa(ip, ipbuf),
-           port);
-    h = t_connect(ip, port, CONNECT_MS);
+    printf("connecting to %s (%s) port %d ...\n", host, ipbuf, port);
+    h = t_connect(&addr, port, CONNECT_MS);
     if (h < 0) {
         printf("telnet: connection to %s:%d failed (refused, filtered or "
-               "timed out after %d ms)\n", ip_ntoa(ip, ipbuf), port,
+               "timed out after %d ms)\n", ipbuf, port,
                CONNECT_MS);
         return 1;
     }

@@ -16,7 +16,9 @@ DNS resolver.
 | `kernel/dhcp.c`, `kernel/include/dhcp.h` | One-shot DHCP client: DISCOVER/OFFER/REQUEST/ACK auto-configuration |
 | `kernel/udp.c` | UDP send/recv, 16 port bindings with 8-packet queues |
 | `kernel/tcp.c`, `kernel/include/tcp.h` | TCP state machine, retransmission, sliding window, HTTP client foundation |
-| `kernel/dns.c` | A-record resolver (compression-pointer aware) + dotted-quad parsing |
+| `kernel/dns.c` | A and AAAA resolver (compression-pointer aware) + dotted-quad / IPv6 literal parsing |
+| `kernel/net6.c` | IPv6 parse/build, ICMPv6 echo, Neighbor Discovery (NS/NA/RS/RA, neighbor cache), SLAAC + RDNSS |
+| `abi/ip6_text.h` | Header-only IPv6 text parse/format (RFC 4291 input, RFC 5952 output) shared by kernel, libc and host tests |
 
 ## Architecture
 
@@ -93,7 +95,21 @@ disabled ("net: no NIC found").
 
 Dynamic DHCP configuration on boot with fallback to QEMU / VirtualBox NAT static defaults (`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3`).
 
-All addresses in the API are big-endian (network order) `uint32_t`.
+IPv4 addresses in the API are big-endian (network order) `uint32_t`.
+
+IPv6 configures itself after IPv4: a link-local `fe80::/64` address from the
+modified EUI-64 of the MAC, then up to three Router Solicitations. The first
+autonomous `/64` prefix in a Router Advertisement gives a SLAAC global address,
+the advertising router becomes the default route and an RDNSS option gives an
+IPv6 DNS server. On QEMU user networking that is `fec0::5054:ff:fe12:3456/64`,
+router `fe80::2`, DNS `fec0::3`; the host is reachable at `fec0::2` (slirp
+connects that to the host's `::1`). IPv6 addresses cross the syscall ABI as
+16 network-order bytes (`SYS_NETINFO6`, `SYS_DNS6`, `SYS_PING6`,
+`SYS_TCP_CONNECT6`, `SYS_UDP_SEND6`). In userspace, `net_resolve()` tries an
+IPv4 literal, an IPv6 literal, DNS A, then AAAA, and `net_tcp_connect()`
+connects to either family, which is what ping, telnet, curl, the HTTP and TLS
+clients and the browser use; URLs take bracketed literals
+(`http://[fec0::2]:8080/`).
 
 ## QEMU flags
 
@@ -106,6 +122,10 @@ or, with the Intel NIC (also what VirtualBox/VMware provide by default):
 ```
 -device e1000,netdev=n0 -netdev user,id=n0
 ```
+
+Slirp enables IPv4 and IPv6 by default. Naming only one of them turns the
+other off, so `-netdev user,id=n0,ipv6=on` alone disables IPv4; use
+`ipv4=on,ipv6=on` (as `tools/e2e.py` does) or neither.
 
 To reach a UDP service in the guest from the host, add a hostfwd, e.g.
 `-netdev user,id=n0,hostfwd=udp::7777-:7777`. To let the host ping the
@@ -121,7 +141,9 @@ ping/UDP/DNS works out of the box.
 * Outbound ICMP ping (`icmp_ping`) to the gateway/DNS or beyond
 * Answering inbound ICMP echo requests and ARP requests
 * UDP send/recv with port queues
-* DNS A-record resolution
+* DNS A and AAAA resolution, over IPv4 or IPv6 DNS servers
+* IPv6: link-local + SLAAC addressing, Neighbor Discovery, ICMPv6 echo both
+  directions (`ping fec0::2`, `ping -6 <name>`), UDP and TCP over IPv6
 * Client TCP with bounded out-of-order receive reassembly and negotiated SACK
 * HTTP/1.1 plus verified TLS 1.3 HTTPS clients
 
@@ -133,6 +155,10 @@ ping/UDP/DNS works out of the box.
   receive SACK blocks, prunes acknowledged transmit blocks, and selectively
   retransmits holes; it does not implement congestion-control algorithms
   beyond the bounded window/retransmission logic in `tcp.c`.
-* ARP cache entries never expire (fine for slirp's static world).
+* ARP and neighbor cache entries never expire (fine for slirp's static world).
+* IPv6: one SLAAC address (first autonomous /64 prefix), optimistic DAD,
+  no fragments, no MLD reports (NICs accept all multicast instead), no
+  privacy addresses, no DHCPv6; RA lifetimes other than router lifetime 0
+  are ignored.
 * On an RX ring error the receiver is reset and any queued frames in the
   ring are lost (never observed under QEMU in practice).

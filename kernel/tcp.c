@@ -8,6 +8,7 @@
 #include "tcp_reassembly.h"
 #include "spinlock.h"
 #include "random.h"
+#include "ip6_text.h"
 
 /* TCP (client side).
  *
@@ -83,6 +84,10 @@ struct tcp_conn {
     int      owner_pid;
 
     uint32_t peer_ip;      /* network order */
+    bool     v6;           /* peer_ip6/local_ip6 are used instead */
+    uint8_t  peer_ip6[16];
+    uint8_t  local_ip6[16];
+    int      mss;          /* largest segment we send and announce */
     uint16_t peer_port;    /* host order */
     uint16_t local_port;   /* host order */
 
@@ -176,8 +181,8 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
         /* MSS, SACK-Permitted, then two NOPs to align the header. */
         pkt[sizeof(*th) + optlen++] = TCP_OPT_MSS;
         pkt[sizeof(*th) + optlen++] = 4;
-        pkt[sizeof(*th) + optlen++] = (uint8_t)(TCP_MSS >> 8);
-        pkt[sizeof(*th) + optlen++] = (uint8_t)(TCP_MSS & 0xFF);
+        pkt[sizeof(*th) + optlen++] = (uint8_t)(c->mss >> 8);
+        pkt[sizeof(*th) + optlen++] = (uint8_t)(c->mss & 0xFF);
         pkt[sizeof(*th) + optlen++] = TCP_OPT_SACK_PERMITTED;
         pkt[sizeof(*th) + optlen++] = 2;
         pkt[sizeof(*th) + optlen++] = TCP_OPT_NOP;
@@ -248,6 +253,11 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
     th->seq = htonl(seq);
     spin_unlock_irqrestore(&tcp_lock, f);
 
+    if (c->v6) {
+        th->csum = net_transport_checksum6(c->local_ip6, c->peer_ip6,
+                                           IP_PROTO_TCP, pkt, hlen + dlen);
+        return net6_send(c->peer_ip6, IP_PROTO_TCP, pkt, hlen + dlen);
+    }
     th->csum = net_transport_checksum(net_ip_addr(), c->peer_ip,
                                       IP_PROTO_TCP, pkt, hlen + dlen);
     return net_ip_send(c->peer_ip, IP_PROTO_TCP, pkt, hlen + dlen);
@@ -262,6 +272,7 @@ static void conn_release_locked(struct tcp_conn *c)
     c->state = TCP_CLOSED;
     c->owner_pid = 0;
     c->peer_ip = 0;
+    c->v6 = false;
     c->peer_port = 0;
     c->local_port = 0;
     c->tx_head = c->tx_len = 0;
@@ -307,13 +318,17 @@ static uint16_t port_alloc(void)
 }
 
 /* IRQ context: match an incoming segment to a connection. */
-static struct tcp_conn *conn_lookup(uint32_t src_ip, uint16_t sport,
-                                    uint16_t dport)
+static struct tcp_conn *conn_lookup(uint32_t src_ip, const uint8_t *src_ip6,
+                                    uint16_t sport, uint16_t dport)
 {
     for (int i = 0; i < TCP_CONNS; i++) {
         struct tcp_conn *c = &conns[i];
-        if (c->used && c->state != TCP_CLOSED && c->peer_ip == src_ip &&
-            c->peer_port == sport && c->local_port == dport)
+        if (!c->used || c->state == TCP_CLOSED || c->v6 != (src_ip6 != 0))
+            continue;
+        if (src_ip6 ? memcmp(c->peer_ip6, src_ip6, 16) != 0
+                    : c->peer_ip != src_ip)
+            continue;
+        if (c->peer_port == sport && c->local_port == dport)
             return c;
     }
     return 0;
@@ -535,21 +550,40 @@ static void accept_peer_fin(struct tcp_conn *c)
      * our own FIN is acknowledged. */
 }
 
+static void tcp_segment(uint32_t src_ip_be, const uint8_t *src_ip6,
+                        const uint8_t *seg, int len);
+
 void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
 {
     if (!seg || len < (int)sizeof(struct tcp_hdr))
         return;
+    if (net_transport_checksum(src_ip_be, net_ip_addr(), IP_PROTO_TCP,
+                               seg, len) != 0)
+        return;
+    tcp_segment(src_ip_be, 0, seg, len);
+}
 
+void tcp_input6(const uint8_t src[16], const uint8_t dst[16],
+                const uint8_t *seg, int len)
+{
+    if (!seg || len < (int)sizeof(struct tcp_hdr))
+        return;
+    if (net_transport_checksum6(src, dst, IP_PROTO_TCP, seg, len) != 0)
+        return;
+    tcp_segment(0, src, seg, len);
+}
+
+/* IRQ context: one checksum-verified segment from an IPv4 or IPv6 peer. */
+static void tcp_segment(uint32_t src_ip_be, const uint8_t *src_ip6,
+                        const uint8_t *seg, int len)
+{
     const struct tcp_hdr *th = (const struct tcp_hdr *)seg;
     int hlen = (th->off >> 4) * 4;
     if (hlen < (int)sizeof(*th) || hlen > len)
         return;
-    if (net_transport_checksum(src_ip_be, net_ip_addr(), IP_PROTO_TCP,
-                               seg, len) != 0)
-        return;
 
     uint64_t lock_flags = spin_lock_irqsave(&tcp_lock);
-    struct tcp_conn *c = conn_lookup(src_ip_be, ntohs(th->sport),
+    struct tcp_conn *c = conn_lookup(src_ip_be, src_ip6, ntohs(th->sport),
                                      ntohs(th->dport));
     if (!c || !c->rxbuf)
         goto out;
@@ -739,13 +773,13 @@ static void conn_pump(struct tcp_conn *c)
 
         if (!stop) {
             n = avail < allow ? avail : allow;
-            if (n > TCP_MSS)
-                n = TCP_MSS;
+            if (n > c->mss)
+                n = c->mss;
             /* A four-block SACK option consumes 36 TCP option bytes. Keep
              * the whole IP packet within the Ethernet MTU even when SACK
              * information is piggybacked on data. */
-            if (c->sack_enabled && n > TCP_MSS - 36)
-                n = TCP_MSS - 36;
+            if (c->sack_enabled && n > c->mss - 36)
+                n = c->mss - 36;
             n = bytes_before_sack(c, nxt, n);
         }
         if (n > 0) {
@@ -902,12 +936,16 @@ static void conn_gc(void)
     }
 }
 
-int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
+static int tcp_connect_any(uint32_t ip_be, const uint8_t *ip6,
+                           uint16_t port, int timeout_ms)
 {
     struct tcp_conn *c = 0;
     int handle = -1;
+    uint8_t local6[16];
 
-    if (!net_ready() || ip_be == 0 || port == 0)
+    if (!net_ready() || (ip_be == 0 && !ip6) || port == 0)
+        return -1;
+    if (ip6 && !net6_source_for(ip6, local6))
         return -1;
     if (timeout_ms <= 0)
         timeout_ms = 5000;
@@ -958,7 +996,14 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
     c->detached = false;
     c->pumping = false;
     c->owner_pid = current ? current->pid : 0;
-    c->peer_ip = ip_be;
+    c->peer_ip = ip6 ? 0 : ip_be;
+    c->v6 = ip6 != 0;
+    if (ip6) {
+        memcpy(c->peer_ip6, ip6, 16);
+        memcpy(c->local_ip6, local6, 16);
+    }
+    /* The IPv6 header is 20 bytes longer, so its MSS is 20 bytes smaller. */
+    c->mss = ip6 ? TCP_MSS - 20 : TCP_MSS;
     c->peer_port = port;
     c->local_port = lport;
     c->iss = isn;
@@ -1020,6 +1065,16 @@ int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
         seg_send(c, TCP_RST, reset_seq, 0, false);
     conn_release(c);
     return -1;
+}
+
+int tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms)
+{
+    return tcp_connect_any(ip_be, 0, port, timeout_ms);
+}
+
+int tcp_connect6(const uint8_t ip6[16], uint16_t port, int timeout_ms)
+{
+    return tcp_connect_any(0, ip6, port, timeout_ms);
 }
 
 int tcp_send(int handle, const void *buf, int len)
@@ -1199,6 +1254,8 @@ struct tcp_snap_row {
     uint16_t local_port;
     uint16_t peer_port;
     uint32_t peer_ip;
+    bool v6;
+    uint8_t peer_ip6[16];
     int rx_bytes;
     int tx_bytes;
 };
@@ -1245,6 +1302,8 @@ uint32_t tcp_snapshot_krec(char *buf, uint32_t cap)
         snap[n].local_port = c->local_port;
         snap[n].peer_port = c->peer_port;
         snap[n].peer_ip = c->peer_ip;
+        snap[n].v6 = c->v6;
+        memcpy(snap[n].peer_ip6, c->peer_ip6, 16);
         snap[n].rx_bytes = c->rx_len;
         snap[n].tx_bytes = c->tx_len;
         n++;
@@ -1261,7 +1320,12 @@ uint32_t tcp_snapshot_krec(char *buf, uint32_t cap)
         krec_kbuf_putc(&b, '\t');
         krec_kbuf_put_u64(&b, snap[i].local_port);
         krec_kbuf_putc(&b, '\t');
-        krec_kbuf_put_ip4(&b, snap[i].peer_ip);
+        if (snap[i].v6) {
+            char t[IP6_TEXT_MAX];
+            krec_kbuf_puts(&b, ip6_text_format(snap[i].peer_ip6, t));
+        } else {
+            krec_kbuf_put_ip4(&b, snap[i].peer_ip);
+        }
         krec_kbuf_putc(&b, '\t');
         krec_kbuf_put_u64(&b, snap[i].peer_port);
         krec_kbuf_putc(&b, '\t');

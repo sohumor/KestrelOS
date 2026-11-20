@@ -24,6 +24,23 @@ uint16_t net_checksum(const void *data, int len)
     return finish_sum(add_bytes(0, (const uint8_t *)data, len));
 }
 
+uint16_t net_transport_checksum6(const uint8_t src[16], const uint8_t dst[16],
+                                 uint8_t next_header,
+                                 const void *segment, int len)
+{
+    uint32_t sum = 0;
+
+    /* IPv6 pseudo-header (RFC 8200 section 8.1): source, destination,
+     * 32-bit upper-layer length, three zero bytes and the next header. */
+    sum = add_bytes(sum, src, 16);
+    sum = add_bytes(sum, dst, 16);
+    sum += (uint32_t)len >> 16;
+    sum += (uint16_t)len;
+    sum += next_header;
+    sum = add_bytes(sum, (const uint8_t *)segment, len);
+    return finish_sum(sum);
+}
+
 uint16_t net_transport_checksum(uint32_t src_be, uint32_t dst_be,
                                 uint8_t protocol,
                                 const void *segment, int len)

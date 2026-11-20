@@ -21,6 +21,7 @@
 
 #define ETHERTYPE_IP  0x0800
 #define ETHERTYPE_ARP 0x0806
+#define ETHERTYPE_IPV6 0x86DD
 
 #define IP_PROTO_ICMP 1
 #define IP_PROTO_TCP  6
@@ -141,6 +142,12 @@ static int eth_send(const uint8_t *dst_mac, uint16_t ethertype,
     eh->type = htons(ethertype);
     memcpy(frame + sizeof(*eh), payload, len);
     return nd->send(frame, (int)sizeof(*eh) + len);
+}
+
+int net_eth_send(const uint8_t *dst_mac, uint16_t ethertype,
+                 const void *payload, int len)
+{
+    return eth_send(dst_mac, ethertype, payload, len);
 }
 
 /* ---- ARP ---- */
@@ -481,6 +488,8 @@ void net_rx(const uint8_t *frame, int len)
         arp_input(payload, plen);
     else if (type == ETHERTYPE_IP)
         ipv4_input(eh, payload, plen);
+    else if (type == ETHERTYPE_IPV6)
+        ipv6_input(eh->src, payload, plen);
 }
 
 void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
@@ -527,6 +536,7 @@ void net_init(void)
                 m[0], m[1], m[2], m[3], m[4], m[5]);
         kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static fallback)\n");
     }
+    net6_init();
 }
 
 void net_get_info(struct k_netinfo *out)
