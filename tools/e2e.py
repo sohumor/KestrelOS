@@ -30,6 +30,7 @@ import base64
 import collections
 import http.client
 import http.server
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ import sys
 import tempfile
 import threading
 import time
+from unittest import mock
 
 def find_qemu():
     env_q = os.environ.get("QEMU")
@@ -120,6 +122,20 @@ PKG_TIMEOUT = 90
 NET_TIMEOUT = 45
 TAIL_LINES = 40
 
+
+def timeout_scale(value):
+    try:
+        scale = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("KESTREL_E2E_TIMEOUT_SCALE must be a finite positive number") from None
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError("KESTREL_E2E_TIMEOUT_SCALE must be a finite positive number")
+    return scale
+
+
+def guest_timeout(seconds):
+    return seconds * timeout_scale(os.environ.get("KESTREL_E2E_TIMEOUT_SCALE", "1"))
+
 # QEMU user networking exposes the host-side slirp endpoint here.  Browser
 # transport tests bind ephemeral host ports and reach them through this IP.
 QEMU_HOST = "10.0.2.2"
@@ -198,7 +214,7 @@ class Harness:
                 stderr=subprocess.STDOUT,
             )
             try:
-                srv.settimeout(15.0)
+                srv.settimeout(guest_timeout(15.0))
                 conn, _ = srv.accept()
                 conn.settimeout(None)
                 self._sock = conn
@@ -266,7 +282,7 @@ class Harness:
         TimeoutError on timeout/EOF.
         """
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -284,7 +300,7 @@ class Harness:
         """Wait for any of several patterns; returns the matching pattern."""
         rxs = [(p, re.compile(p if regex else re.escape(p)))
                for p in patterns]
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -306,7 +322,7 @@ class Harness:
     def capture_until(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
         """Consume through pattern and return the complete consumed block."""
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -333,7 +349,7 @@ class Harness:
 
     def wait_exit(self, timeout=BOOT_TIMEOUT):
         try:
-            code = self.proc.wait(timeout=timeout)
+            code = self.proc.wait(timeout=guest_timeout(timeout))
         except subprocess.TimeoutExpired:
             raise TimeoutError("timeout waiting for QEMU debug-exit") from None
         if code == 35:
@@ -2251,7 +2267,7 @@ def t_elf_banner_quiet(h):
     with tempfile.TemporaryDirectory() as tmp, socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
-        listener.settimeout(BOOT_TIMEOUT)
+        listener.settimeout(guest_timeout(BOOT_TIMEOUT))
         port = listener.getsockname()[1]
         cmd = h.cmd + [
             "-monitor", "tcp:127.0.0.1:%d" % port]
@@ -2260,7 +2276,7 @@ def t_elf_banner_quiet(h):
         try:
             monitor, _ = listener.accept()
             with monitor:
-                monitor.settimeout(DEFAULT_TIMEOUT)
+                monitor.settimeout(guest_timeout(DEFAULT_TIMEOUT))
 
                 def monitor_prompt():
                     reply = b""
@@ -3155,6 +3171,33 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    with mock.patch.dict(os.environ, {}, clear=True):
+        assert guest_timeout(20) == 20
+    for invalid in ("", "0", "-1", "nan", "inf", "invalid"):
+        try:
+            timeout_scale(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("accepted invalid timeout scale %r" % invalid)
+    with mock.patch.dict(os.environ, {"KESTREL_E2E_TIMEOUT_SCALE": "10"}):
+        assert guest_timeout(0) == 0
+        assert guest_timeout(20) == 200
+        for method in ("expect", "expect_any", "capture_until", "wait_exit"):
+            child = ("import sys,time; sys.stdin.readline(); time.sleep(0.15); "
+                     "print('scaled-ready', flush=True); sys.exit(33)")
+            h = Harness([sys.executable, "-u", "-c", child])
+            h.start()
+            try:
+                h.send("go")
+                if method == "wait_exit":
+                    h.wait_exit(timeout=0.05)
+                else:
+                    pattern = ["scaled-ready"] if method == "expect_any" else "scaled-ready"
+                    getattr(h, method)(pattern, timeout=0.05)
+            finally:
+                h.kill()
+    print("PASS selftest: timeout scale default, validation and all guest waits")
     for code in (33, 35, 0):
         h = Harness([sys.executable, "-c", "raise SystemExit(%d)" % code])
         h.start()
@@ -3395,6 +3438,12 @@ def main():
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
     args = ap.parse_args()
+    try:
+        scale = timeout_scale(os.environ.get("KESTREL_E2E_TIMEOUT_SCALE", "1"))
+    except ValueError as e:
+        ap.error(str(e))
+    if scale != 1:
+        print("guest timeout scale: %g" % scale)
     if args.cpus < 1 or args.cpus > 16:
         ap.error("--cpus must be between 1 and 16")
 
