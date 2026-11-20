@@ -99,6 +99,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
+        test-hangar test-hangar-host \
         test-random test-mission test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
@@ -352,6 +353,12 @@ test-mission:
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iabi -idirafter libc/include libc/mission.c tools/test_mission_manifest.c -o $(BUILD)/host-tests/test_mission_manifest
 	$(BUILD)/host-tests/test_mission_manifest
 
+test-hangar-host:
+	sh tools/run-hangar-tests.sh
+
+test-hangar: all test-hangar-host
+	$(PY) tools/test_hangar_reboot.py
+
 test-jpeg-prog:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
@@ -412,6 +419,8 @@ help:
 	@echo "  make test-net   run host TCP + network checksum tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-mission  run mission grant and enforcement core tests"
+	@echo "  make test-hangar-host  run Hangar image codec/validator host tests"
+	@echo "  make test-hangar   park apps, power-cycle QEMU, resume them (E2E)"
 	@echo "  make test-gui-host   run libgui raster regression tests"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
 	@echo "  make test-kfs-readdir   run KFS indexed enumeration regression and benchmark"

@@ -32,6 +32,7 @@
 #include "smp.h"
 #include "flight.h"
 #include "mission.h"
+#include "hangar.h"
 
 /* Hooks exported by idt.c. */
 extern void (*syscall_entry_hook)(struct regs *r);
@@ -1322,6 +1323,9 @@ static void syscall_dispatch(struct regs *r)
     case SYS_WIN_RESIZE:
         ret = cap_has(KCAP_WM) ? wm_sys_resize(a1, a2, a3) : -1;
         break;
+    case SYS_HANGAR:
+        ret = cap_has(KCAP_WM) ? sys_hangar(a1, a2, a3, a4) : -1;
+        break;
 
     default:
         kprintf("syscall: unknown %lu from %s (pid %d)\n",
@@ -1337,6 +1341,8 @@ static void syscall_dispatch(struct regs *r)
      * syscall, so this return checkpoint is what makes the pending kill
      * take effect before any more ring-3 code can run. */
     task_check_kill();
+    if (current->park_state == 1)
+        hangar_checkpoint(r);    /* returns only if parking failed */
     signal_deliver_pending(current, r);
 }
 

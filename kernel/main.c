@@ -33,6 +33,7 @@
 #include "vm.h"
 #include "smp.h"
 #include "flight.h"
+#include "hangar.h"
 #include "testmode.h"
 
 struct bootinfo *boot_info;
@@ -153,6 +154,7 @@ void kmain(uint64_t bootinfo_phys)
     net_init();
     tcp_init();
     wm_init();
+    hangar_init();
     syscall_init();
     initcall_run_level(INITCALL_LATE);
     smp_start_aps();

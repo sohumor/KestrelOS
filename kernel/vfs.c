@@ -139,12 +139,13 @@ uint32_t vfs_now(void)
 
 uint32_t vfs_uid(void)
 {
-    return current ? current->uid : 0;   /* pre-scheduler boot code is root */
+    /* Pre-scheduler boot code and kernel-owned Hangar I/O act as root. */
+    return current && !current->hangar_io ? current->uid : 0;
 }
 
 uint32_t vfs_gid(void)
 {
-    return current ? current->gid : 0;
+    return current && !current->hangar_io ? current->gid : 0;
 }
 
 int vfs_perm_ok(uint32_t mode, uint32_t uid, uint32_t gid, int want)
@@ -224,7 +225,7 @@ static int unveil_allows(const char *path, int write)
 
     if (!mission_path(path, write))
         return 0;
-    if (!current || current->unveil_prefix[0] == '\0')
+    if (!current || current->hangar_io || current->unveil_prefix[0] == '\0')
         return 1;
     if (unveil_canon_path(current->unveil_prefix, prefix, sizeof(prefix)) < 0)
         return 0;
@@ -298,6 +299,10 @@ struct file *vfs_open_guarded(const char *path, int flags,
         return NULL;
     f->ops = m->type->ops;
     f->mnt = m;
+    if (strlen(path) < sizeof(f->path))
+        strcpy(f->path, path);
+    else
+        f->path[0] = '\0';
     return f;
 }
 

@@ -614,6 +614,55 @@ void task_check_kill(void)
     }
 }
 
+int task_park_request(int pid, uint32_t caller_uid)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    struct task *t = task_find_locked(pid);
+    int rc = 0;
+
+    if (!t || !t->user || t->state == TASK_ZOMBIE || t->kill_pending ||
+        (caller_uid != 0 && caller_uid != t->uid))
+        rc = -1;
+    else if (t->mission_id != 0)
+        rc = -3;   /* parking would drop the mission confinement on resume */
+    else if (t->park_state != 0)
+        rc = -2;
+    else {
+        t->park_state = 1;
+        if (t->state == TASK_SLEEPING)
+            t->state = TASK_RUNNABLE;   /* reach the checkpoint promptly */
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return rc;
+}
+
+int task_park_cancel(int pid)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    struct task *t = task_find_locked(pid);
+    int rc = 0;
+
+    if (t && t->park_state == 1) {
+        t->park_state = 0;
+        rc = 1;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return rc;
+}
+
+int task_park_begin(void)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    int rc = 0;
+
+    if (current && current->park_state == 1) {
+        current->park_state = 2;
+        rc = 1;
+    }
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return rc;
+}
+
 static void preempt(struct regs *r)
 {
     if (!sched_active)

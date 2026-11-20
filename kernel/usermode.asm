@@ -46,3 +46,38 @@ enter_usermode:
     xor r15d, r15d
 
     iretq
+
+; void hangar_enter_user(const struct hangar_regs *r)   -- noreturn
+;   Resume a parked process: rdi points at gpr[15] (rax..r15 in struct
+;   regs order), rip, rflags, rsp. Selectors are always the user ones.
+global hangar_enter_user
+hangar_enter_user:
+    cli
+    mov ax, SEL_UDATA | 3
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    swapgs
+
+    push qword SEL_UDATA | 3        ; ss
+    push qword [rdi + 17*8]         ; rsp
+    push qword [rdi + 16*8]         ; rflags
+    push qword SEL_UCODE | 3        ; cs
+    push qword [rdi + 15*8]         ; rip
+
+    mov rax, [rdi + 0*8]
+    mov rbx, [rdi + 1*8]
+    mov rcx, [rdi + 2*8]
+    mov rdx, [rdi + 3*8]
+    mov rsi, [rdi + 4*8]
+    mov rbp, [rdi + 6*8]
+    mov r8,  [rdi + 7*8]
+    mov r9,  [rdi + 8*8]
+    mov r10, [rdi + 9*8]
+    mov r11, [rdi + 10*8]
+    mov r12, [rdi + 11*8]
+    mov r13, [rdi + 12*8]
+    mov r14, [rdi + 13*8]
+    mov r15, [rdi + 14*8]
+    mov rdi, [rdi + 5*8]
+    iretq

@@ -149,3 +149,21 @@ Rules of thumb:
 - Non-zero exits make the shell print `[exit N]` before the next prompt;
   that text sits between your match and the prompt and is consumed
   harmlessly by `wait_prompt`.
+
+## Hangar (park / resume)
+
+```sh
+make test-hangar-host    # image codec + manifest validator (host, ASan/UBSan)
+make test-hangar         # E2E: park, power-cycle QEMU, resume
+```
+
+`tools/test_hangar_reboot.py` boots a private copy of `build/os.img`
+without `-snapshot`, so the disk survives a halt. Boot 1 starts
+`parktest`, which builds state in its heap, stack, an SSE register, an open
+file offset, its window pixels and its signal mask, and checks that apps
+holding a pipe or a TCP connection are refused with the reason. It then
+parks `parktest` with `hangar park PID` and halts. Boot 2 expects the kernel
+to report the waiting bay, runs `hangar resume BAY`, and `parktest` verifies
+every piece of state itself (`PARKTEST RESUMED OK`). `parktest --bg`
+minimizes its window: a focused window would take the serial console's
+keystrokes.

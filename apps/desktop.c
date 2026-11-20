@@ -28,6 +28,8 @@
 #define TALON_H        496
 #define QUICK_W        396
 #define QUICK_H        382
+#define HANGAR_W       760
+#define HANGAR_H       468
 
 #define CALC_LONG_MAX  __LONG_MAX__
 #define CALC_LONG_MIN  (-__LONG_MAX__ - 1L)
@@ -37,7 +39,8 @@ enum popup_kind {
     POP_LAUNCHER,
     POP_TALON,
     POP_QUICK,
-    POP_BRIEF
+    POP_BRIEF,
+    POP_HANGAR
 };
 
 struct app_entry {
@@ -102,7 +105,7 @@ struct perch_eval {
 
 static int children[MAX_CHILDREN];
 static int nchildren;
-static char toast[128];
+static char toast[192];
 static unsigned long toast_until;
 static int toast_needs_background;
 
@@ -157,6 +160,16 @@ static struct {
 } mission_flashes[K_MISSION_MAX];
 static void open_brief(int index);
 static void close_popup(void);
+
+static gui_rc hangar_btn_rc;
+
+/* Hangar: parked apps, refreshed on open and after every park/resume. */
+static struct k_hangar_info hangar_bays[K_HANGAR_BAYS];
+static uint32_t hangar_thumbs[K_HANGAR_BAYS][K_HANGAR_THUMB_W * K_HANGAR_THUMB_H];
+static int hangar_has_thumb[K_HANGAR_BAYS];
+static int nhangar;
+static int hangar_scroll;
+static int hangar_confirm = -1;
 
 /* ----------------------------------------------------------------- helpers */
 
@@ -475,6 +488,83 @@ static void refresh_tasks(void)
         active_ws = (int)((tasks[0].state >> K_WIN_STATE_ACTIVE_WS_SHIFT) &
                           K_WIN_STATE_WS_MASK);
     }
+}
+
+static void refresh_hangar(void)
+{
+    int n = 0;
+
+    while (n < K_HANGAR_BAYS && hangar_list(n, &hangar_bays[n]) == 0) {
+        hangar_has_thumb[n] = hangar_thumb((int)hangar_bays[n].bay,
+                                           hangar_thumbs[n]) == 0;
+        n++;
+    }
+    nhangar = n;
+}
+
+static int task_for_app(const struct app_entry *app)
+{
+    for (int i = 0; i < ntasks; i++) {
+        if (contains_case(tasks[i].title, app->name))
+            return i;
+        if (!strcmp(app->path, "/bin/gfiles") &&
+            contains_case(tasks[i].title, "File"))
+            return i;
+    }
+    return -1;
+}
+
+/* Park the process behind one window. The kernel blocks until the image
+ * is on disk, or explains in one sentence why the app cannot be parked. */
+static void park_task(const struct k_winsummary *t)
+{
+    char reason[K_HANGAR_REASON_MAX];
+    char title[64];
+    int bay;
+
+    memcpy(title, t->title, sizeof(title));
+    title[sizeof(title) - 1] = '\0';
+    reason[0] = '\0';
+    bay = hangar_park(t->pid, reason);
+    if (bay < 0)
+        notify("Hangar: %s", reason[0] ? reason : "could not park the app");
+    else
+        notify("%s parked in Hangar bay %02d", title, bay);
+    refresh_tasks();
+    refresh_hangar();
+}
+
+static void park_window(uint32_t wid)
+{
+    refresh_tasks();
+    for (int i = 0; i < ntasks; i++) {
+        if (tasks[i].wid == wid) {
+            park_task(&tasks[i]);
+            return;
+        }
+    }
+    notify("Hangar: that window is gone");
+}
+
+static int resume_bay(int idx)
+{
+    char reason[K_HANGAR_REASON_MAX];
+    struct k_hangar_info info = hangar_bays[idx];
+    int pid;
+
+    reason[0] = '\0';
+    pid = hangar_resume((int)info.bay, reason);
+    if (pid < 0) {
+        notify("Hangar: %s", reason[0] ? reason : "could not resume");
+        refresh_hangar();
+        return -1;
+    }
+    if (nchildren < MAX_CHILDREN)
+        children[nchildren++] = pid;
+    notify("%s cleared for takeoff from bay %02u",
+           info.nwins ? info.title : info.name, info.bay);
+    refresh_hangar();
+    return 0;
 }
 
 static void refresh_net(void)
@@ -1555,7 +1645,8 @@ static void paint_dock(gui_window *win, gui_ui *ui,
     int item_y = y + (bar_h - item_h) / 2;
     int x = 14;
     int status_w = 194;
-    int max_x = win->w - status_w - 22;
+    int hangar_w = 136;
+    int max_x = win->w - status_w - hangar_w - 32;
 
     gui_rect(win, 0, y, win->w, bar_h, gui_mix(GUI_PANEL, GUI_BLACK, 20));
     gui_rect(win, 0, y, win->w, 1, GUI_EDGE);
@@ -1590,8 +1681,18 @@ static void paint_dock(gui_window *win, gui_ui *ui,
             }
             if (clicked(ui, r))
                 launch_app(i);
-            if (right_clicked(ui, r))
-                open_brief(i);
+            else if (right_clicked(ui, r)) {
+                /* Right-click parks a running app (Hangar); on a dock icon
+                 * that is not running it opens the Mission briefing so the
+                 * launch-time grant review stays reachable for every app. */
+                if (running) {
+                    int ti = task_for_app(&apps[i]);
+                    if (ti >= 0)
+                        park_task(&tasks[ti]);
+                } else {
+                    open_brief(i);
+                }
+            }
         }
         x += item_h + 8;
     }
@@ -1601,6 +1702,40 @@ static void paint_dock(gui_window *win, gui_ui *ui,
                          "Super: Perch   Ctrl+T: Talon   Alt+1..4: WS",
                          FONT_SMALL, FONT_REGULAR, FONT_ROMAN,
                          GUI_TEXT_DIM, GUI_TRANSPARENT);
+    }
+
+    hangar_btn_rc = gui_mkrc(win->w - status_w - hangar_w - 22, item_y,
+                             hangar_w, item_h);
+    if (gui_button_ex(win, hangar_btn_rc, 0, ui, 1,
+                      popup_kind == POP_HANGAR)) {
+        if (popup_kind == POP_HANGAR)
+            close_popup();
+        else
+            open_popup(POP_HANGAR, win->w, win->h, settings);
+    }
+    {
+        gui_rc hr = hangar_btn_rc;
+        uint32_t fg = popup_kind == POP_HANGAR ? GUI_WHITE : GUI_ACCENT;
+        int gx = hr.x + 12, gy = hr.y + (item_h - 18) / 2;
+        char line[24];
+
+        /* Hangar glyph: a bay roof over an arrow settling to the floor. */
+        gui_line_aa(win, gx, gy + 7, gx + 9, gy + 1, fg);
+        gui_line_aa(win, gx + 9, gy + 1, gx + 18, gy + 7, fg);
+        gui_rect(win, gx, gy + 7, 2, 11, fg);
+        gui_rect(win, gx + 16, gy + 7, 2, 11, fg);
+        gui_rect(win, gx + 8, gy + 6, 2, 8, fg);
+        gui_rect(win, gx + 6, gy + 11, 6, 2, fg);
+        gui_rect(win, gx + 7, gy + 13, 4, 2, fg);
+        gui_rect(win, gx + 3, gy + 16, 12, 2, fg);
+        snprintf(line, sizeof(line), "Hangar  %d", nhangar);
+        gui_draw_text_aa(win, hr.x + 38, hr.y + (item_h - 12) / 2, line,
+                         FONT_SMALL, FONT_BOLD, FONT_ROMAN,
+                         popup_kind == POP_HANGAR ? GUI_WHITE : GUI_TEXT,
+                         GUI_TRANSPARENT);
+        if (nhangar > 0)
+            gui_fill_circle(win, hr.x + hr.w - 14, hr.y + item_h / 2, 4,
+                            0xF59E0BU);
     }
 
     quick_btn_rc = gui_mkrc(win->w - status_w - 12, item_y, status_w, item_h);
@@ -1641,8 +1776,8 @@ static void paint_toast(gui_window *win)
     if (!toast[0] || uptime_ms() >= toast_until)
         return;
     w = gui_text_w(toast) + 58;
-    if (w > 440)
-        w = 440;
+    if (w > 640)
+        w = 640;
     r = gui_mkrc(win->w - w - 18, TOP_H + 14, w, 50);
     gui_shadow(win, r, 10, gui_mix(GUI_BORDER, GUI_DESK_BOTTOM, 80));
     gui_round_rect(win, r, 10, GUI_PANEL);
@@ -1707,6 +1842,13 @@ static void open_popup(enum popup_kind kind, int sw, int sh,
         x = sw - w - 10;
         y = TOP_H + 6;
         title = "Talon Visual Shelf";
+    } else if (kind == POP_HANGAR) {
+        refresh_hangar();
+        w = sw - 28 < HANGAR_W ? sw - 28 : HANGAR_W;
+        h = sh - TOP_H - dh - 20 < HANGAR_H ? sh - TOP_H - dh - 20 : HANGAR_H;
+        x = (sw - w) / 2;
+        y = sh - dh - h - 8;
+        title = "Hangar";
     } else {
         w = sw - 28 < QUICK_W ? sw - 28 : QUICK_W;
         h = sh - TOP_H - dh - 20 < QUICK_H ? sh - TOP_H - dh - 20 : QUICK_H;
@@ -1725,6 +1867,8 @@ static void open_popup(enum popup_kind kind, int sw, int sh,
     perch_scroll = 0;
     perch_sel = 0;
     talon_scroll = 0;
+    hangar_scroll = 0;
+    hangar_confirm = -1;
     if (kind == POP_LAUNCHER) {
         search[0] = '\0';
         memset(&searchbox, 0, sizeof(searchbox));
@@ -2332,6 +2476,168 @@ static int paint_quick(gui_window *win, gui_ui *ui, gui_settings *settings)
     return -1;
 }
 
+/* ------------------------------------------------------------- Hangar */
+
+static int paint_hangar(gui_window *win, gui_ui *ui)
+{
+    int margin = 14, bar_w = 12, gap = 10;
+    int view_y = 64, view_h = win->h - view_y - 30;
+    int view_w = win->w - 2 * margin - bar_w - 4;
+    int card_w = (view_w - gap) / 2, card_h = 164, row_h = card_h + gap;
+    int rows = (nhangar + 1) / 2;
+    int total_h = rows > 0 ? rows * row_h : 80;
+    int max_scroll = total_h - view_h;
+    int sweep = (int)((uptime_ms() / 30) % (K_HANGAR_THUMB_H + 40)) - 20;
+    int resume_idx = -1, discard_idx = -1;
+    char badge[24];
+
+    gui_clear(win, GUI_PANEL);
+    gui_hgradient(win, gui_mkrc(0, 0, win->w, 40),
+                  gui_mix(GUI_PANEL, 0xF59E0BU, 30), GUI_PANEL);
+    gui_draw_text_aa(win, 14, 12, "Hangar", FONT_BODY, FONT_BOLD,
+                     FONT_ROMAN, GUI_TEXT, GUI_TRANSPARENT);
+    snprintf(badge, sizeof(badge), "%d / %d bays", nhangar, K_HANGAR_BAYS);
+    gui_badge(win, gui_mkrc(win->w - 152, 8, 104, 24), badge, 0xF59E0BU);
+    if (gui_icon_button(win, gui_mkrc(win->w - 40, 7, 30, 26),
+                        GUI_ICON_CLOSE, 0, ui, 1, 0))
+        return -2;
+    gui_draw_text_aa(win, 14, 44,
+                     "Parked apps are sealed to disk with their memory, "
+                     "registers, files and windows - even across reboots.",
+                     FONT_SMALL, FONT_REGULAR, FONT_ROMAN, GUI_TEXT_DIM,
+                     GUI_TRANSPARENT);
+
+    if (max_scroll < 0)
+        max_scroll = 0;
+    if (ui->wheel && gui_hit(gui_mkrc(margin, view_y, view_w + bar_w + 4,
+                                      view_h), ui->mx, ui->my)) {
+        hangar_scroll -= ui->wheel * 48;
+        ui->wheel = 0;
+    }
+    if (hangar_scroll < 0)
+        hangar_scroll = 0;
+    if (hangar_scroll > max_scroll)
+        hangar_scroll = max_scroll;
+    gui_scrollbar(win, gui_mkrc(win->w - margin - bar_w, view_y, bar_w,
+                                view_h),
+                  total_h, view_h, &hangar_scroll, ui);
+
+    gui_push_clip(win, gui_mkrc(margin, view_y, view_w, view_h));
+    if (nhangar == 0) {
+        gui_card(win, gui_mkrc(margin, view_y + 4, view_w, 76));
+        gui_draw_text_aa(win, margin + 14, view_y + 18,
+                         "All bays are clear", FONT_BODY, FONT_BOLD,
+                         FONT_ROMAN, GUI_TEXT, GUI_TRANSPARENT);
+        gui_draw_text_aa(win, margin + 14, view_y + 40,
+                         "Park an app with the arrow button in its title bar,",
+                         FONT_SMALL, FONT_REGULAR, FONT_ROMAN,
+                         GUI_TEXT_DIM, GUI_TRANSPARENT);
+        gui_draw_text_aa(win, margin + 14, view_y + 56,
+                         "or right-click a running app in the dock.",
+                         FONT_SMALL, FONT_REGULAR, FONT_ROMAN,
+                         GUI_TEXT_DIM, GUI_TRANSPARENT);
+    }
+    for (int i = 0; i < nhangar; i++) {
+        const struct k_hangar_info *hb = &hangar_bays[i];
+        int cx = margin + (i % 2) * (card_w + gap);
+        int cy = view_y + (i / 2) * row_h - hangar_scroll;
+        gui_rc card = gui_mkrc(cx, cy, card_w, card_h);
+        gui_rc thumb = gui_mkrc(cx + 10, cy + 10, K_HANGAR_THUMB_W,
+                                K_HANGAR_THUMB_H);
+        gui_rc resume_rc = gui_mkrc(cx + 10, cy + card_h - 40, 112, 30);
+        gui_rc drop_rc = gui_mkrc(cx + card_w - 40, cy + card_h - 40, 30, 30);
+        int hov = gui_hit(card, ui->mx, ui->my);
+        int tx = thumb.x + thumb.w + 12, tw = card.x + card.w - tx - 8;
+        struct gui_tm tm;
+        char line[48], bayname[12];
+
+        if (cy + card_h < view_y || cy > view_y + view_h)
+            continue;
+        gui_fill_round_rect(win, card, 10, hov ? GUI_PANEL_HI
+                                               : GUI_SURFACE_ALT);
+        gui_stroke_round_rect(win, card, 10, 1, hov ? 0xF59E0BU : GUI_BORDER);
+
+        /* The frozen window, with a slow sensor sweep across it. */
+        if (hangar_has_thumb[i])
+            gui_bitmap(win, thumb.x, thumb.y, thumb.w, thumb.h,
+                       hangar_thumbs[i], K_HANGAR_THUMB_W);
+        else
+            gui_rect(win, thumb.x, thumb.y, thumb.w, thumb.h, GUI_SUNKEN);
+        if (sweep >= 0 && sweep < thumb.h)
+            gui_fill_rect_alpha(win, thumb.x, thumb.y + sweep, thumb.w, 2,
+                                0xF59E0BU, 90);
+        gui_frame(win, thumb.x - 1, thumb.y - 1, thumb.w + 2, thumb.h + 2,
+                  GUI_EDGE);
+
+        snprintf(bayname, sizeof(bayname), "BAY %02u", hb->bay);
+        gui_badge(win, gui_mkrc(tx, cy + 10, 64, 22), bayname, 0xF59E0BU);
+        gui_draw_text_aa_run(win, tx, cy + 38, hb->name, -1, FONT_BODY,
+                             FONT_BOLD, FONT_ROMAN, GUI_TEXT,
+                             GUI_TRANSPARENT, tw, 1);
+        gui_draw_text_aa_run(win, tx, cy + 58,
+                             hb->nwins ? hb->title : "(no window)", -1,
+                             FONT_SMALL, FONT_REGULAR, FONT_ROMAN,
+                             GUI_TEXT_DIM, GUI_TRANSPARENT, tw, 1);
+        gui_gmtime(hb->parked_at, &tm);
+        snprintf(line, sizeof(line), "Parked %02d:%02d UTC", tm.hour, tm.min);
+        gui_draw_text_aa(win, tx, cy + 76, line, FONT_SMALL, FONT_REGULAR,
+                         FONT_ROMAN, GUI_TEXT_DIM, GUI_TRANSPARENT);
+        if (hb->bytes >= 1024 * 1024)
+            snprintf(line, sizeof(line), "%lu.%lu MiB sealed",
+                     (unsigned long)(hb->bytes >> 20),
+                     (unsigned long)((hb->bytes & 0xFFFFF) * 10 >> 20));
+        else
+            snprintf(line, sizeof(line), "%lu KiB sealed",
+                     (unsigned long)((hb->bytes + 1023) >> 10));
+        gui_draw_text_aa(win, tx, cy + 92, line, FONT_SMALL, FONT_REGULAR,
+                         FONT_ROMAN, GUI_TEXT_DIM, GUI_TRANSPARENT);
+        gui_fill_circle(win, tx + 4, cy + 115, 3, 0xF59E0BU);
+        gui_draw_text_aa(win, tx + 12, cy + 109, "COLD  -  SEALED",
+                         FONT_SMALL, FONT_BOLD, FONT_ROMAN, 0xF59E0BU,
+                         GUI_TRANSPARENT);
+
+        if (gui_button_ex(win, resume_rc, "Resume", ui, 1, 0) &&
+            gui_hit(gui_mkrc(margin, view_y, view_w, view_h),
+                    ui->up_x, ui->up_y))
+            resume_idx = i;
+        if (hangar_confirm == (int)hb->bay)
+            gui_draw_text_aa(win, resume_rc.x + resume_rc.w + 8,
+                             resume_rc.y + 8, "Discard?", FONT_SMALL,
+                             FONT_BOLD, FONT_ROMAN, 0xEF4444U,
+                             GUI_TRANSPARENT);
+        if (gui_icon_button(win, drop_rc, GUI_ICON_CLOSE, 0, ui, 1,
+                            hangar_confirm == (int)hb->bay) &&
+            gui_hit(gui_mkrc(margin, view_y, view_w, view_h),
+                    ui->up_x, ui->up_y))
+            discard_idx = i;
+    }
+    gui_pop_clip(win);
+
+    gui_rect(win, 0, win->h - 24, win->w, 24, GUI_SUNKEN);
+    gui_draw_text_aa(win, margin, win->h - 18,
+                     "Apps with live network links, pipes or devices "
+                     "will tell you why they cannot park",
+                     FONT_SMALL, FONT_REGULAR, FONT_ROMAN, GUI_TEXT_DIM,
+                     GUI_TRANSPARENT);
+
+    if (resume_idx >= 0) {
+        hangar_confirm = -1;
+        return resume_bay(resume_idx) == 0 ? -2 : -1;
+    }
+    if (discard_idx >= 0) {
+        int bay = (int)hangar_bays[discard_idx].bay;
+        if (hangar_confirm != bay) {
+            hangar_confirm = bay;
+        } else {
+            hangar_confirm = -1;
+            if (hangar_discard(bay) == 0)
+                notify("Hangar bay %02d cleared", bay);
+            refresh_hangar();
+        }
+    }
+    return -1;
+}
+
 static int paint_popup(gui_settings *settings)
 {
     if (!popup)
@@ -2342,6 +2648,8 @@ static int paint_popup(gui_settings *settings)
         return paint_talon_shelf(popup, &popup_ui);
     if (popup_kind == POP_QUICK)
         return paint_quick(popup, &popup_ui, settings);
+    if (popup_kind == POP_HANGAR)
+        return paint_hangar(popup, &popup_ui);
     return -1;
 }
 
@@ -2570,7 +2878,7 @@ int main(int argc, char **argv)
     gui_ui ui;
     gui_settings settings, painted_settings;
     int sw, sh, wallpaper_dirty = 1, shell_dirty = 1, popup_dirty = 0;
-    unsigned long next_telemetry = 0, next_blink = 0;
+    unsigned long next_telemetry = 0, next_blink = 0, next_hangar = 0;
 
     (void)argc;
     (void)argv;
@@ -2592,6 +2900,7 @@ int main(int argc, char **argv)
     refresh_tasks();
     refresh_net();
     refresh_talon();
+    refresh_hangar();
     init_pulses();
     sample_telemetry();
 
@@ -2611,6 +2920,13 @@ int main(int argc, char **argv)
             gui_ui_event(&ui, &ev);
             if (ev.type == KEV_CLOSE)
                 break;
+            if (ev.type == KEV_HANGAR) {
+                paint_shell(desktop, &ui, &settings);
+                gui_flush(desktop);
+                park_window(ev.key);
+                if (popup && popup_kind == POP_HANGAR)
+                    popup_dirty = 1;
+            }
             if (ev.type == KEV_KEY) {
                 if (ev.key == KEY_LAUNCHER) {
                     open_popup(popup_kind == POP_LAUNCHER ? POP_NONE
@@ -2642,7 +2958,8 @@ int main(int argc, char **argv)
             if (popup && ev.type == KEV_MOUSE_DOWN &&
                 !gui_hit(perch_btn_rc, ev.x, ev.y) &&
                 !gui_hit(talon_btn_rc, ev.x, ev.y) &&
-                !gui_hit(quick_btn_rc, ev.x, ev.y)) {
+                !gui_hit(quick_btn_rc, ev.x, ev.y) &&
+                !gui_hit(hangar_btn_rc, ev.x, ev.y)) {
                 close_popup();
             }
             if (clicked(&ui, shortcut_rc(0)))
@@ -2693,6 +3010,13 @@ int main(int argc, char **argv)
             next_telemetry = now + 1000;
             reap_children();
             sample_telemetry();
+            /* Resumes finish asynchronously and the CLI can park too. */
+            if (now >= next_hangar) {
+                next_hangar = now + 3000;
+                refresh_hangar();
+                if (popup && popup_kind == POP_HANGAR)
+                    popup_dirty = 1;
+            }
             gui_settings_get(&settings);
             if (memcmp(&settings, &painted_settings, sizeof(settings)) != 0) {
                 painted_settings = settings;
@@ -2707,6 +3031,10 @@ int main(int argc, char **argv)
 
         if (popup && popup_kind == POP_LAUNCHER && now >= next_blink) {
             next_blink = now + 500;
+            popup_dirty = 1;
+        }
+        if (popup && popup_kind == POP_HANGAR && now >= next_blink) {
+            next_blink = now + 60;
             popup_dirty = 1;
         }
 

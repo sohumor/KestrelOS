@@ -228,6 +228,31 @@ int win_resize(uint32_t wid, int w, int h)
     return (int)syscall(SYS_WIN_RESIZE, (long)wid, (long)w, (long)h, 0);
 }
 
+int hangar_park(int pid, char *reason)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_PARK, (long)pid, (long)reason, 0);
+}
+
+int hangar_list(int index, struct k_hangar_info *out)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_LIST, (long)index, (long)out, 0);
+}
+
+int hangar_thumb(int bay, uint32_t *pixels)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_THUMB, (long)bay, (long)pixels, 0);
+}
+
+int hangar_resume(int bay, char *reason)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_RESUME, (long)bay, (long)reason, 0);
+}
+
+int hangar_discard(int bay)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_DISCARD, (long)bay, 0, 0);
+}
+
 void sleep_ms(unsigned long ms)
 {
     syscall(SYS_SLEEP_MS, (long)ms, 0, 0, 0);

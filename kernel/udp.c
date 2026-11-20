@@ -236,3 +236,14 @@ int udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms)
         net_wait_tick();
     }
 }
+
+int udp_count_owned(int pid)
+{
+    int n = 0;
+    uint64_t f = spin_lock_irqsave(&udp_lock);
+    for (int i = 0; i < UDP_PORTS; i++)
+        if (binds[i].used && binds[i].owner_pid == pid)
+            n++;
+    spin_unlock_irqrestore(&udp_lock, f);
+    return n;
+}

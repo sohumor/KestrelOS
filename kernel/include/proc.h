@@ -77,6 +77,8 @@ struct task {
     uint64_t cap_mask;
     int mission_id;
     char unveil_prefix[64];
+    int park_state;              /* Hangar: 0, 1 = requested, 2 = parking */
+    bool hangar_io;              /* kernel-owned /hangar I/O in progress */
 };
 
 extern bool sched_active;
@@ -117,6 +119,15 @@ int task_signal_pid(int pid, int sig, uint32_t sender_uid,
  * on the way out of a syscall and before returning to ring 3. */
 int task_kill(struct task *t);
 void task_check_kill(void);
+
+/* Hangar: ask task `pid` to park itself at its next syscall exit.
+ * 0 on success, -1 no such user task / not permitted, -2 already busy,
+ * -3 mission-confined task (parking would drop the grant on resume). */
+int task_park_request(int pid, uint32_t caller_uid);
+/* Withdraw a request the task has not started on; 1 if withdrawn. */
+int task_park_cancel(int pid);
+/* Called by the task itself: 1 if a park request is now being served. */
+int task_park_begin(void);
 
 /* Bounded @krec text formatter shared by kernel table views. */
 struct krec_kbuf {
