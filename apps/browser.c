@@ -7788,8 +7788,11 @@ static struct dom_node *element_ancestor(struct dom_node *n, int tag)
 
 static const char *control_type(struct dom_node *n)
 {
-    const char *t = n && n->tag_id == HTAG_INPUT
+    const char *t = n && (n->tag_id == HTAG_INPUT || n->tag_id == HTAG_BUTTON)
         ? dom_get_attr(n, "type") : 0;
+    if (n && n->tag_id == HTAG_BUTTON)
+        return t && (str_ci_eq(t, "button") || str_ci_eq(t, "reset"))
+            ? t : "submit";
     return t && *t ? t : "text";
 }
 
@@ -8738,9 +8741,8 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
                 return;
         }
         if (allow && action && action->type == DOM_ELEMENT &&
-            (action->tag_id == HTAG_BUTTON ||
-             (action->tag_id == HTAG_INPUT &&
-              str_ci_eq(control_type(action), "submit")))) {
+            (action->tag_id == HTAG_BUTTON || action->tag_id == HTAG_INPUT) &&
+            str_ci_eq(control_type(action), "submit")) {
             form = element_ancestor(action, HTAG_FORM);
             if (form) {
                 submit_form(b, form, action);
