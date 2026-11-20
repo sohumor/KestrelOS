@@ -1101,10 +1101,6 @@ static int rename_locked(struct kfs_fs *fs, const char *oldpath,
     if (strcmp(oldname, ".") == 0 || strcmp(oldname, "..") == 0 ||
         strcmp(newname, ".") == 0 || strcmp(newname, "..") == 0)
         return -1;
-    if ((uint32_t)old_parent == (uint32_t)new_parent &&
-        strcmp(oldname, newname) == 0)
-        return -1;
-
     uint32_t src_ino = dir_lookup(fs, (uint32_t)old_parent, oldname,
                                   &old_slot);
     if (!src_ino || iget(fs, src_ino, &src_ip) < 0)
@@ -1114,8 +1110,10 @@ static int rename_locked(struct kfs_fs *fs, const char *oldpath,
 
     uint32_t dst_ino = dir_lookup(fs, (uint32_t)new_parent, newname,
                                   &dst_slot);
+    if (dst_ino == src_ino)
+        return 0;
     if (dst_ino) {
-        if (dst_ino == src_ino || iget(fs, dst_ino, &dst_ip) < 0)
+        if (iget(fs, dst_ino, &dst_ip) < 0)
             return -1;
         if (dst_ip.type != KFS_TYPE_FILE)
             return -1;
@@ -1663,7 +1661,8 @@ static void fill_stat(const struct kfs_inode *ip, struct k_stat *st)
     st->mtime = ip->mtime;
 }
 
-static struct file *kfs_op_open(struct mount *m, const char *path, int flags)
+static struct file *kfs_op_open(struct mount *m, const char *path, int flags,
+                                struct open_guard *guard)
 {
     struct kfs_fs *fs = mount_fs(m);
     struct kfs_inode ip, dirp;
@@ -1695,6 +1694,11 @@ static struct file *kfs_op_open(struct mount *m, const char *path, int flags)
                          vfs_now());
         if (ino < 0)
             return NULL;
+    }
+    if (guard && ((const struct kfs_file *)guard->exclude)->fs == fs &&
+        guard->exclude->inum == (uint32_t)ino) {
+        guard->same_file = 1;
+        return NULL;
     }
     if (kfs_iget(fs, (uint32_t)ino, &ip) < 0)
         return NULL;
