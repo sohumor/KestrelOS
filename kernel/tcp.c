@@ -564,6 +564,13 @@ void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
         /* An unacknowledged RST during the handshake is not for us. */
         if (c->state == TCP_SYN_SENT && !(fl & TCP_ACK))
             goto out;
+        /* RFC 5961: only an exact RCV.NXT match resets a live connection. */
+        if (c->state != TCP_SYN_SENT && seq != c->rcv_nxt) {
+            int32_t delta = (int32_t)(seq - c->rcv_nxt);
+            if (delta >= 0 && delta < TCP_RXBUF - c->rx_len)
+                c->need_ack = true;
+            goto out;
+        }
         c->reset = true;
         c->state = TCP_CLOSED;
         goto out;
