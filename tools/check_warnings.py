@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clean-build with GCC 11 and enforce the checked-in warning ceiling.
+"""Clean-build with make's default compiler and enforce the warning ceiling.
 
 Run from any directory: python3 tools/check_warnings.py
 After a reduction, lower tools/warning-baseline.txt to the reported count.
@@ -52,8 +52,7 @@ def main():
     subprocess.run(["make", "clean"], cwd=ROOT, env=env, check=True)
     with (ROOT / "build.log").open("w") as log:
         result = subprocess.run(
-            ["make", f"-j{os.cpu_count() or 1}",
-             "CC=gcc-11 -march=x86-64 -fdiagnostics-color=never"],
+            ["make", f"-j{os.cpu_count() or 1}"],
             cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
     output = (ROOT / "build.log").read_text(errors="replace")
     if result.returncode:

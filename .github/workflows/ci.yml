@@ -26,7 +26,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential gcc-11 binutils nasm qemu-system-x86 python3
+          sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3
       - name: Build
         run: python3 tools/check_warnings.py --base-ref "${{ github.event.pull_request.base.sha || github.event.before }}"
       # The harness does not select KVM; QEMU defaults to portable TCG.
