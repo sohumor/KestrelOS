@@ -5,6 +5,7 @@
 #include "interrupts.h"
 #include "kestrel_abi.h"
 #include "smp.h"
+#include "spinlock.h"
 
 #define KSTACK_SIZE 16384
 #define TASK_NAME_MAX 32
@@ -14,6 +15,11 @@
 #define VM_MAX_FILES 8
 
 struct file;                     /* defined by the VFS layer */
+struct task_event_waiter;
+
+struct task_event_channel {
+    struct task_event_waiter *waiters;
+};
 
 /* A demand-paged ELF PT_LOAD region. File bytes occupy
  * [start, start + file_size); the remainder through end is zero-filled. */
@@ -89,6 +95,12 @@ struct task *proc_prepare_cpu(unsigned cpu, uint64_t *stack_top);
 void schedule(void);
 void yield(void);
 void task_sleep_ticks(uint64_t t);
+/* After checking the condition under lock, park until a notification,
+ * deadline or signal. Releases lock and restores flags on every path.
+ * Returns -1 on cancellation, otherwise the caller must recheck. */
+int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                           uint64_t deadline, spinlock_t *lock, uint64_t flags);
+void task_event_notify(struct task_event_channel *channel, uint32_t mask);
 void task_stop_current(void);
 __attribute__((noreturn)) void task_exit(int code);
 void task_wake_sleepers(void);

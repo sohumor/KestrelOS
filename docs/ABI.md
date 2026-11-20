@@ -32,8 +32,12 @@ Binaries may be static ELF64 images linked at `USER_LOAD_BASE` (`0x400000`)
 or Kestrel ET_DYN images with `DT_NEEDED` dependencies. The kernel records
 lazy `PT_LOAD` areas, resolves the supported dynamic relocations, and enters
 `_start`. It provides `rdi = argc` and `rsi = argv` (a NUL-terminated
-`char *` array on the user stack, `argv[argc] == 0`). crt0 calls
-`main(argc, argv)` and passes its return value to `SYS_EXIT`.
+`char *` array on the user stack, `argv[argc] == 0`). An absolute cwd from
+`SYS_SPAWN_CAPS` is passed in `rdx` as a NUL-terminated string on the initial
+stack; otherwise `rdx` is zero. The existing `--cwd=` argument is still
+supplied when it fits, for older binaries. CRT0 exposes the initial
+directory through `kestrel_startup_cwd()` (default `/`), calls
+`main(argc, argv)`, and passes its return value to `SYS_EXIT`.
 
 ## Memory map (per process)
 

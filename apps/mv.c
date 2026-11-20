@@ -1,8 +1,8 @@
 /* mv.c - move (rename) a file.
  *
  * usage: mv <src> <dst>
- * KFS has no rename, so this is copy + unlink. Moving a file onto
- * itself is a no-op. If <dst> is a directory the basename is kept.
+ * Try rename first, then copy + unlink. Moving a file onto itself
+ * is a no-op. If <dst> is a directory the basename is kept.
  */
 
 #include <kestrel.h>
@@ -56,10 +56,12 @@ static int copy_file(const char *src, const char *dst)
         printf("mv: cannot open %s\n", src);
         return 1;
     }
-    out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    out = open_distinct(dst, O_WRONLY | O_CREAT | O_TRUNC, in);
     if (out < 0) {
-        printf("mv: cannot create %s\n", dst);
         close(in);
+        if (out == K_OPEN_SAME_FILE)
+            return K_OPEN_SAME_FILE;
+        printf("mv: cannot create %s\n", dst);
         return 1;
     }
 
@@ -119,7 +121,10 @@ int main(int argc, char **argv)
     if (rename_(src, dst) == 0)
         return 0;
 
-    if (copy_file(src, dst) != 0)
+    int copied = copy_file(src, dst);
+    if (copied == K_OPEN_SAME_FILE)
+        return 0;
+    if (copied != 0)
         return 1;
 
     if (unlink_(src) != 0) {
