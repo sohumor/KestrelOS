@@ -88,8 +88,10 @@ uint64_t pmm_alloc(void)
     panic("pmm: out of memory");
 }
 
-uint64_t pmm_alloc_contig(int npages)
+uint64_t pmm_try_alloc_contig(int npages)
 {
+    if (npages <= 0)
+        return 0;
     uint64_t limit = max_phys / PAGE_SIZE;
     uint64_t f = spin_lock_irqsave(&pmm_lock);
     for (uint64_t p = 256; p + npages <= limit; p++) {
@@ -113,7 +115,15 @@ uint64_t pmm_alloc_contig(int npages)
         return phys;
     }
     spin_unlock_irqrestore(&pmm_lock, f);
-    panic("pmm: out of contiguous memory (%d pages)", npages);
+    return 0;
+}
+
+uint64_t pmm_alloc_contig(int npages)
+{
+    uint64_t phys = pmm_try_alloc_contig(npages);
+    if (!phys)
+        panic("pmm: out of contiguous memory (%d pages)", npages);
+    return phys;
 }
 
 void pmm_free(uint64_t phys)
