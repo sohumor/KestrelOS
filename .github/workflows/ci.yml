@@ -29,6 +29,8 @@ jobs:
         run: python3 tools/check_build_parity.py
       - name: Build
         run: make -j$(nproc) 2>&1 | tee build.log
+      - name: Check artifact size budgets
+        run: python3 tools/check_sizes.py
       # The harness does not select KVM; QEMU defaults to portable TCG.
       - name: Boot smoke test
         timeout-minutes: 3
