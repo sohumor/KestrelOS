@@ -25,14 +25,14 @@ struct platform_dev {
 };
 
 /* The fixed devices, in the order they appear in `lsdev`. Registration
- * order does not imply probe order: drivers bind when they register, at
- * INITCALL_DRIVER. */
+ * order does not imply probe order: drivers bind when they register. */
 static struct platform_dev platform_devs[] = {
     { .dev = { .name = "pit"      }, .info = { 0x0040, 4, 0  } },
     { .dev = { .name = "ps2kbd"   }, .info = { 0x0060, 5, 1  } },
     { .dev = { .name = "ps2mouse" }, .info = { 0x0060, 5, 12 } },
     { .dev = { .name = "serial0"  }, .info = { 0x03F8, 8, 4  } },
     { .dev = { .name = "cmos"     }, .info = { 0x0070, 2, 8  } },
+    { .dev = { .name = "ata-primary" }, .info = { 0x01F0, 8, 14 } },
 };
 
 #define PLATFORM_NDEVS \
