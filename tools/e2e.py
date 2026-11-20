@@ -1927,6 +1927,30 @@ def t_cp_wc(h):
     wait_prompt(h)
 
 
+def t_wc_stdin(h):
+    """Only terminal stdin treats byte 0x04 as EOF."""
+    h.send('kjs -e "Kestrel.writeFile(\'/wc-eof\', \'a\\x04b c\\n\')"')
+    wait_prompt(h)
+    h.send("wc /wc-eof")
+    h.expect(r"\n *1 +2 +6 /wc-eof\n", regex=True)
+    wait_prompt(h)
+    for command in ("wc < /wc-eof", "cat /wc-eof | wc"):
+        h.send(command)
+        h.expect(r"\n *1 +2 +6\n", regex=True)
+        wait_prompt(h)
+    for command in ("wc < /dev/null", "cat /dev/null | wc"):
+        h.send(command)
+        h.expect(r"\n *0 +0 +0\n", regex=True)
+        wait_prompt(h)
+    h.send("wc")
+    h.expect("elf: static image")
+    h.send_raw("one two\n\x04")
+    h.expect(r"\n *1 +2 +8\n", regex=True)
+    wait_prompt(h)
+    h.send("rm /wc-eof")
+    wait_prompt(h)
+
+
 def t_mv_rm(h):
     h.send("mv /t2.txt /t3.txt")
     wait_prompt(h)
@@ -2889,6 +2913,7 @@ TESTS = [
     ("calc", t_calc),
     ("calc-divzero", t_calc_divzero),
     ("cp-wc", t_cp_wc),
+    ("wc-stdin", t_wc_stdin),
     ("mv-rm", t_mv_rm),
     ("mkdir-ls", t_mkdir_ls),
     ("grep", t_grep),
