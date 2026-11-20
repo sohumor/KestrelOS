@@ -1,3 +1,4 @@
+#include "kernel.h"
 #include "serial.h"
 #include "input.h"
 #include "random.h"
@@ -145,9 +146,10 @@ static void serial_handle_byte(uint8_t b)
     input_push(b);
 }
 
-static void serial_irq(struct regs *r)
+static void serial_irq(struct regs *r, void *context)
 {
     (void)r;
+    (void)context;
     serial_drain_rx();
 }
 
@@ -171,7 +173,8 @@ void serial_poll_rx(void)
 
 void serial_init_irq(void)
 {
-    irq_install_handler(4, serial_irq);
+    if (irq_subscribe(4, serial_irq, NULL) < 0)
+        panic("serial: cannot subscribe to IRQ 4");
     serial_input_online = true;
     serial_drain_rx();
     outb(COM1 + 1, 0x01);    /* enable "data available" interrupt */

@@ -1,5 +1,7 @@
 #include "kernel.h"
 #include "blockdev.h"
+#include "config.h"
+#include "module.h"
 #include "proc.h"
 #include "string.h"
 #include "spinlock.h"
@@ -69,22 +71,48 @@ void blockdev_unregister(struct blockdev *bd)
     spin_unlock_irqrestore(&blockdev_lock, f);
 }
 
-struct blockdev *blockdev_find(const char *name)
+static struct blockdev *blockdev_find_locked(const char *name)
 {
-    struct blockdev *found = NULL;
-
     if (name == NULL || name[0] == '\0')
         return NULL;
 
-    uint64_t f = spin_lock_irqsave(&blockdev_lock);
     for (int i = 0; i < BLOCKDEV_MAX; i++) {
-        if (devices[i] != NULL && strcmp(devices[i]->name, name) == 0) {
-            found = devices[i];
-            break;
-        }
+        if (devices[i] != NULL && strcmp(devices[i]->name, name) == 0)
+            return devices[i];
     }
+    return NULL;
+}
+
+struct blockdev *blockdev_find(const char *name)
+{
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
+    struct blockdev *found = blockdev_find_locked(name);
     spin_unlock_irqrestore(&blockdev_lock, f);
     return found;
+}
+
+struct blockdev *blockdev_acquire(const char *name)
+{
+    uint64_t f = spin_lock_irqsave(&blockdev_lock);
+    struct blockdev *found = blockdev_find_locked(name);
+#ifdef CONFIG_MODULES
+    /* Module unload drops the module registry lock before calling exit,
+     * so it can unregister here without reversing the lock order. */
+    if (found && found->owner && module_get(found->owner) != 0)
+        found = NULL;
+#endif
+    spin_unlock_irqrestore(&blockdev_lock, f);
+    return found;
+}
+
+void blockdev_release(struct blockdev *bd)
+{
+#ifdef CONFIG_MODULES
+    if (bd && bd->owner)
+        module_put(bd->owner);
+#else
+    (void)bd;
+#endif
 }
 
 int blockdev_list(int index, struct blockdev **out)

@@ -95,12 +95,18 @@ void task_sleep_ticks(uint64_t t);
  * Returns -1 on cancellation, otherwise the caller must recheck. */
 int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
                            uint64_t deadline, spinlock_t *lock, uint64_t flags);
+/* Wait without a deadline. Returns -1 if an interrupting signal is
+ * already pending before parking; after a wake the caller rechecks. */
+int task_event_wait_interruptible_locked(struct task_event_channel *channel,
+                                         uint32_t mask, spinlock_t *lock,
+                                         uint64_t flags);
 void task_event_notify(struct task_event_channel *channel, uint32_t mask);
 void task_stop_current(void);
 __attribute__((noreturn)) void task_exit(int code);
 void task_wake_sleepers(void);
 void task_signal_wake(struct task *t, bool resume_stopped);
 bool task_exists(int pid);
+bool task_is_child(int parent_pid, int pid);
 int task_psinfo(uint64_t index, struct k_psinfo *out);
 int task_child_pids(int parent_pid, int *out, int max);
 bool task_address_space_matches(int pid, uint64_t *pml4);

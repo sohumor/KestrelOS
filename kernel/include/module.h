@@ -19,11 +19,11 @@
 
 /* --- what a module declares about itself ------------------------------ */
 
-/* One tagged field of a module's declaration. MODULE_NAME/_DESC/_INIT/
- * _EXIT each emit one of these into the .kmod_decl section; the loader
+/* One tagged field of a module's declaration. The MODULE_* macros each
+ * emit one of these into the .kmod_decl section; the loader
  * finds that section by name and merges the records it holds. Splitting
  * the declaration into tagged records instead of one fixed struct makes
- * the four macros order-independent, lets a module omit any of them, and
+ * the records order-independent, lets a module omit optional fields, and
  * keeps a future MODULE_VERSION readable by today's loader (which simply
  * ignores tags it does not know). */
 struct module_decl {
@@ -36,6 +36,13 @@ struct module_decl {
 #define MODDECL_DESC 2
 #define MODDECL_INIT 3
 #define MODDECL_EXIT 4
+#define MODDECL_SERVICE 5
+
+struct module_service_decl {
+    uint32_t version;
+    uint32_t size;
+    const void *ops;
+};
 
 #define MODULE_DECL_SECTION ".kmod_decl"
 
@@ -57,6 +64,13 @@ struct module_decl {
 /* void fn(void): run by rmmod before the module's memory is freed. A
  * module without one can still be unloaded. Optional. */
 #define MODULE_EXIT(f) __KMOD_DECL(exit, MODDECL_EXIT, (f))
+
+/* Publish one static operation table under this module's name. */
+#define MODULE_SERVICE(ver, table)                                        \
+    static const struct module_service_decl __kmod_service = {            \
+        .version = (ver), .size = sizeof(table), .ops = &(table)           \
+    };                                                                    \
+    __KMOD_DECL(service, MODDECL_SERVICE, &__kmod_service)
 
 /* --- what the kernel reports about a module --------------------------- */
 
@@ -93,6 +107,19 @@ int module_list(int index, struct module_info *out);
  * takes a reference; rmmod refuses while any are outstanding. */
 int module_get(const char *name);
 int module_put(const char *name);
+
+struct module;
+struct module_service_ref {
+    const void *ops;
+    struct module *provider;
+};
+
+/* A ref starts zeroed, must not be copied or shared concurrently, and
+ * pins its operation table until release.
+ * Only live providers with the exact nonzero version and size match. */
+int module_service_acquire(struct module_service_ref *ref, const char *name,
+                           uint32_t version, uint32_t size);
+void module_service_release(struct module_service_ref *ref);
 
 /* --- failure codes -----------------------------------------------------
  * Every one of these is also reported to the kernel log with the offending

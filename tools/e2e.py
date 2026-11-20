@@ -1927,6 +1927,22 @@ def t_fs_roundtrip(h):
     wait_prompt(h)
 
 
+def t_fs_hole(h):
+    h.send("kfshole")
+    probe = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("wc -c /run/kfs-hole-test")
+    count = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("cat /run/kfs-hole-test | wc -c")
+    copied = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("rm /run/kfs-hole-test")
+    wait_prompt(h)
+    if ("\nkfshole: zero-filled gap, tail and EOF verified\n" not in probe or
+            not re.search(r"\n *45064 /run/kfs-hole-test\n", count) or
+            not re.search(r"\n *45064\n", copied)):
+        raise TimeoutError("sparse file: unexpected guest output:\n" +
+                           "\n".join((probe, count, copied)))
+
+
 def t_ps(h):
     h.send("ps")
     h.expect("sh")
@@ -2321,6 +2337,16 @@ def t_pipe(h):
 def t_pipe_read(h):
     h.send("sigtest --pipe-read")
     h.expect("sigtest: pipe read modes + interruption + EOF verified")
+    wait_prompt(h)
+
+
+def t_waitpid_children(h):
+    h.send("waittest")
+    h.expect("waittest: stranger live wait=-1")
+    h.expect("waittest: parent live wait=73")
+    h.expect("waittest: stranger exited wait=-1")
+    h.expect("waittest: parent exited wait=73")
+    h.expect("waittest: PASS")
     wait_prompt(h)
 
 
@@ -3146,6 +3172,7 @@ TESTS = [
     ("ls-many", t_ls_many),
     ("cat-motd", t_cat_motd),
     ("fs-roundtrip", t_fs_roundtrip),
+    ("fs-hole", t_fs_hole),
     ("ps", t_ps),
     ("free", t_free),
     ("smp", t_smp),
@@ -3183,6 +3210,7 @@ TESTS = [
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
+    ("waitpid-children", t_waitpid_children),
     ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),

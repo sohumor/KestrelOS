@@ -174,6 +174,14 @@ struct window {
 
 static struct window wins[WM_MAX_WINDOWS];
 
+/* Slot lifetimes can end before their sleepers return. Keep wait state
+ * outside the window record so zeroing or reusing it cannot unlink them. */
+static struct {
+    struct task_event_channel channel;
+    uint64_t generation;
+} window_events[WM_MAX_WINDOWS];
+static spinlock_t window_event_lock = SPINLOCK_INIT;
+
 /* Stacking order, bottom first, holding slot indices. K_WIN_DESKTOP
  * windows are kept as a block at the bottom and never leave it. */
 static uint8_t zord[WM_MAX_WINDOWS];
@@ -524,6 +532,14 @@ static int z_top_focusable(void)
 
 /* ---------------------------------------------------------- event queue */
 
+/* Called with wm_lock held, after publishing the queue or lifetime change. */
+static void evq_notify(int idx)
+{
+    uint64_t f = spin_lock_irqsave(&window_event_lock);
+    task_event_notify(&window_events[idx].channel, 1);
+    spin_unlock_irqrestore(&window_event_lock, f);
+}
+
 static void evq_push(struct window *win, uint32_t type, int x, int y,
                      uint32_t key, uint32_t buttons)
 {
@@ -554,6 +570,7 @@ static void evq_push(struct window *win, uint32_t type, int x, int y,
     win->ev_head = next;
 
     irq_restore(f);
+    evq_notify(win->wid);
 }
 
 static bool evq_pop(struct window *win, struct k_event *out)
@@ -1413,6 +1430,8 @@ static void win_unlink(struct window *win)
 
     z_remove(idx);
     win->dying = true;
+    window_events[idx].generation++;
+    evq_notify(idx);
     if (focus == idx)
         __atomic_store_n(&focus, -1, __ATOMIC_RELEASE);
     if (dragging == idx)
@@ -1785,29 +1804,25 @@ long wm_sys_flush(uint64_t wid)
 long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
 {
     struct k_event ev;
-    uint64_t deadline, ticks;
-
-    wm_lock();
-    bool exists = win_lookup(wid) != NULL;
-    wm_unlock();
-    if (!exists)
-        return -1;
     if (!user_range_ok((const void *)uevent, sizeof(ev)))
         return -1;
 
     if (timeout_ms > (1ULL << 40))
         timeout_ms = 1ULL << 40;
-    ticks = (timeout_ms * TIMER_HZ) / 1000;
+    uint64_t ticks = (timeout_ms * TIMER_HZ) / 1000;
     if (timeout_ms && !ticks)
         ticks = 1;
-    deadline = timer_ticks() + ticks;
 
+    wm_lock();
+    struct window *win = win_lookup(wid);
+    if (!win) {
+        wm_unlock();
+        return -1;
+    }
+    uint64_t generation = window_events[wid].generation;
+    uint64_t deadline = timer_ticks() + ticks;
     for (;;) {
-        /* Re-resolve every round: the window can be destroyed while this
-         * task sleeps, and the slot must not be followed after that. */
-        wm_lock();
-        struct window *win = win_lookup(wid);
-        if (!win) {
+        if (!win || window_events[wid].generation != generation) {
             wm_unlock();
             return -1;
         }
@@ -1818,15 +1833,20 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
                 return -1;
             return 1;
         }
+        if (timeout_ms == 0 || timer_ticks() >= deadline) {
+            wm_unlock();
+            return 0;
+        }
+
+        /* A publisher must take the handoff lock to notify, so it cannot
+         * miss us between dropping the manager mutex and parking. */
+        uint64_t f = spin_lock_irqsave(&window_event_lock);
         wm_unlock();
-        if (timeout_ms == 0 || timer_ticks() >= deadline)
+        if (task_event_wait_locked(&window_events[wid].channel, 1, deadline,
+                                   &window_event_lock, f) < 0)
             return 0;
-        /* A pending kill is only acted on when the task leaves a syscall,
-         * so a long wait must not sit on it: give up and let the syscall
-         * layer's task_check_kill() do its job. */
-        if (current->kill_pending)
-            return 0;
-        task_sleep_ticks(1);
+        wm_lock();
+        win = win_lookup(wid);
     }
 }
 

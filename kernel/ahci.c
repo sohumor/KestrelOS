@@ -159,9 +159,11 @@ void ahci_init(void)
         p[6] &= ~(1U << 4);
         if (wait_clear(&p[6], 1U << 14) < 0)
             continue;
-        uint64_t mem = pmm_alloc_contig(2);
-        if (!mem)
+        uint64_t mem = pmm_try_alloc_contig(2);
+        if (!mem) {
+            kprintf("ahci: no contiguous memory for DMA buffers\n");
             return;
+        }
         if (mem + 2 * PAGE_SIZE > (1ULL << 32)) {
             pmm_free_contig(mem, 2);
             return;

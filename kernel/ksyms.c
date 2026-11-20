@@ -16,6 +16,7 @@
  */
 
 #include "kernel.h"
+#include "config.h"
 #include "export.h"
 #include "kheap.h"
 #include "pmm.h"
@@ -25,6 +26,7 @@
 #include "proc.h"
 #include "vmm.h"
 #include "klog.h"
+#include "module.h"
 
 /* Linker-provided bounds of the .ksyms output section. */
 extern const struct ksym __ksyms_start[];
@@ -88,6 +90,11 @@ EXPORT_SYMBOL(yield);
 
 EXPORT_SYMBOL(klog_write);
 EXPORT_SYMBOL(klog_printf);
+
+#ifdef CONFIG_MODULES
+EXPORT_SYMBOL(module_service_acquire);
+EXPORT_SYMBOL(module_service_release);
+#endif
 
 /* --- block device layer (optional) --------------------------------------
  * Re-declared weak on purpose: the block layer is a separate subsystem

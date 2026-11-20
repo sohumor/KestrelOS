@@ -223,6 +223,7 @@ struct module {
     int state;
     int (*init)(void);
     void (*exit)(void);
+    struct module_service_decl service;
     struct module *next;
 };
 
@@ -637,10 +638,11 @@ static int copy_mod_string(const struct module *m, const void *p,
     return i ? 0 : -1;
 }
 
-static int inside_module(const struct module *m, const void *p)
+static int inside_module(const struct module *m, const void *p, size_t len)
 {
     uint64_t a = (uint64_t)p;
-    return a >= (uint64_t)m->base && a < (uint64_t)m->base + m->size;
+    uint64_t lo = (uint64_t)m->base;
+    return a >= lo && a - lo < m->size && len <= m->size - (a - lo);
 }
 
 static int read_decl(struct load_ctx *c, struct module *m)
@@ -674,15 +676,28 @@ static int read_decl(struct load_ctx *c, struct module *m)
             copy_mod_string(m, d[j].value, m->desc, sizeof(m->desc));
             break;
         case MODDECL_INIT:
-            if (!inside_module(m, d[j].value))
+            if (!inside_module(m, d[j].value, 1))
                 return MODERR_NODECL;
             m->init = (int (*)(void))d[j].value;
             break;
         case MODDECL_EXIT:
-            if (!inside_module(m, d[j].value))
+            if (!inside_module(m, d[j].value, 1))
                 return MODERR_NODECL;
             m->exit = (void (*)(void))d[j].value;
             break;
+        case MODDECL_SERVICE: {
+            struct module_service_decl service;
+            if (!m->service.ops && inside_module(m, d[j].value, sizeof(service))) {
+                memcpy(&service, d[j].value, sizeof(service));
+                if (service.version && service.size &&
+                    inside_module(m, service.ops, service.size)) {
+                    m->service = service;
+                    break;
+                }
+            }
+            kprintf("module: %s: invalid service declaration\n", c->modname);
+            return MODERR_NODECL;
+        }
         default:
             /* A newer module declaring something this loader predates. */
             kprintf("module: %s: ignoring unknown decl tag %u\n",
@@ -971,4 +986,38 @@ int module_put(const char *name)
         m->refs--;
     spin_unlock_irqrestore(&module_registry_lock, f);
     return m ? 0 : MODERR_NOTFOUND;
+}
+
+int module_service_acquire(struct module_service_ref *ref, const char *name,
+                           uint32_t version, uint32_t size)
+{
+    if (!ref || !name || !version || !size)
+        return MODERR_NOTFOUND;
+    if (ref->provider)
+        return MODERR_BUSY;
+
+    uint64_t f = spin_lock_irqsave(&module_registry_lock);
+    struct module *m = module_find(name);
+    int rc = MODERR_NOTFOUND;
+    if (m && m->state == MODULE_STATE_LIVE && m->service.version == version &&
+        m->service.size == size) {
+        m->refs++;
+        ref->provider = m;
+        ref->ops = m->service.ops;
+        rc = 0;
+    }
+    spin_unlock_irqrestore(&module_registry_lock, f);
+    return rc;
+}
+
+void module_service_release(struct module_service_ref *ref)
+{
+    if (!ref || !ref->provider)
+        return;
+
+    uint64_t f = spin_lock_irqsave(&module_registry_lock);
+    ref->provider->refs--;
+    ref->provider = NULL;
+    ref->ops = NULL;
+    spin_unlock_irqrestore(&module_registry_lock, f);
 }

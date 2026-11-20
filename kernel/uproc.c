@@ -65,14 +65,15 @@ void uproc_record_exit(int pid, long code)
                (uint32_t)pid, (uint32_t)code, name);
 }
 
-static int exit_collect_pid(int pid, long *code)
+static int exit_collect_pid(int ppid, int pid, long *code)
 {
     if (pid <= 0)
         return 0;
     uint64_t f = spin_lock_irqsave(&exit_lock);
     for (int i = 0; i < EXIT_RING; i++) {
         int idx = (exit_head - 1 - i + EXIT_RING) % EXIT_RING;
-        if (exit_ring[idx].pid == pid && !exit_ring[idx].collected) {
+        if (exit_ring[idx].pid == pid && exit_ring[idx].ppid == ppid &&
+            !exit_ring[idx].collected) {
             *code = exit_ring[idx].code;
             exit_ring[idx].collected = 1;
             spin_unlock_irqrestore(&exit_lock, f);
@@ -106,15 +107,16 @@ long uproc_waitpid(int pid)
 {
     if (pid <= 0)
         return -1;
+    int ppid = current ? current->pid : 0;
     for (;;) {
         long code;
         int alive;
 
-        if (exit_collect_pid(pid, &code))
+        if (exit_collect_pid(ppid, pid, &code))
             return code;
-        alive = task_exists(pid);
+        alive = task_is_child(ppid, pid);
         if (!alive) {
-            if (exit_collect_pid(pid, &code))
+            if (exit_collect_pid(ppid, pid, &code))
                 return code;
             return -1;             /* never existed, or record overwritten */
         }
