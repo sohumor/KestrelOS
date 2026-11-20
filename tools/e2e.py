@@ -2212,6 +2212,73 @@ def t_pipe_lifetime(h):
     wait_prompt(h)
 
 
+def t_elf_banner_quiet(h):
+    """ELF diagnostics stay on serial, not in the VGA console cell grid."""
+    symbols = {}
+    for line in subprocess.check_output(
+            ["nm", "-S", "build/kernel.elf"], text=True).splitlines():
+        fields = line.split()
+        if fields[-1] in ("cell_ch", "KERNEL_OFFSET"):
+            symbols[fields[-1]] = fields
+    cells = symbols["cell_ch"]
+    address = int(cells[0], 16) - int(symbols["KERNEL_OFFSET"][0], 16)
+    size = int(cells[1], 16)
+
+    with tempfile.TemporaryDirectory() as tmp, socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(BOOT_TIMEOUT)
+        port = listener.getsockname()[1]
+        cmd = h.cmd + [
+            "-monitor", "tcp:127.0.0.1:%d" % port]
+        guest = Harness(cmd)
+        guest.start()
+        try:
+            monitor, _ = listener.accept()
+            with monitor:
+                monitor.settimeout(DEFAULT_TIMEOUT)
+
+                def monitor_prompt():
+                    reply = b""
+                    while b"(qemu) " not in reply:
+                        chunk = monitor.recv(4096)
+                        if not chunk:
+                            raise TimeoutError("QEMU monitor closed")
+                        reply += chunk
+                    return reply
+
+                monitor_prompt()
+                t_boot(guest)
+                t_login(guest)
+                t_prompt(guest)
+                guest.send("clear")
+                guest.expect("clear\n")
+                wait_prompt(guest)
+                guest.send("ls /etc | wc -l")
+                guest.expect("| wc -l\n")
+                serial = guest.capture_until(SHELL_PROMPT, regex=True)
+                count = re.search(r"\n *(\d+)\n", serial)
+                if not count:
+                    raise TimeoutError("pipeline did not count /etc entries")
+                banner = r"elf: static image, 1 object, \d+ lazy segments?"
+                if len(re.findall(banner, serial)) < 2:
+                    raise TimeoutError("ELF pipeline diagnostics missing from serial")
+                dump = os.path.join(tmp, "console.bin")
+                monitor.sendall(('pmemsave 0x%x %d "%s"\n'
+                                 % (address, size, dump)).encode())
+                monitor_prompt()
+                with open(dump, "rb") as f:
+                    console = f.read().decode("latin1")
+                if not any(row.strip(" \x00") == count.group(1)
+                           for row in (console[i:i + 320]
+                                       for i in range(0, size, 320))):
+                    raise TimeoutError("pipeline output missing from VGA console")
+                if re.search(banner, console):
+                    raise TimeoutError("ELF banner leaked onto VGA console")
+        finally:
+            guest.kill()
+
+
 def t_dev(h):
     """/dev: the devfs mount, an immediate-EOF device and an empty dump.
 
@@ -2993,6 +3060,7 @@ TESTS = [
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
+    ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
