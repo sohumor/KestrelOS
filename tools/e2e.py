@@ -1856,6 +1856,31 @@ def t_ls_bin(h):
     wait_prompt(h)
 
 
+def t_ls_many(h):
+    h.send("mkdir /lsmany")
+    wait_prompt(h)
+    h.send("ls /lsmany")
+    h.expect("\n0 entries\n")
+    wait_prompt(h)
+    h.send("ls /lsmany/missing")
+    h.expect("\nls: cannot access /lsmany/missing\n")
+    wait_prompt(h)
+    for start in range(0, 260, 10):
+        h.send("touch " + " ".join(
+            "/lsmany/f%03d" % i for i in range(start, start + 10)))
+        wait_prompt(h)
+    h.send("ls /lsmany")
+    block = h.capture_until(SHELL_PROMPT, regex=True, timeout=120)
+    names = re.findall(r"^- +\d+ +(f\d{3})$", block, re.MULTILINE)
+    expected = ["f%03d" % i for i in range(260)]
+    if sorted(names) != expected or "\n260 entries\n" not in block:
+        raise TimeoutError("ls lost entries: listed %d of 260; count: %s" % (
+            len(names), re.findall(r"\d+ entries", block)))
+    h.send("ls /lsmany/f259")
+    h.expect(r"\n- +0 +/lsmany/f259\n1 entry\n", regex=True)
+    wait_prompt(h)
+
+
 def t_cat_motd(h):
     h.send("cat /etc/motd")
     h.expect("Kestrel")
@@ -3050,6 +3075,7 @@ TESTS = [
     ("help", t_help),
     ("echo", t_echo),
     ("ls-bin", t_ls_bin),
+    ("ls-many", t_ls_many),
     ("cat-motd", t_cat_motd),
     ("fs-roundtrip", t_fs_roundtrip),
     ("ps", t_ps),
