@@ -56,9 +56,12 @@ static int copy_file(const char *src, const char *dst)
         printf("cp: cannot open %s\n", src);
         return 1;
     }
-    out = open(dst, O_WRONLY | O_CREAT | O_TRUNC);
+    out = open_distinct(dst, O_WRONLY | O_CREAT | O_TRUNC, in);
     if (out < 0) {
-        printf("cp: cannot create %s\n", dst);
+        if (out == K_OPEN_SAME_FILE)
+            printf("cp: %s and %s are the same file\n", src, dst);
+        else
+            printf("cp: cannot create %s\n", dst);
         close(in);
         return 1;
     }
