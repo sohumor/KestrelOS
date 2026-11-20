@@ -5,6 +5,7 @@
 #include "proc.h"
 #include "string.h"
 #include "spinlock.h"
+#include "timer.h"
 #include "vfs.h"
 
 #include "pulse.h"
@@ -15,16 +16,25 @@
 
 struct parcel_slot {
     bool valid;
+    uint64_t seq;
     struct k_parcel_info info;
     uint8_t *data;
 };
 
 struct parcel_bucket {
     uint32_t uid;
+    uint64_t last_seq;
     struct parcel_slot slots[K_PARCEL_MAX_SLOTS];
 };
 
+struct parcel_watch_waiter {
+    struct parcel_watch_waiter *next;
+    struct task_event_channel channel;
+    uint32_t uid;
+};
+
 static struct parcel_bucket *buckets[PARCEL_MAX_UIDS];
+static struct parcel_watch_waiter *parcel_watchers;
 static uint32_t next_seq;
 static spinlock_t parcel_lock = SPINLOCK_INIT;
 
@@ -142,8 +152,12 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
         b->slots[i] = b->slots[i - 1];
 
     b->slots[0].valid = true;
+    b->slots[0].seq = ++b->last_seq;
     b->slots[0].info = info;
     b->slots[0].data = payload;
+    for (struct parcel_watch_waiter *w = parcel_watchers; w; w = w->next)
+        if (w->uid == uid)
+            task_event_notify(&w->channel, 1);
     spin_unlock_irqrestore(&parcel_lock, f);
 
     if (new_bucket)
@@ -223,6 +237,52 @@ long parcel_list(uint32_t index, struct k_parcel_info *info_out)
     *info_out = b->slots[index].info;
     spin_unlock_irqrestore(&parcel_lock, f);
     return 0;
+}
+
+long parcel_watch(uint64_t *cursor, struct parcel_change *out,
+                  uint32_t capacity, uint32_t timeout_ms)
+{
+    if (!current || !cursor || (capacity && !out))
+        return -1;
+    if (!capacity)
+        return 0;
+
+    struct parcel_watch_waiter waiter = { .uid = current->uid };
+    uint64_t ticks = ((uint64_t)timeout_ms * TIMER_HZ + 999) / 1000;
+    uint64_t deadline = timer_ticks() + ticks;
+    uint64_t f = spin_lock_irqsave(&parcel_lock);
+    for (;;) {
+        const struct parcel_bucket *b = find_bucket_locked(waiter.uid);
+        uint32_t count = 0;
+        for (int i = K_PARCEL_MAX_SLOTS - 1; b && i >= 0 && count < capacity; i--) {
+            const struct parcel_slot *s = &b->slots[i];
+            if (s->valid && s->seq > *cursor)
+                out[count++] = (struct parcel_change){ s->seq, s->info };
+        }
+        if (count) {
+            *cursor = out[count - 1].seq;
+            spin_unlock_irqrestore(&parcel_lock, f);
+            return count;
+        }
+        if (!ticks || !sched_active || timer_ticks() >= deadline) {
+            spin_unlock_irqrestore(&parcel_lock, f);
+            return 0;
+        }
+
+        waiter.next = parcel_watchers;
+        parcel_watchers = &waiter;
+        int rc = task_event_wait_locked(&waiter.channel, 1, deadline,
+                                        &parcel_lock, f);
+        f = spin_lock_irqsave(&parcel_lock);
+        struct parcel_watch_waiter **link = &parcel_watchers;
+        while (*link != &waiter)
+            link = &(*link)->next;
+        *link = waiter.next;
+        if (rc < 0) {
+            spin_unlock_irqrestore(&parcel_lock, f);
+            return -1;
+        }
+    }
 }
 
 struct parcel_snap_row {
