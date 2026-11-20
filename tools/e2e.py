@@ -42,6 +42,8 @@ import sys
 import tempfile
 import threading
 import time
+import math
+import wave
 
 def find_qemu():
     env_q = os.environ.get("QEMU")
@@ -3239,6 +3241,15 @@ def t_kjs_cli(h):
     wait_prompt(h)
 
 
+def t_hda_absent(h):
+    h.send("cat /dev/audio")
+    h.expect("cat: cannot open /dev/audio")
+    wait_prompt(h)
+    h.send("cat /dev/mixer")
+    h.expect("cat: cannot open /dev/mixer")
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("login", t_login),
@@ -3295,6 +3306,7 @@ TESTS = [
     ("inspect-cli", t_inspect_cli),
     ("kjs-cli", t_kjs_cli),
     ("dev", t_dev),
+    ("hda-absent", t_hda_absent),
     ("flight", t_flight),
     ("aerie-krec", t_aerie_krec),
     ("dmesg", t_dmesg),
@@ -3670,6 +3682,71 @@ def usb_hid_test(nic, cpus, machine):
         h.kill()
 
 
+def check_audio_wav(path):
+    with wave.open(path, "rb") as wav:
+        if wav.getsampwidth() != 2 or wav.getnchannels() != 2:
+            raise ValueError("expected stereo s16 WAV")
+        rate = wav.getframerate()
+        raw = wav.readframes(wav.getnframes())
+    samples = [s[0] for s in struct.iter_unpack("<hh", raw)]
+    active = [i for i, s in enumerate(samples) if abs(s) > 500]
+    if not active:
+        raise ValueError("WAV contains no non-silent playback samples")
+    signal = samples[active[0]:active[-1] + 1]
+    rms = math.sqrt(sum(s * s for s in signal) / len(signal))
+    crossings = sum(a <= 0 < b for a, b in zip(signal, signal[1:]))
+    frequency = crossings * rate / len(signal)
+    if rms < 1000 or not 420 <= frequency <= 460 or len(signal) < rate * 0.8:
+        raise ValueError("bad playback: RMS=%.1f frequency=%.1f Hz duration=%.3f s" %
+                         (rms, frequency, len(signal) / rate))
+    print("PASS hda-wav: non-silent RMS=%.1f frequency=%.1f Hz duration=%.3f s" %
+          (rms, frequency, len(signal) / rate))
+
+
+def run_audio_test(nic, cpus):
+    path = os.path.abspath("build/hda-playback.wav")
+    if os.path.exists(path):
+        os.unlink(path)
+    cmd = qemu_command(nic, cpus) + [
+        "-audiodev", "wav,id=snd0,path=%s,out.frequency=48000" % path,
+        "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
+    h = Harness(cmd)
+    try:
+        h.start()
+        match = h.expect(r"hda: codec \d+ dac nid=\d+ pin nid=\d+", regex=True, timeout=30)
+        print(match.group(0))
+        for _, fn in TESTS[:SMOKE_TESTS]:
+            fn(h)
+        h.send("echo 63 > /dev/mixer")
+        wait_prompt(h)
+        h.send("cat /dev/mixer")
+        h.expect("\nvolume=63\n")
+        wait_prompt(h)
+        h.send("audiotest")
+        h.expect("audio: empty, invalid, exclusive-open and mixer checks passed")
+        wait_prompt(h)
+        h.send("cat /doc/tone.pcm > /dev/audio")
+        wait_prompt(h, timeout=20)
+        h.send("echo AUDIO-DRAINED")
+        h.expect("\nAUDIO-DRAINED\n")
+        wait_prompt(h)
+        h.send("sleep 1")
+        wait_prompt(h)
+    except (OSError, TimeoutError, ValueError) as e:
+        print("FAIL hda-audio: %s" % e)
+        h.print_tail()
+        return False
+    finally:
+        h.kill()
+    try:
+        check_audio_wav(path)
+    except (OSError, ValueError, wave.Error) as e:
+        print("FAIL hda-audio: %s" % e)
+        return False
+    print("PASS hda-audio")
+    return True
+
+
 def main():
     global browser_fixtures
 
@@ -3702,6 +3779,7 @@ def main():
     if args.list:
         for name, _ in TESTS:
             print(name)
+        print("hda-audio")
         return 0
 
     if args.selftest:
@@ -3717,7 +3795,7 @@ def main():
         return usb_hid_test(args.nic, args.cpus, args.usb_machine)
 
     if args.only:
-        available = dict(TESTS)
+        available = dict(TESTS, **{"hda-audio": run_audio_test})
         missing = [name for name in args.only if name not in available]
         if missing:
             ap.error("unknown --only test(s): %s" % ", ".join(missing))
@@ -3762,7 +3840,10 @@ def main():
         if fixtures:
             fixtures.close()
             browser_fixtures = None
-    return 0 if summarize(results) else 1
+    ok = summarize(results)
+    if not args.smoke and (not args.only or "hda-audio" in args.only):
+        ok = run_audio_test(args.nic, args.cpus) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

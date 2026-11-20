@@ -34,6 +34,7 @@
 #include "vm.h"
 #include "smp.h"
 #include "flight.h"
+#include "hda.h"
 #include "testmode.h"
 
 struct bootinfo *boot_info;
@@ -73,6 +74,7 @@ static void housekeeper(void *arg)
     (void)arg;
     for (;;) {
         tcp_tick();
+        hda_poll();
         wm_tick();
         task_sleep_ticks(2);         /* ~50 Hz */
     }
@@ -139,6 +141,7 @@ void kmain(uint64_t bootinfo_phys)
     initcall_run_level(INITCALL_CORE);
 
     ata_init();
+    hda_init();
     ahci_init();
     virtio_blk_init();
     swap_init();

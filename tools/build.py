@@ -440,11 +440,15 @@ def build_all(tc):
     rootfs_stage = b("rootfs")
     if os.path.exists(rootfs_stage):
         shutil.rmtree(rootfs_stage)
-    for d in ("bin", "dev", "run", "tmp", "var/log", "lib/modules",
+    for d in ("bin", "dev", "run", "tmp", "media", "var/log", "lib/modules",
               "var/pkg/repo", "var/pkg/db", "var/pkg/cache"):
         os.makedirs(os.path.join(rootfs_stage, d), exist_ok=True)
     if os.path.isdir(r("rootfs")):
         shutil.copytree(r("rootfs"), rootfs_stage, dirs_exist_ok=True)
+    run_cmd([sys.executable, r("tools/mkaudio.py"),
+             os.path.join(rootfs_stage, "doc", "tone.pcm")])
+    run_cmd([sys.executable, r("tools/mkchime.py"),
+             os.path.join(rootfs_stage, "media", "chime.wav")])
     for app in app_bins:
         dst = os.path.join(rootfs_stage, "bin", os.path.basename(app))
         shutil.copyfile(app, dst)
@@ -498,6 +502,7 @@ def run_host_tests(tc):
          ["-Ikernel/include"]),
         ("test_virtio_ring", [r("kernel/virtio_ring.c"), r("kernel/virtio_net_core.c"), r("tools/test_virtio_ring.c")],
          ["-Ikernel/include"]),
+        ("test_play", [r("tools/test_play.c")], []),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],

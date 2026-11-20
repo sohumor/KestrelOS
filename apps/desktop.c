@@ -26,7 +26,7 @@
 #define TALON_W        476
 #define TALON_H        496
 #define QUICK_W        396
-#define QUICK_H        382
+#define QUICK_H        452
 
 #define CALC_LONG_MAX  __LONG_MAX__
 #define CALC_LONG_MIN  (-__LONG_MAX__ - 1L)
@@ -72,6 +72,8 @@ static struct app_entry apps[] = {
       GUI_ICON_CALCULATOR, 0x14B8A6U, 0, 0 },
     { "Clock", "UTC dial and calendar", "/bin/gclock", 0,
       GUI_ICON_CLOCK, 0x8B5CF6U, 0, 0 },
+    { "Audio Player", "WAV playback & master volume", "/bin/play", 0,
+      GUI_ICON_MONITOR, 0x14B8A6U, 0, 0 },
     { "Settings", "Avionics themes & workspaces", "/bin/settings", 0,
       GUI_ICON_SETTINGS, 0x64748BU, 0, 1 },
     { "About", "KestrelOS system information", "/bin/about", 0,
@@ -2151,6 +2153,32 @@ static int paint_talon_shelf(gui_window *win, gui_ui *ui)
 
 /* --------------------------------------------------------- Quick settings */
 
+static int read_volume(void)
+{
+    char line[32];
+    int fd = open("/dev/mixer", O_RDONLY);
+    if (fd < 0)
+        return -1;
+    long n = read(fd, line, sizeof(line) - 1);
+    close(fd);
+    if (n < 8 || memcmp(line, "volume=", 7))
+        return -1;
+    line[n] = 0;
+    return atoi(line + 7);
+}
+
+static int write_volume(int volume)
+{
+    char line[8];
+    int fd = open("/dev/mixer", O_WRONLY);
+    if (fd < 0)
+        return -1;
+    int n = snprintf(line, sizeof(line), "%d\n", volume);
+    long result = write(fd, line, n);
+    close(fd);
+    return result == n ? 0 : -1;
+}
+
 static int paint_quick(gui_window *win, gui_ui *ui, gui_settings *settings)
 {
     struct gui_tm tm;
@@ -2208,16 +2236,32 @@ static int paint_quick(gui_window *win, gui_ui *ui, gui_settings *settings)
     gui_badge(win, gui_mkrc(166, 256, 92, 26), line, GUI_ACCENT);
 
     {
+        int volume = read_volume();
+        int target = volume;
+        gui_text(win, 20, 298, "Volume", GUI_TEXT_DIM, GUI_TRANSPARENT);
+        if (gui_button_ex(win, gui_mkrc(20, 322, 32, 28), "-", ui, volume >= 0, 0))
+            target = volume < 5 ? 0 : volume - 5;
+        gui_progress(win, gui_mkrc(64, 330, win->w - 190, 12),
+                     volume < 0 ? 0 : volume, volume < 0 ? GUI_TEXT_DIM : GUI_ACCENT);
+        snprintf(line, sizeof(line), volume < 0 ? "N/A" : "%d%%", volume);
+        gui_text(win, win->w - 112, 328, line, GUI_TEXT_DIM, GUI_TRANSPARENT);
+        if (gui_button_ex(win, gui_mkrc(win->w - 52, 322, 32, 28), "+", ui, volume >= 0, 0))
+            target = volume > 95 ? 100 : volume + 5;
+        if (target != volume && write_volume(target) != 0)
+            notify("Could not update volume");
+    }
+
+    {
         int light = settings->light;
         int compact = settings->compact;
 
-        if (gui_toggle(win, 20, 300, "Daylight mode", &light, ui)) {
+        if (gui_toggle(win, 20, 370, "Daylight mode", &light, ui)) {
             settings->light = light;
             settings->preset = light ? GUI_THEME_DAYLIGHT
                                      : GUI_THEME_AVIONICS_DARK;
             changed = 1;
         }
-        if (gui_toggle(win, 196, 300, "Compact dock", &compact, ui)) {
+        if (gui_toggle(win, 196, 370, "Compact dock", &compact, ui)) {
             settings->compact = compact;
             changed = 1;
         }
