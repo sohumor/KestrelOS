@@ -1435,6 +1435,80 @@ static int check_random_hook(void)
     return fails;
 }
 
+static int check_shared_execution_budget(void)
+{
+    js_config cfg;
+    js_execution_budget budget;
+    js_ctx *jobs = NULL, *limited = NULL, *later = NULL;
+    js_value r;
+    unsigned long before;
+    const char *failure = "context allocation";
+
+    js_execution_budget_init(&budget, 128);
+    js_config_default(&cfg);
+    cfg.execution_budget = &budget;
+    cfg.max_steps = 0;
+    jobs = js_new(&cfg);
+    if (!jobs)
+        goto fail;
+
+    failure = "promise reaction did not use shared credit";
+    if (js_eval(jobs, "var n = 0; var p = Promise.resolve();"
+                    "p.then(() => { n++; }); p.then(() => { n++; });",
+                "shared-jobs", &r) != JS_OK)
+        goto fail;
+    before = js_execution_budget_remaining(&budget);
+    if (js_run_jobs(jobs, 1) != 1 ||
+        js_execution_budget_remaining(&budget) >= before)
+        goto fail;
+    before = js_execution_budget_remaining(&budget);
+
+    failure = "local limit charged a rejected step or reset shared credit";
+    cfg.max_steps = 1;
+    limited = js_new(&cfg);
+    if (!limited ||
+        js_eval(limited, "while (true) {}", "local-limit", &r) != JS_THROW ||
+        !js_fatal(limited) ||
+        strcmp(js_error_text(limited, r), "FatalError: script step limit exceeded") != 0 ||
+        js_execution_budget_remaining(&budget) != before - 1)
+        goto fail;
+    js_reset_steps(limited);
+    js_free(limited);
+    limited = NULL;
+    if (js_execution_budget_remaining(&budget) != before - 1 ||
+        js_fatal(jobs))
+        goto fail;
+
+    failure = "later context renewed shared credit or caught exhaustion";
+    cfg.max_steps = 0;
+    later = js_new(&cfg);
+    if (!later ||
+        js_eval(later, "try { while (true) {} } catch (e) { 1; }",
+                "shared-limit", &r) != JS_THROW ||
+        !js_fatal(later) ||
+        strcmp(js_error_text(later, r),
+               "FatalError: shared script execution budget exhausted") != 0 ||
+        js_execution_budget_remaining(&budget) != 0)
+        goto fail;
+
+    failure = "pending reaction escaped the exhausted pool";
+    js_reset_steps(jobs);
+    if (js_fatal(jobs) || js_run_jobs(jobs, 1) != -1 || !js_fatal(jobs) ||
+        js_execution_budget_remaining(&budget) != 0)
+        goto fail;
+    failure = NULL;
+
+fail:
+    js_free(later);
+    js_free(limited);
+    js_free(jobs);
+    if (failure)
+        printf("FAIL [shared execution budget] %s\n", failure);
+    else
+        printf("PASS shared JS execution credit: local limit, later context, and Promise reactions\n");
+    return failure != NULL;
+}
+
 int main(int argc, char **argv)
 {
     int i, pass = 0, fail = 0, verbose = 0;
@@ -1496,6 +1570,10 @@ int main(int argc, char **argv)
         }
     }
     if (check_random_hook() == 0)
+        pass++;
+    else
+        fail++;
+    if (check_shared_execution_budget() == 0)
         pass++;
     else
         fail++;

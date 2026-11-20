@@ -96,6 +96,17 @@ typedef int (*js_native)(js_ctx *ctx, js_value this_val,
  * whatever `host` pointed at. Registered per host tag. */
 typedef void (*js_host_free)(void *user, void *host);
 
+/* A finite pool of metered interpreter steps. The host owns its storage
+ * and must keep it alive until all attached contexts are freed. Initialize
+ * once before attaching it; do not copy or reinitialize a pool in use.
+ * Independent contexts may draw from a pool concurrently. */
+typedef struct js_execution_budget {
+    unsigned long remaining;
+} js_execution_budget;
+
+void js_execution_budget_init(js_execution_budget *budget, unsigned long steps);
+unsigned long js_execution_budget_remaining(const js_execution_budget *budget);
+
 typedef struct js_config {
     unsigned long max_heap;       /* bytes; default 16 MiB */
     unsigned long max_steps;      /* default 20,000,000; 0 = unlimited */
@@ -107,6 +118,7 @@ typedef struct js_config {
     double (*now_ms)(void *user);                  /* ms since Unix epoch */
     int (*random_bytes)(void *user, uint8_t *out, unsigned long len);
     void *user;
+    js_execution_budget *execution_budget;      /* optional; 0 steps = empty */
 } js_config;
 
 void    js_config_default(js_config *cfg);
@@ -123,7 +135,8 @@ int js_eval(js_ctx *ctx, const char *src, const char *name, js_value *result);
  * inspected but must not be used to run more script. */
 int js_fatal(js_ctx *ctx);
 
-/* Reset the step counter, e.g. between two independent event handlers. */
+/* Reset the local step counter, e.g. between event handlers. Shared credit
+ * is not restored, and a fatal context remains fatal. */
 void js_reset_steps(js_ctx *ctx);
 
 /* ---- constructing values ---- */
