@@ -18,6 +18,8 @@ long syscall(long n, long a, long b, long c, long d);
 #define SEEK_END 2
 
 int open(const char *path, int flags);               /* -> fd or -1 */
+/* Like open(), but returns K_OPEN_SAME_FILE if path resolves to exclude_fd's file. */
+int open_distinct(const char *path, int flags, int exclude_fd);
 long read(int fd, void *buf, unsigned long len);     /* blocks; -> bytes or -1 */
 long write(int fd, const void *buf, unsigned long len);
 int close(int fd);

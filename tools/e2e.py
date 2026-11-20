@@ -1855,6 +1855,31 @@ def t_ls_bin(h):
     wait_prompt(h)
 
 
+def t_ls_many(h):
+    h.send("mkdir /lsmany")
+    wait_prompt(h)
+    h.send("ls /lsmany")
+    h.expect("\n0 entries\n")
+    wait_prompt(h)
+    h.send("ls /lsmany/missing")
+    h.expect("\nls: cannot access /lsmany/missing\n")
+    wait_prompt(h)
+    for start in range(0, 260, 10):
+        h.send("touch " + " ".join(
+            "/lsmany/f%03d" % i for i in range(start, start + 10)))
+        wait_prompt(h)
+    h.send("ls /lsmany")
+    block = h.capture_until(SHELL_PROMPT, regex=True, timeout=120)
+    names = re.findall(r"^- +\d+ +(f\d{3})$", block, re.MULTILINE)
+    expected = ["f%03d" % i for i in range(260)]
+    if sorted(names) != expected or "\n260 entries\n" not in block:
+        raise TimeoutError("ls lost entries: listed %d of 260; count: %s" % (
+            len(names), re.findall(r"\d+ entries", block)))
+    h.send("ls /lsmany/f259")
+    h.expect(r"\n- +0 +/lsmany/f259\n1 entry\n", regex=True)
+    wait_prompt(h)
+
+
 def t_cat_motd(h):
     h.send("cat /etc/motd")
     h.expect("Kestrel")
@@ -1956,6 +1981,30 @@ def t_cp_wc(h):
     wait_prompt(h)
 
 
+def t_wc_stdin(h):
+    """Only terminal stdin treats byte 0x04 as EOF."""
+    h.send('kjs -e "Kestrel.writeFile(\'/wc-eof\', \'a\\x04b c\\n\')"')
+    wait_prompt(h)
+    h.send("wc /wc-eof")
+    h.expect(r"\n *1 +2 +6 /wc-eof\n", regex=True)
+    wait_prompt(h)
+    for command in ("wc < /wc-eof", "cat /wc-eof | wc"):
+        h.send(command)
+        h.expect(r"\n *1 +2 +6\n", regex=True)
+        wait_prompt(h)
+    for command in ("wc < /dev/null", "cat /dev/null | wc"):
+        h.send(command)
+        h.expect(r"\n *0 +0 +0\n", regex=True)
+        wait_prompt(h)
+    h.send("wc")
+    h.expect("elf: static image")
+    h.send_raw("one two\n\x04")
+    h.expect(r"\n *1 +2 +8\n", regex=True)
+    wait_prompt(h)
+    h.send("rm /wc-eof")
+    wait_prompt(h)
+
+
 def t_mv_rm(h):
     h.send("mv /t2.txt /t3.txt")
     wait_prompt(h)
@@ -1966,6 +2015,46 @@ def t_mv_rm(h):
     wait_prompt(h)
     h.send("cat /t3.txt")
     h.expect("cat: cannot open")    # not present in the echoed command
+    wait_prompt(h)
+
+
+def check_same_file(h, command, status):
+    h.send("mkdir /tmp/same-file-dir")
+    wait_prompt(h)
+    h.send("echo keep-original-bytes > /tmp/same-file-dir/a")
+    wait_prompt(h)
+    for dst in ("/tmp/same-file-dir/./a", "/tmp//same-file-dir/../same-file-dir/a",
+                "/tmp/same-file-dir/."):
+        h.send(f"{command} /tmp/same-file-dir/a {dst}; echo SAME-FILE-$?; "
+               "cat /tmp/same-file-dir/a")
+        lines = h.capture_until(SHELL_PROMPT, regex=True).splitlines()
+        if f"SAME-FILE-{status}" not in lines or "keep-original-bytes" not in lines:
+            raise TimeoutError(f"{dst}: expected status {status} and preserved bytes")
+    h.send("rm /tmp/same-file-dir/a")
+    wait_prompt(h)
+    h.send("rm /tmp/same-file-dir")
+    wait_prompt(h)
+
+
+def t_cp_same_file(h):
+    check_same_file(h, "cp", 1)
+
+
+def t_mv_same_file(h):
+    check_same_file(h, "mv", 0)
+
+
+def t_same_device(h):
+    # A second devfs mount forces mv to take its copy + unlink fallback.
+    h.send('mount -t devfs "" /tmp/same-file-dev; echo MOUNT-$?')
+    h.expect(r"\nMOUNT-0\n", regex=True)
+    wait_prompt(h)
+    for command, status in (("cp", 1), ("mv", 0)):
+        h.send(f"{command} /dev/null /tmp/same-file-dev/null; echo SAME-DEVICE-$?")
+        h.expect(rf"\nSAME-DEVICE-{status}\n", regex=True)
+        wait_prompt(h)
+    h.send("mount -u /tmp/same-file-dev; echo UNMOUNT-$?")
+    h.expect(r"\nUNMOUNT-0\n", regex=True)
     wait_prompt(h)
 
 
@@ -2011,6 +2100,45 @@ def t_tail(h):
     h.send("tail -n 0 /tail-empty.txt")
     h.expect("tail: cannot open /tail-empty.txt")
     wait_prompt(h)
+
+
+def t_text_long_lines(h):
+    line = "a" * 510 + "BOUNDARY" + "b" * 1600 + "LATE-MARKER"
+    body = "\n" + line + "\nshort\n" + line
+    h.send("writefile /long-lines.txt")
+    h.expect("writefile: type text, finish with ctrl-D\n")
+    for start in range(0, len(body), 64):
+        chunk = body[start:start + 64]
+        h.send_raw(chunk)
+        h.expect(chunk)
+    h.send_raw("\x04")
+    h.expect("wrote %d bytes" % len(body))
+    wait_prompt(h)
+
+    failures = []
+    cases = [
+        ("head -n 4", body + "\n"),
+        ("head -n 2", "\n" + line + "\n"),
+        ("tail -n 2", "short\n" + line + "\n"),
+        ("grep -n LATE-MARKER", "2:" + line + "\n4:" + line + "\n"),
+        ("grep -i boundary", line + "\n" + line + "\n"),
+        ("grep absent", ""),
+    ]
+    for command, expected in cases:
+        h.send(command + " /long-lines.txt")
+        output = h.capture_until(SHELL_PROMPT, regex=True)
+        actual = output.split("\n", 1)[1]
+        actual = re.sub(r"^elf: [^\n]*\n", "", actual)
+        actual = re.sub(SHELL_PROMPT + r"$", "", actual)
+        actual = re.sub(r"\[exit 1\]\n$", "", actual)
+        if actual != expected:
+            print("FAIL long-lines: %s (expected %d bytes, got %d)" %
+                  (command, len(expected), len(actual)))
+            failures.append(command)
+    h.send("rm /long-lines.txt")
+    wait_prompt(h)
+    if failures:
+        raise TimeoutError("long-line output mismatch: " + ", ".join(failures))
 
 
 def t_tree(h):
@@ -2171,6 +2299,73 @@ def t_pipe_lifetime(h):
     h.send("sigtest --pipe-lifetime")
     h.expect("sigtest: pipe dup + spawn + peer close verified")
     wait_prompt(h)
+
+
+def t_elf_banner_quiet(h):
+    """ELF diagnostics stay on serial, not in the VGA console cell grid."""
+    symbols = {}
+    for line in subprocess.check_output(
+            ["nm", "-S", "build/kernel.elf"], text=True).splitlines():
+        fields = line.split()
+        if fields[-1] in ("cell_ch", "KERNEL_OFFSET"):
+            symbols[fields[-1]] = fields
+    cells = symbols["cell_ch"]
+    address = int(cells[0], 16) - int(symbols["KERNEL_OFFSET"][0], 16)
+    size = int(cells[1], 16)
+
+    with tempfile.TemporaryDirectory() as tmp, socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(BOOT_TIMEOUT)
+        port = listener.getsockname()[1]
+        cmd = h.cmd + [
+            "-monitor", "tcp:127.0.0.1:%d" % port]
+        guest = Harness(cmd)
+        guest.start()
+        try:
+            monitor, _ = listener.accept()
+            with monitor:
+                monitor.settimeout(DEFAULT_TIMEOUT)
+
+                def monitor_prompt():
+                    reply = b""
+                    while b"(qemu) " not in reply:
+                        chunk = monitor.recv(4096)
+                        if not chunk:
+                            raise TimeoutError("QEMU monitor closed")
+                        reply += chunk
+                    return reply
+
+                monitor_prompt()
+                t_boot(guest)
+                t_login(guest)
+                t_prompt(guest)
+                guest.send("clear")
+                guest.expect("clear\n")
+                wait_prompt(guest)
+                guest.send("ls /etc | wc -l")
+                guest.expect("| wc -l\n")
+                serial = guest.capture_until(SHELL_PROMPT, regex=True)
+                count = re.search(r"\n *(\d+)\n", serial)
+                if not count:
+                    raise TimeoutError("pipeline did not count /etc entries")
+                banner = r"elf: static image, 1 object, \d+ lazy segments?"
+                if len(re.findall(banner, serial)) < 2:
+                    raise TimeoutError("ELF pipeline diagnostics missing from serial")
+                dump = os.path.join(tmp, "console.bin")
+                monitor.sendall(('pmemsave 0x%x %d "%s"\n'
+                                 % (address, size, dump)).encode())
+                monitor_prompt()
+                with open(dump, "rb") as f:
+                    console = f.read().decode("latin1")
+                if not any(row.strip(" \x00") == count.group(1)
+                           for row in (console[i:i + 320]
+                                       for i in range(0, size, 320))):
+                    raise TimeoutError("pipeline output missing from VGA console")
+                if re.search(banner, console):
+                    raise TimeoutError("ELF banner leaked onto VGA console")
+        finally:
+            guest.kill()
 
 
 def t_dev(h):
@@ -2919,6 +3114,7 @@ TESTS = [
     ("help", t_help),
     ("echo", t_echo),
     ("ls-bin", t_ls_bin),
+    ("ls-many", t_ls_many),
     ("cat-motd", t_cat_motd),
     ("fs-roundtrip", t_fs_roundtrip),
     ("ps", t_ps),
@@ -2934,11 +3130,16 @@ TESTS = [
     ("calc", t_calc),
     ("calc-divzero", t_calc_divzero),
     ("cp-wc", t_cp_wc),
+    ("wc-stdin", t_wc_stdin),
     ("mv-rm", t_mv_rm),
+    ("cp-same-file", t_cp_same_file),
+    ("mv-same-file", t_mv_same_file),
+    ("same-device", t_same_device),
     ("mkdir-ls", t_mkdir_ls),
     ("grep", t_grep),
     ("head", t_head),
     ("tail", t_tail),
+    ("text-long-lines", t_text_long_lines),
     ("tree", t_tree),
     ("du", t_du),
     ("find", t_find),
@@ -2953,6 +3154,7 @@ TESTS = [
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
+    ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
