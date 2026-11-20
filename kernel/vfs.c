@@ -261,17 +261,6 @@ int vfs_pipe(struct file **read_end, struct file **write_end)
     return 0;
 }
 
-/* A handle created by pipe_create() directly (rather than through
- * vfs_pipe) carries no ops vector; bind it on first use so the old entry
- * point keeps working. Nothing else can produce a handle without ops:
- * vfs_open() stamps every one it hands out. */
-static const struct fs_ops *file_ops(struct file *f)
-{
-    if (f->ops == NULL && f->type == FILE_PIPE)
-        f->ops = &pipe_ops;
-    return f->ops;
-}
-
 /* --- mounting -------------------------------------------------------- */
 
 int vfs_init(void)
@@ -455,7 +444,7 @@ void vfs_close(struct file *f)
     if (!gone)
         return;
 
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops != NULL && ops->close != NULL)
         ops->close(f);
     else
@@ -470,7 +459,7 @@ long vfs_read(struct file *f, void *buf, unsigned long n)
         return -1;
     if (!vfs_flags_allow_read(f->flags))
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->read == NULL)
         return -1;
     if (n > 0x7FFFFFFFUL)
@@ -486,7 +475,7 @@ long vfs_write(struct file *f, const void *buf, unsigned long n)
         return -1;
     if (!vfs_flags_allow_write(f->flags))
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->write == NULL)
         return -1;
     if (n > 0x7FFFFFFFUL)
@@ -500,7 +489,7 @@ long vfs_seek(struct file *f, long off, int whence)
 
     if (f == NULL)
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->seek == NULL)
         return -1;              /* pipes are not seekable */
     return ops->seek(f, off, whence);
