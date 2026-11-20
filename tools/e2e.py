@@ -17,7 +17,7 @@ program prints are the three tricks used throughout.
 
 Usage:
     python3 tools/e2e.py            # full test sequence
-    python3 tools/e2e.py --smoke    # boot + prompt only
+    python3 tools/e2e.py --smoke    # boot + login + prompt + guest exit code
     python3 tools/e2e.py --nic e1000
     python3 tools/e2e.py --list     # list tests without running
     python3 tools/e2e.py --selftest # exercise expect/send plumbing
@@ -90,6 +90,9 @@ def qemu_command(nic, cpus, disk="ata"):
                ["-drive", "file=build/os.img,format=raw"])
     return [
         find_qemu(),
+        "-accel", "tcg",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-fw_cfg", "name=opt/kestrel-test,string=2",
         *storage,
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
@@ -156,6 +159,7 @@ def clean(text):
 class Harness:
     def __init__(self, cmd):
         self.cmd = list(cmd)
+        self.test_mode = any("name=opt/kestrel-test," in arg for arg in cmd)
         self.proc = None
         self._sock = None
         self.buf = ""                 # cleaned, unconsumed text
@@ -245,6 +249,8 @@ class Harness:
                 for line in lines:
                     self.tail.append(line)
                 self.cond.notify_all()
+        if self.test_mode:
+            self.proc.wait()
         with self.cond:
             self._esc = ""            # nothing will ever complete it now
             if self._partial:
@@ -264,6 +270,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     self.buf = self.buf[m.end():]
@@ -281,6 +288,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 best = None
                 for p, rx in rxs:
                     m = rx.search(self.buf)
@@ -302,6 +310,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     block = self.buf[:m.end()]
@@ -313,6 +322,26 @@ class Harness:
                         "timeout capturing through %r (eof=%s)"
                         % (pattern, self.eof))
                 self.cond.wait(min(remaining, 0.5))
+
+    def check_exit(self):
+        if not self.test_mode:
+            return
+        code = self.proc.poll()
+        if code is not None:
+            if code == 35:
+                raise TimeoutError("guest failure (QEMU exit 35)")
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+
+    def wait_exit(self, timeout=BOOT_TIMEOUT):
+        try:
+            code = self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("timeout waiting for QEMU debug-exit") from None
+        if code == 35:
+            raise TimeoutError("guest failure (QEMU exit 35)")
+        if code != 33:
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+        print("  QEMU exit 33 (guest success)")
 
     def send(self, line):
         self.send_raw(line + "\n")
@@ -2978,6 +3007,42 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    for code in (33, 35, 0):
+        h = Harness([sys.executable, "-c", "raise SystemExit(%d)" % code])
+        h.start()
+        try:
+            try:
+                h.wait_exit(timeout=5)
+            except TimeoutError as e:
+                if code == 33 or str(code) not in str(e):
+                    raise AssertionError(str(e))
+            else:
+                if code != 33:
+                    raise AssertionError("accepted QEMU exit %d" % code)
+            h.test_mode = True
+            for wait in (h.expect, h.expect_any, h.capture_until):
+                try:
+                    wait(["missing"] if wait == h.expect_any else "missing",
+                         timeout=5)
+                except TimeoutError as e:
+                    if str(code) not in str(e):
+                        raise AssertionError(str(e))
+                else:
+                    raise AssertionError("serial wait accepted exited guest")
+        finally:
+            h.kill()
+    h = Harness([sys.executable, "-c", "import time; time.sleep(30)"])
+    h.start()
+    try:
+        try:
+            h.wait_exit(timeout=0.01)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("accepted a guest that never exits")
+    finally:
+        h.kill()
+    print("PASS selftest: guest exit success, failure, unexpected and timeout")
     fake = (
         "import sys\n"
         "sys.stdout.write('\\x1b[32mKESTREL READY\\x1b[0m\\r\\n')\n"
@@ -3257,7 +3322,7 @@ def main():
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
-                    help="run boot + prompt tests only")
+                    help="check boot, login and shell prompt, then guest exit code")
     ap.add_argument("--usb-hid", action="store_true",
                     help="opt-in xHCI monitor test (disables PS/2 on supported QEMU)")
     ap.add_argument("--usb-machine", choices=["pc", "q35"], default="pc",
@@ -3331,6 +3396,11 @@ def main():
         return 1
     try:
         results = run_tests(h, tests)
+        if all(status != "FAIL" for _, status in results):
+            def finish(h):
+                h.send("halt")
+                h.wait_exit()
+            results += run_tests(h, [("guest-exit", finish)])
     finally:
         h.kill()
         if fixtures:
