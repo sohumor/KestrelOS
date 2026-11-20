@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Browser
+exec: /bin/browser
+mission: Browse local documents and the web
+display: yes
+fs.read: /lib /etc /share /doc ~ /tmp
+fs.write: ~ /tmp
+net: any
+device: random
+ipc: talon pulse
+spawn: no

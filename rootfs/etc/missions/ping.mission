@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: ping
+exec: /bin/ping
+mission: Probe selected network hosts
+display: no
+fs.read: none
+fs.write: none
+net: any
+device: none
+ipc: none
+spawn: no

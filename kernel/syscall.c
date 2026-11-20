@@ -12,7 +12,6 @@
 #include "timer.h"
 #include "rtc.h"
 #include "power.h"
-#include "pipe.h"
 #include "klog.h"
 #include "fb.h"
 #include "mouse.h"
@@ -32,6 +31,7 @@
 #include "kestrel_abi.h"
 #include "smp.h"
 #include "flight.h"
+#include "mission.h"
 
 /* Hooks exported by idt.c. */
 extern void (*syscall_entry_hook)(struct regs *r);
@@ -210,9 +210,8 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
         uint64_t n = len - done;
         if (n > chunk_sz)
             n = chunk_sz;
-        long g = (f->type == FILE_PIPE)
-                     ? pipe_read_ex(f, chunk, n, blocking)
-                     : vfs_read(f, chunk, n);
+        int read_once;
+        long g = vfs_read_ex(f, chunk, n, blocking, &read_once);
         if (g < 0) {
             if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
@@ -224,7 +223,7 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
             return done ? (long)done : -1;
         }
         done += (uint64_t)g;
-        if (f->type == FILE_PIPE || (uint64_t)g < n)
+        if (read_once || (uint64_t)g < n)
             break;
     }
     if (chunk != small)
@@ -232,19 +231,28 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
     return (long)done;
 }
 
-static long sys_open(uint64_t upath, uint64_t flags)
+static int cap_has(uint64_t cap);
+
+static long sys_open(uint64_t upath, uint64_t flags, uint64_t uexclude)
 {
     char path[UPROC_PATH_MAX];
-    if (!(current->cap_mask & KCAP_FS_READ))
+    struct open_guard guard = {0};
+    if (!cap_has(KCAP_FS_READ))
         return -1;
     if ((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
-        !(current->cap_mask & KCAP_FS_WRITE))
+        !cap_has(KCAP_FS_WRITE))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
-    struct file *f = vfs_open(path, (int)flags);
+    if (flags & O_DISTINCT) {
+        guard.exclude = fd_file(uexclude);
+        if (!guard.exclude)
+            return -1;
+    }
+    struct file *f = vfs_open_guarded(path, (int)flags & ~O_DISTINCT,
+                                      guard.exclude ? &guard : NULL);
     if (!f)
-        return -1;
+        return guard.same_file ? K_OPEN_SAME_FILE : -1;
     for (int fd = 3; fd < MAX_OPEN_FILES; fd++) {
         if (!current->files[fd]) {
             current->files[fd] = f;
@@ -449,7 +457,7 @@ static long sys_rtc(uint64_t urtc)
 
 static long sys_power(uint64_t action)
 {
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     switch (action) {
     case K_POWER_REBOOT:
@@ -483,7 +491,7 @@ static long sys_pipe(uint64_t ufds)
     struct file *rd, *wr;
     int fds[2];
 
-    if (pipe_create(&rd, &wr) < 0)
+    if (vfs_pipe(&rd, &wr) < 0)
         return -1;
 
     fds[0] = fd_alloc_from(3, rd);
@@ -532,7 +540,7 @@ static long sys_dup2(uint64_t oldfd, uint64_t newfd)
 
 static long sys_setuid(uint64_t uid)
 {
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;                   /* only root may change identity */
     current->uid = (uint32_t)uid;
     current->gid = (uint32_t)uid;
@@ -585,7 +593,7 @@ static long sys_insmod(uint64_t upath)
 {
     char path[UPROC_PATH_MAX];
 
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -596,7 +604,7 @@ static long sys_rmmod(uint64_t uname)
 {
     char name[MODULE_NAME_MAX];
 
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(name, (const void *)uname, sizeof(name)) < 0)
         return -1;
@@ -625,7 +633,7 @@ static long sys_mount(uint64_t upath, uint64_t utype, uint64_t udev)
 {
     char path[UPROC_PATH_MAX], type[32], dev[32];
 
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -644,7 +652,7 @@ static long sys_umount(uint64_t upath)
 {
     char path[UPROC_PATH_MAX];
 
-    if (current->uid != 0 || !(current->cap_mask & KCAP_ADMIN))
+    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -850,7 +858,7 @@ static long sys_spawn_caps(uint64_t upath, uint64_t uargv, uint64_t ucaps)
 {
     struct k_spawn_caps kcaps;
 
-    if (!(current->cap_mask & KCAP_SPAWN) || ucaps == 0)
+    if (!cap_has(KCAP_SPAWN) || ucaps == 0)
         return -1;
     if (copy_from_user(&kcaps, (const void *)ucaps, sizeof(kcaps)) < 0)
         return -1;
@@ -888,7 +896,7 @@ static long sys_rename(uint64_t uold, uint64_t unew)
 {
     char oldp[UPROC_PATH_MAX], newp[UPROC_PATH_MAX];
 
-    if (!(current->cap_mask & KCAP_FS_WRITE))
+    if (!cap_has(KCAP_FS_WRITE))
         return -1;
     if (copy_str_from_user(oldp, (const void *)uold, sizeof(oldp)) < 0)
         return -1;
@@ -902,7 +910,7 @@ static long sys_pulse_poll(uint64_t uquery, uint64_t uout)
     struct k_pulse_query q;
     struct k_pulse *kout = NULL;
 
-    if (!(current->cap_mask & KCAP_IPC))
+    if (!cap_has(KCAP_IPC) || !mission_ipc(K_MISSION_IPC_PULSE))
         return -1;
     if (copy_from_user(&q, (const void *)uquery, sizeof(q)) < 0)
         return -1;
@@ -934,7 +942,7 @@ static long sys_parcel_put(uint64_t ureq)
     struct k_parcel_put req;
     void *kbuf = NULL;
 
-    if (!(current->cap_mask & KCAP_IPC))
+    if (!cap_has(KCAP_IPC) || !mission_ipc(K_MISSION_IPC_TALON))
         return -1;
     if (copy_from_user(&req, (const void *)ureq, sizeof(req)) < 0)
         return -1;
@@ -961,7 +969,7 @@ static long sys_parcel_get(uint64_t slot_or_id, uint64_t uinfo,
     struct k_parcel_info kinfo;
     void *kbuf = NULL;
 
-    if (!(current->cap_mask & KCAP_IPC))
+    if (!cap_has(KCAP_IPC) || !mission_ipc(K_MISSION_IPC_TALON))
         return -1;
     if (uinfo == 0 && (ubuf == 0 || bufsz == 0))
         return -1;
@@ -994,7 +1002,7 @@ static long sys_parcel_list(uint64_t index, uint64_t uinfo)
 {
     struct k_parcel_info kinfo;
 
-    if (!(current->cap_mask & KCAP_IPC) || uinfo == 0)
+    if (!cap_has(KCAP_IPC) || !mission_ipc(K_MISSION_IPC_TALON) || uinfo == 0)
         return -1;
     if (parcel_list((uint32_t)index, &kinfo) < 0)
         return -1;
@@ -1003,7 +1011,29 @@ static long sys_parcel_list(uint64_t index, uint64_t uinfo)
 
 static int cap_has(uint64_t cap)
 {
-    return (current->cap_mask & cap) != 0;
+    return mission_cap(cap, (__atomic_load_n(&current->cap_mask, __ATOMIC_RELAXED) & cap) != 0);
+}
+
+static long sys_mission_spawn(uint64_t path, uint64_t argv, uint64_t ugrant, uint64_t uid)
+{
+    struct k_mission_grant g;
+    uint32_t id = 0;
+    if (!cap_has(KCAP_SPAWN) || !ugrant ||
+        copy_from_user(&g, (const void *)ugrant, sizeof(g)) < 0) return -1;
+    if (uid && copy_to_user((void *)uid, &id, sizeof(id)) < 0) return -1;
+    long pid = uproc_spawn_mission_from_user((const char *)path,
+                                             (char *const *)argv, &g, &id);
+    if (pid >= 0 && uid && copy_to_user((void *)uid, &id, sizeof(id)) < 0) return -1;
+    flight_record_spawn(pid, (const char *)path);
+    return pid;
+}
+
+static long sys_mission_info(uint64_t index, uint64_t uout)
+{
+    struct k_mission_info info;
+    if (index >= K_MISSION_MAX || !uout || mission_info((unsigned)index, &info) < 0)
+        return -1;
+    return copy_to_user((void *)uout, &info, sizeof(info)) < 0 ? -1 : 0;
 }
 
 /* --- dispatcher ------------------------------------------------------- */
@@ -1031,7 +1061,7 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_read(a1, a2, a3, 0);
         break;
     case SYS_OPEN:
-        ret = sys_open(a1, a2);
+        ret = sys_open(a1, a2, a3);
         break;
     case SYS_CLOSE:
         ret = sys_close(a1);
@@ -1093,10 +1123,10 @@ static void syscall_dispatch(struct regs *r)
         ret = cap_has(KCAP_NET) ? sys_dns(a1, a2) : -1;
         break;
     case SYS_PING:
-        ret = cap_has(KCAP_NET) ? icmp_ping((uint32_t)a1, (uint32_t)a2) : -1;
+        ret = cap_has(KCAP_NET) && mission_host((uint32_t)a1) ? icmp_ping((uint32_t)a1, (uint32_t)a2) : -1;
         break;
     case SYS_UDP_SEND:
-        ret = cap_has(KCAP_NET) ? sys_udp_send(a1, a2, a3, a4) : -1;
+        ret = cap_has(KCAP_NET) && mission_host((uint32_t)a1) ? sys_udp_send(a1, a2, a3, a4) : -1;
         break;
     case SYS_UDP_RECV:
         ret = cap_has(KCAP_NET) ? sys_udp_recv(a1, a2, a3, a4) : -1;
@@ -1113,13 +1143,13 @@ static void syscall_dispatch(struct regs *r)
 
     /* --- descriptors and processes --- */
     case SYS_PIPE:
-        ret = cap_has(KCAP_IPC) ? sys_pipe(a1) : -1;
+        ret = cap_has(KCAP_IPC) && mission_ipc(K_MISSION_IPC_PIPE) ? sys_pipe(a1) : -1;
         break;
     case SYS_DUP2:
         ret = sys_dup2(a1, a2);
         break;
     case SYS_KILL:
-        ret = cap_has(KCAP_IPC) ? sys_kill(a1, a2) : -1;
+        ret = cap_has(KCAP_IPC) && mission_ipc(K_MISSION_IPC_SIGNAL) ? sys_kill(a1, a2) : -1;
         break;
     case SYS_WAITANY:
         ret = sys_waitany(a1);
@@ -1182,7 +1212,7 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_mountlist(a1, a2);
         break;
     case SYS_GETRANDOM:
-        ret = sys_getrandom(a1, a2, a3);
+        ret = mission_device(K_MISSION_RANDOM) ? sys_getrandom(a1, a2, a3) : -1;
         break;
     case SYS_SWAPINFO:
         ret = sys_swapinfo(a1, a2);
@@ -1241,7 +1271,7 @@ static void syscall_dispatch(struct regs *r)
 
     /* --- TCP --- */
     case SYS_TCP_CONNECT:
-        ret = cap_has(KCAP_NET)
+        ret = cap_has(KCAP_NET) && mission_host((uint32_t)a1)
             ? tcp_connect((uint32_t)a1, (uint16_t)a2, (int)a3) : -1;
         break;
     case SYS_TCP_SEND:
@@ -1257,6 +1287,16 @@ static void syscall_dispatch(struct regs *r)
     /* --- capabilities, atomic rename, pulses, talon parcels, WM v2 --- */
     case SYS_SPAWN_CAPS:
         ret = sys_spawn_caps(a1, a2, a3);
+        break;
+    case SYS_MISSION_SPAWN:
+        ret = sys_mission_spawn(a1, a2, a3, a4);
+        break;
+    case SYS_MISSION_CTL:
+        ret = a1 > 0x7fffffffU || a2 > K_MISSION_END || a3 > 0xffffffffU ? -1 :
+              mission_ctl((int)a1, (int)a2, (unsigned)a3);
+        break;
+    case SYS_MISSION_INFO:
+        ret = sys_mission_info(a1, a2);
         break;
     case SYS_SANDBOX:
         ret = sys_sandbox(a1, a2);

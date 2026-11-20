@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Settings
+exec: /bin/settings
+mission: Adjust desktop themes and preferences
+display: yes
+fs.read: /bin /etc ~
+fs.write: /etc/desktop.conf /etc/theme ~
+net: none
+device: none
+ipc: pulse
+spawn: yes

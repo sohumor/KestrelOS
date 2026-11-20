@@ -17,7 +17,7 @@ program prints are the three tricks used throughout.
 
 Usage:
     python3 tools/e2e.py            # full test sequence
-    python3 tools/e2e.py --smoke    # boot + prompt only
+    python3 tools/e2e.py --smoke    # boot + login + prompt + guest exit code
     python3 tools/e2e.py --nic e1000
     python3 tools/e2e.py --list     # list tests without running
     python3 tools/e2e.py --selftest # exercise expect/send plumbing
@@ -82,10 +82,17 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus):
+def qemu_command(nic, cpus, disk="ata"):
+    storage = (["-machine", "q35", "-drive",
+                "if=none,id=d0,file=build/os.img,format=raw",
+                "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
+               ["-drive", "file=build/os.img,format=raw"])
     return [
         find_qemu(),
-        "-drive", "file=build/os.img,format=raw",
+        "-accel", "tcg",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-fw_cfg", "name=opt/kestrel-test,string=2",
+        *storage,
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
         # image produced by make and never contaminate build/os.img.
@@ -151,9 +158,11 @@ def clean(text):
 class Harness:
     def __init__(self, cmd):
         self.cmd = list(cmd)
+        self.test_mode = any("name=opt/kestrel-test," in arg for arg in cmd)
         self.proc = None
         self._sock = None
         self.buf = ""                 # cleaned, unconsumed text
+        self.boot_output = ""
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.tail = collections.deque(maxlen=TAIL_LINES)
@@ -231,12 +240,16 @@ class Harness:
                 continue
             with self.cond:
                 self.buf += text
+                if "KESTREL READY" not in self.boot_output:
+                    self.boot_output += text
                 self._partial += text
                 lines = self._partial.split("\n")
                 self._partial = lines.pop()
                 for line in lines:
                     self.tail.append(line)
                 self.cond.notify_all()
+        if self.test_mode:
+            self.proc.wait()
         with self.cond:
             self._esc = ""            # nothing will ever complete it now
             if self._partial:
@@ -256,6 +269,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     self.buf = self.buf[m.end():]
@@ -273,6 +287,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 best = None
                 for p, rx in rxs:
                     m = rx.search(self.buf)
@@ -294,6 +309,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     block = self.buf[:m.end()]
@@ -305,6 +321,26 @@ class Harness:
                         "timeout capturing through %r (eof=%s)"
                         % (pattern, self.eof))
                 self.cond.wait(min(remaining, 0.5))
+
+    def check_exit(self):
+        if not self.test_mode:
+            return
+        code = self.proc.poll()
+        if code is not None:
+            if code == 35:
+                raise TimeoutError("guest failure (QEMU exit 35)")
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+
+    def wait_exit(self, timeout=BOOT_TIMEOUT):
+        try:
+            code = self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("timeout waiting for QEMU debug-exit") from None
+        if code == 35:
+            raise TimeoutError("guest failure (QEMU exit 35)")
+        if code != 33:
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+        print("  QEMU exit 33 (guest success)")
 
     def send(self, line):
         self.send_raw(line + "\n")
@@ -1755,7 +1791,14 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
+    if getattr(h, "disk", "ata") == "ahci":
+        line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
+                        timeout=BOOT_TIMEOUT, regex=True)
+        print("  " + line.group(0))
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+    if getattr(h, "disk", "ata") == "ahci":
+        if "ata: primary master:" in h.boot_output:
+            raise AssertionError("ATA claimed a disk in AHCI mode")
 
 
 def t_login(h):
@@ -1809,6 +1852,31 @@ def t_ls_bin(h):
     h.send("ls /bin")
     h.expect("ls")     # alphabetical: ls prints before sh
     h.expect("sh")
+    wait_prompt(h)
+
+
+def t_ls_many(h):
+    h.send("mkdir /lsmany")
+    wait_prompt(h)
+    h.send("ls /lsmany")
+    h.expect("\n0 entries\n")
+    wait_prompt(h)
+    h.send("ls /lsmany/missing")
+    h.expect("\nls: cannot access /lsmany/missing\n")
+    wait_prompt(h)
+    for start in range(0, 260, 10):
+        h.send("touch " + " ".join(
+            "/lsmany/f%03d" % i for i in range(start, start + 10)))
+        wait_prompt(h)
+    h.send("ls /lsmany")
+    block = h.capture_until(SHELL_PROMPT, regex=True, timeout=120)
+    names = re.findall(r"^- +\d+ +(f\d{3})$", block, re.MULTILINE)
+    expected = ["f%03d" % i for i in range(260)]
+    if sorted(names) != expected or "\n260 entries\n" not in block:
+        raise TimeoutError("ls lost entries: listed %d of 260; count: %s" % (
+            len(names), re.findall(r"\d+ entries", block)))
+    h.send("ls /lsmany/f259")
+    h.expect(r"\n- +0 +/lsmany/f259\n1 entry\n", regex=True)
     wait_prompt(h)
 
 
@@ -1913,6 +1981,30 @@ def t_cp_wc(h):
     wait_prompt(h)
 
 
+def t_wc_stdin(h):
+    """Only terminal stdin treats byte 0x04 as EOF."""
+    h.send('kjs -e "Kestrel.writeFile(\'/wc-eof\', \'a\\x04b c\\n\')"')
+    wait_prompt(h)
+    h.send("wc /wc-eof")
+    h.expect(r"\n *1 +2 +6 /wc-eof\n", regex=True)
+    wait_prompt(h)
+    for command in ("wc < /wc-eof", "cat /wc-eof | wc"):
+        h.send(command)
+        h.expect(r"\n *1 +2 +6\n", regex=True)
+        wait_prompt(h)
+    for command in ("wc < /dev/null", "cat /dev/null | wc"):
+        h.send(command)
+        h.expect(r"\n *0 +0 +0\n", regex=True)
+        wait_prompt(h)
+    h.send("wc")
+    h.expect("elf: static image")
+    h.send_raw("one two\n\x04")
+    h.expect(r"\n *1 +2 +8\n", regex=True)
+    wait_prompt(h)
+    h.send("rm /wc-eof")
+    wait_prompt(h)
+
+
 def t_mv_rm(h):
     h.send("mv /t2.txt /t3.txt")
     wait_prompt(h)
@@ -1923,6 +2015,46 @@ def t_mv_rm(h):
     wait_prompt(h)
     h.send("cat /t3.txt")
     h.expect("cat: cannot open")    # not present in the echoed command
+    wait_prompt(h)
+
+
+def check_same_file(h, command, status):
+    h.send("mkdir /tmp/same-file-dir")
+    wait_prompt(h)
+    h.send("echo keep-original-bytes > /tmp/same-file-dir/a")
+    wait_prompt(h)
+    for dst in ("/tmp/same-file-dir/./a", "/tmp//same-file-dir/../same-file-dir/a",
+                "/tmp/same-file-dir/."):
+        h.send(f"{command} /tmp/same-file-dir/a {dst}; echo SAME-FILE-$?; "
+               "cat /tmp/same-file-dir/a")
+        lines = h.capture_until(SHELL_PROMPT, regex=True).splitlines()
+        if f"SAME-FILE-{status}" not in lines or "keep-original-bytes" not in lines:
+            raise TimeoutError(f"{dst}: expected status {status} and preserved bytes")
+    h.send("rm /tmp/same-file-dir/a")
+    wait_prompt(h)
+    h.send("rm /tmp/same-file-dir")
+    wait_prompt(h)
+
+
+def t_cp_same_file(h):
+    check_same_file(h, "cp", 1)
+
+
+def t_mv_same_file(h):
+    check_same_file(h, "mv", 0)
+
+
+def t_same_device(h):
+    # A second devfs mount forces mv to take its copy + unlink fallback.
+    h.send('mount -t devfs "" /tmp/same-file-dev; echo MOUNT-$?')
+    h.expect(r"\nMOUNT-0\n", regex=True)
+    wait_prompt(h)
+    for command, status in (("cp", 1), ("mv", 0)):
+        h.send(f"{command} /dev/null /tmp/same-file-dev/null; echo SAME-DEVICE-$?")
+        h.expect(rf"\nSAME-DEVICE-{status}\n", regex=True)
+        wait_prompt(h)
+    h.send("mount -u /tmp/same-file-dev; echo UNMOUNT-$?")
+    h.expect(r"\nUNMOUNT-0\n", regex=True)
     wait_prompt(h)
 
 
@@ -1952,6 +2084,61 @@ def t_tail(h):
     h.send("tail -n 1 /doc/welcome.md")
     # last line of welcome.md, and nothing after it but the prompt
     h.expect(r"for the release\.\nkestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 /doc/welcome.md")
+    h.expect(r"tail -n 0 /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 < /doc/welcome.md")
+    h.expect(r"tail -n 0 < /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("touch /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect(r"tail -n 0 /tail-empty\.txt\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("rm /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect("tail: cannot open /tail-empty.txt")
+    wait_prompt(h)
+
+
+def t_text_long_lines(h):
+    line = "a" * 510 + "BOUNDARY" + "b" * 1600 + "LATE-MARKER"
+    body = "\n" + line + "\nshort\n" + line
+    h.send("writefile /long-lines.txt")
+    h.expect("writefile: type text, finish with ctrl-D\n")
+    for start in range(0, len(body), 64):
+        chunk = body[start:start + 64]
+        h.send_raw(chunk)
+        h.expect(chunk)
+    h.send_raw("\x04")
+    h.expect("wrote %d bytes" % len(body))
+    wait_prompt(h)
+
+    failures = []
+    cases = [
+        ("head -n 4", body + "\n"),
+        ("head -n 2", "\n" + line + "\n"),
+        ("tail -n 2", "short\n" + line + "\n"),
+        ("grep -n LATE-MARKER", "2:" + line + "\n4:" + line + "\n"),
+        ("grep -i boundary", line + "\n" + line + "\n"),
+        ("grep absent", ""),
+    ]
+    for command, expected in cases:
+        h.send(command + " /long-lines.txt")
+        output = h.capture_until(SHELL_PROMPT, regex=True)
+        actual = output.split("\n", 1)[1]
+        actual = re.sub(r"^elf: [^\n]*\n", "", actual)
+        actual = re.sub(SHELL_PROMPT + r"$", "", actual)
+        actual = re.sub(r"\[exit 1\]\n$", "", actual)
+        if actual != expected:
+            print("FAIL long-lines: %s (expected %d bytes, got %d)" %
+                  (command, len(expected), len(actual)))
+            failures.append(command)
+    h.send("rm /long-lines.txt")
+    wait_prompt(h)
+    if failures:
+        raise TimeoutError("long-line output mismatch: " + ", ".join(failures))
 
 
 def t_tree(h):
@@ -2100,6 +2287,85 @@ def t_pipe(h):
     if got != r"\n *\d+\n":
         return "SKIP"
     have_pipes = True
+
+
+def t_pipe_read(h):
+    h.send("sigtest --pipe-read")
+    h.expect("sigtest: pipe read modes + interruption + EOF verified")
+    wait_prompt(h)
+
+
+def t_pipe_lifetime(h):
+    h.send("sigtest --pipe-lifetime")
+    h.expect("sigtest: pipe dup + spawn + peer close verified")
+    wait_prompt(h)
+
+
+def t_elf_banner_quiet(h):
+    """ELF diagnostics stay on serial, not in the VGA console cell grid."""
+    symbols = {}
+    for line in subprocess.check_output(
+            ["nm", "-S", "build/kernel.elf"], text=True).splitlines():
+        fields = line.split()
+        if fields[-1] in ("cell_ch", "KERNEL_OFFSET"):
+            symbols[fields[-1]] = fields
+    cells = symbols["cell_ch"]
+    address = int(cells[0], 16) - int(symbols["KERNEL_OFFSET"][0], 16)
+    size = int(cells[1], 16)
+
+    with tempfile.TemporaryDirectory() as tmp, socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        listener.settimeout(BOOT_TIMEOUT)
+        port = listener.getsockname()[1]
+        cmd = h.cmd + [
+            "-monitor", "tcp:127.0.0.1:%d" % port]
+        guest = Harness(cmd)
+        guest.start()
+        try:
+            monitor, _ = listener.accept()
+            with monitor:
+                monitor.settimeout(DEFAULT_TIMEOUT)
+
+                def monitor_prompt():
+                    reply = b""
+                    while b"(qemu) " not in reply:
+                        chunk = monitor.recv(4096)
+                        if not chunk:
+                            raise TimeoutError("QEMU monitor closed")
+                        reply += chunk
+                    return reply
+
+                monitor_prompt()
+                t_boot(guest)
+                t_login(guest)
+                t_prompt(guest)
+                guest.send("clear")
+                guest.expect("clear\n")
+                wait_prompt(guest)
+                guest.send("ls /etc | wc -l")
+                guest.expect("| wc -l\n")
+                serial = guest.capture_until(SHELL_PROMPT, regex=True)
+                count = re.search(r"\n *(\d+)\n", serial)
+                if not count:
+                    raise TimeoutError("pipeline did not count /etc entries")
+                banner = r"elf: static image, 1 object, \d+ lazy segments?"
+                if len(re.findall(banner, serial)) < 2:
+                    raise TimeoutError("ELF pipeline diagnostics missing from serial")
+                dump = os.path.join(tmp, "console.bin")
+                monitor.sendall(('pmemsave 0x%x %d "%s"\n'
+                                 % (address, size, dump)).encode())
+                monitor_prompt()
+                with open(dump, "rb") as f:
+                    console = f.read().decode("latin1")
+                if not any(row.strip(" \x00") == count.group(1)
+                           for row in (console[i:i + 320]
+                                       for i in range(0, size, 320))):
+                    raise TimeoutError("pipeline output missing from VGA console")
+                if re.search(banner, console):
+                    raise TimeoutError("ELF banner leaked onto VGA console")
+        finally:
+            guest.kill()
 
 
 def t_dev(h):
@@ -2833,6 +3099,98 @@ def t_inspect_cli(h):
     wait_prompt(h)
 
 
+def mission_command(h, command):
+    h.send(command)
+    return h.capture_until(SHELL_PROMPT, regex=True)
+
+
+def mission_probe_start(h, denied="-", host="-"):
+    block = mission_command(
+        h, "mission run missionprobe --fs-read /tmp/mission-allowed "
+        "--net-host 127.0.0.1 --bg -- /tmp/mission-allowed %s %s" % (denied, host))
+    match = re.search(r"mission (\d+) pid (\d+)", block)
+    assert match, block
+    mid, pid = map(int, match.groups())
+    assert mid > 0 and pid > 0, block
+    initial = r"missionprobe pid=%d read=allow file=deny net=deny" % pid
+    if not re.search(initial, block):
+        h.expect(initial, regex=True)
+    return mid, pid
+
+
+def mission_probe_end(h, mid):
+    block = mission_command(h, "mission end %d" % mid)
+    assert "mission %d: ending" % mid in block, block
+    # End wakes a sleeping task. Await scheduler progress via guest commands,
+    # rather than assuming the control syscall synchronously reaps it.
+    for _ in range(20):
+        block = mission_command(h, "mission ps")
+        if not re.search(r"mission %d app=" % mid, block):
+            return
+    raise AssertionError("ended mission remained live: " + block)
+
+
+def t_mission_grant(h):
+    block = mission_command(h, "mission list")
+    for name in ("sight", "notes", "kjs", "edit", "browser", "terminal", "gfiles",
+                 "sysmon", "gpaint", "gcalc", "gclock", "settings", "about",
+                 "cat", "curl", "ping", "sh", "missionprobe"):
+        assert re.search(r"\n%s:" % name, block), block
+    block = mission_command(h, "mission show sh")
+    assert "exec: /bin/sh" in block and "spawn" in block, block
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    block = mission_command(h, "mission run cat --fs-read /tmp/mission-allowed -- /tmp/mission-allowed")
+    assert re.search(r"\nMISSION-ALLOWED-READ\n", block), block
+    assert "cannot open" not in block and "[exit 1]" not in block, block
+    block = mission_command(h, "mission run missionprobe --fs-read /etc/passwd --bg -- /tmp/mission-allowed - -")
+    assert "grant widens filesystem paths" in block and " pid " not in block, block
+    # Even a child that exits immediately has a race-free mission id result.
+    block = mission_command(h, "mission run cat --fs-read /tmp/mission-allowed --bg -- /tmp/mission-allowed")
+    assert re.search(r"mission [1-9]\d* pid [1-9]\d*", block), block
+
+
+def t_mission_deny(h):
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    mid, pid = mission_probe_start(h, denied="/etc/passwd")
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read active uses=[1-9]\d* denies=[1-9]\d*", block), block
+        assert "last_deny=/etc/passwd" in block, block
+        block = mission_command(h, "cat /dev/missions")
+        assert "@krec id:int" in block and "/etc/passwd" in block, block
+    finally:
+        mission_probe_end(h, mid)
+    mid, pid = mission_probe_start(h, host="10.0.2.2")
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"net active uses=[1-9]\d* denies=[1-9]\d*", block), block
+        assert "last_deny=10.0.2.2" in block, block
+        assert "host:0 127.0.0.1" in block, block
+    finally:
+        mission_probe_end(h, mid)
+
+
+def t_mission_revoke_live(h):
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    mid, pid = mission_probe_start(h)
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*tasks=1 pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read active uses=[1-9]\d* denies=0", block), block
+        block = mission_command(h, "mission revoke %d fs.read" % mid)
+        assert "mission %d: revoked fs.read" % mid in block, block
+        changed = "missionprobe pid=%d read=deny file=deny net=deny" % pid
+        if changed not in block:
+            h.expect(changed)
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*tasks=1 pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read revoked uses=[1-9]\d* denies=[1-9]\d*", block), block
+        print("  live revoke: mission %d, same pid %d changed read=allow -> read=deny" % (mid, pid))
+    finally:
+        mission_probe_end(h, mid)
+
+
 def t_kjs_cli(h):
     h.send('kjs -e "var m = Kestrel.memInfo(); '
            "Kestrel.parcelPut('text', 'kjs', 'JS-OK-' + (m.totalKb > 0)); "
@@ -2845,9 +3203,13 @@ TESTS = [
     ("boot", t_boot),
     ("login", t_login),
     ("shell-prompt", t_prompt),
+    ("mission-grant", t_mission_grant),
+    ("mission-deny", t_mission_deny),
+    ("mission-revoke-live", t_mission_revoke_live),
     ("help", t_help),
     ("echo", t_echo),
     ("ls-bin", t_ls_bin),
+    ("ls-many", t_ls_many),
     ("cat-motd", t_cat_motd),
     ("fs-roundtrip", t_fs_roundtrip),
     ("ps", t_ps),
@@ -2863,11 +3225,16 @@ TESTS = [
     ("calc", t_calc),
     ("calc-divzero", t_calc_divzero),
     ("cp-wc", t_cp_wc),
+    ("wc-stdin", t_wc_stdin),
     ("mv-rm", t_mv_rm),
+    ("cp-same-file", t_cp_same_file),
+    ("mv-same-file", t_mv_same_file),
+    ("same-device", t_same_device),
     ("mkdir-ls", t_mkdir_ls),
     ("grep", t_grep),
     ("head", t_head),
     ("tail", t_tail),
+    ("text-long-lines", t_text_long_lines),
     ("tree", t_tree),
     ("du", t_du),
     ("find", t_find),
@@ -2880,6 +3247,9 @@ TESTS = [
     ("id", t_id),
     ("redirect", t_redirect),
     ("pipe", t_pipe),
+    ("pipe-read", t_pipe_read),
+    ("pipe-lifetime", t_pipe_lifetime),
+    ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
@@ -2949,6 +3319,42 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    for code in (33, 35, 0):
+        h = Harness([sys.executable, "-c", "raise SystemExit(%d)" % code])
+        h.start()
+        try:
+            try:
+                h.wait_exit(timeout=5)
+            except TimeoutError as e:
+                if code == 33 or str(code) not in str(e):
+                    raise AssertionError(str(e))
+            else:
+                if code != 33:
+                    raise AssertionError("accepted QEMU exit %d" % code)
+            h.test_mode = True
+            for wait in (h.expect, h.expect_any, h.capture_until):
+                try:
+                    wait(["missing"] if wait == h.expect_any else "missing",
+                         timeout=5)
+                except TimeoutError as e:
+                    if str(code) not in str(e):
+                        raise AssertionError(str(e))
+                else:
+                    raise AssertionError("serial wait accepted exited guest")
+        finally:
+            h.kill()
+    h = Harness([sys.executable, "-c", "import time; time.sleep(30)"])
+    h.start()
+    try:
+        try:
+            h.wait_exit(timeout=0.01)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("accepted a guest that never exits")
+    finally:
+        h.kill()
+    print("PASS selftest: guest exit success, failure, unexpected and timeout")
     fake = (
         "import sys\n"
         "sys.stdout.write('\\x1b[32mKESTREL READY\\x1b[0m\\r\\n')\n"
@@ -3137,7 +3543,7 @@ def main():
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
-                    help="run boot + prompt tests only")
+                    help="check boot, login and shell prompt, then guest exit code")
     ap.add_argument("--only", action="append", metavar="NAME",
                     help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
@@ -3148,6 +3554,8 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
+    ap.add_argument("--disk", choices=["ata", "ahci"], default="ata",
+                    help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
     args = ap.parse_args()
@@ -3190,7 +3598,8 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    h.disk = args.disk
     try:
         h.start()
     except FileNotFoundError:
@@ -3201,6 +3610,11 @@ def main():
         return 1
     try:
         results = run_tests(h, tests)
+        if all(status != "FAIL" for _, status in results):
+            def finish(h):
+                h.send("halt")
+                h.wait_exit()
+            results += run_tests(h, [("guest-exit", finish)])
     finally:
         h.kill()
         if fixtures:

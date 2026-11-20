@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: About
+exec: /bin/about
+mission: Show KestrelOS system information
+display: yes
+fs.read: /etc
+fs.write: none
+net: none
+device: none
+ipc: none
+spawn: no

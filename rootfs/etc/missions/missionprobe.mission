@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Mission probe
+exec: /bin/missionprobe
+mission: Exercise and observe live mission grants
+display: no
+fs.read: /tmp
+fs.write: none
+net: any
+device: none
+ipc: none
+spawn: no

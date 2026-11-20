@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -179,7 +180,9 @@ def build_all(tc):
     ])
     cfg = parse_config_mk(b("config.mk"))
 
-    target_flags = ["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []
+    target_flags = (["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []) + [
+        "-march=x86-64", "-mtune=generic",
+    ]
     kreg_flags = ["-mgeneral-regs-only"] if tc["is_clang"] else ["-mno-mmx", "-mno-sse", "-mno-sse2"]
     ldflags = ["-nostdlib", "-z", "max-page-size=0x1000"]
     if tc["has_nowarn_rwx"]:
@@ -491,6 +494,10 @@ def run_host_tests(tc):
         common += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
 
     suites = [
+        ("test_mission", [r("kernel/mission_core.c"), r("tools/test_mission.c")],
+         ["-Ikernel/include", "-Iabi"]),
+        ("test_mission_manifest", [r("libc/mission.c"), r("tools/test_mission_manifest.c")],
+         ["-Iabi", "-idirafter", "libc/include"]),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
@@ -547,6 +554,8 @@ def run_host_tests(tc):
         run_cmd([sys.executable, r("tools/kfsck.py"), b("fs.img")])
     print("=== Running test_kfs_journal.py ===")
     run_cmd([sys.executable, r("tools/test_kfs_journal.py")])
+    print("=== Running test_kfs_readdir.py ===")
+    run_cmd([sys.executable, r("tools/test_kfs_readdir.py"), "--cc", tc["cc"]])
 
 
 def generate_compile_commands(tc):
@@ -560,7 +569,9 @@ def generate_compile_commands(tc):
     ])
     cfg = parse_config_mk(b("config.mk"))
 
-    target_flags = ["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []
+    target_flags = (["--target=x86_64-unknown-none-elf"] if tc["is_clang"] else []) + [
+        "-march=x86-64", "-mtune=generic",
+    ]
     kreg_flags = ["-mgeneral-regs-only"] if tc["is_clang"] else ["-mno-mmx", "-mno-sse", "-mno-sse2"]
     cflags = target_flags + [
         "-m64", "-ffreestanding", "-nostdlib", "-fno-stack-protector",
@@ -640,6 +651,8 @@ def generate_compile_commands(tc):
             add_entry(rel, "pkgobj/%s/%s.o" % (pkg, prog), ucflags)
 
     host_suites = [
+        ("tools/test_mission.c", ["-Ikernel/include", "-Iabi"]),
+        ("tools/test_mission_manifest.c", ["-Iabi", "-idirafter", "libc/include"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),
@@ -668,10 +681,19 @@ def generate_compile_commands(tc):
 def main():
     ap = argparse.ArgumentParser(description="KestrelOS cross-platform build runner")
     ap.add_argument("action", nargs="?", default="build",
-                    choices=["build", "clean", "test-host", "fsck", "e2e", "smoke", "compdb", "all"])
+                    choices=["build", "clean", "debug", "gdb", "test-host", "fsck", "e2e", "smoke", "compdb", "all"])
+    ap.add_argument("--qemu-flags", default=os.environ.get("QEMU_FLAGS", ""),
+                    help="extra QEMU arguments for debug (default: QEMU_FLAGS)")
+    ap.add_argument("--gdb-flags", default=os.environ.get("GDB_FLAGS", ""),
+                    help="extra GDB arguments, e.g. batch commands (default: GDB_FLAGS)")
     ap.add_argument("--nic", default="rtl8139")
     ap.add_argument("--cpus", type=int, default=2)
     args = ap.parse_args()
+
+    if args.action == "gdb":
+        gdb = find_tool([os.environ.get("GDB", "gdb")])
+        return subprocess.call([gdb, "-nx", "-x", r("tools/.gdbinit")]
+                               + shlex.split(args.gdb_flags), cwd=ROOT)
 
     if args.action == "clean":
         if os.path.exists(BUILD):
@@ -680,10 +702,18 @@ def main():
         return 0
 
     tc = detect_toolchain()
-    if args.action in ("build", "compdb", "all"):
+    if args.action in ("build", "debug", "compdb", "all"):
         generate_compile_commands(tc)
-    if args.action in ("build", "all"):
+    if args.action in ("build", "debug", "all"):
         build_all(tc)
+    if args.action == "debug":
+        qemu = find_tool([os.environ.get("QEMU", "qemu-system-x86_64")])
+        return subprocess.call([
+            qemu, "-drive", "file=%s,format=raw" % b("os.img"),
+            "-no-reboot", "-smp", "2", "-device", "rtl8139,netdev=n0",
+            "-netdev", "user,id=n0", "-display", "none", "-serial", "stdio",
+            "-s", "-S",
+        ] + shlex.split(args.qemu_flags), cwd=ROOT)
     if args.action in ("test-host", "all"):
         run_host_tests(tc)
     if args.action == "fsck":

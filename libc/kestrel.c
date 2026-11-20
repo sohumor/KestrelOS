@@ -7,12 +7,39 @@
 #include <kestrel.h>
 #include <stdio.h>
 #include <string.h>
+#include <mission.h>
+
+int mission_spawn(const char *path, char *const argv[], const struct k_mission_grant *grant)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, 0);
+}
+
+int mission_spawn_id(const char *path, char *const argv[], const struct k_mission_grant *grant,
+                     uint32_t *id)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, (long)id);
+}
+
+int mission_ctl(uint32_t id, unsigned op, unsigned arg)
+{
+    return (int)syscall(SYS_MISSION_CTL, id, op, arg, 0);
+}
+
+int mission_info(unsigned index, struct k_mission_info *out)
+{
+    return (int)syscall(SYS_MISSION_INFO, index, (long)out, 0, 0);
+}
 
 /* ---- files ---- */
 
 int open(const char *path, int flags)
 {
     return (int)syscall(SYS_OPEN, (long)path, flags, 0, 0);
+}
+
+int open_distinct(const char *path, int flags, int exclude_fd)
+{
+    return (int)syscall(SYS_OPEN, (long)path, flags | O_DISTINCT, exclude_fd, 0);
 }
 
 long read(int fd, void *buf, unsigned long len)

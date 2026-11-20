@@ -11,9 +11,10 @@
 #include "kestrel_abi.h"
 #include "spinlock.h"
 #include "pulse.h"
+#include "mission.h"
 
 extern void enter_usermode(uint64_t entry, uint64_t user_rsp,
-                           uint64_t argc, uint64_t argv)
+                           uint64_t argc, uint64_t argv, uint64_t cwd)
     __attribute__((noreturn));
 
 /* Everything the new task needs, copied so the spawner keeps ownership
@@ -23,12 +24,14 @@ struct uproc_pkg {
     char path[UPROC_PATH_MAX];
     int argc;
     char argv[UPROC_MAX_ARGS][UPROC_ARG_MAX];
+    char cwd[sizeof(((struct k_spawn_caps *)0)->cwd)];
     struct k_spawn_io io;
     int n_fds;
     int32_t fd_nums[K_SPAWN_CAPS_MAX_FDS];
     struct file *fds[K_SPAWN_CAPS_MAX_FDS];
     int has_cap_mask;
     uint64_t cap_mask;
+    int mission_id;
 };
 
 /* copy_str_from_user's "no NUL within max" result; the destination still
@@ -197,12 +200,19 @@ static uint8_t *slurp_file(const char *path, uint32_t *size_out)
  * stack. Returns the final 16-byte-aligned rsp; *argv_out points at the
  * user-side pointer array. Runs after vmm_switch to the process pml4. */
 static uint64_t build_user_stack(const struct uproc_pkg *pkg,
-                                 uint64_t *argv_out)
+                                 uint64_t *argv_out, uint64_t *cwd_out)
 {
     uint64_t sp = USER_STACK_TOP;
     uint64_t uptr[UPROC_MAX_ARGS];
     int argc = pkg->argc;
 
+    *cwd_out = 0;
+    if (pkg->cwd[0] != '\0') {
+        size_t len = strlen(pkg->cwd) + 1;
+        sp -= len;
+        memcpy((void *)sp, pkg->cwd, len);
+        *cwd_out = sp;
+    }
     for (int i = argc - 1; i >= 0; i--) {
         size_t len = strlen(pkg->argv[i]) + 1;
         sp -= len;
@@ -243,7 +253,7 @@ static void user_task_thunk(void *arg)
     uint8_t *buf = NULL;
     struct file *backing = NULL;
     uint32_t fsize = 0;
-    uint64_t entry, brk, argv_user, rsp, f;
+    uint64_t entry, brk, argv_user, cwd_user, rsp, f;
     int argc;
 
     if (pmm_free_pages() <= 256) {
@@ -324,17 +334,21 @@ static void user_task_thunk(void *arg)
      * the stack pages it needs; the remainder of the 16-page reservation
      * remains lazy. */
     size_t stack_need = (size_t)pkg->argc * (UPROC_ARG_MAX + sizeof(uint64_t))
-                        + 64;
+                        + sizeof(pkg->cwd) + 64;
     if (vm_fault_in_range(current, USER_STACK_TOP - stack_need,
                           stack_need, 1) < 0) {
         kprintf("uproc: cannot allocate initial stack for %s\n", pkg->path);
         goto live_fail;
     }
-    rsp = build_user_stack(pkg, &argv_user);
+    rsp = build_user_stack(pkg, &argv_user, &cwd_user);
     argc = pkg->argc;
 
     if (pkg->has_cap_mask) {
-        current->cap_mask = pkg->cap_mask;
+        if (current->mission_id)
+            __atomic_fetch_and(&current->cap_mask, pkg->cap_mask, __ATOMIC_SEQ_CST);
+        else
+            current->cap_mask = pkg->cap_mask;
+        mission_limit_current();
         if (current->uid != 0)
             current->cap_mask &= ~KCAP_ADMIN;
     }
@@ -344,7 +358,7 @@ static void user_task_thunk(void *arg)
     pulse_emit(K_TOPIC_PROC, K_PULSE_PROC_SPAWN,
                (uint32_t)current->pid, (uint32_t)current->parent_pid,
                current->name);
-    enter_usermode(entry, rsp, (uint64_t)argc, argv_user);
+    enter_usermode(entry, rsp, (uint64_t)argc, argv_user, cwd_user);
 
 live_fail:
     free_pkg(pkg);
@@ -379,7 +393,7 @@ static int spawn_pkg(struct uproc_pkg *pkg)
     /* The scheduler publishes the PID through pid_out before it releases
      * its cross-CPU run-queue lock. The child may complete immediately
      * after publication without leaving us to dereference a freed task. */
-    t = kthread_create_with_pid(user_task_thunk, pkg, name, &pid);
+    t = kthread_create_mission(user_task_thunk, pkg, name, &pid, pkg->mission_id);
     if (!t) {
         free_pkg(pkg);
         return -1;
@@ -591,6 +605,8 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
     }
 
     if (kcaps->cwd[0]) {
+        if (kcaps->cwd[0] == '/')
+            memcpy(pkg->cwd, kcaps->cwd, sizeof(pkg->cwd));
         int slot = -1;
         if (pkg->argc > 0 &&
             strncmp(pkg->argv[pkg->argc - 1], "--cwd=", 6) == 0) {
@@ -615,4 +631,19 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
 fail:
     free_pkg(pkg);
     return -1;
+}
+
+int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
+                                 const struct k_mission_grant *grant, uint32_t *mission_id)
+{
+    if (!spawn_user_allowed()) return -1;
+    struct uproc_pkg *pkg = alloc_pkg_from_user(upath, uargv);
+    if (!pkg) return -1;
+    int id = mission_create(grant, pkg->path);
+    if (id < 0) { free_pkg(pkg); return -1; }
+    pkg->mission_id = id;
+    int pid = spawn_pkg(pkg);
+    if (pid >= 0 && mission_id) *mission_id = (uint32_t)id;
+    mission_put(id);
+    return pid;
 }

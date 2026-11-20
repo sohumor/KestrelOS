@@ -6,6 +6,7 @@
 - Note Windows clang target flags differ between freestanding kernel/userspace translation units (`--target=x86_64-unknown-none-elf -ffreestanding -nostdlib`) and host tests (`-DJS_HOST`); keep all of them indexed via `tools/build.py compdb`.
 
 ## Live VM & Kernel Debugging (`qemu` + `gdbstub` MCP Servers)
+- On Linux/WSL, no MCP servers are needed: run `make debug` (headless QEMU, paused at reset with `-s -S`), then `make gdb` in another terminal. Alternatively use `python3 tools/build.py debug` and `python3 tools/build.py gdb`. Both load `tools/.gdbinit` explicitly with `-x`, load `build/kernel.elf`, and connect to `localhost:1234`. Use `hbreak kmain`, `continue`, then `bt`; hardware breakpoints work before the higher-half kernel is mapped. See `docs/RUNNING.md#debugging-on-linuxwsl` for batch commands and shutdown instructions.
 - Boot/inspect KestrelOS interactively via `qemu_boot(disk="build/os.img", accel="whpx:tcg", smp=2, extra_args="-device rtl8139,netdev=n0 -netdev user,id=n0")` (or `e1000`, `smp=4`), capture COM1 with `qemu_wait_serial` / `qemu_serial`, and inspect VGA framebuffer output with `qemu_screenshot`.
 - For page faults, triple faults, or deadlocks, boot QEMU with `extra_args="-s -S -d int,cpu_reset -D int.log -no-reboot"` and attach `gdbstub` (`debug_connect`, symbols from `build/kernel.elf`, `debug_registers`, `debug_backtrace`, `debug_disassemble`, `debug_explain_fault`).
 

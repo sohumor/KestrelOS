@@ -30,7 +30,6 @@ void gui_ui_begin(gui_ui *ui)
     ui->dbl = 0;
     ui->key = 0;
     ui->wheel = 0;
-    ui->down_btn = 0;
     ui->up_btn = 0;
 }
 

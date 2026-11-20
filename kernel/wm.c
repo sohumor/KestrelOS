@@ -489,6 +489,10 @@ static void z_insert(int idx)
 {
     int at = (wins[idx].flags & K_WIN_DESKTOP) ? z_desktop_count() : nz;
 
+    if (!(wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)))
+        while (at > 0 && (wins[zord[at - 1]].flags & K_WIN_OVERLAY))
+            at--;
+
     for (int i = nz; i > at; i--)
         zord[i] = zord[i - 1];
     zord[at] = (uint8_t)idx;
@@ -516,7 +520,7 @@ static int z_top_focusable(void)
 {
     for (int i = nz - 1; i >= 0; i--) {
         const struct window *win = &wins[zord[i]];
-        if (!(win->flags & K_WIN_DESKTOP) && win_visible(win))
+        if (!(win->flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) && win_visible(win))
             return zord[i];
     }
     return -1;
@@ -578,7 +582,7 @@ static void set_focus(int idx)
     int old;
 
     if (idx >= 0 &&
-        ((wins[idx].flags & K_WIN_DESKTOP) || !win_visible(&wins[idx])))
+        ((wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) || !win_visible(&wins[idx])))
         return;                       /* the desktop layer never takes focus */
     if (focus == idx)
         return;
@@ -1088,7 +1092,7 @@ static void focus_next_window(void)
             pos += nz;
         idx = zord[pos];
         if (wins[idx].used && !wins[idx].dying &&
-            !(wins[idx].flags & K_WIN_DESKTOP) &&
+            !(wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) &&
             ((wins[idx].flags & K_WIN_NODECOR) || wins[idx].pinned ||
              (int)wins[idx].workspace == current_ws)) {
             restore_window(idx, true);
@@ -1267,7 +1271,7 @@ static void pump_keyboard(void)
             switch_workspace(c - KEY_WM_WS1);
             continue;
         }
-        if (c == KEY_LAUNCHER) {
+        if (c == KEY_LAUNCHER || c == KEY_MISSION) {
             route_to_desktop((uint32_t)c);
             continue;
         }
@@ -1626,7 +1630,10 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
         return -1;
     if (copy_from_user(&req, (const void *)ureq, sizeof(req)) < 0)
         return -1;
-    if (req.flags & ~(uint32_t)(K_WIN_NODECOR | K_WIN_DESKTOP))
+    if (req.flags & ~(uint32_t)(K_WIN_NODECOR | K_WIN_DESKTOP | K_WIN_OVERLAY))
+        return -1;
+    if ((req.flags & K_WIN_OVERLAY) &&
+        (!(req.flags & K_WIN_NODECOR) || (req.flags & K_WIN_DESKTOP)))
         return -1;
     if (!user_range_ok((const void *)uout, sizeof(info)))
         return -1;

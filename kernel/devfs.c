@@ -23,6 +23,7 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "flight.h"
 #include "tcp.h"
 #include "parcel.h"
+#include "mission.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -77,6 +78,7 @@ static const struct devdesc devtab[] = {
     { "sockets", DEV_SOCKETS, 0444 },
     { "caps",    DEV_CAPS,    0444 },
     { "parcels", DEV_PARCELS, 0444 },
+    { "missions", DEV_MISSIONS, 0444 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -267,7 +269,7 @@ static uint32_t blk_size_bytes(struct blockdev *bd)
 static bool is_krec_dev(int id)
 {
     return id == DEV_FLIGHT || id == DEV_PROCS || id == DEV_SOCKETS ||
-           id == DEV_CAPS || id == DEV_PARCELS;
+           id == DEV_CAPS || id == DEV_PARCELS || id == DEV_MISSIONS;
 }
 
 static uint32_t krec_dev_cap(int id)
@@ -301,6 +303,8 @@ static uint32_t render_krec_view(int id, char *buf, uint32_t cap)
         return proc_caps_snapshot_krec(buf, cap);
     case DEV_PARCELS:
         return parcel_snapshot_krec(buf, cap);
+    case DEV_MISSIONS:
+        return mission_snapshot_krec(buf, cap);
     default:
         return 0;
     }
@@ -383,11 +387,14 @@ static struct devfile *devfile_new(int id, int flags)
  * created or grown, and truncating a device is meaningless -- but
  * `cmd > /dev/null` passes both, and refusing them would break the most
  * common thing anyone does with this filesystem. */
-static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
+static struct file *devfs_op_open(struct mount *m, const char *path, int flags,
+                                  struct open_guard *guard)
 {
     const struct devdesc *d;
     struct blockdev *bd;
     struct devfile *df;
+    const struct devfile *exclude = guard
+        ? (const struct devfile *)guard->exclude : NULL;
 
     (void)m;
     if (!devfs_ready)
@@ -395,6 +402,10 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
 
     d = dev_lookup(path);
     if (d != NULL) {
+        if (exclude && exclude->dev == d->id) {
+            guard->same_file = 1;
+            return NULL;
+        }
         if (!vfs_perm_ok(d->mode, 0, 0,
                          (vfs_flags_allow_read(flags) ? VFS_R : 0) |
                          (vfs_flags_allow_write(flags) ? VFS_W : 0)))
@@ -431,6 +442,10 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
     bd = blk_lookup(path);
     if (bd == NULL)
         return NULL;            /* "/" itself is a directory, not a file */
+    if (exclude && exclude->dev == DEV_BLOCKDEV && exclude->bd == bd) {
+        guard->same_file = 1;
+        return NULL;
+    }
     if (bd->block_size > DEVFS_BLOCK_MAX)
         return NULL;
     if (!vfs_perm_ok(DEVFS_BLOCK_MODE, 0, 0,
@@ -574,8 +589,9 @@ static long read_blockdev(struct devfile *df, void *buf, unsigned long n)
     return (long)done;
 }
 
-static long devfs_op_read(struct file *f, void *buf, unsigned long n)
+static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocking)
 {
+    (void)blocking;
     struct devfile *df = (struct devfile *)f;
 
     if (df == NULL || buf == NULL)
@@ -614,6 +630,7 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n)
     case DEV_SOCKETS:
     case DEV_CAPS:
     case DEV_PARCELS:
+    case DEV_MISSIONS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);

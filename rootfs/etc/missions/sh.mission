@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Shell
+exec: /bin/sh
+mission: Run commands within a shared mission
+display: no
+fs.read: /bin /lib /etc /share /doc ~ /tmp
+fs.write: ~ /tmp
+net: any
+device: random
+ipc: talon pulse signal pipe
+spawn: yes

@@ -14,6 +14,7 @@
 #include "smp.h"
 #include "spinlock.h"
 #include "flight.h"
+#include "mission.h"
 
 bool sched_active;
 
@@ -22,6 +23,12 @@ static struct task *all_tasks;
 static struct task *reap_list;   /* stacks safe after scheduler handoff */
 static int next_pid = 1;
 static spinlock_t sched_lock = SPINLOCK_INIT;
+
+struct task_event_waiter {
+    struct task_event_waiter *next;
+    struct task *task;
+    uint32_t mask;
+};
 
 extern void ctx_switch(uint64_t *save_rsp, uint64_t new_rsp);
 extern void ctx_switch_unlock(uint64_t *save_rsp, uint64_t new_rsp,
@@ -310,6 +317,51 @@ void task_sleep_ticks(uint64_t t)
     schedule_locked(f);
 }
 
+static bool event_wait_cancelled(const struct task *task)
+{
+    return task->kill_pending ||
+           (__atomic_load_n(&task->sig_pending, __ATOMIC_SEQ_CST) &
+            (1ULL << (SIGKILL - 1)));
+}
+
+int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                           uint64_t deadline, spinlock_t *lock, uint64_t flags)
+{
+    struct task_event_waiter waiter = { .task = current, .mask = mask };
+
+    spin_lock(&sched_lock);
+    if (event_wait_cancelled(waiter.task)) {
+        spin_unlock(&sched_lock);
+        spin_unlock_irqrestore(lock, flags);
+        return -1;
+    }
+    waiter.next = channel->waiters;
+    channel->waiters = &waiter;
+    waiter.task->state = TASK_SLEEPING;
+    waiter.task->cpu = -1;
+    waiter.task->sleep_until = deadline;
+    spin_unlock(lock);
+    schedule_locked(flags);
+
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    struct task_event_waiter **link = &channel->waiters;
+    while (*link != &waiter)
+        link = &(*link)->next;
+    *link = waiter.next;
+    bool cancelled = event_wait_cancelled(waiter.task);
+    spin_unlock_irqrestore(&sched_lock, f);
+    return cancelled ? -1 : 0;
+}
+
+void task_event_notify(struct task_event_channel *channel, uint32_t mask)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    for (struct task_event_waiter *w = channel->waiters; w; w = w->next)
+        if ((w->mask & mask) && w->task->state == TASK_SLEEPING)
+            w->task->state = TASK_RUNNABLE;
+    spin_unlock_irqrestore(&sched_lock, flags);
+}
+
 void task_stop_current(void)
 {
     uint64_t flags = irq_save();
@@ -365,6 +417,13 @@ void task_exit(int code)
 
     uint64_t flags = irq_save();
     spin_lock(&sched_lock);
+    int mission_id = current->mission_id;
+    current->mission_id = 0;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    mission_put(mission_id);
+
+    flags = irq_save();
+    spin_lock(&sched_lock);
     current->state = TASK_ZOMBIE;
     current->cpu = -1;
     current->exit_code = code;
@@ -381,8 +440,8 @@ void task_exit_from_bootstrap(int code)
     task_exit(code);
 }
 
-struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
-                                     const char *name, int *pid_out)
+struct task *kthread_create_mission(void (*func)(void *), void *arg,
+                                   const char *name, int *pid_out, int mission_id)
 {
     struct task *t = kzalloc(sizeof(*t));
     if (!t)
@@ -433,6 +492,8 @@ struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
 
     uint64_t f = irq_save();
     spin_lock(&sched_lock);
+    t->mission_id = mission_id;
+    mission_inherit(t, current);
     t->pid = next_pid++;
     t->allnext = all_tasks;
     all_tasks = t;
@@ -441,6 +502,40 @@ struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
         *pid_out = t->pid;
     spin_unlock_irqrestore(&sched_lock, f);
     return t;
+}
+
+struct task *kthread_create_with_pid(void (*func)(void *), void *arg,
+                                     const char *name, int *pid_out)
+{
+    return kthread_create_mission(func, arg, name, pid_out, 0);
+}
+
+void proc_mission_ctl(int id, uint64_t drop, int end)
+{
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *t = all_tasks; t; t = t->allnext) {
+        if (t->mission_id != id || t->state == TASK_ZOMBIE) continue;
+        __atomic_fetch_and(&t->cap_mask, ~drop, __ATOMIC_SEQ_CST);
+        if (end) {
+            t->kill_pending = 1;
+            if (t->state == TASK_SLEEPING || t->state == TASK_STOPPED) {
+                t->state = TASK_RUNNABLE;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
+}
+
+void proc_mission_pids(struct k_mission_info *out)
+{
+    out->task_count = out->pid_count = 0;
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (struct task *t = all_tasks; t; t = t->allnext) {
+        if (t->mission_id != (int)out->id || t->state == TASK_ZOMBIE) continue;
+        out->task_count++;
+        if (out->pid_count < K_MISSION_PIDS) out->pids[out->pid_count++] = t->pid;
+    }
+    spin_unlock_irqrestore(&sched_lock, f);
 }
 
 struct task *kthread_create(void (*func)(void *), void *arg, const char *name)

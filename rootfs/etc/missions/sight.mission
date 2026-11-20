@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Sight
+exec: /bin/sight
+mission: Inspect kernel, processes and IPC
+display: yes
+fs.read: /lib /etc /doc ~ /tmp
+fs.write: none
+net: any
+device: none
+ipc: talon pulse signal
+spawn: no

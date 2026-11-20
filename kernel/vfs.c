@@ -3,7 +3,6 @@
 #include "mount.h"
 #include "kfs.h"
 #include "devfs.h"
-#include "pipe.h"
 #include "kheap.h"
 #include "proc.h"
 #include "rtc.h"
@@ -11,6 +10,7 @@
 #include "string.h"
 #include "kestrel_abi.h"
 #include "spinlock.h"
+#include "mission.h"
 
 /* The VFS. All paths are absolute.
  *
@@ -217,11 +217,13 @@ static int unveil_canon_path(const char *path, char *out, size_t outsz)
     return 0;
 }
 
-static int unveil_allows(const char *path)
+static int unveil_allows(const char *path, int write)
 {
     char canon[256];
     char prefix[64];
 
+    if (!mission_path(path, write))
+        return 0;
     if (!current || current->unveil_prefix[0] == '\0')
         return 1;
     if (unveil_canon_path(current->unveil_prefix, prefix, sizeof(prefix)) < 0)
@@ -233,43 +235,6 @@ static int unveil_allows(const char *path)
     size_t plen = strlen(prefix);
     return strncmp(canon, prefix, plen) == 0 &&
            (canon[plen] == '\0' || canon[plen] == '/');
-}
-
-/* --- pipes as ordinary handles ---------------------------------------
- * pipe.c owns the ring buffer; the ops vector below is what lets a pipe
- * end travel the same read/write path as a file. Seek is absent, so
- * vfs_seek() answers -1 for a pipe without knowing what a pipe is. */
-
-static void pipe_op_close(struct file *f)
-{
-    pipe_close(f);
-    kfree(f);
-}
-
-static struct fs_ops pipe_ops = {
-    .read  = pipe_read,
-    .write = pipe_write,
-    .close = pipe_op_close,
-};
-
-int vfs_pipe(struct file **read_end, struct file **write_end)
-{
-    if (pipe_create(read_end, write_end) < 0)
-        return -1;
-    (*read_end)->ops = &pipe_ops;
-    (*write_end)->ops = &pipe_ops;
-    return 0;
-}
-
-/* A handle created by pipe_create() directly (rather than through
- * vfs_pipe) carries no ops vector; bind it on first use so the old entry
- * point keeps working. Nothing else can produce a handle without ops:
- * vfs_open() stamps every one it hands out. */
-static const struct fs_ops *file_ops(struct file *f)
-{
-    if (f->ops == NULL && f->type == FILE_PIPE)
-        f->ops = &pipe_ops;
-    return f->ops;
 }
 
 /* --- mounting -------------------------------------------------------- */
@@ -285,6 +250,8 @@ int vfs_init(void)
     devfs_init();
 
     rooted = (mount_add("/", "kfs", "hda") == 0);
+    if (!rooted)
+        rooted = (mount_add("/", "kfs", "sda") == 0);
     if (!rooted)
         kprintf("vfs: no root filesystem, running diskless\n");
     else
@@ -305,16 +272,28 @@ int vfs_init(void)
 
 struct file *vfs_open(const char *path, int flags)
 {
+    return vfs_open_guarded(path, flags, NULL);
+}
+
+struct file *vfs_open_guarded(const char *path, int flags,
+                              struct open_guard *guard)
+{
     const char *rel;
     struct mount *m;
     struct file *f;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0))
+        return NULL;
+    if (current && current->mission_id && vfs_flags_allow_read(flags) &&
+        (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
+        !unveil_allows(path, 0))
         return NULL;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->open == NULL)
         return NULL;
-    f = m->type->ops->open(m, rel, flags);
+    if (guard && guard->exclude->ops != m->type->ops)
+        guard = NULL;
+    f = m->type->ops->open(m, rel, flags, guard);
     if (f == NULL)
         return NULL;
     f->ops = m->type->ops;
@@ -327,7 +306,7 @@ int vfs_stat(const char *path, struct k_stat *st)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || st == NULL || !unveil_allows(path))
+    if (path == NULL || st == NULL || !unveil_allows(path, 0))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->stat == NULL)
@@ -340,7 +319,7 @@ int vfs_readdir(const char *path, int index, struct k_dirent *de)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || de == NULL || index < 0 || !unveil_allows(path))
+    if (path == NULL || de == NULL || index < 0 || !unveil_allows(path, 0))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->readdir == NULL)
@@ -353,7 +332,7 @@ int vfs_unlink(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->unlink == NULL)
@@ -366,7 +345,7 @@ int vfs_mkdir(const char *path)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->mkdir == NULL)
@@ -381,7 +360,7 @@ int vfs_rename(const char *oldpath, const char *newpath)
 
     if (oldpath == NULL || newpath == NULL)
         return -1;
-    if (!unveil_allows(oldpath) || !unveil_allows(newpath))
+    if (!unveil_allows(oldpath, 1) || !unveil_allows(newpath, 1))
         return -1;
     oldm = mount_resolve(oldpath, &oldrel);
     newm = mount_resolve(newpath, &newrel);
@@ -397,7 +376,7 @@ int vfs_chmod(const char *path, uint32_t mode)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chmod == NULL)
@@ -410,7 +389,7 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
     const char *rel;
     struct mount *m;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 1))
         return -1;
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->chown == NULL)
@@ -425,7 +404,7 @@ int vfs_exec_ok(const char *path)
 {
     struct k_stat st;
 
-    if (path == NULL || !unveil_allows(path))
+    if (path == NULL || !unveil_allows(path, 0))
         return 0;
     if (vfs_stat(path, &st) < 0 || st.is_dir)
         return 0;
@@ -455,14 +434,15 @@ void vfs_close(struct file *f)
     if (!gone)
         return;
 
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops != NULL && ops->close != NULL)
         ops->close(f);
     else
         kfree(f);
 }
 
-long vfs_read(struct file *f, void *buf, unsigned long n)
+long vfs_read_ex(struct file *f, void *buf, unsigned long n, int blocking,
+                 int *read_once)
 {
     const struct fs_ops *ops;
 
@@ -470,12 +450,19 @@ long vfs_read(struct file *f, void *buf, unsigned long n)
         return -1;
     if (!vfs_flags_allow_read(f->flags))
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->read == NULL)
         return -1;
     if (n > 0x7FFFFFFFUL)
         n = 0x7FFFFFFFUL;
-    return ops->read(f, buf, n);
+    if (read_once != NULL)
+        *read_once = ops->read_once;
+    return ops->read(f, buf, n, blocking);
+}
+
+long vfs_read(struct file *f, void *buf, unsigned long n)
+{
+    return vfs_read_ex(f, buf, n, 1, NULL);
 }
 
 long vfs_write(struct file *f, const void *buf, unsigned long n)
@@ -486,7 +473,7 @@ long vfs_write(struct file *f, const void *buf, unsigned long n)
         return -1;
     if (!vfs_flags_allow_write(f->flags))
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->write == NULL)
         return -1;
     if (n > 0x7FFFFFFFUL)
@@ -500,7 +487,7 @@ long vfs_seek(struct file *f, long off, int whence)
 
     if (f == NULL)
         return -1;
-    ops = file_ops(f);
+    ops = f->ops;
     if (ops == NULL || ops->seek == NULL)
         return -1;              /* pipes are not seekable */
     return ops->seek(f, off, whence);

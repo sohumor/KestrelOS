@@ -32,8 +32,12 @@ Binaries may be static ELF64 images linked at `USER_LOAD_BASE` (`0x400000`)
 or Kestrel ET_DYN images with `DT_NEEDED` dependencies. The kernel records
 lazy `PT_LOAD` areas, resolves the supported dynamic relocations, and enters
 `_start`. It provides `rdi = argc` and `rsi = argv` (a NUL-terminated
-`char *` array on the user stack, `argv[argc] == 0`). crt0 calls
-`main(argc, argv)` and passes its return value to `SYS_EXIT`.
+`char *` array on the user stack, `argv[argc] == 0`). An absolute cwd from
+`SYS_SPAWN_CAPS` is passed in `rdx` as a NUL-terminated string on the initial
+stack; otherwise `rdx` is zero. The existing `--cwd=` argument is still
+supplied when it fits, for older binaries. CRT0 exposes the initial
+directory through `kestrel_startup_cwd()` (default `/`), calls
+`main(argc, argv)`, and passes its return value to `SYS_EXIT`.
 
 ## Memory map (per process)
 
@@ -113,6 +117,51 @@ Numbers, argument registers in order (rdi, rsi, rdx, r10).
 | 64 | `SYS_SIGPROCMASK` | how, mask, old mask | 0 / -1 |
 | 65 | `SYS_SIGRETURN` | internal restorer | restores interrupted frame |
 | 66 | `SYS_CPUINFO` | `struct k_cpuinfo *` | 0 / -1 |
+| 90 | `SYS_MISSION_SPAWN` | path, argv, `const struct k_mission_grant *`, optional `u32 *mission_id` | pid / -1 |
+| 91 | `SYS_MISSION_CTL` | mission id, op, arg | 0 / -1 |
+| 92 | `SYS_MISSION_INFO` | live index, `struct k_mission_info *` | 0 / -1 at end |
+
+`K_WIN_OVERLAY` (flag 4) requires `K_WIN_NODECOR` and excludes `K_WIN_DESKTOP`.
+Overlay windows stay above normal windows without taking keyboard focus or
+participating in Alt-Tab. `KEY_MISSION` (0x90, Ctrl+M) is routed to the desktop.
+
+### Mission grants
+
+See [missions.md](missions.md) for enforcement and lifetime rules. Numbers
+78–82 are reserved for IPv6; mission calls use 90–92.
+
+`k_mission_grant` contains `app[24]`, `title[48]`, `cap_mask`, `path_count`,
+`net_mode`, `host_count`, `device_bits`, `ipc_bits`, a zero `reserved` field,
+eight `k_mission_path` entries (`prefix[64]`, R/W `mode`, `revoked`), and four
+`k_mission_host` entries (`ip_be`, `revoked`). Input strings must terminate,
+prefixes must be canonical absolute paths (userspace expands `~`), and input
+revocation fields must be zero. Counts bound the active entries. Missions
+cannot receive `KCAP_ADMIN`. The effective mask intersects the caller's mask;
+an already-mission-scoped caller may only narrow its effective mission grant.
+
+`k_mission_info` contains `id`, `owner_uid`, the effective `grant`, a
+channel-bitmap `revoked`, ten `k_mission_counter` entries (`uses`, `denies`,
+`last_use_tick`, `last_deny_tick`), `last_deny[40]`, `task_count`, `pid_count`,
+and `pids[32]`. Timestamps are monotonic milliseconds; counts include suppressed
+pulses. PID lists truncate at 32 while `task_count` remains the full count.
+Enumeration is a live snapshot, not a stable cursor across task exits.
+
+Channel indices 0–9 are fs.read, fs.write, net, display, spawn, ipc, audio,
+camera, input, random. Device bits 0–3 correspond to audio, camera, input,
+random. IPC bits 0–3 are talon, pulse, signal, pipe. Net modes are none (0),
+any (1), hosts (2). Paths have READ (1) and WRITE (2) mode bits.
+
+Control operations are `K_MISSION_REVOKE_CAP` (1, arg = channel index),
+`K_MISSION_REVOKE_PATH` (2, arg = path index), `K_MISSION_REVOKE_HOST` (3,
+arg = host index), and `K_MISSION_END` (4, arg ignored). Only a non-mission
+caller that is root or the mission owner may control a mission. Revocation
+updates the effective grant, records revoked channels/entries, and clears
+corresponding capability bits on every live task in the mission.
+
+`K_TOPIC_MISSION` is `0x40` and is included in `K_TOPIC_ALL` (`0x7f`). Mission
+pulse kinds START/USE/DENY/REVOKE/END have values 11–15. `arg0` is the mission
+id; `arg1` is the channel (zero for start/end); `tag` is short detail. USE
+pulses have a 250 ms per-mission/channel minimum interval; DENY pulses 50 ms.
 
 `open()` flags: `O_RDONLY 0x000`, `O_WRONLY 0x001`, `O_RDWR 0x002`,
 `O_CREAT 0x040`, `O_TRUNC 0x200`, `O_APPEND 0x400`.

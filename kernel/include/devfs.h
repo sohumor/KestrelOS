@@ -37,6 +37,7 @@
 #define DEV_SOCKETS  13         /* active TCP sockets @krec snapshot */
 #define DEV_CAPS     14         /* process capability & unveil @krec snapshot */
 #define DEV_PARCELS  15         /* active Talon parcels @krec snapshot */
+#define DEV_MISSIONS 16         /* mission grants and counters @krec snapshot */
 
 /* Register the "devfs" filesystem type. Idempotent. */
 void devfs_init(void);

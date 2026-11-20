@@ -1,0 +1,47 @@
+name: Build and boot
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3
+      - name: Build
+        run: make -j$(nproc) 2>&1 | tee build.log
+      # The harness does not select KVM; QEMU defaults to portable TCG.
+      - name: Boot smoke test
+        timeout-minutes: 3
+        run: timeout --kill-after=5s 120s python3 -u tools/e2e.py --smoke 2>&1 | tee smoke.log
+      - name: Host tests
+        timeout-minutes: 3
+        run: make test-net test-random test-gui-host test-kfs-journal 2>&1 | tee host-tests.log
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-logs
+          path: |
+            build.log
+            smoke.log
+            host-tests.log
+          if-no-files-found: ignore
+          retention-days: 7
