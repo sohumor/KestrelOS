@@ -8,6 +8,7 @@
  */
 
 #include <kestrel.h>
+#include <mission.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +36,8 @@ enum popup_kind {
     POP_NONE = 0,
     POP_LAUNCHER,
     POP_TALON,
-    POP_QUICK
+    POP_QUICK,
+    POP_BRIEF
 };
 
 struct app_entry {
@@ -136,6 +138,25 @@ static int power_confirm = -1;
 static gui_rc perch_btn_rc;
 static gui_rc talon_btn_rc;
 static gui_rc quick_btn_rc;
+static gui_rc mission_btn_rc;
+static int screen_w, screen_h;
+static int brief_app, brief_scroll;
+static struct mission_manifest brief_manifest;
+static int brief_read[K_MISSION_PATHS], brief_write[K_MISSION_PATHS];
+static int brief_net, brief_hosts[K_MISSION_HOSTS], brief_device[4], brief_ipc[4];
+static int brief_display, brief_spawn;
+static char brief_scope[64], brief_error[96];
+static gui_textbox_state brief_scope_box;
+static gui_window *mission_hud;
+static gui_ui mission_ui;
+static int mission_hidden, mission_scroll, mission_count;
+static struct k_mission_info mission_snap[K_MISSION_MAX];
+static struct {
+    uint32_t id;
+    unsigned long use[K_MISSION_CHANNELS], deny[K_MISSION_CHANNELS];
+} mission_flashes[K_MISSION_MAX];
+static void open_brief(int index);
+static void close_popup(void);
 
 /* ----------------------------------------------------------------- helpers */
 
@@ -194,7 +215,7 @@ static int app_index(const char *path)
     return -1;
 }
 
-static void launch_app(int index)
+static int launch_mission_app(int index, const struct mission_options *options)
 {
     char *argv[3];
     int pid;
@@ -202,19 +223,41 @@ static void launch_app(int index)
     if (index < 0 || index >= NAPPS || !apps[index].enabled) {
         notify("%s is not installed", index >= 0 && index < NAPPS
                                       ? apps[index].name : "Application");
-        return;
+        return -1;
     }
     argv[0] = (char *)apps[index].path;
     argv[1] = (char *)apps[index].arg;
     argv[2] = 0;
-    pid = spawn(apps[index].path, argv);
+    struct mission_manifest m;
+    struct k_mission_grant grant;
+    struct k_stat st;
+    char path[128], error[96];
+    const char *id = apps[index].path + 5;
+    snprintf(path, sizeof(path), "/etc/missions/%s.mission", id);
+    if (stat_(path, &st) == 0) {
+        if (mission_load(id, &m, error, sizeof(error)) < 0 ||
+            mission_build_current(&m, options, &grant, error, sizeof(error)) < 0) {
+            notify("Mission: %s", error);
+            return -1;
+        }
+        pid = mission_spawn(m.exec, argv, &grant);
+    } else if (options) {
+        notify("No manifest for %s", apps[index].name);
+        return -1;
+    } else pid = spawn(apps[index].path, argv);
     if (pid < 0) {
         notify("Could not start %s", apps[index].name);
-        return;
+        return -1;
     }
     if (nchildren < MAX_CHILDREN)
         children[nchildren++] = pid;
     notify("Opening %s", apps[index].name);
+    return pid;
+}
+
+static void launch_app(int index)
+{
+    launch_mission_app(index, NULL);
 }
 
 static void reap_children(void)
@@ -544,7 +587,7 @@ static void init_pulses(void)
     memset(&q, 0, sizeof(q));
     q.seq = 0;
     q.topic_mask = K_TOPIC_WIN | K_TOPIC_PROC | K_TOPIC_PARCEL |
-                   K_TOPIC_THEME | K_TOPIC_NET;
+                   K_TOPIC_THEME | K_TOPIC_NET | K_TOPIC_MISSION;
     q.max_out = 0;
     q.timeout_ms = 0;
     if (pulse_poll(&q, 0) >= 0)
@@ -564,7 +607,7 @@ static void poll_pulses(gui_settings *settings, int *wallpaper_dirty,
         memset(&q, 0, sizeof(q));
         q.seq = pulse_seq;
         q.topic_mask = K_TOPIC_WIN | K_TOPIC_PROC | K_TOPIC_PARCEL |
-                       K_TOPIC_THEME | K_TOPIC_NET;
+                       K_TOPIC_THEME | K_TOPIC_NET | K_TOPIC_MISSION;
         q.max_out = 16;
         q.timeout_ms = 0;
         n = pulse_poll(&q, pulses);
@@ -576,6 +619,27 @@ static void poll_pulses(gui_settings *settings, int *wallpaper_dirty,
         pulse_seq = q.seq;
         pulse_burst += (uint32_t)n;
         for (int i = 0; i < n; i++) {
+            if (pulses[i].topic & K_TOPIC_MISSION) {
+                unsigned slot;
+                for (slot = 0; slot < K_MISSION_MAX; slot++)
+                    if (mission_flashes[slot].id == pulses[i].arg0) break;
+                if (slot == K_MISSION_MAX)
+                    for (slot = 0; slot < K_MISSION_MAX; slot++)
+                        if (!mission_flashes[slot].id) break;
+                if (slot < K_MISSION_MAX) {
+                    mission_flashes[slot].id = pulses[i].arg0;
+                    if (pulses[i].arg1 < K_MISSION_CHANNELS) {
+                        if (pulses[i].kind == K_PULSE_MISSION_USE)
+                            mission_flashes[slot].use[pulses[i].arg1] = uptime_ms() + 700;
+                        if (pulses[i].kind == K_PULSE_MISSION_DENY)
+                            mission_flashes[slot].deny[pulses[i].arg1] = uptime_ms() + 700;
+                    }
+                }
+                if (pulses[i].kind == K_PULSE_MISSION_START) mission_hidden = 0;
+                if (pulses[i].kind == K_PULSE_MISSION_END && slot < K_MISSION_MAX)
+                    memset(&mission_flashes[slot], 0, sizeof(mission_flashes[slot]));
+                *shell_dirty = 1;
+            }
             if (pulses[i].topic & K_TOPIC_WIN) {
                 got_win = 1;
                 if (pulses[i].kind == K_PULSE_WIN_WS)
@@ -1197,6 +1261,10 @@ static void paint_topbar(gui_window *win, gui_ui *ui)
     }
 
     /* 3. Right telemetry cluster */
+    mission_btn_rc = gui_mkrc(x, 4, 86, TOP_H - 8);
+    if (gui_button_ex(win, mission_btn_rc, "Missions", ui, 1, mission_hud != NULL))
+        mission_hidden = !mission_hidden;
+    x += 94;
     clock_text(clock_s, sizeof(clock_s), win->w >= 1160);
     clock_w = gui_text_w(clock_s) + 18;
     net_w = compact_bar ? 46 : 54;
@@ -1522,6 +1590,8 @@ static void paint_dock(gui_window *win, gui_ui *ui,
             }
             if (clicked(ui, r))
                 launch_app(i);
+            if (right_clicked(ui, r))
+                open_brief(i);
         }
         x += item_h + 8;
     }
@@ -1933,8 +2003,14 @@ static int paint_launcher(gui_window *win, gui_ui *ui)
             if (clicked(ui, card) &&
                 gui_hit(gui_mkrc(view_x, view_y, view_w, view_h),
                         ui->up_x, ui->up_y)) {
-                launch = idx;
+                launch = gui_hit(gui_mkrc(card.x + card.w - 48, card.y + 34, 44, 22),
+                                 ui->up_x, ui->up_y) ? -10 - idx : idx;
             }
+            gui_fill_round_rect(win, gui_mkrc(card.x + card.w - 50, card.y + 33, 46, 23),
+                                4, GUI_SUNKEN);
+            gui_draw_text_aa(win, card.x + card.w - 44, card.y + 38, "Brief",
+                             FONT_SMALL, FONT_BOLD, FONT_ROMAN, GUI_ACCENT, GUI_TRANSPARENT);
+            if (right_clicked(ui, card)) launch = -10 - idx;
         }
     } else if (!evres.valid && !evres.is_error && nwin_matches == 0) {
         gui_draw_text_aa(win, view_x, cur_y + 10,
@@ -2271,6 +2347,222 @@ static int paint_popup(gui_settings *settings)
 
 /* -------------------------------------------------------------------- main */
 
+static void open_brief(int index)
+{
+    if (index < 0 || index >= NAPPS) return;
+    if (mission_load(apps[index].path + 5, &brief_manifest, brief_error, sizeof(brief_error)) < 0) {
+        notify("Mission: %s", brief_error); return;
+    }
+    close_popup();
+    brief_app = index; brief_scroll = 0;
+    struct k_mission_grant *g = &brief_manifest.declared;
+    for (unsigned i = 0; i < K_MISSION_PATHS; i++) {
+        brief_read[i] = i < g->path_count && (g->paths[i].mode & K_MISSION_READ);
+        brief_write[i] = i < g->path_count && (g->paths[i].mode & K_MISSION_WRITE);
+    }
+    brief_net = !!g->net_mode;
+    for (unsigned i = 0; i < K_MISSION_HOSTS; i++) brief_hosts[i] = i < g->host_count;
+    for (unsigned i = 0; i < 4; i++) {
+        brief_device[i] = !!(g->device_bits & (1U << i));
+        brief_ipc[i] = !!(g->ipc_bits & (1U << i));
+    }
+    brief_display = !!(g->cap_mask & KCAP_WM); brief_spawn = !!(g->cap_mask & KCAP_SPAWN);
+    brief_scope[0] = brief_error[0] = 0;
+    memset(&brief_scope_box, 0, sizeof(brief_scope_box));
+    brief_scope_box.buf = brief_scope; brief_scope_box.cap = sizeof(brief_scope);
+    int height = screen_h - TOP_H - DOCK_H_FULL - 20;
+    if (height > 660) height = 660;
+    popup = gui_open("Mission Briefing", 12, TOP_H + 8, 510, height, K_WIN_NODECOR);
+    if (!popup) { notify("Could not open Mission Briefing"); return; }
+    popup_kind = POP_BRIEF;
+    memset(&popup_ui, 0, sizeof(popup_ui));
+}
+
+static void mission_text(gui_window *w, int x, int y, const char *s, uint32_t color)
+{
+    gui_draw_text_aa_run(w, x, y, s, -1, FONT_SMALL, FONT_REGULAR, FONT_ROMAN,
+                         color, GUI_TRANSPARENT, w->w - x - 14, 1);
+}
+
+static void brief_toggle(gui_window *w, gui_ui *ui, int *y, const char *s, int *on)
+{
+    if (*y >= 84 && *y + 24 <= w->h - 118) gui_toggle(w, 18, *y, s, on, ui);
+    *y += 28;
+}
+
+static int paint_brief(gui_window *w, gui_ui *ui)
+{
+    struct k_mission_grant *g = &brief_manifest.declared;
+    static const char *const devices[] = {"audio", "camera", "input", "random"};
+    static const char *const ipc[] = {"talon", "pulse", "signal", "pipe"};
+    gui_clear(w, GUI_PANEL);
+    gui_rect(w, 0, 0, w->w, 3, GUI_ACCENT);
+    gui_text(w, 18, 16, "MISSION BRIEFING", GUI_ACCENT, GUI_TRANSPARENT);
+    gui_text(w, 18, 40, g->app, GUI_TEXT, GUI_TRANSPARENT);
+    mission_text(w, 18, 65, g->title, GUI_TEXT_DIM);
+    int rows = !!(g->cap_mask & KCAP_WM) + !!(g->cap_mask & KCAP_SPAWN) + !!g->net_mode;
+    for (unsigned i = 0; i < g->path_count; i++)
+        rows += !!(g->paths[i].mode & K_MISSION_READ) + !!(g->paths[i].mode & K_MISSION_WRITE);
+    rows += g->host_count;
+    for (unsigned i = 0; i < 4; i++) rows += !!(g->device_bits & (1U << i)) + !!(g->ipc_bits & (1U << i));
+    brief_scroll -= ui->wheel * 56;
+    int max = rows * 28 - (w->h - 210);
+    if (brief_scroll > max) brief_scroll = max;
+    if (brief_scroll < 0) brief_scroll = 0;
+    int y = 88 - brief_scroll;
+    char label[112];
+    gui_push_clip(w, gui_mkrc(8, 84, w->w - 16, w->h - 202));
+    if (g->cap_mask & KCAP_WM) brief_toggle(w, ui, &y, "Display / windows", &brief_display);
+    for (unsigned i = 0; i < g->path_count; i++) {
+        if (g->paths[i].mode & K_MISSION_READ) {
+            snprintf(label, sizeof(label), "Read   %s", g->paths[i].prefix);
+            brief_toggle(w, ui, &y, label, &brief_read[i]);
+        }
+        if (g->paths[i].mode & K_MISSION_WRITE) {
+            snprintf(label, sizeof(label), "Write  %s", g->paths[i].prefix);
+            brief_toggle(w, ui, &y, label, &brief_write[i]);
+        }
+    }
+    if (g->net_mode) brief_toggle(w, ui, &y, "Network", &brief_net);
+    for (unsigned i = 0; i < g->host_count; i++) {
+        snprintf(label, sizeof(label), "Host   %s", brief_manifest.hosts[i]);
+        brief_toggle(w, ui, &y, label, &brief_hosts[i]);
+    }
+    for (unsigned i = 0; i < 4; i++) {
+        if (g->device_bits & (1U << i)) {
+            snprintf(label, sizeof(label), "Device / %s", devices[i]);
+            brief_toggle(w, ui, &y, label, &brief_device[i]);
+        }
+        if (g->ipc_bits & (1U << i)) {
+            snprintf(label, sizeof(label), "IPC / %s", ipc[i]);
+            brief_toggle(w, ui, &y, label, &brief_ipc[i]);
+        }
+    }
+    if (g->cap_mask & KCAP_SPAWN) brief_toggle(w, ui, &y, "Spawn helpers", &brief_spawn);
+    gui_pop_clip(w);
+    gui_rect(w, 12, w->h - 118, w->w - 24, 1, GUI_EDGE);
+    mission_text(w, 18, w->h - 108, "Wheel: more grants. Optional narrower write prefix:", GUI_TEXT_DIM);
+    gui_textbox(w, gui_mkrc(18, w->h - 88, w->w - 36, 26), &brief_scope_box, ui);
+    mission_text(w, 18, w->h - 55, brief_error[0] ? brief_error :
+                 "Empty prefix keeps selected writes. Grants can only shrink.", GUI_TEXT_DIM);
+    if (gui_button_ex(w, gui_mkrc(18, w->h - 34, 90, 26), "Cancel", ui, 1, 0)) return -2;
+    if (gui_button_ex(w, gui_mkrc(w->w - 138, w->h - 34, 120, 26), "Launch", ui, 1, 1)) {
+        struct mission_options o = {0};
+        struct k_mission_grant grant;
+        o.read_set = o.write_set = o.net_set = 1;
+        for (unsigned i = 0; i < g->path_count; i++) {
+            if (brief_read[i]) strcpy(o.read[o.read_count++], g->paths[i].prefix);
+            if (brief_write[i]) strcpy(o.write[o.write_count++], g->paths[i].prefix);
+        }
+        if (brief_scope[0]) { o.write_count = 1; strcpy(o.write[0], brief_scope); }
+        o.net_mode = brief_net ? g->net_mode : K_MISSION_NET_NONE;
+        if (brief_net && g->net_mode == K_MISSION_NET_HOSTS) {
+            for (unsigned i = 0; i < g->host_count; i++)
+                if (brief_hosts[i]) strcpy(o.hosts[o.host_count++], brief_manifest.hosts[i]);
+            if (!o.host_count) o.net_mode = K_MISSION_NET_NONE;
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            if (!brief_device[i]) o.drop_devices |= 1U << i;
+            if (!brief_ipc[i]) o.drop_ipc |= 1U << i;
+        }
+        if (!brief_display) o.drop_caps |= KCAP_WM;
+        if (!brief_spawn) o.drop_caps |= KCAP_SPAWN;
+        if (mission_build_current(&brief_manifest, &o, &grant, brief_error, sizeof(brief_error)) < 0) return -1;
+        if (launch_mission_app(brief_app, &o) >= 0) return -2;
+        snprintf(brief_error, sizeof(brief_error), "Launch failed; see desktop notification.");
+    }
+    return -1;
+}
+
+static int mission_channel_enabled(const struct k_mission_grant *g, unsigned c)
+{
+    static const uint64_t caps[] = {KCAP_FS_READ, KCAP_FS_WRITE, KCAP_NET, KCAP_WM, KCAP_SPAWN, KCAP_IPC};
+    return c < K_MISSION_AUDIO ? !!(g->cap_mask & caps[c]) : !!(g->device_bits & (1U << (c - K_MISSION_AUDIO)));
+}
+
+static void update_mission_hud(void)
+{
+    mission_count = 0;
+    while (mission_count < K_MISSION_MAX && mission_info(mission_count, &mission_snap[mission_count]) == 0) mission_count++;
+    if (mission_hidden || !mission_count) {
+        if (mission_hud) gui_close(mission_hud);
+        mission_hud = NULL; return;
+    }
+    if (!mission_hud) {
+        int height = screen_h - TOP_H - DOCK_H_FULL - 20;
+        if (height > 660) height = 660;
+        mission_hud = gui_open("Mission HUD", screen_w - 482, TOP_H + 8, 470,
+                               height, K_WIN_NODECOR | K_WIN_OVERLAY);
+        memset(&mission_ui, 0, sizeof(mission_ui));
+    }
+    if (!mission_hud) return;
+    struct k_event ev;
+    gui_ui_begin(&mission_ui);
+    while (gui_next_event(mission_hud, &ev, 0) > 0) gui_ui_event(&mission_ui, &ev);
+    gui_window *w = mission_hud;
+    gui_clear(w, GUI_PANEL);
+    gui_rect(w, 0, 0, w->w, 3, GUI_ACCENT);
+    char text[192];
+    snprintf(text, sizeof(text), "MISSION CONTROL  /  %d LIVE", mission_count);
+    gui_text(w, 14, 16, text, GUI_ACCENT, GUI_TRANSPARENT);
+    if (gui_button_ex(w, gui_mkrc(w->w - 65, 9, 54, 24), "Hide", &mission_ui, 1, 0)) mission_hidden = 1;
+    mission_text(w, 14, 39, "Green active   Amber use   Red deny   [x] revoke", GUI_TEXT_DIM);
+    mission_scroll -= mission_ui.wheel * 60;
+    int max = mission_count * 232 - (w->h - 82);
+    if (mission_scroll > max) mission_scroll = max;
+    if (mission_scroll < 0) mission_scroll = 0;
+    gui_push_clip(w, gui_mkrc(8, 62, w->w - 16, w->h - 88));
+    unsigned long now = uptime_ms();
+    for (int i = 0; i < mission_count; i++) {
+        struct k_mission_info *m = &mission_snap[i];
+        int y = 66 + i * 232 - mission_scroll;
+        gui_rc card = gui_mkrc(10, y, w->w - 20, 222);
+        gui_fill_round_rect(w, card, 8, GUI_SURFACE_ALT);
+        gui_stroke_round_rect(w, card, 8, 1, GUI_BORDER);
+        snprintf(text, sizeof(text), "%s  #%u / PID %d", m->grant.app, m->id, m->pid_count ? m->pids[0] : 0);
+        gui_text(w, 20, y + 10, text, GUI_TEXT, GUI_TRANSPARENT);
+        if (y >= 62 && y + 34 <= w->h - 26 &&
+            gui_button_ex(w, gui_mkrc(w->w - 76, y + 6, 54, 26), "End", &mission_ui, 1, 0))
+            if (mission_ctl(m->id, K_MISSION_END, 0) < 0) notify("Mission end denied");
+        mission_text(w, 20, y + 34, m->grant.title, GUI_TEXT_DIM);
+        for (unsigned c = 0; c < K_MISSION_CHANNELS; c++) {
+            int revoked = !!(m->revoked & (1ULL << c));
+            int enabled = mission_channel_enabled(&m->grant, c);
+            uint32_t color = enabled && !revoked ? 0x34D399 : GUI_TEXT_DIM;
+            for (unsigned s = 0; s < K_MISSION_MAX; s++) if (mission_flashes[s].id == m->id && !revoked) {
+                if (mission_flashes[s].deny[c] > now) color = 0xF87171;
+                else if (mission_flashes[s].use[c] > now) color = GUI_WARN;
+            }
+            gui_rc chip = gui_mkrc(18 + (int)(c % 5) * 87, y + 58 + (int)(c / 5) * 42, 82, 36);
+            gui_fill_round_rect(w, chip, 5, gui_mix(GUI_SURFACE, color, 40));
+            gui_stroke_round_rect(w, chip, 5, 1, color);
+            mission_text(w, chip.x + 4, chip.y + 4, mission_channel_name(c), color);
+            if (revoked) strcpy(text, "revoked");
+            else if (!enabled) strcpy(text, "off");
+            else snprintf(text, sizeof(text), "%lu/%lu", (unsigned long)m->counters[c].uses, (unsigned long)m->counters[c].denies);
+            mission_text(w, chip.x + 4, chip.y + 21, text, GUI_TEXT_DIM);
+            gui_rc revoke = gui_mkrc(chip.x + 65, chip.y + 1, 16, 18);
+            mission_text(w, revoke.x + 3, revoke.y + 2, "x", color);
+            if (!revoked && chip.y >= 62 && chip.y + chip.h <= w->h - 26 && clicked(&mission_ui, revoke))
+                if (mission_ctl(m->id, K_MISSION_REVOKE_CAP, c) < 0) notify("Mission revoke denied");
+        }
+        strcpy(text, "Write: ");
+        for (unsigned p = 0; p < m->grant.path_count; p++) if (m->grant.paths[p].mode & K_MISSION_WRITE) {
+            size_t n = strlen(text); snprintf(text + n, sizeof(text) - n, "%s ", m->grant.paths[p].prefix);
+        }
+        if (!strcmp(text, "Write: ")) strcat(text, "none");
+        mission_text(w, 20, y + 150, text, GUI_TEXT);
+        snprintf(text, sizeof(text), "Network: %s   Tasks: %u   Counters: use/deny",
+                 !m->grant.net_mode ? "none" : m->grant.net_mode == K_MISSION_NET_ANY ? "any" : "hosts", m->task_count);
+        mission_text(w, 20, y + 170, text, GUI_TEXT_DIM);
+        snprintf(text, sizeof(text), "Last deny: %s", m->last_deny[0] ? m->last_deny : "none");
+        mission_text(w, 20, y + 194, text, m->last_deny[0] ? 0xF87171 : GUI_TEXT_DIM);
+    }
+    gui_pop_clip(w);
+    mission_text(w, 14, w->h - 18, "Ctrl+M toggle / Wheel scroll / Live task-scoped grants", GUI_TEXT_DIM);
+    if (gui_flush(w) < 0) { gui_close(w); mission_hud = NULL; }
+}
+
 int main(int argc, char **argv)
 {
     struct k_event ev;
@@ -2287,6 +2579,8 @@ int main(int argc, char **argv)
         printf("desktop: no framebuffer, nothing to draw on\n");
         return 1;
     }
+    screen_w = sw;
+    screen_h = sh;
     desktop = gui_open("Kestrel Desktop", 0, 0, sw, sh,
                        K_WIN_DESKTOP | K_WIN_NODECOR);
     if (!desktop) {
@@ -2323,6 +2617,9 @@ int main(int argc, char **argv)
                                                           : POP_LAUNCHER,
                                sw, sh, &settings);
                     popup_dirty = popup != 0;
+                    shell_dirty = 1;
+                } else if (ev.key == KEY_MISSION) {
+                    mission_hidden = !mission_hidden;
                     shell_dirty = 1;
                 } else if (ev.key >= KEY_WM_WS1 && ev.key <= KEY_WM_WS4) {
                     int ws = (int)(ev.key - KEY_WM_WS1);
@@ -2379,6 +2676,7 @@ int main(int argc, char **argv)
         }
 
         poll_pulses(&settings, &wallpaper_dirty, &shell_dirty, &popup_dirty);
+        update_mission_hud();
 
         now = uptime_ms();
         if (toast[0] && now >= toast_until) {
@@ -2423,10 +2721,13 @@ int main(int argc, char **argv)
                 break;
             shell_dirty = 0;
         }
-        if (popup && popup_dirty) {
-            int action = paint_popup(&settings);
+        if (popup && (popup_dirty || popup_kind == POP_BRIEF)) {
+            int action = popup_kind == POP_BRIEF ? paint_brief(popup, &popup_ui) : paint_popup(&settings);
 
-            if (action == -2) {
+            if (action <= -10) {
+                open_brief(-10 - action);
+                shell_dirty = 1;
+            } else if (action == -2) {
                 close_popup();
                 shell_dirty = 1;
             } else if (action >= 0) {
@@ -2442,6 +2743,7 @@ int main(int argc, char **argv)
     }
 
     close_popup();
+    if (mission_hud) gui_close(mission_hud);
     gui_close(desktop);
     return 0;
 }

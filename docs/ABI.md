@@ -117,6 +117,10 @@ Numbers, argument registers in order (rdi, rsi, rdx, r10).
 | 91 | `SYS_MISSION_CTL` | mission id, op, arg | 0 / -1 |
 | 92 | `SYS_MISSION_INFO` | live index, `struct k_mission_info *` | 0 / -1 at end |
 
+`K_WIN_OVERLAY` (flag 4) requires `K_WIN_NODECOR` and excludes `K_WIN_DESKTOP`.
+Overlay windows stay above normal windows without taking keyboard focus or
+participating in Alt-Tab. `KEY_MISSION` (0x90, Ctrl+M) is routed to the desktop.
+
 ### Mission grants
 
 See [missions.md](missions.md) for enforcement and lifetime rules. Numbers

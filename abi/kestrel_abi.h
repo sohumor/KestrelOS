@@ -277,6 +277,7 @@ struct k_netinfo {
 #define KEY_WM_WS2   0x8D  /* Alt-2 */
 #define KEY_WM_WS3   0x8E  /* Alt-3 */
 #define KEY_WM_WS4   0x8F  /* Alt-4 */
+#define KEY_MISSION  0x90  /* Ctrl-M */
 
 /* --- kernel log ---------------------------------------------------- */
 
@@ -360,6 +361,7 @@ struct k_mouse {
  * row (no padding). The kernel maps the buffer into the caller and keeps
  * it until SYS_WIN_DESTROY or process exit. */
 #define K_WIN_NODECOR 1    /* no title bar or border (desktop, panels) */
+#define K_WIN_OVERLAY 4    /* above normal windows; never takes keyboard focus */
 #define K_WIN_DESKTOP 2    /* full-screen background layer, never focused */
 
 struct k_wincreate {

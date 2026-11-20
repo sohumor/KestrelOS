@@ -62,6 +62,14 @@ static void narrowing(void)
     assert(!strcmp(g.paths[0].prefix, "/home/pilot/notes/today"));
     assert(g.device_bits == K_MISSION_DEVICE_RANDOM && !g.ipc_bits && !(g.cap_mask & KCAP_IPC));
     assert(g.host_count == 1 && g.hosts[0].ip_be == 0x04030201U);
+    o.drop_caps = KCAP_WM | KCAP_SPAWN;
+    o.no_ipc = 0; o.drop_ipc = K_MISSION_IPC_TALON;
+    assert(BUILD() == 0);
+    assert(!(g.cap_mask & (KCAP_WM | KCAP_SPAWN)));
+    assert(g.ipc_bits == (K_MISSION_IPC_ALL & ~K_MISSION_IPC_TALON));
+    o.drop_caps = KCAP_NET; assert(BUILD() < 0);
+    o.drop_caps = 0; o.drop_ipc = 16; assert(BUILD() < 0);
+    o.drop_ipc = 0;
     strcpy(o.read[0], "~/notesX"); assert(BUILD() < 0);
     strcpy(o.read[0], "~/notes/../secret"); assert(BUILD() < 0);
     strcpy(o.read[0], "/doc"); strcpy(o.write[0], "/doc"); assert(BUILD() < 0);

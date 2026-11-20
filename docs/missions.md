@@ -133,3 +133,26 @@ options and every shipped manifest. Guest tests `mission-grant`, `mission-deny`,
 and `mission-revoke-live` cover successful reads, path/host denials with
 telemetry, and revocation on the same still-running PID. `missionprobe` is a
 small repeated-open/ping helper for these live-policy checks.
+
+## Desktop mission control
+
+Dock, Perch and desktop-shortcut launches use the app's manifest ceiling.
+Missing manifests retain ordinary launch behavior; malformed manifests fail
+closed. Right-click a dock icon or choose **Brief** in Perch to review the
+mission text and remove individual read/write prefixes, hosts, devices, IPC
+kinds, display or helper spawning. The optional write-prefix field replaces
+the selected writes with a narrower prefix (for example `~/notes`); the same
+libc builder rejects widening. Scroll the briefing to reach additional grants.
+
+Mission Control appears automatically on mission start. **Missions** in the
+topbar or **Ctrl+M** toggles it. Scroll to see every live mission. Each card
+shows its mission text, PID, channel use/deny counters, write prefixes, network
+policy and latest denial. Green chips are active, grey chips are off/revoked;
+USE flashes amber and DENY flashes red for 700 ms. A chip's **x** revokes that
+channel live; **End** terminates the mission's tasks. Revoked chips stay grey
+even if a running task continues attempting denied operations.
+
+The HUD combines mission-topic pulses with syscall snapshots, refreshed even
+if pulses were missed. `K_WIN_OVERLAY` nodecor windows form a separate stack
+above normal windows, remain visible across workspaces, and never take keyboard
+focus or participate in Alt-Tab. Clicking HUD controls leaves app focus intact.

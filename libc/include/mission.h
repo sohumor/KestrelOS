@@ -17,6 +17,8 @@ struct mission_options {
     unsigned net_set, net_mode, host_count;
     char hosts[K_MISSION_HOSTS][MISSION_HOST_NAME];
     unsigned drop_devices, no_ipc;
+    unsigned drop_ipc;
+    uint64_t drop_caps;
 };
 
 typedef int (*mission_resolver)(const char *name, uint32_t *ip, void *ctx);

@@ -95,6 +95,10 @@ static void kbd_irq(struct regs *r)
         return;
     }
 
+    if (ctrl && sc == 0x32) {
+        input_push(KEY_MISSION);
+        return;
+    }
     char c = shift ? map_shift[sc] : map_normal[sc];
     if (!c)
         return;

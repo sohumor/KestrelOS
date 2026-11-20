@@ -263,7 +263,9 @@ int mission_build(const struct mission_manifest *m, const struct mission_options
     if (o) {
         if (o->read_count > K_MISSION_PATHS || o->write_count > K_MISSION_PATHS ||
             o->host_count > K_MISSION_HOSTS || o->net_mode > K_MISSION_NET_HOSTS ||
-            (o->drop_devices & ~15U)) return fail(error, error_size, "invalid narrowing options");
+            (o->drop_devices & ~15U) || (o->drop_ipc & ~K_MISSION_IPC_ALL) ||
+            (o->drop_caps & ~(KCAP_WM | KCAP_SPAWN)))
+            return fail(error, error_size, "invalid narrowing options");
         memset(out->paths, 0, sizeof(out->paths)); out->path_count = 0;
         for (unsigned mode = 1; mode <= 2; mode++) {
             unsigned replace = mode == 1 ? o->read_set : o->write_set;
@@ -286,6 +288,8 @@ int mission_build(const struct mission_manifest *m, const struct mission_options
                 return fail(error, error_size, "invalid or unresolved network grant");
         }
         out->device_bits &= ~o->drop_devices;
+        out->cap_mask &= ~o->drop_caps;
+        out->ipc_bits &= ~o->drop_ipc;
         if (o->no_ipc) out->ipc_bits = 0;
     }
     caps(out);
