@@ -62,12 +62,53 @@ static int test_pipe_read(void)
     return 0;
 }
 
+static int test_pipe_lifetime(void)
+{
+    int fds[2];
+    char data[16];
+    char *args[] = { "echo", "child", 0 };
+    struct k_spawn_caps caps = {0};
+
+    if (pipe_(fds) < 0)
+        return 1;
+    int alias = open("/dev/null", O_WRONLY);
+    if (alias < 0 || dup2_(fds[1], alias) != alias || close(fds[1]) != 0 ||
+        write(alias, "x", 1) != 1 || read_nb(fds[0], data, sizeof(data)) != 1 ||
+        data[0] != 'x') {
+        printf("sigtest: duplicated pipe end did not survive close\n");
+        return 1;
+    }
+
+    caps.fds[0].child_fd = 1;
+    caps.fds[0].parent_fd = alias;
+    caps.n_fds = 1;
+    caps.flags = K_SPAWN_CLOSE_OTHER;
+    int child = spawn_caps("/bin/echo", args, &caps);
+    if (child < 0 || close(alias) != 0 || waitpid(child) != 0 ||
+        read(fds[0], data, sizeof(data)) != 6 ||
+        memcmp(data, "child\n", 6) != 0 ||
+        read(fds[0], data, sizeof(data)) != 0 || close(fds[0]) != 0) {
+        printf("sigtest: spawned pipe end or final EOF failed\n");
+        return 1;
+    }
+
+    if (pipe_(fds) < 0 || close(fds[0]) != 0 ||
+        write(fds[1], "x", 1) != -1 || close(fds[1]) != 0) {
+        printf("sigtest: closed pipe reader was not detected\n");
+        return 1;
+    }
+    printf("sigtest: pipe dup + spawn + peer close verified\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--pipe-read") == 0)
         return test_pipe_read();
     if (argc > 2 && strcmp(argv[1], "--interrupt-reader") == 0)
         return interrupt_reader(atoi(argv[2]));
+    if (argc > 1 && strcmp(argv[1], "--pipe-lifetime") == 0)
+        return test_pipe_lifetime();
 
     uint64_t bit = 1ULL << (SIGUSR1 - 1);
 

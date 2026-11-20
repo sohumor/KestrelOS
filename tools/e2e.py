@@ -2122,6 +2122,12 @@ def t_pipe_read(h):
     wait_prompt(h)
 
 
+def t_pipe_lifetime(h):
+    h.send("sigtest --pipe-lifetime")
+    h.expect("sigtest: pipe dup + spawn + peer close verified")
+    wait_prompt(h)
+
+
 def t_dev(h):
     """/dev: the devfs mount, an immediate-EOF device and an empty dump.
 
@@ -2901,6 +2907,7 @@ TESTS = [
     ("redirect", t_redirect),
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
+    ("pipe-lifetime", t_pipe_lifetime),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),

@@ -1725,7 +1725,6 @@ static struct file *kfs_op_open(struct mount *m, const char *path, int flags)
         return NULL;
     }
     kf->fs = fs;
-    kf->f.type = FILE_KFS;
     kf->f.inum = (uint32_t)ino;
     kf->f.pos = 0;
     kf->f.flags = flags;
