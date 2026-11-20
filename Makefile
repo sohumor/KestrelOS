@@ -284,14 +284,16 @@ $(BUILD)/repo/index.kpi: $(KPKGS) tools/mkrepo.py
 # ---------------- filesystem image ----------------
 
 $(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
-                 $(BUILD)/repo/index.kpi
+                 $(BUILD)/repo/index.kpi tools/mkaudio.py tools/mkchime.py
 	rm -rf $(BUILD)/rootfs
-	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run \
+	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run $(BUILD)/rootfs/media \
 	         $(BUILD)/rootfs/tmp $(BUILD)/rootfs/var/log \
 	         $(BUILD)/rootfs/lib/modules \
 	         $(BUILD)/rootfs/var/pkg/repo $(BUILD)/rootfs/var/pkg/db \
 	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
+	$(PY) tools/mkaudio.py $(BUILD)/rootfs/doc/tone.pcm
+	$(PY) tools/mkchime.py $(BUILD)/rootfs/media/chime.wav
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
 	# Keep symbol-bearing build artifacts for debugging, but do not spend KFS
 	# file blocks on DWARF sections that the target loader never reads.
@@ -353,6 +355,13 @@ test-img-formats:
 test-browser-host: test-jpeg-prog test-img-formats
 	sh tools/run-jsdom-tests.sh
 	sh tools/run-browser-stack.sh
+
+.PHONY: test-play
+test-play:
+	mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
+	  -fno-omit-frame-pointer tools/test_play.c -o $(BUILD)/host-tests/test_play
+	$(BUILD)/host-tests/test_play
 
 test-gui-host:
 	sh tools/run-gui-tests.sh
