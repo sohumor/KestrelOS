@@ -494,6 +494,8 @@ def run_host_tests(tc):
         common += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
 
     suites = [
+        ("test_console_scroll", [r("tools/test_console_scroll.c")],
+         ["-Ikernel/include", "-Iabi", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections"]),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
@@ -647,6 +649,7 @@ def generate_compile_commands(tc):
             add_entry(rel, "pkgobj/%s/%s.o" % (pkg, prog), ucflags)
 
     host_suites = [
+        ("tools/test_console_scroll.c", ["-Ikernel/include", "-Iabi", "-ffunction-sections", "-fdata-sections"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),
