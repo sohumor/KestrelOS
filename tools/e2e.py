@@ -455,7 +455,8 @@ def _marker_handler(marker):
                     "<p>Disabled (must stay DISABLED)</p>"
                     "<input id=d disabled value=DISABLED>"
                     "<p>Readonly (must stay READONLY)</p>"
-                    "<input id=r readonly value=READONLY>"
+                    "<form action=/readonly-submit>"
+                    "<input id=r name=r readonly value=READONLY></form>"
                     "<p>Editable control</p><input id=e value=EDIT>"
                     "<p><button onclick=\"fetch('/input-check/'+"
                     "document.getElementById('d').value+'/'+"
@@ -2522,6 +2523,13 @@ def t_browser_protected_inputs(h):
         print("  protected input values: %r" % paths)
         if paths != ["/input-check/DISABLED/READONLY/EDITxEDITx"]:
             raise TimeoutError("protected values changed or GUI editing did not execute")
+        submissions = browser_fixtures.http.path_count("/readonly-submit")
+        click(100, 317)
+        cmd("sendkey ret")
+        time.sleep(3)
+        if browser_fixtures.http.path_count("/readonly-submit") != submissions + 1:
+            raise TimeoutError("Enter in readonly input did not submit its form")
+        print("  readonly input Enter submitted its form")
     finally:
         cmd("sendkey ctrl-q")
         monitor.close()

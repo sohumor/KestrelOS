@@ -8103,7 +8103,8 @@ static int edit_focused_control(struct bstate *b, unsigned int key)
         return 1;
     }
     if (dom_has_attr(n, "readonly") && key != KEY_LEFT && key != KEY_RIGHT &&
-        key != KEY_HOME && key != KEY_END) {
+        key != KEY_HOME && key != KEY_END &&
+        !(n->tag_id == HTAG_INPUT && (key == '\n' || key == '\r'))) {
         free(old);
         return 1;
     }
