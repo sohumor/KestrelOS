@@ -1,5 +1,5 @@
 ; First entry into ring 3. Builds an iretq frame by hand and drops into
-; the user program with a clean register file.
+; the user program with its startup arguments.
 
 BITS 64
 section .text
@@ -8,8 +8,8 @@ SEL_UCODE equ 0x18
 SEL_UDATA equ 0x20
 
 ; void enter_usermode(uint64_t entry, uint64_t user_rsp,
-;                     uint64_t argc, uint64_t argv)   -- noreturn
-;   rdi = entry, rsi = user_rsp, rdx = argc, rcx = argv
+;                     uint64_t argc, uint64_t argv, uint64_t cwd) -- noreturn
+;   rdi = entry, rsi = user_rsp, rdx = argc, rcx = argv, r8 = cwd
 global enter_usermode
 enter_usermode:
     cli                             ; no interrupts until iretq restores IF
@@ -30,11 +30,11 @@ enter_usermode:
 
     mov rdi, rdx                    ; argc -> first user argument
     mov rsi, rcx                    ; argv -> second user argument
+    mov rdx, r8                     ; initial cwd, or NULL
 
     xor eax, eax                    ; scrub everything else
     xor ebx, ebx
     xor ecx, ecx
-    xor edx, edx
     xor ebp, ebp
     xor r8d, r8d
     xor r9d, r9d

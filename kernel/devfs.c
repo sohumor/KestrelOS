@@ -383,11 +383,14 @@ static struct devfile *devfile_new(int id, int flags)
  * created or grown, and truncating a device is meaningless -- but
  * `cmd > /dev/null` passes both, and refusing them would break the most
  * common thing anyone does with this filesystem. */
-static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
+static struct file *devfs_op_open(struct mount *m, const char *path, int flags,
+                                  struct open_guard *guard)
 {
     const struct devdesc *d;
     struct blockdev *bd;
     struct devfile *df;
+    const struct devfile *exclude = guard
+        ? (const struct devfile *)guard->exclude : NULL;
 
     (void)m;
     if (!devfs_ready)
@@ -395,6 +398,10 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
 
     d = dev_lookup(path);
     if (d != NULL) {
+        if (exclude && exclude->dev == d->id) {
+            guard->same_file = 1;
+            return NULL;
+        }
         if (!vfs_perm_ok(d->mode, 0, 0,
                          (vfs_flags_allow_read(flags) ? VFS_R : 0) |
                          (vfs_flags_allow_write(flags) ? VFS_W : 0)))
@@ -431,6 +438,10 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags)
     bd = blk_lookup(path);
     if (bd == NULL)
         return NULL;            /* "/" itself is a directory, not a file */
+    if (exclude && exclude->dev == DEV_BLOCKDEV && exclude->bd == bd) {
+        guard->same_file = 1;
+        return NULL;
+    }
     if (bd->block_size > DEVFS_BLOCK_MAX)
         return NULL;
     if (!vfs_perm_ok(DEVFS_BLOCK_MODE, 0, 0,
