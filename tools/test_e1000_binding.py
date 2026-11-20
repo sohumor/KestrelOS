@@ -9,7 +9,7 @@ from e2e import Harness, qemu_command, t_boot, t_login, t_prompt, wait_prompt
 
 def main():
     cmd = qemu_command("e1000", 2)
-    cmd[cmd.index("-device") + 1] = "e1000-82545em,netdev=n0"
+    cmd[cmd.index("e1000,netdev=n0")] = "e1000-82545em,netdev=n0"
     cmd += ["-netdev", "user,id=n1", "-device", "e1000,netdev=n1"]
     h = Harness(cmd)
     try:
