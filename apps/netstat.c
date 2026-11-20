@@ -64,6 +64,22 @@ static void show_iface(const struct k_netinfo *ni)
         show_ip("network", net);
         show_ip("broadcast", bcast);
     }
+    {
+        struct k_netinfo6 n6;
+        char a[48];
+        if (netinfo6(&n6) == 0) {
+            if (n6.flags & K_NET6_LINKLOCAL)
+                printf("  %-12s %s/64 (link)\n", "inet6",
+                       ip6_ntoa(n6.link_local, a));
+            if (n6.flags & K_NET6_GLOBAL)
+                printf("  %-12s %s/%u (slaac)\n", "inet6",
+                       ip6_ntoa(n6.global, a), n6.prefix_len);
+            if (n6.flags & K_NET6_ROUTER)
+                printf("  %-12s %s\n", "gateway6", ip6_ntoa(n6.router, a));
+            if (n6.flags & K_NET6_DNS)
+                printf("  %-12s %s\n", "nameserver6", ip6_ntoa(n6.dns, a));
+        }
+    }
 }
 
 static void show_routes(const struct k_netinfo *ni)

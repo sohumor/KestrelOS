@@ -103,7 +103,10 @@ def qemu_command(nic, cpus, disk="ata"):
         "-m", "128M",
         "-smp", str(cpus),
         "-device", "%s,netdev=n0" % QEMU_NICS[nic],
-        "-netdev", "user,id=n0",
+        # Both families are slirp's default, but the IPv6 tests depend on its
+        # router advertisements (prefix fec0::/64, host fec0::2, DNS
+        # fec0::3), so spell them out. Naming only ipv6=on turns IPv4 off.
+        "-netdev", "user,id=n0,ipv4=on,ipv6=on",
     ]
 
 
@@ -1943,6 +1946,72 @@ def t_ping(h):
         return "SKIP"
 
 
+QEMU_HOST6 = "fec0::2"
+IPV6_BODY_MARKER = "CONTROLLED-IPV6-BODY-OK"
+
+
+def t_ipv6_slaac(h):
+    """SLAAC from slirp's router advertisement: a fec0::/64 address."""
+    if not re.search(r"net6: global fec0:", h.boot_output):
+        raise AssertionError("no SLAAC address in boot log")
+    h.send("netstat")
+    h.expect(r"inet6\s+fe80::[0-9a-f:]+/64 \(link\)", regex=True)
+    h.expect(r"inet6\s+fec0:[0-9a-f:]+/64 \(slaac\)", regex=True)
+    wait_prompt(h)
+
+
+def t_ping6(h):
+    """ICMPv6 echo to the slirp host, after neighbor discovery."""
+    h.send("ping %s 2" % QEMU_HOST6)
+    h.expect("reply from %s" % QEMU_HOST6, timeout=NET_TIMEOUT)
+    wait_prompt(h)
+
+
+class _IPv6HTTPServer(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+
+class _IPv6Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ("<html><body>%s %s</body></html>"
+                % (IPV6_BODY_MARKER, self.client_address[0])).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def t_tcp6(h):
+    """HTTP over TCP over IPv6: slirp maps fec0::2 to the host's ::1."""
+    try:
+        srv = _IPv6HTTPServer(("::1", 0), _IPv6Handler)
+    except OSError:
+        return "SKIP"
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        url = "http://[%s]:%d/v6" % (QEMU_HOST6, srv.server_address[1])
+        h.send("curl -s %s" % url)
+        h.expect(IPV6_BODY_MARKER, timeout=NET_TIMEOUT)
+        wait_prompt(h)
+        # The browser goes through libweb's transport, not libc's client.
+        h.send("/bin/browser -t %s; echo BROWSER6-STATUS-$?" % url)
+        block = h.capture_until(r"\nBROWSER6-STATUS-\d+\n",
+                                timeout=NET_TIMEOUT, regex=True)
+        if IPV6_BODY_MARKER not in block or "BROWSER6-STATUS-0" not in block:
+            raise AssertionError("browser IPv6 fetch failed")
+        wait_prompt(h)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
 def t_nslookup(h):
     h.send("nslookup example.com")
     got = h.expect_any([DOTTED_QUAD, re.escape("network unavailable")],
@@ -3126,6 +3195,9 @@ TESTS = [
     ("dynamic-linking", t_dynamic_linking),
     ("ping", t_ping),
     ("nslookup", t_nslookup),
+    ("ipv6-slaac", t_ipv6_slaac),
+    ("ping6", t_ping6),
+    ("tcp6", t_tcp6),
     ("uptime", t_uptime),
     ("calc", t_calc),
     ("calc-divzero", t_calc_divzero),

@@ -95,6 +95,32 @@ uint16_t net_transport_checksum(uint32_t src_be, uint32_t dst_be,
 uint32_t net_ip_addr(void);
 uint32_t net_dns_addr(void);
 
+/* Raw Ethernet transmit through the active NIC. */
+int  net_eth_send(const uint8_t *dst_mac, uint16_t ethertype,
+                  const void *payload, int len);
+
+/* ---- IPv6 (net6.c); addresses are 16 network-order bytes ---- */
+
+#define NET6_UDP_MAX     1452   /* ETH_MTU - 40 (ipv6) - 8 (udp) */
+
+void net6_init(void);                 /* link-local + SLAAC, after net_init */
+void ipv6_input(const uint8_t *eth_src, const uint8_t *pkt, int len);
+int  net6_send(const uint8_t dst[16], uint8_t next_header,
+               const void *payload, int len);
+bool net6_source_for(const uint8_t dst[16], uint8_t src_out[16]);
+bool net6_dns_addr(uint8_t out[16]);
+void net6_get_info(struct k_netinfo6 *out);
+long icmp6_ping(const uint8_t dst[16], int timeout_ms);
+int  dns_resolve6(const char *name, uint8_t out[16]);
+int  udp_send6(const uint8_t dst[16], uint16_t sport, uint16_t dport,
+               const void *buf, int len);
+void udp_input6(const uint8_t src[16], const uint8_t dst[16],
+                const uint8_t *seg, int len);
+/* IPv6 pseudo-header + transport segment checksum (TCP/UDP/ICMPv6). */
+uint16_t net_transport_checksum6(const uint8_t src[16], const uint8_t dst[16],
+                                 uint8_t next_header,
+                                 const void *segment, int len);
+
 /* Poll + give up the CPU for ~1 tick (task context wait loops). */
 void net_wait_tick(void);
 

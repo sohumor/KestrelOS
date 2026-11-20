@@ -7,6 +7,7 @@
 #include <kestrel.h>
 #include <stdio.h>
 #include <string.h>
+#include <ip6_text.h>
 
 /* ---- files ---- */
 
@@ -366,6 +367,88 @@ char *ip_ntoa(uint32_t ip_be, char buf[16])
              (unsigned int)((ip_be >> 8) & 0xff),
              (unsigned int)((ip_be >> 16) & 0xff),
              (unsigned int)((ip_be >> 24) & 0xff));
+    return buf;
+}
+
+int dns_resolve6(const char *name, uint8_t ip6[16])
+{
+    return (int)syscall(SYS_DNS6, (long)name, (long)ip6, 0, 0);
+}
+
+long ping6(const uint8_t ip6[16], int timeout_ms)
+{
+    return syscall(SYS_PING6, (long)ip6, timeout_ms, 0, 0);
+}
+
+int udp_send6(const uint8_t ip6[16], uint16_t dport, uint16_t sport,
+              const void *buf, unsigned long len)
+{
+    return (int)syscall(SYS_UDP_SEND6, (long)ip6,
+                        ((long)dport << 16) | sport, (long)buf, (long)len);
+}
+
+int netinfo6(struct k_netinfo6 *out)
+{
+    return (int)syscall(SYS_NETINFO6, (long)out, 0, 0, 0);
+}
+
+int ip6_aton(const char *s, uint8_t out[16])
+{
+    return ip6_text_parse(s, out);
+}
+
+char *ip6_ntoa(const uint8_t ip6[16], char buf[46])
+{
+    return ip6_text_format(ip6, buf);
+}
+
+int net_resolve(const char *host, int family, struct net_addr *out)
+{
+    if (!host || !host[0] || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    if (family != NET_AF_INET6) {
+        out->ip4 = ip_aton(host);
+        if (out->ip4) {
+            out->family = NET_AF_INET;
+            return 0;
+        }
+    }
+    if (ip6_text_parse(host, out->ip6) == 0) {
+        if (family == NET_AF_INET)
+            return -1;
+        out->family = NET_AF_INET6;
+        return 0;
+    }
+    if (family != NET_AF_INET6 && dns_resolve(host, &out->ip4) == 0 &&
+        out->ip4) {
+        out->family = NET_AF_INET;
+        return 0;
+    }
+    if (family != NET_AF_INET && dns_resolve6(host, out->ip6) == 0) {
+        out->family = NET_AF_INET6;
+        return 0;
+    }
+    return -1;
+}
+
+int net_tcp_connect(const struct net_addr *a, int port, int timeout_ms)
+{
+    if (!a)
+        return -1;
+    if (a->family == NET_AF_INET6)
+        return (int)syscall(SYS_TCP_CONNECT6, (long)a->ip6, port,
+                            timeout_ms, 0);
+    return (int)syscall(SYS_TCP_CONNECT, (long)a->ip4, port, timeout_ms, 0);
+}
+
+char *net_addr_str(const struct net_addr *a, char *buf, unsigned long n)
+{
+    char t[IP6_TEXT_MAX];
+    if (a->family == NET_AF_INET6)
+        snprintf(buf, n, "%s", ip6_text_format(a->ip6, t));
+    else
+        snprintf(buf, n, "%s", ip_ntoa(a->ip4, t));
     return buf;
 }
 

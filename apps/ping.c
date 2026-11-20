@@ -39,10 +39,19 @@ int main(int argc, char *argv[])
     const char *host = 0;
     int count = 4;
     int narg = 0;
+    int family = NET_AF_ANY;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0)
             continue;
+        if (strcmp(argv[i], "-6") == 0) {
+            family = NET_AF_INET6;
+            continue;
+        }
+        if (strcmp(argv[i], "-4") == 0) {
+            family = NET_AF_INET;
+            continue;
+        }
         if (narg == 0)
             host = argv[i];
         else if (narg == 1)
@@ -51,7 +60,7 @@ int main(int argc, char *argv[])
     }
 
     if (!host || count <= 0) {
-        printf("usage: ping <host> [count]\n");
+        printf("usage: ping [-4|-6] <host> [count]\n");
         return 1;
     }
     if (count > PING_MAX_COUNT)
@@ -63,23 +72,24 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t ip = ip_aton(host);
-    if (ip == 0) {
-        if (dns_resolve(host, &ip) != 0) {
+    struct net_addr addr;
+    static const uint8_t unspec6[16];
+    if (net_resolve(host, family, &addr) != 0) {
+        /* ip_aton() returns 0 for both "0.0.0.0" and a parse failure. */
+        if (strcmp(host, "0.0.0.0") == 0)
+            printf("ping: invalid destination %s\n", host);
+        else
             printf("ping: cannot resolve %s\n", host);
-            return 1;
-        }
+        return 1;
     }
-    /* ip_aton() returns 0 for both "0.0.0.0" and a parse failure, and
-     * dns_resolve() happily parses "0.0.0.0" too; the unspecified address
-     * is never a valid destination. */
-    if (ip == 0) {
+    /* The unspecified address is never a valid destination. */
+    if (addr.family == NET_AF_INET6 && memcmp(addr.ip6, unspec6, 16) == 0) {
         printf("ping: invalid destination %s\n", host);
         return 1;
     }
 
-    char ipbuf[16];
-    ip_ntoa(ip, ipbuf);
+    char ipbuf[48];
+    net_addr_str(&addr, ipbuf, sizeof ipbuf);
     const char *unit = (count == 1) ? "probe" : "probes";
     if (strcmp(host, ipbuf) == 0)
         printf("PING %s: %d %s\n", ipbuf, count, unit);
@@ -90,7 +100,9 @@ int main(int argc, char *argv[])
     int sent = 0;
     long min = 0, max = 0, sum = 0;
     for (int seq = 0; seq < count; seq++) {
-        long rtt = ping(ip, PING_TIMEOUT_MS);
+        long rtt = addr.family == NET_AF_INET6
+                       ? ping6(addr.ip6, PING_TIMEOUT_MS)
+                       : ping(addr.ip4, PING_TIMEOUT_MS);
         sent++;
         if (rtt >= 0) {
             printf("reply from %s: seq=%d time=%ldms\n", ipbuf, seq, rtt);

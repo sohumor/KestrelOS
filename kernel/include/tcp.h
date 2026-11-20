@@ -19,6 +19,7 @@ void tcp_init(void);
 int  tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms);
 
 /* Queue len bytes for transmission. Returns bytes queued or -1. */
+int  tcp_connect6(const uint8_t ip6[16], uint16_t port, int timeout_ms);
 int  tcp_send(int handle, const void *buf, int len);
 
 /* >0 bytes read, 0 = peer closed cleanly, -1 = error or timeout. */
@@ -31,6 +32,8 @@ int  tcp_close(int handle);
 void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len);
 
 /* Task context: retransmit / timeout / delayed-ACK pump. Call ~10x/s. */
+void tcp_input6(const uint8_t src[16], const uint8_t dst[16],
+                const uint8_t *seg, int len);
 void tcp_tick(void);
 
 /* Render active TCP socket table as a @krec stream (buf may be NULL to measure). */

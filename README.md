@@ -60,7 +60,8 @@ device files.
 
 **Networking** — PCI enumeration, two NIC drivers (RTL8139 and Intel e1000)
 behind a common interface, DHCP configuration with static QEMU fallback, and a
-from-scratch stack: Ethernet, ARP, IPv4, ICMP, UDP, DNS, and **TCP with
+from-scratch stack: Ethernet, ARP, IPv4, IPv6 (SLAAC, Neighbor Discovery,
+ICMPv6), ICMP, UDP, DNS (A and AAAA), and **TCP with
 out-of-order reassembly and selective acknowledgements (SACK)**, with persistent
 HTTP/1.1 Keep-Alive connection pooling and verified TLS 1.3 HTTPS clients on
 top (128-SAN X.509 parsing).

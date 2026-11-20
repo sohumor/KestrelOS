@@ -61,6 +61,20 @@ static int url_host(const char *url, char *host, unsigned long n, int *port)
     if (!p)
         return -1;
     p += 3;
+    if (*p == '[') {
+        /* IPv6 literal host: strip the brackets, keep an optional :port. */
+        q = strchr(p, ']');
+        if (!q || q == p + 1 || (unsigned long)(q - p - 1) >= n)
+            return -1;
+        memcpy(host, p + 1, (unsigned long)(q - p - 1));
+        host[q - p - 1] = 0;
+        if (q[1] == ':') {
+            *port = atoi(q + 2);
+            if (*port <= 0 || *port > 65535)
+                *port = 80;
+        }
+        return 0;
+    }
     q = p;
     while (*q && *q != '/' && *q != '?' && *q != '#')
         q++;
@@ -122,7 +136,7 @@ int main(int argc, char **argv)
         char full[512];
         char host[160];
         struct k_netinfo ni;
-        uint32_t ip;
+        struct net_addr addr;
         char *body = 0;
         unsigned long len = 0;
         int status = 0, port = 80, rc;
@@ -148,8 +162,7 @@ int main(int argc, char **argv)
                 printf("curl: network unavailable (no NIC)\n");
             return 1;
         }
-        ip = ip_aton(host);
-        if (ip == 0 && dns_resolve(host, &ip) != 0) {
+        if (net_resolve(host, NET_AF_ANY, &addr) != 0) {
             if (!silent)
                 printf("curl: cannot resolve %s\n", host);
             return 1;

@@ -8,8 +8,12 @@ static uint8_t response[512];
 static int length, mode, checks, failures;
 struct task *smp_current_task(void) { return NULL; }
 bool net_ready(void) { return true; }
-uint32_t net_dns_addr(void) { return 0; }
+uint32_t net_dns_addr(void) { return 0x08080808; }
+bool net6_dns_addr(uint8_t out[16]) { (void)out; return false; }
 uint32_t random_u32(void) { return 1234; }
+int udp_send6(const uint8_t dst[16], uint16_t sport, uint16_t dport,
+              const void *buf, int len)
+{ (void)dst; (void)sport; (void)dport; (void)buf; (void)len; return -1; }
 uint64_t timer_ticks(void) { static uint64_t t; return ++t; }
 void net_stat_inc(int kind, uint32_t bytes) { (void)kind; (void)bytes; }
 void flight_record(uint8_t cat, const char *event, int16_t pid,

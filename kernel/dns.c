@@ -8,6 +8,7 @@
 #include "spinlock.h"
 #include "flight.h"
 #include "kheap.h"
+#include "ip6_text.h"
 
 /* Minimal DNS A-record resolver over UDP port 53 with 16-entry TTL cache. */
 
@@ -200,7 +201,8 @@ static int read_name(const uint8_t *msg, int msglen, int off, uint8_t *name)
 }
 
 static int parse_response(const uint8_t *r, int n, const uint8_t *q,
-                          int qlen, uint32_t *ip_be, uint32_t *ttl_out)
+                          int qlen, int want_type, void *out, int outlen,
+                          uint32_t *ttl_out)
 {
     if (n < 12 || r[0] != q[0] || r[1] != q[1] ||
         !(r[2] & 0x80) || (r[2] & 0x7A) || (r[3] & 0x0F) ||
@@ -237,8 +239,8 @@ static int parse_response(const uint8_t *r, int n, const uint8_t *q,
             if (p + rdlen > n)
                 return -1;
             if (klass == 1 && !memcmp(target, owner, 256)) {
-                if (type == 1 && rdlen == 4) {
-                    memcpy(ip_be, r + p, 4);
+                if (type == want_type && rdlen == outlen) {
+                    memcpy(out, r + p, outlen);
                     if (ttl_out)
                         *ttl_out = rr_ttl;
                     return 0;
@@ -259,20 +261,26 @@ static int parse_response(const uint8_t *r, int n, const uint8_t *q,
     return -1;
 }
 
-int dns_resolve(const char *name, uint32_t *ip_be)
+/* Query the configured resolver (IPv4 if DHCP or the fallback gave one,
+ * else the RA's RDNSS address) for the first record of qtype whose data is
+ * exactly outlen bytes. */
+static int dns_query(const char *name, int qtype, void *out, int outlen)
 {
-    if (!name || !ip_be || !name[0])
-        return -1;
-    if (parse_dotted(name, ip_be) == 0)
-        return 0;
-    if (!net_ready())
+    uint8_t dns6[16];
+    uint32_t dns4 = net_dns_addr();
+    bool have6 = net6_dns_addr(dns6);
+
+    if (!net_ready() || (dns4 == 0 && !have6))
         return -1;
 
+    /* The TTL cache only holds 4-byte A-record answers. */
+    bool cacheable = (qtype == 1 && outlen == 4);
     uint32_t cached_ttl = 0;
-    if (dns_cache_lookup(name, ip_be, &cached_ttl)) {
+    if (cacheable && dns_cache_lookup(name, out, &cached_ttl)) {
         net_stat_inc(NET_STAT_DNS_HIT, 0);
         flight_record(FLIGHT_CAT_NET, "dns_hit", -1,
-                      (uint64_t)ntohl(*ip_be), (uint64_t)cached_ttl, name);
+                      (uint64_t)ntohl(*(const uint32_t *)out),
+                      (uint64_t)cached_ttl, name);
         return 0;
     }
 
@@ -304,7 +312,8 @@ int dns_resolve(const char *name, uint32_t *ip_be)
             s++;
     }
     q[off++] = 0;
-    q[off++] = 0; q[off++] = 1;          /* QTYPE = A */
+    q[off++] = (uint8_t)(qtype >> 8);    /* QTYPE (A or AAAA) */
+    q[off++] = (uint8_t)qtype;
     q[off++] = 0; q[off++] = 1;          /* QCLASS = IN */
     int qlen = off;
 
@@ -324,29 +333,37 @@ int dns_resolve(const char *name, uint32_t *ip_be)
     }
 
     int found = 0;
-    uint32_t resolved_ip = 0;
     uint32_t raw_ttl = 0;
 
     for (int attempt = 0; attempt < 2 && !found; attempt++) {
         if (current && current->kill_pending)
             break;
-        if (udp_send(net_dns_addr(), sport, 53, q, qlen) < 0)
+        /* Prefer IPv4 DNS; use the IPv6 one when it is the only one, and as
+         * the retry when both exist. */
+        bool use6 = have6 && (dns4 == 0 || attempt == 1);
+        if ((use6 ? udp_send6(dns6, sport, 53, q, qlen)
+                  : udp_send(dns4, sport, 53, q, qlen)) < 0)
             continue;
 
         uint8_t r[DNS_MSG_MAX];
         int n = udp_recv(sport, r, sizeof(r), 1000);
         if (current && current->kill_pending)
             break;
-        found = parse_response(r, n, q, qlen, &resolved_ip, &raw_ttl) == 0;
+        found = parse_response(r, n, q, qlen, qtype, out, outlen,
+                               &raw_ttl) == 0;
     }
 
     udp_unbind(sport);
     if (found) {
-        uint32_t ttl_sec = clamp_dns_ttl_sec(raw_ttl);
-        *ip_be = resolved_ip;
-        dns_cache_store(name, resolved_ip, ttl_sec);
-        flight_record(FLIGHT_CAT_NET, "dns_miss", -1,
-                      (uint64_t)ntohl(resolved_ip), (uint64_t)ttl_sec, name);
+        if (cacheable) {
+            uint32_t ttl_sec = clamp_dns_ttl_sec(raw_ttl);
+            dns_cache_store(name, *(const uint32_t *)out, ttl_sec);
+            flight_record(FLIGHT_CAT_NET, "dns_miss", -1,
+                          (uint64_t)ntohl(*(const uint32_t *)out),
+                          (uint64_t)ttl_sec, name);
+        } else {
+            flight_record(FLIGHT_CAT_NET, "dns_miss", -1, 0, 0, name);
+        }
         return 0;
     }
     flight_record(FLIGHT_CAT_NET, "dns_miss", -1, 0, 0, name);
@@ -417,4 +434,22 @@ uint32_t dns_snapshot_krec(char *buf, uint32_t cap)
 
     kfree(snap);
     return krec_kbuf_finish(&b);
+}
+
+int dns_resolve(const char *name, uint32_t *ip_be)
+{
+    if (!name || !ip_be || !name[0])
+        return -1;
+    if (parse_dotted(name, ip_be) == 0)
+        return 0;
+    return dns_query(name, 1, ip_be, 4);
+}
+
+int dns_resolve6(const char *name, uint8_t out[16])
+{
+    if (!name || !out || !name[0])
+        return -1;
+    if (ip6_text_parse(name, out) == 0)
+        return 0;
+    return dns_query(name, 28, out, 16);
 }

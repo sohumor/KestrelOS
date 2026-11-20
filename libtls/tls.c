@@ -3014,15 +3014,12 @@ static int tcp_open(const char *host, int port, int timeout_ms,
                     struct tls_transport *out)
 {
     struct sock_ctx *s;
-    uint32_t ip;
+    struct net_addr addr;
     int handle;
 
-    ip = ip_aton(host);
-    if (ip == 0 && dns_resolve(host, &ip) < 0)
+    if (net_resolve(host, NET_AF_ANY, &addr) < 0)
         return TLS_E_DNS;
-    if (ip == 0)
-        return TLS_E_DNS;
-    handle = (int)syscall(SYS_TCP_CONNECT, (long)ip, port, timeout_ms, 0);
+    handle = net_tcp_connect(&addr, port, timeout_ms);
     if (handle < 0)
         return TLS_E_CONNECT;
     s = malloc(sizeof(*s));

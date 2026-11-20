@@ -418,6 +418,56 @@ static long sys_udp_send(uint64_t ip_be, uint64_t ports, uint64_t ubuf,
                     (uint16_t)(ports >> 16), kb, (int)len);
 }
 
+static long sys_dns6(uint64_t uname, uint64_t uip)
+{
+    char name[UPROC_PATH_MAX];
+    uint8_t ip[16];
+    if (copy_str_from_user(name, (const void *)uname, sizeof(name)) < 0)
+        return -1;
+    if (dns_resolve6(name, ip) < 0)
+        return -1;
+    return copy_to_user((void *)uip, ip, sizeof(ip));
+}
+
+static long sys_ping6(uint64_t uip, uint64_t timeout_ms)
+{
+    uint8_t ip[16];
+    if (copy_from_user(ip, (const void *)uip, sizeof(ip)) < 0)
+        return -1;
+    return icmp6_ping(ip, (int)timeout_ms);
+}
+
+static long sys_tcp_connect6(uint64_t uip, uint64_t port, uint64_t timeout_ms)
+{
+    uint8_t ip[16];
+    if (copy_from_user(ip, (const void *)uip, sizeof(ip)) < 0)
+        return -1;
+    return tcp_connect6(ip, (uint16_t)port, (int)timeout_ms);
+}
+
+static long sys_udp_send6(uint64_t uip, uint64_t ports, uint64_t ubuf,
+                          uint64_t len)
+{
+    uint8_t ip[16];
+    uint8_t kb[NET6_UDP_MAX];
+    if (len > NET6_UDP_MAX)
+        return -1;
+    if (copy_from_user(ip, (const void *)uip, sizeof(ip)) < 0 ||
+        copy_from_user(kb, (const void *)ubuf, len) < 0)
+        return -1;
+    return udp_send6(ip, (uint16_t)(ports & 0xFFFF),
+                     (uint16_t)(ports >> 16), kb, (int)len);
+}
+
+static long sys_netinfo6(uint64_t uinfo)
+{
+    struct k_netinfo6 ni;
+    if (!net_ready())
+        return -1;
+    net6_get_info(&ni);
+    return copy_to_user((void *)uinfo, &ni, sizeof(ni));
+}
+
 static long sys_udp_recv(uint64_t port, uint64_t ubuf, uint64_t maxlen,
                          uint64_t timeout_ms)
 {
@@ -1108,6 +1158,21 @@ static void syscall_dispatch(struct regs *r)
         break;
     case SYS_NETINFO:
         ret = cap_has(KCAP_NET) ? sys_netinfo(a1) : -1;
+        break;
+    case SYS_NETINFO6:
+        ret = cap_has(KCAP_NET) ? sys_netinfo6(a1) : -1;
+        break;
+    case SYS_DNS6:
+        ret = cap_has(KCAP_NET) ? sys_dns6(a1, a2) : -1;
+        break;
+    case SYS_PING6:
+        ret = cap_has(KCAP_NET) ? sys_ping6(a1, a2) : -1;
+        break;
+    case SYS_TCP_CONNECT6:
+        ret = cap_has(KCAP_NET) ? sys_tcp_connect6(a1, a2, a3) : -1;
+        break;
+    case SYS_UDP_SEND6:
+        ret = cap_has(KCAP_NET) ? sys_udp_send6(a1, a2, a3, a4) : -1;
         break;
     case SYS_RTC:
         ret = sys_rtc(a1);

@@ -65,6 +65,7 @@ static const uint16_t e1000_devices[] = { 0x100E, 0x100F, 0x10D3, 0x153A };
 #define ICR_RXT0   (1u << 7)
 
 #define RCTL_EN    (1u << 1)
+#define RCTL_MPE   (1u << 4)      /* all multicast: IPv6 ND groups */
 #define RCTL_BAM   (1u << 15)
 #define RCTL_SECRC (1u << 26)     /* strip CRC; BSIZE 00 = 2048 bytes */
 
@@ -373,7 +374,7 @@ bool e1000_init(void)
     reg_write(REG_RDLEN, RX_NDESC * 16);
     reg_write(REG_RDH, 0);
     reg_write(REG_RDT, RX_NDESC - 1);
-    reg_write(REG_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    reg_write(REG_RCTL, RCTL_EN | RCTL_MPE | RCTL_BAM | RCTL_SECRC);
 
     reg_write(REG_TDBAL, (uint32_t)tx_ring_phys);
     reg_write(REG_TDBAH, (uint32_t)(tx_ring_phys >> 32));

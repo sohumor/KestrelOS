@@ -90,6 +90,29 @@ uint32_t ip_aton(const char *s);
 /* Format big-endian ip into buf (>= 16 bytes), returns buf. */
 char *ip_ntoa(uint32_t ip_be, char buf[16]);
 
+/* ---- IPv6: addresses are 16 network-order bytes ---- */
+int dns_resolve6(const char *name, uint8_t ip6[16]); /* AAAA or literal */
+long ping6(const uint8_t ip6[16], int timeout_ms);   /* -> rtt ms or -1 */
+int udp_send6(const uint8_t ip6[16], uint16_t dport, uint16_t sport,
+              const void *buf, unsigned long len);
+int netinfo6(struct k_netinfo6 *out);                /* 0 / -1 no nic */
+int ip6_aton(const char *s, uint8_t out[16]);        /* 0 / -1; "[..]" ok */
+char *ip6_ntoa(const uint8_t ip6[16], char buf[46]);
+
+/* Family-agnostic client helpers: IPv4 and IPv6 literals, then DNS A,
+ * then AAAA (NET_AF_ANY), or only one family. */
+#define NET_AF_ANY   0
+#define NET_AF_INET  4
+#define NET_AF_INET6 6
+struct net_addr {
+    int family;           /* NET_AF_INET or NET_AF_INET6 */
+    uint32_t ip4;         /* network order */
+    uint8_t ip6[16];
+};
+int net_resolve(const char *host, int family, struct net_addr *out);
+int net_tcp_connect(const struct net_addr *a, int port, int timeout_ms);
+char *net_addr_str(const struct net_addr *a, char *buf, unsigned long n);
+
 /* ---- line input ----
  * Read a line from fd 0 with echo, backspace and ctrl-U editing.
  * Stores up to n-1 bytes plus NUL (newline not stored). Returns buf,
