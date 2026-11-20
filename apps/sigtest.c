@@ -102,6 +102,38 @@ static int test_pipe_lifetime(void)
     return 0;
 }
 
+static int test_cwd_consumers(void)
+{
+    static const char expected[] = "--cwd=/literal\n";
+    char *sh_args[17] = { "sh", "-c",
+                          "cat welcome.md >/dev/null && echo --cwd=/literal" };
+    char *cat_args[17] = { "cat" };
+    struct k_spawn_caps caps = { .cwd = "/doc" };
+    int output[2];
+    char data[sizeof(expected)];
+    int sink = open("/dev/null", O_WRONLY);
+
+    if (sink < 0 || pipe_(output) != 0)
+        return 1;
+    caps.fds[0].child_fd = 1;
+    caps.fds[0].parent_fd = sink;
+    caps.n_fds = 1;
+    for (int i = 1; i < 16; i++)
+        cat_args[i] = "welcome.md";
+    for (int i = 3; i < 16; i++)
+        sh_args[i] = "unused";
+    int cat = spawn_caps("/bin/cat", cat_args, &caps);
+    caps.fds[0].parent_fd = output[1];
+    int sh = spawn_caps("/bin/sh", sh_args, &caps);
+    close(sink);
+    close(output[1]);
+    int failed = cat < 0 || sh < 0 || waitpid(cat) != 0 || waitpid(sh) != 0 ||
+                 read(output[0], data, sizeof(data)) != sizeof(expected) - 1 ||
+                 memcmp(data, expected, sizeof(expected) - 1) != 0;
+    close(output[0]);
+    return failed;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--startup-cwd") == 0)
@@ -147,6 +179,10 @@ int main(int argc, char **argv)
     child = spawn_caps("/bin/sigtest", full_args, &caps);
     if (child < 0 || waitpid(child) != 0) {
         printf("sigtest: cwd metadata missing with a full argument list\n");
+        return 1;
+    }
+    if (test_cwd_consumers() != 0) {
+        printf("sigtest: shell or cat did not use cwd metadata\n");
         return 1;
     }
     printf("sigtest: handlers + masks + sigreturn verified\n");
