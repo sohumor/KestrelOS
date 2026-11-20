@@ -417,8 +417,13 @@ void task_exit(int code)
 
     uint64_t flags = irq_save();
     spin_lock(&sched_lock);
-    mission_put(current->mission_id);
+    int mission_id = current->mission_id;
     current->mission_id = 0;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    mission_put(mission_id);
+
+    flags = irq_save();
+    spin_lock(&sched_lock);
     current->state = TASK_ZOMBIE;
     current->cpu = -1;
     current->exit_code = code;

@@ -23,30 +23,48 @@ static int slot(int id)
     return -1;
 }
 
-static void event(struct k_mission_info *m, unsigned kind, unsigned c,
-                  const char *detail)
+struct mission_event {
+    unsigned id, kind, channel;
+    int denied;
+    char detail[256];
+};
+
+static void prepare_event(struct mission_event *e, unsigned id, unsigned kind,
+                          unsigned channel, const char *detail)
 {
-    pulse_emit(K_TOPIC_MISSION, kind, m->id, c, detail);
-    if (kind == K_PULSE_MISSION_REVOKE)
-        flight_record(FLIGHT_CAT_PROC, "mission", current ? current->pid : 0,
-                      m->id, kind, detail);
+    e->id = id;
+    e->kind = kind;
+    e->channel = channel;
+    strncpy(e->detail, detail, sizeof(e->detail) - 1);
+    e->detail[sizeof(e->detail) - 1] = '\0';
 }
 
-static int count(int s, unsigned c, int allow, const char *detail)
+/* Pulse notification takes sched_lock; publish only after mission_lock is released. */
+static void event(const struct mission_event *e)
 {
-    if (s >= 0 && mission_core_count(&missions[s].info, &missions[s].rate, c, allow,
-                                    timer_ticks() * (1000 / TIMER_HZ), detail))
-        event(&missions[s].info, allow ? K_PULSE_MISSION_USE : K_PULSE_MISSION_DENY,
-              c, detail);
-    if (s >= 0 && !allow)
+    if (e->kind)
+        pulse_emit(K_TOPIC_MISSION, e->kind, e->id, e->channel, e->detail);
+    if (e->denied || e->kind == K_PULSE_MISSION_REVOKE)
         flight_record(FLIGHT_CAT_PROC, "mission", current ? current->pid : 0,
-                      missions[s].info.id, K_PULSE_MISSION_DENY, detail);
-    return allow;
+                      e->id, e->denied ? K_PULSE_MISSION_DENY : e->kind, e->detail);
+}
+
+static void count(int s, unsigned c, int allow, const char *detail,
+                  struct mission_event *e)
+{
+    if (s < 0) return;
+    int emit = mission_core_count(&missions[s].info, &missions[s].rate, c, allow,
+                                 timer_ticks() * (1000 / TIMER_HZ), detail);
+    prepare_event(e, missions[s].info.id,
+                  emit ? (allow ? K_PULSE_MISSION_USE : K_PULSE_MISSION_DENY) : 0,
+                  c, detail);
+    e->denied = !allow;
 }
 
 int mission_create(const struct k_mission_grant *g, const char *exec)
 {
     char canon[256];
+    struct mission_event e = {0};
     if (!mission_grant_valid(g) || mission_canon(exec, canon, sizeof(canon)) < 0)
         return -1;
     uint64_t f = spin_lock_irqsave(&mission_lock);
@@ -74,21 +92,24 @@ int mission_create(const struct k_mission_grant *g, const char *exec)
         strcpy(missions[s].exec, canon);
         missions[s].refs = 1;
         id = (int)m->id;
-        event(m, K_PULSE_MISSION_START, 0, m->grant.app);
+        prepare_event(&e, m->id, K_PULSE_MISSION_START, 0, m->grant.app);
         break;
     }
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     return id;
 }
 
 void mission_put(int id)
 {
     if (!id) return;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(id);
     if (s >= 0 && !--missions[s].refs)
-        event(&missions[s].info, K_PULSE_MISSION_END, 0, missions[s].info.grant.app);
+        prepare_event(&e, missions[s].info.id, K_PULSE_MISSION_END, 0, missions[s].info.grant.app);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
 }
 
 void mission_inherit(struct task *child, const struct task *parent)
@@ -118,18 +139,21 @@ void mission_limit_current(void)
 int mission_cap(uint64_t cap, int allow)
 {
     if (!current || !current->mission_id) return allow;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(current->mission_id);
     int c = mission_cap_channel(cap);
     allow = allow && s >= 0 && (missions[s].info.grant.cap_mask & cap);
-    if (c >= 0) count(s, (unsigned)c, allow, "cap");
+    if (c >= 0) count(s, (unsigned)c, allow, "cap", &e);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     return allow;
 }
 
 int mission_path(const char *path, int write)
 {
     if (!current || !current->mission_id) return 1;
+    struct mission_event e[2] = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(current->mission_id);
     int allow = s >= 0 && mission_core_path(&missions[s].info, missions[s].exec, path, write);
@@ -137,16 +161,19 @@ int mission_path(const char *path, int write)
     char canon[256];
     if (mission_canon(path, canon, sizeof(canon)) == 0) {
         int d = mission_device_channel(canon);
-        if (d >= 0) count(s, (unsigned)d, allow, path);
+        if (d >= 0) count(s, (unsigned)d, allow, path, &e[0]);
     }
-    count(s, c, allow, path);
+    count(s, c, allow, path, &e[1]);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e[0]);
+    event(&e[1]);
     return allow;
 }
 
 int mission_host(uint32_t ip)
 {
     if (!current || !current->mission_id) return 1;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(current->mission_id);
     int allow = s >= 0 && mission_core_host(&missions[s].info, ip);
@@ -155,38 +182,44 @@ int mission_host(uint32_t ip)
     krec_kbuf_init(&b, detail, sizeof(detail));
     krec_kbuf_put_ip4(&b, ip);
     krec_kbuf_finish(&b);
-    count(s, K_MISSION_NET, allow, detail);
+    count(s, K_MISSION_NET, allow, detail, &e);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     return allow;
 }
 
 int mission_ipc(unsigned bit)
 {
     if (!current || !current->mission_id) return 1;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(current->mission_id);
     int allow = s >= 0 && (missions[s].info.grant.cap_mask & KCAP_IPC) &&
                 (missions[s].info.grant.ipc_bits & bit);
-    count(s, K_MISSION_IPC, allow, "ipc");
+    count(s, K_MISSION_IPC, allow, "ipc", &e);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     return allow;
 }
 
 int mission_device(unsigned c)
 {
     if (!current || !current->mission_id) return 1;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(current->mission_id);
     int allow = c >= K_MISSION_AUDIO && c < K_MISSION_CHANNELS && s >= 0 &&
                 (missions[s].info.grant.device_bits & (1U << (c - K_MISSION_AUDIO)));
-    count(s, c, allow, "device");
+    count(s, c, allow, "device", &e);
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     return allow;
 }
 
 int mission_ctl(int id, int op, unsigned arg)
 {
     if (!current || current->mission_id) return -1;
+    struct mission_event e = {0};
     uint64_t f = spin_lock_irqsave(&mission_lock);
     int s = slot(id);
     if (s < 0 || (current->uid && current->uid != missions[s].info.owner_uid)) {
@@ -222,9 +255,10 @@ int mission_ctl(int id, int op, unsigned arg)
                       K_MISSION_FS_WRITE : K_MISSION_FS_READ;
             detail = m->grant.paths[arg].prefix;
         } else if (op == K_MISSION_REVOKE_HOST) channel = K_MISSION_NET;
-        event(m, K_PULSE_MISSION_REVOKE, channel, detail);
+        prepare_event(&e, m->id, K_PULSE_MISSION_REVOKE, channel, detail);
     }
     spin_unlock_irqrestore(&mission_lock, f);
+    event(&e);
     if (ok) proc_mission_ctl(id, drop, op == K_MISSION_END);
     return ok ? 0 : -1;
 }
