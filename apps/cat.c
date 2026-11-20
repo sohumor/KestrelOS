@@ -1,6 +1,7 @@
 /* cat.c - concatenate files to the console. */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -37,6 +38,7 @@ int main(int argc, char **argv)
     long n;
     int i, fd, rc = 0;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
     if (argc < 2) {
         printf("usage: cat <file>...\n");
