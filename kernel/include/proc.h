@@ -95,6 +95,11 @@ void task_sleep_ticks(uint64_t t);
  * Returns -1 on cancellation, otherwise the caller must recheck. */
 int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
                            uint64_t deadline, spinlock_t *lock, uint64_t flags);
+/* Wait without a deadline. Returns -1 if an interrupting signal is
+ * already pending before parking; after a wake the caller rechecks. */
+int task_event_wait_interruptible_locked(struct task_event_channel *channel,
+                                         uint32_t mask, spinlock_t *lock,
+                                         uint64_t flags);
 void task_event_notify(struct task_event_channel *channel, uint32_t mask);
 void task_stop_current(void);
 __attribute__((noreturn)) void task_exit(int code);

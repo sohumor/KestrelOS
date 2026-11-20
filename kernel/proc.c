@@ -323,13 +323,15 @@ static bool event_wait_cancelled(const struct task *task)
             (1ULL << (SIGKILL - 1)));
 }
 
-int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
-                           uint64_t deadline, spinlock_t *lock, uint64_t flags)
+static int event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                             uint64_t deadline, spinlock_t *lock,
+                             uint64_t flags, bool interruptible)
 {
     struct task_event_waiter waiter = { .task = current, .mask = mask };
 
     spin_lock(&sched_lock);
-    if (event_wait_cancelled(waiter.task)) {
+    if (event_wait_cancelled(waiter.task) ||
+        (interruptible && signal_interrupt_pending(waiter.task))) {
         spin_unlock(&sched_lock);
         spin_unlock_irqrestore(lock, flags);
         return -1;
@@ -347,9 +349,22 @@ int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
     while (*link != &waiter)
         link = &(*link)->next;
     *link = waiter.next;
-    bool cancelled = event_wait_cancelled(waiter.task);
+    bool cancelled = !interruptible && event_wait_cancelled(waiter.task);
     spin_unlock_irqrestore(&sched_lock, f);
     return cancelled ? -1 : 0;
+}
+
+int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                           uint64_t deadline, spinlock_t *lock, uint64_t flags)
+{
+    return event_wait_locked(channel, mask, deadline, lock, flags, false);
+}
+
+int task_event_wait_interruptible_locked(struct task_event_channel *channel,
+                                         uint32_t mask, spinlock_t *lock,
+                                         uint64_t flags)
+{
+    return event_wait_locked(channel, mask, UINT64_MAX, lock, flags, true);
 }
 
 void task_event_notify(struct task_event_channel *channel, uint32_t mask)

@@ -3,7 +3,6 @@
 #include "mount.h"
 #include "kheap.h"
 #include "proc.h"
-#include "signal.h"
 #include "spinlock.h"
 #include "string.h"
 
@@ -12,17 +11,20 @@
  * The ring buffer and the two reference counts are plain memory touched by
  * tasks on different CPUs, so every inspection or update of head/tail/
  * count/readers/writers runs under the pipe's IRQ-safe spin lock. The
- * critical sections only contain a bounded copy; blocking is always done
- * with the lock dropped, by sleeping a tick and re-checking. None of this
- * runs in IRQ context, so kmalloc() here is fine.
+ * blocked reader or writer parks atomically with releasing that lock and
+ * rechecks the ring and peer state on wake. None of this runs in IRQ
+ * context, so kmalloc() here is fine.
  *
  * Writing to a pipe with no readers currently returns an error; SIGPIPE is
  * not yet wired into this VFS operation. */
 
 #define PIPE_BUF_SIZE 4096
+#define PIPE_READABLE 1U
+#define PIPE_WRITABLE 2U
 
 struct pipe {
     spinlock_t lock;
+    struct task_event_channel events;
     uint8_t *buf;               /* PIPE_BUF_SIZE bytes */
     uint32_t head;              /* next byte to read */
     uint32_t tail;              /* next byte to write */
@@ -93,7 +95,10 @@ static long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
     for (;;) {
         fl = spin_lock_irqsave(&p->lock);
         if (p->count > 0) {
+            bool was_full = p->count == PIPE_BUF_SIZE;
             got = ring_take(p, (uint8_t *)buf, n);
+            if (was_full)
+                task_event_notify(&p->events, PIPE_WRITABLE);
             spin_unlock_irqrestore(&p->lock, fl);
             return (long)got;
         }
@@ -101,12 +106,9 @@ static long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
             spin_unlock_irqrestore(&p->lock, fl);
             return 0;           /* EOF or non-blocking empty */
         }
-        spin_unlock_irqrestore(&p->lock, fl);
-        if (current && (current->kill_pending || signal_interrupt_pending(current)))
+        if (task_event_wait_interruptible_locked(&p->events, PIPE_READABLE,
+                                                 &p->lock, fl) < 0)
             return -1;
-        /* Empty but still writable: wait. task_sleep_ticks() is safe here
-         * because the pipe holds no lock of its own. */
-        task_sleep_ticks(1);
     }
 }
 
@@ -131,14 +133,16 @@ static long pipe_write(struct file *f, const void *buf, unsigned long n)
             return done ? (long)done : -1;
         }
         if (p->count < PIPE_BUF_SIZE) {
+            bool was_empty = p->count == 0;
             done += ring_put(p, (const uint8_t *)buf + done, n - done);
+            if (was_empty)
+                task_event_notify(&p->events, PIPE_READABLE);
             spin_unlock_irqrestore(&p->lock, fl);
             continue;
         }
-        spin_unlock_irqrestore(&p->lock, fl);
-        if (current && (current->kill_pending || signal_interrupt_pending(current)))
+        if (task_event_wait_interruptible_locked(&p->events, PIPE_WRITABLE,
+                                                 &p->lock, fl) < 0)
             return done ? (long)done : -1;
-        task_sleep_ticks(1);    /* full: wait for the reader to drain it */
     }
     return (long)done;
 }
@@ -152,11 +156,11 @@ static void pipe_close(struct file *f)
 
     fl = spin_lock_irqsave(&p->lock);
     if (end->writable) {
-        if (p->writers > 0)
-            p->writers--;
+        if (p->writers > 0 && --p->writers == 0)
+            task_event_notify(&p->events, PIPE_READABLE);
     } else {
-        if (p->readers > 0)
-            p->readers--;
+        if (p->readers > 0 && --p->readers == 0)
+            task_event_notify(&p->events, PIPE_WRITABLE);
     }
     if (p->readers <= 0 && p->writers <= 0)
         dead = 1;
