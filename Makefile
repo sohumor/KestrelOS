@@ -98,7 +98,7 @@ ROOTFS_SRC := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).repl
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
+.PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum test-dns \
         test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
@@ -340,7 +340,10 @@ test-tcp:
 test-checksum:
 	sh tools/run-net-checksum-tests.sh
 
-test-net: test-tcp test-checksum
+test-dns:
+	sh tools/run-dns-tests.sh
+
+test-net: test-tcp test-checksum test-dns
 
 test-random:
 	sh tools/run-random-tests.sh
@@ -402,7 +405,8 @@ help:
 	@echo "  make test       run the end-to-end suite in headless QEMU"
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
 	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
-	@echo "  make test-net   run host TCP + network checksum tests"
+	@echo "  make test-dns   run host DNS response validation tests with sanitizers"
+	@echo "  make test-net   run host TCP + network checksum + DNS tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-gui-host   run libgui raster regression tests"
 	@echo "  make test-kfs-journal   run KFS crash-recovery tests"
