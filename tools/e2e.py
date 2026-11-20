@@ -1929,6 +1929,12 @@ def t_signals(h):
     wait_prompt(h)
 
 
+def t_waitany_bad_pointer(h):
+    h.send("sigtest --waitany-bad-pointer")
+    h.expect("sigtest: waitany preserved child PID and status after bad pointer")
+    wait_prompt(h)
+
+
 def t_dynamic_linking(h):
     h.send("dynhello")
     h.expect("dynhello: DT_NEEDED library returned 42")
@@ -3123,6 +3129,7 @@ TESTS = [
     ("rng", t_rng),
     ("demand-paging", t_demand_paging),
     ("signals", t_signals),
+    ("waitany-bad-pointer", t_waitany_bad_pointer),
     ("dynamic-linking", t_dynamic_linking),
     ("ping", t_ping),
     ("nslookup", t_nslookup),

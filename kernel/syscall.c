@@ -73,12 +73,17 @@ int copy_from_user(void *dst, const void *usrc, size_t len)
     return 0;
 }
 
+static int user_write_ok(const void *udst, size_t len)
+{
+    return user_range_ok(udst, len) &&
+           vm_fault_in_range(current, (uint64_t)udst, len, 1) == 0;
+}
+
 int copy_to_user(void *udst, const void *src, size_t len)
 {
     if (len == 0)
         return 0;
-    if (!user_range_ok(udst, len) ||
-        vm_fault_in_range(current, (uint64_t)udst, len, 1) < 0)
+    if (!user_write_ok(udst, len))
         return -1;
     memcpy(udst, src, len);
     return 0;
@@ -771,6 +776,8 @@ static long sys_kill(uint64_t pid, uint64_t sig)
 static long sys_waitany(uint64_t upid)
 {
     int pid = 0;
+    if (!user_write_ok((void *)upid, sizeof(pid)))
+        return -1;
     long code = uproc_waitany(&pid);
     if (code == -1 && pid == 0)
         return -1;
