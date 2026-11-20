@@ -6,6 +6,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -13,7 +14,7 @@
 #define MAX_DEPTH  8
 #define MAX_ENTRY  1024
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 static const char *g_name;
 static char g_path[MAX_PATH];
 
@@ -146,6 +147,7 @@ int main(int argc, char **argv)
     struct k_stat st;
     int i;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
 
     for (i = 1; i < argc; i++) {
