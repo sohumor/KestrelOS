@@ -16,6 +16,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_pulse.h>
 #include <krec.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,7 +112,7 @@ static int nparcels;
 
 static struct k_pulse pulses[MAX_PULSES];
 static int npulses;
-static uint64_t last_pulse_seq;
+static struct pulse_cursor pulse_history = { .topics = K_TOPIC_ALL };
 
 static struct k_modinfo mods[MAX_MODS];
 static int nmods;
@@ -951,25 +952,15 @@ static void push_pulse(const struct k_pulse *p)
 
 static void init_pulses(void)
 {
-    struct k_pulse_query q;
     struct k_pulse batch[64];
     int n;
 
     npulses = 0;
-    last_pulse_seq = 0;
+    pulse_history.seq = 0;
     for (;;) {
-        q.seq = last_pulse_seq;
-        q.topic_mask = K_TOPIC_ALL;
-        q.max_out = 64;
-        q.timeout_ms = 0;
-        q._pad = 0;
-        n = pulse_poll(&q, batch);
-        if (n <= 0) {
-            if (n == 0)
-                last_pulse_seq = q.seq;
+        n = pulse_cursor_read(&pulse_history, batch, 64, 0);
+        if (n <= 0)
             break;
-        }
-        last_pulse_seq = q.seq;
         for (int i = 0; i < n; i++)
             push_pulse(&batch[i]);
         if (n < 64)
@@ -1107,24 +1098,14 @@ static void refresh_all_counts(void)
 
 static void check_live_pulses(void)
 {
-    struct k_pulse_query q;
     struct k_pulse batch[32];
     int n, any = 0;
     uint32_t topics = 0;
 
     for (;;) {
-        q.seq = last_pulse_seq;
-        q.topic_mask = K_TOPIC_ALL;
-        q.max_out = 32;
-        q.timeout_ms = 0;
-        q._pad = 0;
-        n = pulse_poll(&q, batch);
-        if (n <= 0) {
-            if (n == 0)
-                last_pulse_seq = q.seq;
+        n = pulse_cursor_read(&pulse_history, batch, 32, 0);
+        if (n <= 0)
             break;
-        }
-        last_pulse_seq = q.seq;
         for (int i = 0; i < n; i++) {
             topics |= batch[i].topic;
             push_pulse(&batch[i]);
@@ -1709,7 +1690,7 @@ static void paint(gui_window *win, gui_ui *ui)
         char seq_pill[32];
         int pw;
         snprintf(seq_pill, sizeof(seq_pill), "pulse #%llu",
-                 (unsigned long long)last_pulse_seq);
+                 (unsigned long long)pulse_history.seq);
         pw = (int)strlen(seq_pill) * 6 + 18;
         if (W >= 660)
             gui_draw_pill(win, gui_mkrc(112, 12, pw, 22),
