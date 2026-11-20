@@ -349,6 +349,8 @@ test-mission:
 	@mkdir -p $(BUILD)/host-tests
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Ikernel/include -Iabi kernel/mission_core.c tools/test_mission.c -o $(BUILD)/host-tests/test_mission
 	$(BUILD)/host-tests/test_mission
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iabi -idirafter libc/include libc/mission.c tools/test_mission_manifest.c -o $(BUILD)/host-tests/test_mission_manifest
+	$(BUILD)/host-tests/test_mission_manifest
 
 test-jpeg-prog:
 	@mkdir -p $(BUILD)

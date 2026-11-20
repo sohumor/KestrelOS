@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Paint
+exec: /bin/gpaint
+mission: Draw and edit KPX images
+display: yes
+fs.read: /lib /etc /share /doc ~ /tmp
+fs.write: ~ /tmp
+net: none
+device: none
+ipc: talon pulse
+spawn: no

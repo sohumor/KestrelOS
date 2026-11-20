@@ -624,7 +624,7 @@ fail:
 }
 
 int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
-                                 const struct k_mission_grant *grant)
+                                 const struct k_mission_grant *grant, uint32_t *mission_id)
 {
     if (!spawn_user_allowed()) return -1;
     struct uproc_pkg *pkg = alloc_pkg_from_user(upath, uargv);
@@ -633,6 +633,7 @@ int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
     if (id < 0) { free_pkg(pkg); return -1; }
     pkg->mission_id = id;
     int pid = spawn_pkg(pkg);
+    if (pid >= 0 && mission_id) *mission_id = (uint32_t)id;
     mission_put(id);
     return pid;
 }

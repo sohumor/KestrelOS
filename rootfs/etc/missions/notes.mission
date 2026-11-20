@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Notes
+exec: /bin/notes
+mission: Edit notes and exchange Talon text
+display: yes
+fs.read: /lib /etc /doc ~ /tmp
+fs.write: ~ /tmp
+net: none
+device: none
+ipc: talon pulse
+spawn: no

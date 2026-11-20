@@ -1007,13 +1007,16 @@ static int cap_has(uint64_t cap)
     return mission_cap(cap, (__atomic_load_n(&current->cap_mask, __ATOMIC_RELAXED) & cap) != 0);
 }
 
-static long sys_mission_spawn(uint64_t path, uint64_t argv, uint64_t ugrant)
+static long sys_mission_spawn(uint64_t path, uint64_t argv, uint64_t ugrant, uint64_t uid)
 {
     struct k_mission_grant g;
+    uint32_t id = 0;
     if (!cap_has(KCAP_SPAWN) || !ugrant ||
         copy_from_user(&g, (const void *)ugrant, sizeof(g)) < 0) return -1;
+    if (uid && copy_to_user((void *)uid, &id, sizeof(id)) < 0) return -1;
     long pid = uproc_spawn_mission_from_user((const char *)path,
-                                             (char *const *)argv, &g);
+                                             (char *const *)argv, &g, &id);
+    if (pid >= 0 && uid && copy_to_user((void *)uid, &id, sizeof(id)) < 0) return -1;
     flight_record_spawn(pid, (const char *)path);
     return pid;
 }
@@ -1279,7 +1282,7 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_spawn_caps(a1, a2, a3);
         break;
     case SYS_MISSION_SPAWN:
-        ret = sys_mission_spawn(a1, a2, a3);
+        ret = sys_mission_spawn(a1, a2, a3, a4);
         break;
     case SYS_MISSION_CTL:
         ret = a1 > 0x7fffffffU || a2 > K_MISSION_END || a3 > 0xffffffffU ? -1 :

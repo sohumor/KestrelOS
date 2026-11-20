@@ -7,6 +7,28 @@
 #include <kestrel.h>
 #include <stdio.h>
 #include <string.h>
+#include <mission.h>
+
+int mission_spawn(const char *path, char *const argv[], const struct k_mission_grant *grant)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, 0);
+}
+
+int mission_spawn_id(const char *path, char *const argv[], const struct k_mission_grant *grant,
+                     uint32_t *id)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, (long)id);
+}
+
+int mission_ctl(uint32_t id, unsigned op, unsigned arg)
+{
+    return (int)syscall(SYS_MISSION_CTL, id, op, arg, 0);
+}
+
+int mission_info(unsigned index, struct k_mission_info *out)
+{
+    return (int)syscall(SYS_MISSION_INFO, index, (long)out, 0, 0);
+}
 
 /* ---- files ---- */
 

@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: cat
+exec: /bin/cat
+mission: Read and print selected files
+display: no
+fs.read: /
+fs.write: none
+net: none
+device: none
+ipc: none
+spawn: no

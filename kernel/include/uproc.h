@@ -1,7 +1,7 @@
 #pragma once
 #include "kestrel_abi.h"
 int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
-                                 const struct k_mission_grant *grant);
+                                 const struct k_mission_grant *grant, uint32_t *mission_id);
 
 #include <stdint.h>
 #include <stddef.h>

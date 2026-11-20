@@ -4,7 +4,8 @@ Missions are per-launch, task-scoped grants rather than permanent application
 permissions. A launcher describes what an application is doing and grants a
 subset of its manifest ceiling. Kernel checks make those limits effective;
 pulses and counters let a desktop HUD explain use, denial, and live revocation.
-The manifest parser, launch CLI, and desktop UI build on this kernel ABI.
+The manifest parser and launch CLI build on this kernel ABI; desktop UI is
+the next layer.
 
 ## Kernel model
 
@@ -88,3 +89,47 @@ ASan/UBSan policy tests: valid/empty/malformed grants, cannot-widen subsets,
 canonical and boundary-safe path matching, write modes, runtime exceptions,
 device restrictions, host checks, revocation, counters and rate limits.
 See [ABI.md](ABI.md#mission-grants) for syscall and field details.
+
+## Userspace
+
+Manifests live at `/etc/missions/<id>.mission`. Each is line-oriented
+`key: value`, with `#` comments. Required fields are `app`, `exec` (absolute),
+and `mission`. Optional fields default to no access: `display` and `spawn`
+take `yes`/`no`; `fs.read`/`fs.write` take space-separated prefixes or `none`;
+`net` takes `none`, `any`, or `host` followed by names/IPv4 addresses;
+`device` takes audio/camera/input/random or `none`; `ipc` takes
+talon/pulse/signal/pipe or `none`. Unknown or duplicate keys are errors.
+There is no quoting or environment substitution. `~` and `~/...` expand to
+the calling UID's home from `/etc/passwd`, not the current directory.
+
+`<mission.h>` exposes `mission_parse` and `mission_build` (host-testable,
+with caller-supplied home and resolver), plus `mission_load` and
+`mission_build_current` for guest filesystem/home/DNS integration. DNS is
+performed when constructing a grant, never by the parser or kernel. The
+kernel receives only resolved IPv4 addresses; aliases can narrow a host grant
+only if they resolve to an address already in its ceiling.
+
+```
+mission list
+mission show <id>
+mission run <id> [--fs-read P]... [--fs-write P]...
+  [--no-net | --net-host H]... [--no-device D]... [--no-ipc] [--bg] [-- args]
+mission ps
+mission revoke <mid> <channel | path:N | host:N>
+mission end <mid>
+```
+
+Read/write flags replace that mode's declared prefixes, retaining the other
+mode. Every replacement must be contained by a same-mode declared prefix.
+Network flags only remove access or select declared destinations; device/IPC
+flags only remove bits. No option enables an undeclared capability.
+`ps` shows channel states and counters, PIDs, paths/hosts and the latest deny.
+`--bg` prints `mission <mid> pid <pid>` without waiting for the child; the
+optional fourth spawn syscall argument returns the mission ID atomically
+with launch, even if the child exits before userspace can query it.
+
+The host manifest tests cover parsing errors, home expansion, DNS, narrow-only
+options and every shipped manifest. Guest tests `mission-grant`, `mission-deny`,
+and `mission-revoke-live` cover successful reads, path/host denials with
+telemetry, and revocation on the same still-running PID. `missionprobe` is a
+small repeated-open/ping helper for these live-policy checks.

@@ -496,6 +496,8 @@ def run_host_tests(tc):
     suites = [
         ("test_mission", [r("kernel/mission_core.c"), r("tools/test_mission.c")],
          ["-Ikernel/include", "-Iabi"]),
+        ("test_mission_manifest", [r("libc/mission.c"), r("tools/test_mission_manifest.c")],
+         ["-Iabi", "-idirafter", "libc/include"]),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
@@ -648,6 +650,7 @@ def generate_compile_commands(tc):
 
     host_suites = [
         ("tools/test_mission.c", ["-Ikernel/include", "-Iabi"]),
+        ("tools/test_mission_manifest.c", ["-Iabi", "-idirafter", "libc/include"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),

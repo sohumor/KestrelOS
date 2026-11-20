@@ -619,6 +619,7 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocki
     case DEV_SOCKETS:
     case DEV_CAPS:
     case DEV_PARCELS:
+    case DEV_MISSIONS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);
