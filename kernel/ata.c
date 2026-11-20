@@ -1,17 +1,15 @@
 #include "kernel.h"
 #include "ata.h"
 #include "blockdev.h"
+#include "device.h"
 #include "io.h"
 #include "string.h"
 #include "random.h"
 #include "spinlock.h"
 
-/* ATA PIO driver: primary bus, master drive, 28-bit LBA, polling.
- *
- * The transfer path below is unchanged; the only new thing is that
- * ata_init() publishes the drive as block device "hda" instead of
- * leaving KFS to call ata_read()/ata_write() by name. */
+/* ATA PIO driver: primary bus, master drive, 28-bit LBA, polling. */
 
+#define ATA_SECTOR_SIZE 512
 #define ATA_IO_BASE   0x1F0
 #define ATA_REG_DATA     (ATA_IO_BASE + 0)
 #define ATA_REG_ERROR    (ATA_IO_BASE + 1)
@@ -37,7 +35,6 @@
 
 #define ATA_TIMEOUT 1000000
 
-static int ata_present;
 static struct blockdev ata_bdev;
 static spinlock_t ata_lock = SPINLOCK_INIT;
 
@@ -136,8 +133,6 @@ static int ata_rw_chunk(uint32_t lba, uint32_t count, void *buf, int write)
 
 static int ata_rw(uint32_t lba, uint32_t count, void *buf, int write)
 {
-    if (!ata_present)
-        return -1;
     uint64_t flags = spin_lock_irqsave(&ata_lock);
     while (count > 0) {
         uint32_t chunk = count > 256 ? 256 : count;
@@ -153,16 +148,6 @@ static int ata_rw(uint32_t lba, uint32_t count, void *buf, int write)
     return 0;
 }
 
-int ata_read(uint32_t lba, uint32_t count, void *buf)
-{
-    return ata_rw(lba, count, buf, 0);
-}
-
-int ata_write(uint32_t lba, uint32_t count, const void *buf)
-{
-    return ata_rw(lba, count, (void *)buf, 1);
-}
-
 /* --- block device face ------------------------------------------------
  * One block = one 512-byte sector, so the LBA needs no scaling. The
  * command registers only carry 28 bits of LBA, so anything above that is
@@ -176,7 +161,7 @@ static int ata_bd_read(struct blockdev *bd, uint64_t lba, uint32_t count,
     (void)bd;
     if (lba > ATA_LBA28_MAX || count > ATA_LBA28_MAX - (uint32_t)lba)
         return -1;
-    return ata_read((uint32_t)lba, count, buf);
+    return ata_rw((uint32_t)lba, count, buf, 0);
 }
 
 static int ata_bd_write(struct blockdev *bd, uint64_t lba, uint32_t count,
@@ -185,7 +170,7 @@ static int ata_bd_write(struct blockdev *bd, uint64_t lba, uint32_t count,
     (void)bd;
     if (lba > ATA_LBA28_MAX || count > ATA_LBA28_MAX - (uint32_t)lba)
         return -1;
-    return ata_write((uint32_t)lba, count, buf);
+    return ata_rw((uint32_t)lba, count, (void *)buf, 1);
 }
 
 /* Model string is stored word-swapped in IDENTIFY words 27..46. */
@@ -200,7 +185,7 @@ static void ata_extract_model(const uint16_t *id, char *model)
         model[i] = '\0';
 }
 
-void ata_init(void)
+static int ata_probe(struct device *dev)
 {
     uint16_t id[256];
     char model[41];
@@ -211,7 +196,7 @@ void ata_init(void)
     /* Floating bus: no controller/drive at all. */
     if (inb(ATA_REG_STATUS) == 0xFF) {
         kprintf("ata: no controller on primary bus\n");
-        return;
+        return -1;
     }
 
     outb(ATA_REG_COUNT, 0);
@@ -223,27 +208,26 @@ void ata_init(void)
 
     if (inb(ATA_REG_STATUS) == 0) {
         kprintf("ata: primary master not present\n");
-        return;
+        return -1;
     }
     if (ata_wait_not_busy() < 0) {
         kprintf("ata: primary master timed out\n");
-        return;
+        return -1;
     }
     /* Non-zero signature here means ATAPI/SATA, not plain ATA. */
     if (inb(ATA_REG_LBA_MID) != 0 || inb(ATA_REG_LBA_HI) != 0) {
         kprintf("ata: primary master is not an ATA disk\n");
-        return;
+        return -1;
     }
     if (ata_wait_drq() < 0) {
         kprintf("ata: IDENTIFY failed\n");
-        return;
+        return -1;
     }
 
     ata_insw(id, 256);
     ata_extract_model(id, model);
 
     uint32_t sectors = (uint32_t)id[60] | ((uint32_t)id[61] << 16);
-    ata_present = 1;
     kprintf("ata: primary master: %s, %u sectors (%u MiB)\n",
             model, sectors, sectors / 2048);
 
@@ -258,5 +242,22 @@ void ata_init(void)
     ata_bdev.priv = NULL;
     ata_bdev.read = ata_bd_read;
     ata_bdev.write = ata_bd_write;
-    blockdev_register(&ata_bdev);
+    if (blockdev_register(&ata_bdev) < 0)
+        return -1;
+    dev->drv_data = &ata_bdev;
+    return 0;
+}
+
+void ata_init(void)
+{
+    static const char *const names[] = { "ata-primary", NULL };
+    static struct driver ata_driver = {
+        .name = "ata-pio",
+        .probe = ata_probe,
+        .match_table = names,
+    };
+
+    ata_driver.bus = bus_find("platform");
+    if (ata_driver.bus)
+        driver_register(&ata_driver);
 }
