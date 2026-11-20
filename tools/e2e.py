@@ -121,6 +121,7 @@ PKG_TIMEOUT = 90
 # handshake to the outside world still has to be given time to fail.
 NET_TIMEOUT = 45
 TAIL_LINES = 40
+SERIAL_HARD_TIMEOUT_FACTOR = 10
 
 
 def timeout_scale(value):
@@ -185,6 +186,7 @@ class Harness:
         self._partial = ""
         self._esc = ""                # half of an escape sequence, held back
         self.eof = False
+        self._last_serial = 0
 
     def _use_win_tcp_serial(self):
         if sys.platform != "win32":
@@ -244,6 +246,9 @@ class Harness:
                 chunk = self.proc.stdout.read1(4096)
             if not chunk:
                 break
+            with self.cond:
+                self._last_serial = time.monotonic()
+                self.cond.notify_all()
             raw = self._esc + chunk.decode("utf-8", errors="replace")
             m = ANSI_TAIL_RE.search(raw)
             if m:
@@ -274,6 +279,11 @@ class Harness:
             self.eof = True
             self.cond.notify_all()
 
+    def _serial_remaining(self, started, idle_limit):
+        idle_deadline = max(started, self._last_serial) + idle_limit
+        hard_deadline = started + idle_limit * SERIAL_HARD_TIMEOUT_FACTOR
+        return min(idle_deadline, hard_deadline) - time.monotonic()
+
     def expect(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
         """Wait until pattern appears in output; consume through match.
 
@@ -282,7 +292,8 @@ class Harness:
         TimeoutError on timeout/EOF.
         """
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + guest_timeout(timeout)
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -290,7 +301,7 @@ class Harness:
                 if m:
                     self.buf = self.buf[m.end():]
                     return m if regex else m.group(0)
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout waiting for %r (eof=%s)" % (pattern, self.eof))
@@ -300,7 +311,8 @@ class Harness:
         """Wait for any of several patterns; returns the matching pattern."""
         rxs = [(p, re.compile(p if regex else re.escape(p)))
                for p in patterns]
-        deadline = time.monotonic() + guest_timeout(timeout)
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -312,7 +324,7 @@ class Harness:
                 if best:
                     self.buf = self.buf[best[1].end():]
                     return best[0]
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout waiting for any of %r (eof=%s)"
@@ -322,7 +334,8 @@ class Harness:
     def capture_until(self, pattern, timeout=DEFAULT_TIMEOUT, regex=False):
         """Consume through pattern and return the complete consumed block."""
         rx = re.compile(pattern if regex else re.escape(pattern))
-        deadline = time.monotonic() + guest_timeout(timeout)
+        started = time.monotonic()
+        idle_limit = guest_timeout(timeout)
         with self.cond:
             while True:
                 self.check_exit()
@@ -331,7 +344,7 @@ class Harness:
                     block = self.buf[:m.end()]
                     self.buf = self.buf[m.end():]
                     return block
-                remaining = deadline - time.monotonic()
+                remaining = self._serial_remaining(started, idle_limit)
                 if remaining <= 0 or self.eof:
                     raise TimeoutError(
                         "timeout capturing through %r (eof=%s)"
@@ -3171,6 +3184,44 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    with mock.patch.dict(os.environ, {"KESTREL_E2E_TIMEOUT_SCALE": "1"}):
+        for method in ("expect", "expect_any", "capture_until"):
+            for case in ("progress", "silent", "hard-cap"):
+                body = {
+                    "progress": ("for _ in range(5):\n"
+                                 " time.sleep(0.1); print('\\x1b[0m', end='', flush=True)\n"
+                                 "print('done', flush=True)\n"),
+                    "silent": "time.sleep(30)\n",
+                    "hard-cap": ("while True:\n"
+                                 " time.sleep(0.02); print('.', end='', flush=True)\n"),
+                }[case]
+                child = ("import sys,time\nprint('ready', flush=True)\n"
+                         "sys.stdin.readline()\n" + body)
+                h = Harness([sys.executable, "-u", "-c", child])
+                h.start()
+                try:
+                    h.expect("ready", timeout=5)
+                    h.send("go")
+                    started = time.monotonic()
+                    idle_limit = 0.05 if case == "hard-cap" else 0.2
+                    pattern = ["done"] if method == "expect_any" else "done"
+                    try:
+                        getattr(h, method)(pattern, timeout=idle_limit)
+                    except TimeoutError:
+                        if case == "progress":
+                            raise
+                    else:
+                        if case != "progress":
+                            raise AssertionError("unbounded serial wait")
+                    elapsed = time.monotonic() - started
+                    expected = idle_limit * (SERIAL_HARD_TIMEOUT_FACTOR
+                                             if case == "hard-cap" else 1)
+                    if case != "progress" and not expected * 0.9 <= elapsed < expected + 1:
+                        raise AssertionError("%s %s expired at %.3fs" %
+                                             (method, case, elapsed))
+                    print("PASS selftest: %s %s %.3fs" % (method, case, elapsed))
+                finally:
+                    h.kill()
     with mock.patch.dict(os.environ, {}, clear=True):
         assert guest_timeout(20) == 20
     for invalid in ("", "0", "-1", "nan", "inf", "invalid"):
