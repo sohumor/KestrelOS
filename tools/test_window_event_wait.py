@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Exercise per-window event delivery in a two-CPU QEMU guest."""
 
+import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 
@@ -20,12 +22,64 @@ SCRIPT = (
     "b.close();a.close();",
 )
 
+VICTIM = (
+    "var keep=Kestrel.openWindow('probe-keep',120,80);",
+    "var w=Kestrel.openWindow('probe-victim',120,80);while(w.pollEvent(0)){}",
+    "print('WINDOW-REUSE-READY');var t=Kestrel.uptime(),e=w.pollEvent(5000);",
+    "print(e&&e.type=='close'&&Kestrel.uptime()-t<4500?'WINDOW-OLD-CLOSED':'WINDOW-REUSE-FAIL');",
+    "w.close();keep.close();",
+)
+
+REPLACEMENT = (
+    "var w=Kestrel.openWindow('probe-replacement',120,80),e=w.pollEvent(0);",
+    "print(e&&e.type=='focus'?'WINDOW-NEW-FOCUSED':'WINDOW-REUSE-FAIL');w.close();",
+)
+
 
 def expect(h, expected):
     marker = rf"\n{expected}(?=\n)"
     result = h.expect_any([marker, r"\nWINDOW-FAIL(?=\n)"], regex=True)
     if result != marker:
         raise AssertionError(f"guest rejected {expected}")
+
+
+def write_script(h, name, script):
+    for line in script:
+        h.send(f'echo "{line}" >> /tmp/{name}.js')
+        wait_prompt(h)
+
+
+def test_reuse(work):
+    image = Path(work) / "os.img"
+    subprocess.run(["make", "-f", "Makefile", "-f", "tools/window_event_probe.mk",
+                    f"PROBE_DIR={work}", f"CC={os.environ.get('CC', 'gcc -march=x86-64')}",
+                    str(image)], check=True)
+    command = qemu_command("rtl8139", 2)
+    command[command.index("-drive") + 1] = f"file={image},format=raw"
+    h = Harness(command)
+    try:
+        h.start()
+        t_boot(h)
+        t_login(h)
+        t_prompt(h)
+        write_script(h, "victim", VICTIM)
+        write_script(h, "replacement", REPLACEMENT)
+        h.send("kjs /tmp/victim.js & kjs /tmp/replacement.js")
+        seen = set()
+        markers = {rf"(?<=\n){name}(?=\n)" for name in
+                   ("WINDOW-SLOT-REUSED", "WINDOW-OLD-CLOSED", "WINDOW-NEW-FOCUSED")}
+        failure = r"(?<=\n)WINDOW-REUSE-FAIL(?=\n)"
+        while seen != markers:
+            matched = h.expect_any(sorted(markers - seen) + [failure], regex=True)
+            if matched == failure:
+                raise AssertionError("guest rejected window slot reuse")
+            seen.add(matched)
+        print("PASS window slot reuse: blocked owner released; replacement event retained")
+    except (OSError, RuntimeError, AssertionError):
+        h.print_tail()
+        raise
+    finally:
+        h.kill()
 
 
 def main():
@@ -39,9 +93,7 @@ def main():
             t_boot(h)
             t_login(h)
             t_prompt(h)
-            for line in SCRIPT:
-                h.send(f'echo "{line}" >> /tmp/window-events.js')
-                wait_prompt(h)
+            write_script(h, "window-events", SCRIPT)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as hmp:
                 hmp.connect(monitor)
                 h.send("kjs /tmp/window-events.js")
@@ -60,6 +112,11 @@ def main():
             return 1
         finally:
             h.kill()
+        try:
+            test_reuse(work)
+        except (OSError, RuntimeError, AssertionError, subprocess.CalledProcessError) as exc:
+            print(f"FAIL window slot reuse: {exc}", file=sys.stderr)
+            return 1
     return 0
 
 
