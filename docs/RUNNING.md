@@ -7,6 +7,7 @@ Everything here is verified against the sources in this repository:
 - [Building](#building)
 - [Running in QEMU](#running-in-qemu)
 - [Debugging on Linux/WSL](#debugging-on-linuxwsl)
+- [Profiling](#profiling)
 - [Running in VirtualBox](#running-in-virtualbox)
 - [Running in VMware](#running-in-vmware)
 - [Running in Bochs](#running-in-bochs)
@@ -167,6 +168,49 @@ adds GDB arguments; `QEMU_FLAGS` adds debug QEMU arguments, e.g.
 `--gdb-flags` and `--qemu-flags`. A connection error usually means the
 debug VM has not started or another process occupies port 1234; a missing
 `build/kernel.elf` means you need to build/start the debug target first.
+
+## Profiling
+
+Build and profile a fresh headless TCG guest with one command:
+
+```sh
+make profile
+make profile PROFILE_FLAGS='--cmd "ls /bin" --window all --hz 200 --top 20 --json build/profile.json --out build/profile.txt'
+python3 tools/build.py profile --profile-flags "--window boot"
+```
+
+Both entry points build first; the Python runner also accepts the
+`PROFILE_FLAGS` environment variable. To use an existing build directly,
+run `python3 tools/profile.py`. The default command is `ls /bin`.
+`--window cmd` (default) samples only the command; `boot` samples from CPU
+start through the first logged-in shell prompt, and `all` samples both.
+Phase timings always cover QEMU launch, first serial byte, `KESTREL READY`,
+login prompt, shell prompt, and command start/end. Times are host monotonic
+wall time, not guest CPU time; the command-end delta is its end-to-end latency.
+Boot/login/command timeouts honor `KESTREL_E2E_TIMEOUT_SCALE` (default 1).
+QEMU always exits afterward and guest disk writes use a temporary snapshot.
+
+Each QMP round reads all CPUs' RIP, CS privilege level, and halted state.
+Halted CPUs count as idle; remaining samples count as kernel (CPL 0) or user.
+Percentages, including function percentages, use **all CPU samples** as the
+denominator. A short command may yield few or no user samples; increase the
+workload or frequency before drawing conclusions. `--hz` is the requested
+round frequency, not a guaranteed rate. QMP register sampling perturbs TCG
+and can materially slow it down; this is a statistical hotspot guide, not
+a cycle-accurate benchmark. Idle samples include waiting secondary CPUs.
+
+Kernel symbols come from `build/kernel.elf`, and the command's first word
+selects `build/apps/<binary>` when present (these ELFs retain their symbol
+tables, as do the `--strip-debug` rootfs copies). Add repeatable
+`--user-elf PATH` options for other binaries. `nm` (or `$NM`) must be on PATH.
+Only addresses inside text-symbol ranges are attributed. Unknown user
+addresses appear as `[user 0x...]`. This sampler does not track processes or
+load bias: shell/login/other processes can share virtual addresses with the
+command, and multiple matching ELF symbols are shown separated by `|`.
+Treat user attribution as candidate symbols, especially in the boot window,
+for shell builtins, pipelines, or dynamically loaded code.
+`--top` limits each function table; `--json` and `--out` save the same report
+data and text respectively.
 
 ## Running in QEMU
 
