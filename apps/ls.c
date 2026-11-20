@@ -12,7 +12,6 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_ENTRIES 256
 #define MAX_PATH    256
 
 static const char *g_cwd = "/";
@@ -47,14 +46,11 @@ static void emit_krec_entry(const char *name, int is_dir, uint32_t size,
 
 static int list_path(const char *path, int show_all, int rflag)
 {
-    static struct k_dirent ents[MAX_ENTRIES];
+    struct k_dirent ent;
     struct k_stat st;
-    int n = 0, i, pass, count = 0;
+    int i, pass, count = 0;
 
-    while (n < MAX_ENTRIES && readdir_at(path, n, &ents[n]) == 0)
-        n++;
-
-    if (n == 0) {
+    if (readdir_at(path, 0, &ent) != 0) {
         if (stat_(path, &st) != 0) {
             if (rflag)
                 krec_err("ls: cannot access %s\n", path);
@@ -74,19 +70,18 @@ static int list_path(const char *path, int show_all, int rflag)
     }
 
     for (pass = 0; pass < 2; pass++) {
-        for (i = 0; i < n; i++) {
-            if ((pass == 0) != (ents[i].is_dir != 0))
+        for (i = 0; readdir_at(path, i, &ent) == 0; i++) {
+            ent.name[sizeof(ent.name) - 1] = '\0';
+            if ((pass == 0) != (ent.is_dir != 0))
                 continue;
-            if (!show_all && is_dot(ents[i].name))
+            if (!show_all && is_dot(ent.name))
                 continue;
-            ents[i].name[sizeof(ents[i].name) - 1] = '\0';
             if (rflag) {
-                emit_krec_entry(ents[i].name, ents[i].is_dir != 0,
-                                ents[i].size, ents[i].uid, ents[i].gid,
-                                ents[i].mode);
+                emit_krec_entry(ent.name, ent.is_dir != 0,
+                                ent.size, ent.uid, ent.gid, ent.mode);
             } else {
-                printf("%c %8u  %s\n", ents[i].is_dir ? 'd' : '-',
-                       ents[i].size, ents[i].name);
+                printf("%c %8u  %s\n", ent.is_dir ? 'd' : '-',
+                       ent.size, ent.name);
             }
             count++;
         }
