@@ -7,6 +7,9 @@
 #include "kheap.h"
 #include "string.h"
 #include "kestrel_abi.h"
+#include "klog.h"
+#include "output.h"
+#include "serial.h"
 
 /* Lowest half of the canonical address space is userland. */
 #define USER_VA_LIMIT 0x0000800000000000ULL
@@ -518,10 +521,15 @@ int elf_load(struct task *task, struct file *backing,
 
     *entry_out = entry;
     *brk_out = (max_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    kprintf("elf: %s image, %d object%s, %d lazy segment%s\n",
+    char message[112];
+    klog_snprintf(message, sizeof(message),
+            "elf: %s image, %d object%s, %d lazy segment%s\n",
             objects[0].eh->e_type == ELF_ET_DYN ? "dynamic" : "static",
             object_count, object_count == 1 ? "" : "s",
             task->vm_area_count, task->vm_area_count == 1 ? "" : "s");
+    uint64_t flags = output_begin();
+    serial_write(message);
+    output_end(flags);
     result = 0;
 
 out:
