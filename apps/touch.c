@@ -4,12 +4,13 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <string.h>
 
 #define MAX_PATH 256
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 /* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
 static int strip_cwd_arg(int argc, char **argv)
@@ -42,6 +43,7 @@ int main(int argc, char **argv)
     struct k_stat st;
     int i, fd, rc = 0;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
     if (argc < 2) {
         printf("usage: touch <file>...\n");
