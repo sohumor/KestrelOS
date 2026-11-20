@@ -641,16 +641,16 @@ static void ifree(struct kfs_fs *fs, uint32_t ino)
 
 /* Map file block `fbn` of inode `ino` (whose in-memory copy is *ip) to an
  * FS block, allocating if requested. Writes the inode / indirect block
- * back on any change. Returns the block number, or 0. */
-static uint32_t bmap(struct kfs_fs *fs, uint32_t ino, struct kfs_inode *ip,
-                     uint32_t fbn, int alloc)
+ * back on any change. Returns the block number, 0 for a hole, or -1 on error. */
+static int64_t bmap(struct kfs_fs *fs, uint32_t ino, struct kfs_inode *ip,
+                    uint32_t fbn, int alloc)
 {
     if (fbn < KFS_NDIRECT) {
         uint32_t b = ip->direct[fbn];
         if (!b && alloc) {
             b = balloc(fs);
             if (!b)
-                return 0;
+                return -1;
             ip->direct[fbn] = b;
             iput(fs, ino, ip);
         }
@@ -659,30 +659,30 @@ static uint32_t bmap(struct kfs_fs *fs, uint32_t ino, struct kfs_inode *ip,
 
     fbn -= KFS_NDIRECT;
     if (fbn >= KFS_NINDIRECT)
-        return 0;
+        return -1;
 
     if (!ip->indirect) {
         if (!alloc)
             return 0;
         uint32_t nb = balloc(fs);
         if (!nb)
-            return 0;
+            return -1;
         ip->indirect = nb;
         iput(fs, ino, ip);
     }
 
     if (bread(fs, ip->indirect, ind_buf) < 0)
-        return 0;
+        return -1;
     uint32_t *tab = (uint32_t *)ind_buf;
     uint32_t b = tab[fbn];
     if (!b && alloc) {
         b = balloc(fs);
         if (!b)
-            return 0;
+            return -1;
         /* balloc does not touch ind_buf; the table is still valid. */
         tab[fbn] = b;
         if (journal_stage(fs, ip->indirect, ind_buf) < 0)
-            return 0;
+            return -1;
     }
     return b;
 }
@@ -707,10 +707,16 @@ static long readi(struct kfs_fs *fs, uint32_t ino, uint32_t off, void *buf,
         uint32_t chunk = KFS_BLOCK_SIZE - boff;
         if (chunk > n - done)
             chunk = n - done;
-        uint32_t b = bmap(fs, ino, &ip, fbn, 0);
-        if (!b || bread(fs, b, data_buf) < 0)
+        int64_t b = bmap(fs, ino, &ip, fbn, 0);
+        if (b < 0 || (b == 0 && ip.type != KFS_TYPE_FILE))
             return done ? (long)done : -1;
-        memcpy((uint8_t *)buf + done, data_buf + boff, chunk);
+        if (b == 0) {
+            memset((uint8_t *)buf + done, 0, chunk);
+        } else {
+            if (bread(fs, (uint32_t)b, data_buf) < 0)
+                return done ? (long)done : -1;
+            memcpy((uint8_t *)buf + done, data_buf + boff, chunk);
+        }
         done += chunk;
     }
     return done;
@@ -735,11 +741,11 @@ static long writei(struct kfs_fs *fs, uint32_t ino, uint32_t off,
         uint32_t chunk = KFS_BLOCK_SIZE - boff;
         if (chunk > n - done)
             chunk = n - done;
-        uint32_t b = bmap(fs, ino, &ip, fbn, 1);
-        if (!b)
+        int64_t b = bmap(fs, ino, &ip, fbn, 1);
+        if (b <= 0)
             break;              /* disk full */
         if (chunk < KFS_BLOCK_SIZE) {
-            if (bread(fs, b, data_buf) < 0)
+            if (bread(fs, (uint32_t)b, data_buf) < 0)
                 break;
         }
         memcpy(data_buf + boff, (const uint8_t *)buf + done, chunk);
@@ -747,7 +753,7 @@ static long writei(struct kfs_fs *fs, uint32_t ino, uint32_t off,
          * allocation bitmap and pointer updates. A committed replay
          * therefore installs either the whole 512-byte syscall write or
          * none of it, including in-place overwrites. */
-        if (journal_stage(fs, b, data_buf) < 0)
+        if (journal_stage(fs, (uint32_t)b, data_buf) < 0)
             break;
         done += chunk;
         if (pos + chunk > ip.size) {
