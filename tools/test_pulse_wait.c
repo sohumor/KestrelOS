@@ -4,6 +4,7 @@
 
 #define PROBE "/bin/pulse-wait-probe"
 #define UNUSED_TOPIC (1U << 31)
+#define READY_FD 3
 
 static int reader(const char *mode)
 {
@@ -17,6 +18,8 @@ static int reader(const char *mode)
     query.max_out = 1;
     query.timeout_ms = times_out ? 1500 : 5000;
     unsigned long start = uptime_ms();
+    if (write(READY_FD, "R", 1) != 1)
+        return 1;
     int n = pulse_poll(&query, &event);
     unsigned long elapsed = uptime_ms() - start;
 
@@ -31,18 +34,44 @@ static int reader(const char *mode)
 
 static int spawn_reader(const char *mode)
 {
-    char *args[] = { PROBE, (char *)mode, 0 };
-    int pid = spawn(PROBE, args);
-    if (pid < 0)
+    int ready[2];
+    if (pipe_(ready) < 0)
         return -1;
+
+    char *args[] = { PROBE, (char *)mode, 0 };
+    struct k_spawn_caps caps = {
+        .fds = { { .child_fd = READY_FD, .parent_fd = ready[1] } },
+        .n_fds = 1,
+    };
+    int pid = spawn_caps(PROBE, args, &caps);
+    close(ready[1]);
+
+    /* Startup can sleep on KFS. Only inspect task state after the child
+     * has primed its Pulse cursor and is about to enter the blocking poll. */
     unsigned long start = uptime_ms();
-    while (uptime_ms() - start < 1000) {
-        struct k_psinfo info;
-        for (int i = 0; psinfo(i, &info) == 0; i++)
-            if (info.pid == pid && info.state == K_STATE_SLEEPING)
-                return pid;
+    int armed = 0;
+    while (pid >= 0 && uptime_ms() - start < 1000) {
+        if (!armed) {
+            char marker;
+            long n = read_nb(ready[0], &marker, 1);
+            if (n < 0 || (n == 1 && marker != 'R'))
+                break;
+            armed = n == 1;
+        }
+        if (armed) {
+            struct k_psinfo info;
+            for (int i = 0; psinfo(i, &info) == 0; i++) {
+                if (info.pid == pid && info.state == K_STATE_SLEEPING) {
+                    close(ready[0]);
+                    return pid;
+                }
+            }
+        }
         sleep_ms(10);
     }
+    close(ready[0]);
+    printf("FAIL Pulse %s reader did not park (pid=%d, ready=%d)\n",
+           mode, pid, armed);
     return -1;
 }
 
