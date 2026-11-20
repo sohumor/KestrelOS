@@ -1,0 +1,79 @@
+name: Build and boot
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3
+      - name: Check build parity
+        run: python3 tools/check_build_parity.py
+      - name: Build
+        run: python3 tools/check_warnings.py --base-ref "${{ github.event.pull_request.base.sha || github.event.before }}"
+      - name: Check artifact size budgets
+        run: python3 tools/check_sizes.py
+      # The harness does not select KVM; QEMU defaults to portable TCG.
+      - name: Boot smoke test
+        timeout-minutes: 3
+        run: timeout --kill-after=5s 120s python3 -u tools/e2e.py --smoke 2>&1 | tee smoke.log
+      - name: Host tests
+        timeout-minutes: 3
+        run: make test-net test-random test-gui-host test-kfs-journal 2>&1 | tee host-tests.log
+      - name: Complete guest and host compile coverage
+        timeout-minutes: 20
+        env:
+          CC: gcc
+          LD: ld
+          AR: ar
+          OBJCOPY: objcopy
+        run: |
+          {
+            # Same compiles as build.py all, without repeating the full guest E2E suite.
+            # build.py sets -march=x86-64 for guest code itself.
+            python3 -u tools/build.py build
+            python3 -u tools/build.py test-host
+            make test-browser-host
+            sh tools/run-stdio-tests.sh
+            # Standalone host suites not registered in either build runner.
+            flags=(-std=gnu11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -fno-omit-frame-pointer)
+            gcc "${flags[@]}" -Ilibtls -o build/test_cryptoasym tools/test_cryptoasym.c \
+              libtls/bignum.c libtls/rsa.c libtls/ecc.c libtls/x509.c
+            gcc "${flags[@]}" -Ilibweb -DHTTP_HOST -DHTTP_TEST_WRAP_ALLOC -Wl,--wrap=malloc \
+              -o build/test_http tools/test_http.c libweb/http.c libweb/url.c libweb/cookie.c libweb/cache.c
+            gcc "${flags[@]}" -Ilibimg -Ilibz -o build/test_img tools/test_img.c libimg/*.c libz/*.c -lm
+            gcc "${flags[@]}" -Ilibz -o build/test_inflate tools/test_inflate.c libz/*.c
+            gcc "${flags[@]}" -Ilibtls -DTLS_HOST -o build/test_tls tools/test_tls.c libtls/*.c
+          } 2>&1 | tee compile-coverage.log
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-logs
+          path: |
+            build.log
+            smoke.log
+            host-tests.log
+            compile-coverage.log
+          if-no-files-found: ignore
+          retention-days: 7

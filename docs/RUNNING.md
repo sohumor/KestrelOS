@@ -6,6 +6,8 @@ Everything here is verified against the sources in this repository:
 - [Prerequisites](#prerequisites)
 - [Building](#building)
 - [Running in QEMU](#running-in-qemu)
+- [Debugging on Linux/WSL](#debugging-on-linuxwsl)
+- [Profiling](#profiling)
 - [Running in VirtualBox](#running-in-virtualbox)
 - [Running in VMware](#running-in-vmware)
 - [Running in Bochs](#running-in-bochs)
@@ -17,6 +19,29 @@ Everything here is verified against the sources in this repository:
 ---
 
 ## Prerequisites
+
+### QEMU test exit status
+
+`python3 tools/e2e.py --smoke` (also `make smoke` and
+`python3 tools/build.py smoke`) uses TCG and checks boot readiness, login
+and the shell prompt over serial, then sends `halt` and requires QEMU
+exit **33** for success. Panic at any stage fails immediately with exit **35**.
+Timeouts still bound guests that hang without reporting a result.
+
+The harness supplies `-device isa-debug-exit,iobase=0xf4,iosize=0x04`
+and `-fw_cfg name=opt/kestrel-test,string=2`. The custom BIOS boot protocol
+has no kernel command line, so the kernel reads this runtime option from
+QEMU's fw_cfg directory. Value `1` exits successfully at readiness; value
+`2` keeps running for interactive tests and reports success on `halt`.
+Both modes report panic/fatal kernel exceptions as exit **35**. Other
+exit statuses are errors. Serial assertions still validate test content;
+both smoke and the full suite request `halt` after their assertions and check exit 33.
+Normal boots without the option are unchanged. No new userspace syscall
+is needed: the existing privileged halt path reports completion.
+
+The guest writes `0x10` (success) or `0x11` (failure) to port `0xf4`;
+QEMU returns `(value << 1) | 1`. The debug-exit device alone does not
+enable test mode.
 
 The build is a Linux build. On Windows use **WSL2 with Ubuntu**; the
 repository can live on the Windows filesystem and be built from
@@ -40,6 +65,7 @@ Optional extras:
 | Package        | Needed for                                             |
 |----------------|--------------------------------------------------------|
 | `qemu-utils`   | `qemu-img`, used by `tools/mkvm.sh` to make a VMDK      |
+| `gdb`          | kernel debugging with `make debug` / `make gdb`          |
 | `zip`          | the compressed image produced by `tools/mkvm.sh`        |
 | VirtualBox     | `VBoxManage`, used by `tools/mkvm.sh` to make a VDI      |
 
@@ -82,12 +108,109 @@ Useful targets (`make help` prints the same list):
 | `make`             | build `build/os.img`                                  |
 | `make run`         | boot in QEMU, VGA window plus serial on stdio         |
 | `make run-headless`| boot in QEMU, serial only                             |
+| `make debug`       | headless QEMU, paused, GDB stub on port 1234           |
+| `make gdb`         | load kernel symbols and attach to the debug VM        |
 | `make test`        | full end-to-end suite in headless QEMU                |
-| `make smoke`       | boot-only quick check                                 |
+| `make smoke`       | boot, login, shell prompt and guest exit status        |
 | `make fsck`        | validate and list `build/fs.img`                      |
 | `make screenshot`  | capture the VGA console to a PNG                      |
 | `make vm-images`   | run `tools/mkvm.sh` (VDI / VMDK / zip)                |
 | `make clean`       | remove `build/`                                       |
+
+## Debugging on Linux/WSL
+
+Install `gdb` (`sudo apt install gdb`) in addition to the build prerequisites.
+No Windows MCP servers or GDB auto-load safe-path changes are required.
+From the repository root, use two terminals:
+
+```sh
+# Terminal 1: builds the image, starts headless QEMU paused at reset
+make debug
+# Terminal 2: loads build/kernel.elf and connects to localhost:1234
+make gdb
+```
+
+The equivalent Python runner commands are `python3 tools/build.py debug`
+and `python3 tools/build.py gdb`. The debug targets use the same disk,
+two CPUs and RTL8139 networking as `make run`, plus `-display none -s -S`.
+Both GDB targets use `-nx -x tools/.gdbinit` explicitly, so local/user
+initialization files are not needed. Start only one debug VM at a time;
+QEMU's `-s` opens TCP port 1234, so use it only on a trusted machine/network
+(do not expose the stub to untrusted clients).
+
+At the GDB prompt:
+
+```gdb
+hbreak kmain
+continue
+bt
+```
+
+Use a **hardware** breakpoint for the initial stop: the higher-half kernel
+address is not mapped at reset, so a software breakpoint may fail to insert.
+The kernel is built with `-g`; optimized locals may still be unavailable.
+The CPU remains paused until `continue`. After the breakpoint, `continue`
+boots normally. Ctrl-C in GDB interrupts execution; `detach` resumes the VM
+and `quit` exits GDB. Stop QEMU with Ctrl-C in its terminal after detaching.
+Do not rebuild the image/symbols while a debugging session is running.
+
+For a noninteractive breakpoint/backtrace check (with the debug VM running):
+
+```sh
+make gdb GDB_FLAGS="-batch -ex 'hbreak kmain' -ex continue -ex bt -ex detach"
+# Or, with python3 tools/build.py debug running instead:
+python3 tools/build.py gdb --gdb-flags="-batch -ex 'hbreak kmain' -ex continue -ex bt -ex detach"
+```
+
+`GDB` and `QEMU` override executable paths in both runners. `GDB_FLAGS`
+adds GDB arguments; `QEMU_FLAGS` adds debug QEMU arguments, e.g.
+`QEMU_FLAGS='-d int,cpu_reset -D build/int.log'`. Python also accepts
+`--gdb-flags` and `--qemu-flags`. A connection error usually means the
+debug VM has not started or another process occupies port 1234; a missing
+`build/kernel.elf` means you need to build/start the debug target first.
+
+## Profiling
+
+Build and profile a fresh headless TCG guest with one command:
+
+```sh
+make profile
+make profile PROFILE_FLAGS='--cmd "ls /bin" --window all --hz 200 --top 20 --json build/profile.json --out build/profile.txt'
+python3 tools/build.py profile --profile-flags "--window boot"
+```
+
+Both entry points build first; the Python runner also accepts the
+`PROFILE_FLAGS` environment variable. To use an existing build directly,
+run `python3 tools/profile.py`. The default command is `ls /bin`.
+`--window cmd` (default) samples only the command; `boot` samples from CPU
+start through the first logged-in shell prompt, and `all` samples both.
+Phase timings always cover QEMU launch, first serial byte, `KESTREL READY`,
+login prompt, shell prompt, and command start/end. Times are host monotonic
+wall time, not guest CPU time; the command-end delta is its end-to-end latency.
+Boot/login/command timeouts honor `KESTREL_E2E_TIMEOUT_SCALE` (default 1).
+QEMU always exits afterward and guest disk writes use a temporary snapshot.
+
+Each QMP round reads all CPUs' RIP, CS privilege level, and halted state.
+Halted CPUs count as idle; remaining samples count as kernel (CPL 0) or user.
+Percentages, including function percentages, use **all CPU samples** as the
+denominator. A short command may yield few or no user samples; increase the
+workload or frequency before drawing conclusions. `--hz` is the requested
+round frequency, not a guaranteed rate. QMP register sampling perturbs TCG
+and can materially slow it down; this is a statistical hotspot guide, not
+a cycle-accurate benchmark. Idle samples include waiting secondary CPUs.
+
+Kernel symbols come from `build/kernel.elf`, and the command's first word
+selects `build/apps/<binary>` when present (these ELFs retain their symbol
+tables, as do the `--strip-debug` rootfs copies). Add repeatable
+`--user-elf PATH` options for other binaries. `nm` (or `$NM`) must be on PATH.
+Only addresses inside text-symbol ranges are attributed. Unknown user
+addresses appear as `[user 0x...]`. This sampler does not track processes or
+load bias: shell/login/other processes can share virtual addresses with the
+command, and multiple matching ELF symbols are shown separated by `|`.
+Treat user attribution as candidate symbols, especially in the boot window,
+for shell builtins, pipelines, or dynamically loaded code.
+`--top` limits each function table; `--json` and `--out` save the same report
+data and text respectively.
 
 ## Running in QEMU
 
@@ -211,9 +334,36 @@ Bochs has no RTL8139 either, so networking is unavailable there too.
 
 ## Running the tests
 
+On slow TCG/CI runners, set `KESTREL_E2E_TIMEOUT_SCALE` to a finite positive
+multiplier (default `1`). It scales every guest serial wait, including
+explicit per-test overrides, boot/login, network/package tests, QEMU serial
+connection setup, monitor connections and guest exit waits. For example:
+
+```sh
+KESTREL_E2E_TIMEOUT_SCALE=10 python3 tools/e2e.py --only ls-bin
+KESTREL_E2E_TIMEOUT_SCALE=10 make smoke
+KESTREL_E2E_TIMEOUT_SCALE=10 python3 tools/build.py smoke
+```
+
+Both build entry points inherit the same environment variable; no extra
+flags are needed. The 20-second default guest wait becomes 200 seconds at
+scale 10. Serial waits use that timeout as an **idle limit**, reset whenever
+raw serial bytes arrive (including partial lines and ANSI escapes). Thus
+slow commands that keep producing output can complete without configuring
+the environment variable. Each serial assertion also has a hard cap of
+**10 times its scaled idle limit**, measured from the start of that wait,
+so endless output cannot keep a broken test alive indefinitely. A silent
+guest still times out after the idle limit. Guest failure/EOF is reported
+immediately. Connection and guest-exit waits retain absolute deadlines.
+Host fixture HTTP/TLS behavior (including `/compat`) and forced process
+cleanup deadlines are deliberately unchanged. Invalid scales are rejected
+before starting QEMU. Choose a scale appropriate to the runner; no automatic
+boot calibration is used because boot speed need not predict directory or
+network test speed.
+
 ```sh
 make test           # equivalent to: python3 tools/e2e.py
-make smoke          # boot + shell prompt only
+make smoke          # boot + login + shell prompt + guest exit status
 python3 tools/e2e.py --list      # list test names
 python3 tools/e2e.py --selftest  # check the harness itself, no image needed
 ```

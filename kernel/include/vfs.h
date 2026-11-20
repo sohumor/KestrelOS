@@ -17,26 +17,23 @@
  * applies it belongs to each filesystem, which is the only thing that
  * can traverse its own directories in one pass. */
 
-/* What a struct file refers to. FILE_KFS is 0 so a zeroed (kzalloc'd)
- * struct file is a regular file by default. The tag survives for the
- * benefit of pipe.c, which checks it; dispatch no longer uses it. */
-#define FILE_KFS  0
-#define FILE_PIPE 1
-
-struct pipe;                    /* defined by pipe.c */
 struct fs_ops;                  /* defined by mount.h */
 struct mount;                   /* defined by mount.h */
 
 struct file {
     const struct fs_ops *ops;   /* how to read/write/seek/close this */
     struct mount *mnt;          /* the mount it came from, NULL for pipes */
-    int type;                   /* FILE_KFS or FILE_PIPE */
     uint32_t inum;              /* filesystem's own handle id */
     uint32_t pos;               /* byte offset */
     int flags;                  /* open() flags */
     int refs;                   /* dup / spawn share a struct file */
-    struct pipe *pipe;          /* FILE_PIPE: the shared ring buffer */
-    int writable;               /* FILE_PIPE: 1 = write end, 0 = read end */
+};
+
+/* Optional open guard. Only passed to the owning filesystem type, which
+ * sets same_file and rejects the open before modifying that object. */
+struct open_guard {
+    const struct file *exclude;
+    int same_file;
 };
 
 /* Permission bits used with the vfs_* access helpers. */
@@ -46,9 +43,13 @@ struct file {
 
 int  vfs_init(void);   /* register the filesystems and mount / and /dev */
 struct file *vfs_open(const char *path, int flags);
+struct file *vfs_open_guarded(const char *path, int flags,
+                              struct open_guard *guard);
 struct file *vfs_file_dup(struct file *f);
 void vfs_close(struct file *f);
 long vfs_read(struct file *f, void *buf, unsigned long n);
+long vfs_read_ex(struct file *f, void *buf, unsigned long n, int blocking,
+                 int *read_once);
 long vfs_write(struct file *f, const void *buf, unsigned long n);
 long vfs_seek(struct file *f, long off, int whence);
 int  vfs_stat(const char *path, struct k_stat *st);

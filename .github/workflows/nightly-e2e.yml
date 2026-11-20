@@ -1,0 +1,54 @@
+name: Nightly full E2E
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            args: ''
+          - variant: e1000
+            args: '--nic e1000'
+          - variant: smp4
+            args: '--cpus 4'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential binutils nasm qemu-system-x86 python3 openssl
+      - name: Build
+        # Ubuntu's amd64v3 compiler default exceeds QEMU's baseline CPU.
+        run: make -j$(nproc) CC="gcc -march=x86-64" 2>&1 | tee build.log
+      - name: Full E2E (${{ matrix.variant }})
+        timeout-minutes: 25
+        # The harness explicitly selects TCG and prints a serial tail on failure.
+        run: timeout --kill-after=10s 24m python3 -u tools/e2e.py ${{ matrix.args }} 2>&1 | tee e2e.log
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-e2e-${{ matrix.variant }}-failure-logs
+          path: |
+            build.log
+            e2e.log
+          if-no-files-found: ignore
+          retention-days: 7

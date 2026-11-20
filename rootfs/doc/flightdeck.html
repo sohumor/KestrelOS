@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>KestrelOS Avionics Web Flight Deck</title>
+  <link rel="icon" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAzMiAzMiIgd2lkdGg9IjMyIiBoZWlnaHQ9IjMyIj48cmVjdCB4PSIyIiB5PSIyIiB3aWR0aD0iMjgiIGhlaWdodD0iMjgiIHJ4PSI2IiBmaWxsPSIjMGYyMzNmIiBzdHJva2U9IiM1OGE2ZmYiIHN0cm9rZS13aWR0aD0iMiIvPjxjaXJjbGUgY3g9IjE2IiBjeT0iMTYiIHI9IjgiIGZpbGw9IiMwYjE3MjkiIHN0cm9rZT0iIzM0ZDM5OSIgc3Ryb2tlLXdpZHRoPSIyIi8+PGNpcmNsZSBjeD0iMTYiIGN5PSIxNiIgcj0iMyIgZmlsbD0iI2Y1OWUwYiIvPjwvc3ZnPg==">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --pad: 16px;
+      --gap: calc(var(--pad) * 1);
+      --radius: calc(10px + 2px);
+      --bg: light-dark(#ecf2f8, #0a1220);
+      --surface: light-dark(#ffffff, #121d31);
+      --surface-alt: light-dark(#f4f8fc, #182640);
+      --ink: light-dark(#0f2136, #e6effa);
+      --muted: light-dark(#4c6078, #94a9c4);
+      --line: light-dark(#ccd9e8, #273957);
+      --accent: light-dark(#0f62c8, #58a6ff);
+      --accent-soft: light-dark(#dcebfa, #1b3356);
+      --ok: light-dark(#0f766e, #34d399);
+      --warn: light-dark(#b45309, #f59e0b);
+      --bad: light-dark(#b91c1c, #f87171);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0a1220;
+        --surface: #121d31;
+        --surface-alt: #182640;
+        --ink: #e6effa;
+        --muted: #94a9c4;
+        --line: #273957;
+        --accent: #58a6ff;
+        --accent-soft: #1b3356;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px var(--pad) 28px;
+      background-color: var(--bg);
+      color: var(--ink);
+      font-family: sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .shell {
+      max-width: 880px;
+      margin: 0 auto;
+    }
+
+    .hero {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--gap);
+      padding: 18px 20px;
+      margin-bottom: var(--gap);
+      border-radius: calc(var(--radius) + 2px);
+      background-color: #10243e;
+      background-image: linear-gradient(135deg, #0c1c32, #183d68);
+      color: #f4f8ff;
+      border: 1px solid #2c517e;
+      box-shadow: 0 8px 22px rgba(8, 18, 34, 0.26);
+    }
+
+    .hero-main {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex: 1 1 320px;
+    }
+
+    .hero h1 {
+      margin: 0 0 4px;
+      font-size: 21px;
+      color: #ffffff;
+    }
+
+    .hero p {
+      margin: 0;
+      font-size: 12px;
+      color: #cfe0f5;
+    }
+
+    .hero-nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .nav-pill {
+      display: inline-block;
+      padding: 6px 11px;
+      border-radius: 8px;
+      background-color: rgba(255, 255, 255, 0.14);
+      border: 1px solid rgba(147, 197, 253, 0.45);
+      color: #ffffff;
+      text-decoration: none;
+      font-size: 12px;
+      font-weight: bold;
+      transition: transform 0.15s ease, background-color 0.15s ease;
+    }
+
+    .nav-pill:hover {
+      background-color: #0f62c8;
+      transform: translateY(-2px);
+    }
+
+    .deck {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: var(--gap);
+    }
+
+    @media (min-width: 720px) {
+      .deck {
+        grid-template-columns: 1fr 1fr;
+      }
+      .span-2 {
+        grid-column: 1 / 3;
+      }
+    }
+
+    .card {
+      background-color: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: var(--pad);
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+      transition: transform 0.15s ease, border-color 0.15s ease;
+    }
+
+    .card:hover {
+      border-color: var(--accent);
+      outline: 1px solid var(--accent);
+      outline-offset: 2px;
+      transform: translateY(-2px);
+    }
+
+    .card h2 {
+      margin: 0 0 6px;
+      font-size: 16px;
+      color: var(--ink);
+    }
+
+    .sub {
+      margin: 0 0 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .radar-stage {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: var(--gap);
+    }
+
+    #radar {
+      display: block;
+      width: 320px;
+      max-width: 100%;
+      height: 180px;
+      border-radius: 10px;
+      border: 1px solid #2b4c76;
+      background-color: #091322;
+    }
+
+    .radar-side {
+      flex: 1 1 240px;
+      min-width: 210px;
+    }
+
+    .readout {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background-color: var(--surface-alt);
+      border: 1px solid var(--line);
+      font-family: monospace;
+      font-size: 12px;
+      margin-bottom: 10px;
+    }
+
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    button {
+      padding: 6px 11px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background-color: var(--accent-soft);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+
+    button:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+
+    input[type="text"] {
+      flex: 1 1 180px;
+      min-width: 140px;
+      padding: 6px 9px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background-color: var(--surface-alt);
+      color: var(--ink);
+      font-size: 12px;
+    }
+
+    .media-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      grid-template-rows: auto auto;
+      gap: 12px;
+    }
+
+    .badge-card {
+      padding: 10px;
+      border-radius: 8px;
+      background-color: var(--surface-alt);
+      border: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .badge-frame {
+      width: 100%;
+      aspect-ratio: 2 / 1;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background-color: #0b1729;
+      overflow: hidden;
+    }
+
+    .badge-contain {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    .badge-cover {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+
+    .ellipsis-tag {
+      max-width: 100%;
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-family: monospace;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    details {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background-color: var(--surface-alt);
+      margin-bottom: 10px;
+    }
+
+    details > summary {
+      cursor: pointer;
+      font-weight: bold;
+      color: var(--accent);
+    }
+
+    dialog[open] {
+      display: block;
+      width: 100%;
+      margin: 10px 0 0;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--accent);
+      background-color: var(--surface-alt);
+      color: var(--ink);
+      font-size: 12px;
+    }
+
+    .diag-banner {
+      padding: 9px 12px;
+      border-radius: 8px;
+      background-color: var(--surface-alt);
+      border-left: 4px solid var(--ok);
+      font-family: monospace;
+      font-size: 12px;
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+
+    .diag-banner.warn {
+      border-left-color: var(--warn);
+    }
+
+    .diag-banner.bad {
+      border-left-color: var(--bad);
+    }
+
+    .diag-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 6px;
+    }
+
+    @media (min-width: 720px) {
+      .diag-list {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    .diag-item {
+      padding: 7px 10px;
+      border-radius: 7px;
+      background-color: var(--surface-alt);
+      border: 1px solid var(--line);
+      font-family: monospace;
+      font-size: 11px;
+    }
+
+    .diag-pass {
+      border-left: 3px solid var(--ok);
+    }
+
+    .diag-fail {
+      border-left: 3px solid var(--bad);
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div class="hero-main">
+        <svg viewBox="0 0 64 64" width="52" height="52" aria-label="Kestrel Flight Deck Emblem">
+          <rect x="3" y="3" width="58" height="58" rx="12" fill="#0f233f" stroke="#58a6ff" stroke-width="2"></rect>
+          <circle cx="32" cy="32" r="18" fill="#091322" stroke="#34d399" stroke-width="2"></circle>
+          <path d="M16 32 L48 32 M32 16 L32 48" stroke="#1e4976" stroke-width="1.5"></path>
+          <path d="M32 32 L44 20" stroke="#f59e0b" stroke-width="3"></path>
+          <circle cx="32" cy="32" r="3" fill="#e0f2fe"></circle>
+        </svg>
+        <div>
+          <h1>KestrelOS Avionics Web Flight Deck</h1>
+          <p>Zero-network local SPA &amp; self-test: Canvas gradients/ImageData, Web Crypto SHA-256, ES2023, URL, &amp; CSS Grid.</p>
+        </div>
+      </div>
+      <nav class="hero-nav">
+        <a class="nav-pill" href="/doc/home.html">Home</a>
+        <a class="nav-pill" href="/doc/playground.html">Playground</a>
+      </nav>
+    </header>
+
+    <main class="deck">
+      <section class="card span-2">
+        <h2>Avionics Radar: CanvasGradient &amp; Pixel Buffer Synthesis</h2>
+        <p class="sub">Uses createLinearGradient, createRadialGradient, createImageData, Uint8ClampedArray, putImageData, and getImageData.</p>
+        <div class="radar-stage">
+          <canvas id="radar" width="320" height="180"></canvas>
+          <div class="radar-side">
+            <div class="readout" id="radar-readout">Initializing gradient &amp; pixel buffer...</div>
+            <div class="btn-row">
+              <button type="button" id="btn-sweep">Sweep +30</button>
+              <button type="button" id="btn-pixels">Synth Pixels</button>
+              <button type="button" id="btn-grad">Radial/Linear</button>
+            </div>
+            <div class="ellipsis-tag">Telemetry channel: KESTREL-AVIONICS-RADAR-BUFFER-VERIFIED-64X24-RGBA-STREAM</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Media Cards: aspect-ratio &amp; object-fit</h2>
+        <p class="sub">Offline SVG and PNG data: URI badges in 2:1 aspect-ratio Grid cells.</p>
+        <div class="media-grid">
+          <div class="badge-card">
+            <div class="badge-frame">
+              <img class="badge-contain" alt="SVG badge" src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCAzMiIgd2lkdGg9IjY0IiBoZWlnaHQ9IjMyIj48cmVjdCB4PSIxIiB5PSIxIiB3aWR0aD0iNjIiIGhlaWdodD0iMzAiIHJ4PSI2IiBmaWxsPSIjMGYyMzNmIiBzdHJva2U9IiM1OGE2ZmYiIHN0cm9rZS13aWR0aD0iMiIvPjxjaXJjbGUgY3g9IjE4IiBjeT0iMTYiIHI9IjgiIGZpbGw9IiMwYjE3MjkiIHN0cm9rZT0iIzM0ZDM5OSIgc3Ryb2tlLXdpZHRoPSIyIi8+PHBhdGggZD0iTTMwIDIyIEw0MiAxMCBMNTQgMjIiIGZpbGw9Im5vbmUiIHN0cm9rZT0iI2Y1OWUwYiIgc3Ryb2tlLXdpZHRoPSIzIi8+PC9zdmc+">
+            </div>
+            <div class="ellipsis-tag">SVG data:URI (object-fit: contain)</div>
+          </div>
+          <div class="badge-card">
+            <div class="badge-frame">
+              <img class="badge-cover" alt="PNG badge" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAQCAYAAAAMJL+VAAADFklEQVR4nLXUIQu06BrG8bdvOjg4KIrCMuKD8sjgBovFYjGMMIig4QkKgxgmbDQYDAbDhAkuDMum/UL7WU7+Hw4MrF/gDdddf1xXuH/Uf8PPzI//n/+IAk3cOIk7uqg5ixZDKEzRYYkHthhxxBNX/M5///yFX8XERcx4YsEXK0JsBOJFKN5IsROJD1fx1wGQBZq8cZJ3dFlzli2GVJiyw5IPbDniyCeu/AJy4iJnPLngyxUhNwL5IpRvpNyJ5IerPAJxgRbfOMV39LjmHLcYscKMO6z4gR2POPETN/4C8cQlnvHiBT9eEfFGEL8I4zcy3oniD9f4CCQFWnLjlNzRk5pz0mIkCjPpsJIHdjLiJE/c5AskE5dkxksW/GRFJBtB8iJM3shkJ0o+XJMjkBZo6Y1TekdPa85pi5EqzLTDSh/Y6YiTPnHTL5BOXNIZL13w0xWRbgTpizB9I9OdKP1wTY9AVqBlN07ZHT2rOWctRqYwsw4re2BnI072xM2+QDZxyWa8bMHPVkS2EWQvwuyNzHai7MM1OwJ5gZbfOOV39LzmnLcYucLMO6z8gZ2POPkTN/8C+cQln/HyBT9fEflGkL8I8zcy34nyD9f8APz2zx8/Jf82KAu08sapvKOXNeeyxSgVZtlhlQ/scsQpn7jlt0E5cSlnvHLBL1dEuRGUL8LyjSx3ovLDtTxOVBVo1Y1TdUevas5Vi1EpzKrDqh7Y1YhTPXGrL1BNXKoZr1rwqxVRbQTVi7B6I6udqPpwrY5AU6A1N07NHb2pOTctRqMwmw6reWA3I07zxG2+QDNxaWa8ZsFvVkSzETQvwuaNbHai5sO1OQKqQFM3TuqOrmrOqsVQClN1WOqBrUYc9cRVX0BNXNSMpxZ8tSLURqBehOqNVDuR+nBVR6Av0Pobp/6O3tec+xajV5h9h9U/sPsRp3/i9l+gn7j0M16/4Pcrot8I+hdh/0b2O1H/4dofgaFAG26chjv6UHMeWoxBYQ4d1vDAHkac4Yk7fIFh4jLMeMOCP6yIYSMYXoTDGznsRMOH63AAfua7/h+rNT2dugukMAAAAABJRU5ErkJggg==">
+            </div>
+            <div class="ellipsis-tag">PNG data:URI (object-fit: cover)</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Interactive Disclosure &amp; Dialog</h2>
+        <p class="sub">Native HTML &lt;details&gt;/&lt;summary&gt; toggle and styled &lt;dialog open&gt; panel.</p>
+        <details open>
+          <summary>Flight Systems Overview (open by default)</summary>
+          <p class="sub" style="margin-top: 6px; margin-bottom: 0;">Click any summary bar in GUI mode to toggle its open attribute and reflow the page.</p>
+        </details>
+        <details>
+          <summary>Hidden Diagnostics Notes (click to expand)</summary>
+          <p class="sub" style="margin-top: 6px; margin-bottom: 0;">DET-COLLAPSED: revealed only when details[open] is active.</p>
+        </details>
+        <div class="btn-row" style="margin-bottom: 0;">
+          <button type="button" id="btn-dialog">Toggle Dialog Panel</button>
+        </div>
+        <dialog id="flight-dialog" open>
+          Avionics Notice: Local Flight Deck offline sandbox active. Press Ctrl-U in GUI mode for view-source.
+        </dialog>
+      </section>
+
+      <section class="card span-2">
+        <h2>Live Web &amp; ES2022/2023 Diagnostics</h2>
+        <p class="sub">Runs TypedArrays, DataView, URL, structuredClone, ES2023 Arrays, Web Crypto, AbortController, Blob, FormData, and History on load.</p>
+        <div class="diag-banner warn" id="diag-summary">Running self-diagnostics...</div>
+        <div class="btn-row">
+          <input type="text" id="sha-input" value="KestrelOS" aria-label="Text to SHA-256 hash">
+          <button type="button" id="btn-sha">Compute SHA-256</button>
+          <button type="button" id="btn-rerun">Re-run Suite</button>
+        </div>
+        <div class="readout" id="sha-readout">SHA-256("KestrelOS") pending...</div>
+        <ul class="diag-list" id="diag-list"></ul>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const toHex = (buf) => {
+      const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+      let out = "";
+      for (let i = 0; i < bytes.length; i++) {
+        out += bytes[i].toString(16).padStart(2, "0");
+      }
+      return out;
+    };
+
+    class RadarScope {
+      constructor(canvasId, readoutId) {
+        this.canvas = document.getElementById(canvasId);
+        this.readout = document.getElementById(readoutId);
+        this.angleDeg = 42;
+        this.phase = 0;
+        this.radialMode = true;
+        this.lastPixel = [0, 0, 0, 0];
+      }
+
+      render() {
+        if (!this.canvas || !this.canvas.getContext) return false;
+        const ctx = this.canvas.getContext("2d");
+        const w = 320;
+        const h = 180;
+        const cx = 160;
+        const cy = 84;
+
+        const bgGrad = ctx.createLinearGradient(0, 0, w, h);
+        bgGrad.addColorStop(0, "#081222");
+        bgGrad.addColorStop(1, "#122a4a");
+        ctx.fillStyle = bgGrad;
+        ctx.fillRect(0, 0, w, h);
+
+        if (this.radialMode) {
+          const glow = ctx.createRadialGradient(cx, cy, 4, cx, cy, 74);
+          glow.addColorStop(0, "rgba(52, 211, 153, 0.38)");
+          glow.addColorStop(0.6, "rgba(88, 166, 255, 0.16)");
+          glow.addColorStop(1, "rgba(9, 19, 34, 0)");
+          ctx.fillStyle = glow;
+          ctx.beginPath();
+          ctx.arc(cx, cy, 74, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.strokeStyle = "#22466e";
+        ctx.lineWidth = 1;
+        for (const r of [24, 48, 72]) {
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.moveTo(cx - 78, cy);
+        ctx.lineTo(cx + 78, cy);
+        ctx.moveTo(cx, cy - 76);
+        ctx.lineTo(cx, cy + 76);
+        ctx.stroke();
+
+        const rad = (this.angleDeg * Math.PI) / 180;
+        ctx.strokeStyle = "#34d399";
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + Math.cos(rad) * 70, cy + Math.sin(rad) * 70);
+        ctx.stroke();
+
+        // Direct pixel buffer synthesis via createImageData + Uint8ClampedArray + putImageData
+        const pw = 64;
+        const ph = 20;
+        const img = ctx.createImageData(pw, ph);
+        const px = img.data;
+        for (let y = 0; y < ph; y++) {
+          for (let x = 0; x < pw; x++) {
+            const off = (y * pw + x) * 4;
+            px[off] = (x * 4 + this.phase * 17) & 255;
+            px[off + 1] = 120 + y * 6;
+            px[off + 2] = 220 - x * 2;
+            px[off + 3] = 255;
+          }
+        }
+        ctx.putImageData(img, 14, 148);
+        const sample = ctx.getImageData(14, 148, 1, 1);
+        this.lastPixel = [sample.data[0], sample.data[1], sample.data[2], sample.data[3]];
+
+        ctx.fillStyle = "#e2f1ff";
+        ctx.font = "11px monospace";
+        ctx.fillText(`BRG ${String(this.angleDeg).padStart(3, "0")} DEG`, 12, 18);
+        ctx.fillText(this.radialMode ? "GRAD: RADIAL" : "GRAD: LINEAR", 224, 18);
+        ctx.fillStyle = "#93c5fd";
+        ctx.fillText("IMAGEDATA 64x20", 88, 162);
+
+        if (this.readout) {
+          this.readout.textContent =
+            `Sweep ${this.angleDeg} deg | ${this.radialMode ? "Radial" : "Linear"}Grad | Pixel[14,148]=rgba(${this.lastPixel.join(",")})`;
+        }
+        return this.lastPixel[1] === 120 && this.lastPixel[2] === 220 && this.lastPixel[3] === 255;
+      }
+    }
+
+    const scope = new RadarScope("radar", "radar-readout");
+    scope.render();
+
+    const updateShaInput = async (text) => {
+      const outEl = document.getElementById("sha-readout");
+      try {
+        const bytes = new TextEncoder().encode(text);
+        const dig = await crypto.subtle.digest("SHA-256", bytes);
+        if (outEl) {
+          outEl.textContent = `SHA-256("${text}") = ${toHex(dig)}`;
+        }
+      } catch (e) {
+        if (outEl) {
+          outEl.textContent = `SHA-256 error: ${e && e.message ? e.message : e}`;
+        }
+      }
+    };
+
+    const runDiagnostics = async () => {
+      const results = [];
+      const record = (name, ok, detail) => {
+        results.push({ name, ok: !!ok, detail: String(detail) });
+      };
+
+      try {
+        const i16 = new Int16Array([-320, 1024]);
+        const u32 = new Uint32Array([0x11223344]);
+        const f32 = new Float32Array([3.5]);
+        const clamped = new Uint8ClampedArray([-5, 300]);
+        const dv = new DataView(new ArrayBuffer(8));
+        dv.setUint16(0, 0x1234, false);
+        dv.setUint16(2, 0x1234, true);
+        dv.setFloat32(4, 2.25, false);
+        const ok = i16[0] === -320 && u32[0] === 0x11223344 &&
+          f32[0] === 3.5 && clamped[0] === 0 && clamped[1] === 255 &&
+          dv.getUint16(0, false) === 0x1234 && dv.getUint8(0) === 0x12 &&
+          dv.getUint8(2) === 0x34 && dv.getUint16(2, true) === 0x1234 &&
+          dv.getFloat32(4, false) === 2.25;
+        record("TypedArrays+DataView", ok, "Int16/Uint32/Float32/Clamped/BE+LE");
+      } catch (e) {
+        record("TypedArrays+DataView", false, e.message || e);
+      }
+
+      try {
+        const vs = new URL("view-source:/doc/home.html");
+        const q = new URL("https://kestrel.os/deck?mode=v2&n=7#ok");
+        const ok = vs.protocol === "view-source:" && vs.pathname === "/doc/home.html" &&
+          URL.canParse("https://kestrel.os/flight") && !URL.canParse("://bad") &&
+          q.searchParams.get("mode") === "v2" && q.hash === "#ok";
+        record("WHATWG URL", ok, `${vs.protocol}${vs.pathname} canParse=ok`);
+      } catch (e) {
+        record("WHATWG URL", false, e.message || e);
+      }
+
+      try {
+        const orig = { tag: "kestrel", nested: [1, 2] };
+        orig.self = orig;
+        const copy = structuredClone(orig);
+        const ok = copy !== orig && copy.self === copy &&
+          copy.tag === "kestrel" && copy.nested[1] === 2 &&
+          copy.nested !== orig.nested;
+        record("structuredClone", ok, "cyclic graph identity preserved");
+      } catch (e) {
+        record("structuredClone", false, e.message || e);
+      }
+
+      try {
+        const src = [10, 4, 25, 8];
+        const rev = src.toReversed();
+        const srt = src.toSorted((a, b) => a - b);
+        const wth = src.with(1, 99);
+        const last = src.findLast((x) => x > 9);
+        const ok = src.at(-1) === 8 && src[0] === 10 &&
+          rev[0] === 8 && rev[3] === 10 &&
+          srt[0] === 4 && srt[3] === 25 &&
+          wth[1] === 99 && src[1] === 4 && last === 25;
+        record("ES2023 Array", ok, `at(-1)=${src.at(-1)} findLast=${last}`);
+      } catch (e) {
+        record("ES2023 Array", false, e.message || e);
+      }
+
+      try {
+        const id = crypto.randomUUID();
+        const rnd = new Uint32Array(2);
+        crypto.getRandomValues(rnd);
+        const ok = typeof id === "string" && id.length === 36 &&
+          id.charAt(14) === "4" && id.charAt(8) === "-" && rnd.length === 2;
+        record("WebCrypto UUID+RNG", ok, id);
+      } catch (e) {
+        record("WebCrypto UUID+RNG", false, e.message || e);
+      }
+
+      try {
+        const abc = new TextEncoder().encode("abc");
+        const dig = await crypto.subtle.digest("SHA-256", abc);
+        const hex = toHex(dig);
+        const expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        record("WebCrypto SHA-256", hex === expected, hex.slice(0, 24) + "...");
+      } catch (e) {
+        record("WebCrypto SHA-256", false, e.message || e);
+      }
+
+      try {
+        const ac = new AbortController();
+        let fired = false;
+        ac.signal.addEventListener("abort", () => { fired = true; });
+        ac.abort("flight-halt");
+        const sig2 = AbortSignal.abort("pre-aborted");
+        const ok = ac.signal.aborted === true && ac.signal.reason === "flight-halt" &&
+          fired && sig2.aborted === true && sig2.reason === "pre-aborted";
+        record("AbortController", ok, `reason=${ac.signal.reason}`);
+      } catch (e) {
+        record("AbortController", false, e.message || e);
+      }
+
+      try {
+        const b = new Blob(["Kestrel", new Uint8Array([79, 83])], { type: "TEXT/PLAIN" });
+        const txt = await b.slice(0, 7).text();
+        const ab = await b.arrayBuffer();
+        const u8 = new Uint8Array(ab);
+        const ok = b.size === 9 && b.type === "text/plain" &&
+          txt === "Kestrel" && u8.length === 9 && u8[7] === 79 && u8[8] === 83;
+        record("Blob", ok, `size=${b.size} slice=${txt}`);
+      } catch (e) {
+        record("Blob", false, e.message || e);
+      }
+
+      try {
+        const fd = new FormData();
+        fd.append("node", "n1");
+        fd.append("node", "n2");
+        fd.set("mode", "flight");
+        fd.append("tmp", "drop");
+        fd.delete("tmp");
+        const ok = fd.get("node") === "n1" && fd.getAll("node").length === 2 &&
+          fd.get("mode") === "flight" && !fd.has("tmp");
+        record("FormData", ok, `nodes=${fd.getAll("node").join(",")}`);
+      } catch (e) {
+        record("FormData", false, e.message || e);
+      }
+
+      try {
+        history.pushState({ step: 1, deck: "flight" }, "", "#step1");
+        history.replaceState({ step: 2, deck: "v2" }, "", "#ready");
+        const ok = history.state && history.state.step === 2 &&
+          history.state.deck === "v2" && location.hash === "#ready";
+        record("History API", ok, `hash=${location.hash} len=${history.length}`);
+      } catch (e) {
+        record("History API", false, e.message || e);
+      }
+
+      try {
+        const ok = scope.render();
+        record("Canvas Grad+ImageData", ok, `px=${scope.lastPixel.join(",")}`);
+      } catch (e) {
+        record("Canvas Grad+ImageData", false, e.message || e);
+      }
+
+      const list = document.getElementById("diag-list");
+      const summary = document.getElementById("diag-summary");
+      let passed = 0;
+      if (list) {
+        while (list.firstChild) list.removeChild(list.firstChild);
+        for (const item of results) {
+          if (item.ok) passed++;
+          const li = document.createElement("li");
+          li.className = item.ok ? "diag-item diag-pass" : "diag-item diag-fail";
+          li.textContent = `[${item.ok ? "PASS" : "FAIL"}] ${item.name}: ${item.detail}`;
+          list.appendChild(li);
+        }
+      }
+      if (summary) {
+        const allOk = passed === results.length;
+        summary.className = allOk ? "diag-banner" : "diag-banner bad";
+        summary.textContent = allOk
+          ? `FLIGHTDECK-DIAG-PASS: ${passed}/${results.length} checks passed`
+          : `FLIGHTDECK-DIAG-FAIL: ${passed}/${results.length} checks passed`;
+      }
+    };
+
+    const bind = (id, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener("click", fn);
+    };
+
+    bind("btn-sweep", () => {
+      scope.angleDeg = (scope.angleDeg + 30) % 360;
+      scope.render();
+    });
+    bind("btn-pixels", () => {
+      scope.phase = (scope.phase + 1) % 16;
+      scope.render();
+    });
+    bind("btn-grad", () => {
+      scope.radialMode = !scope.radialMode;
+      scope.render();
+    });
+    bind("btn-dialog", () => {
+      const dlg = document.getElementById("flight-dialog");
+      if (!dlg) return;
+      if (dlg.hasAttribute("open")) dlg.removeAttribute("open");
+      else dlg.setAttribute("open", "");
+    });
+    bind("btn-sha", () => {
+      const inp = document.getElementById("sha-input");
+      updateShaInput(inp ? String(inp.value || "") : "");
+    });
+    bind("btn-rerun", () => {
+      runDiagnostics();
+    });
+
+    updateShaInput("KestrelOS");
+    runDiagnostics();
+  </script>
+</body>
+</html>

@@ -154,14 +154,14 @@ Built by `tools/mkimage.py` from the stage binaries, `kernel.bin` and
 | Entry / CPU | `entry.asm`, `ap_trampoline.asm`, `smp.c`, `cpu.asm`, `isr.asm`, `switch.asm`, `usermode.asm` | long-mode/AP entry, ACPI/xAPIC SMP, per-CPU GS, port/CR helpers, ISR stubs, context switch, `iretq` into ring 3 |
 | Descriptors | `gdt.c`, `idt.c` | per-CPU GDT/TSS with current kernel stack, 256 IDT gates, vector `0x80` at DPL 3 |
 | Interrupts / Clocks | `pic.c`, `timer.c`, `rtc.c`, `smp.c` | 8259 remap to `0x20`–`0x2F`, PIT at 100 Hz on BSP, CMOS RTC, LAPIC EOI and reschedule IPIs |
-| Console / Log / Mon | `console.c`, `fb.c`, `font.c`, `serial.c`, `output.c`, `kprintf.c`, `klog.c`, `kmon.c`, `power.c` | framebuffer & VGA text consoles, 8×16 font, COM1 I/O, `kprintf`/`panic`, kernel log ring, rescue console, ACPI/reboot |
+| Console / Log / Mon | `console.c`, `fb.c`, `font.c`, `serial.c`, `output.c`, `kprintf.c`, `klog.c`, `kmon.c`, `flight.c`, `power.c` | framebuffer & VGA text consoles, 8×16 font, COM1 I/O, `kprintf`/`panic`, kernel log ring, Avionics Flight Recorder (`/dev/flight`), rescue console, ACPI/reboot |
 | Input | `keyboard.c`, `mouse.c`, `input.c` | PS/2 keyboard + mouse and COM1 keys into shared event/input queues (`KEY_*`) |
 | FPU / Memory | `fpu.c`, `pmm.c`, `vmm.c`, `vm.c`, `kheap.c` | x87/SSE FXSAVE; E820 page bitmap; 4-level paging; lazy ELF/heap/stack faults + dynamic swap; kernel heap |
-| Processes / IPC | `proc.c`, `signal.c`, `pipe.c`, `pulse.c`, `parcel.c`, `switch.asm` | SMP-safe circular run queue, per-CPU current/slices, sleep/wake, signals, pipes, 128-slot Kernel Pulses ring, Talon typed parcels |
+| Processes / IPC | `proc.c`, `signal.c`, `pipe.c`, `pulse.c`, `parcel.c`, `switch.asm` | SMP-safe circular run queue, per-CPU current/slices, `proc_mark_current_idle()`, sleep/wake, signals, pipes, 128-slot Kernel Pulses ring, Talon typed parcels, Aerie `/dev/{procs,caps,parcels}` `@krec` views |
 | Userspace / Modules | `uproc.c`, `elf.c`, `usermode.asm`, `syscall.c`, `module.c`, `ksyms.c` | static/`ET_DYN` ELF64 loading, capability masks & path prefix unveiling (`SYS_SPAWN_CAPS`, `SYS_SANDBOX`), ring-3 dispatch (`0..77`), `.ko` modules |
 | Compositor | `wm.c` | kernel window objects (`USER_WIN_BASE`..), 4 workspaces, pinning, live `SYS_WIN_RESIZE` remapping, `SYS_WM_THEME` broadcast |
-| Devices / Storage | `initcall.c`, `device.c`, `bus_pci.c`, `bus_platform.c`, `pci.c`, `ata.c`, `blockdev.c`, `kfs.c`, `vfs.c`, `mount.c`, `devfs.c` | unified initcall/bus/device model, ATA PIO + block devices, KFS v3 (33-block data+metadata redo journal, atomic rename), VFS mounts + `/dev` |
-| Network | `rtl8139.c`, `e1000.c`, `net.c`, `net_checksum.c`, `dhcp.c`, `udp.c`, `dns.c`, `tcp.c`, `tcp_reassembly.c` | two PCI NICs, Ethernet/ARP/IPv4/ICMP/UDP/DNS/DHCP, full TCP with out-of-order reassembly, retransmission and SACK |
+| Devices / Storage | `initcall.c`, `device.c`, `bus_pci.c`, `bus_platform.c`, `pci.c`, `ata.c`, `blockdev.c`, `kfs.c`, `vfs.c`, `mount.c`, `devfs.c` | unified initcall/bus/device model, ATA PIO + block devices, KFS v3 (33-block data+metadata redo journal, FIFO ticket `fs_lock`, atomic rename), VFS mounts + `/dev` devices and `@krec` tables |
+| Network | `rtl8139.c`, `e1000.c`, `net.c`, `net_checksum.c`, `dhcp.c`, `udp.c`, `dns.c`, `tcp.c`, `tcp_reassembly.c` | two PCI NICs, Ethernet/ARP/IPv4/ICMP/UDP/DNS (with Wave 9 TTL cache)/DHCP, full TCP with out-of-order reassembly, retransmission and SACK, `/dev/sockets` + Wave 9 `/dev/{net,arp,dns}` telemetry |
 | Random / Tests | `random.c`, `random_core.c`, `sched_test.c`, `string.c` | hardware/timing entropy, SHA-256 mixing pool, ChaCha20 CSPRNG, scheduler self-test, freestanding string/memory helpers |
 
 Headers live in `kernel/include/`, one per subsystem, plus `kernel.h`
@@ -247,7 +247,9 @@ The BSP PIT tick broadcasts a LAPIC reschedule IPI; every CPU tracks its own
 five-tick slice (`SCHED_QUANTUM = 5`) and selects a runnable task that is not
 already running elsewhere. The context-switch assembly drops `sched_lock` only
 after switching to the incoming kernel stack. Address-space and FPU state
-follow the task; idle tasks are pinned per CPU and ordinary tasks may migrate.
+follow the task; idle tasks are pinned per CPU (`proc_mark_current_idle()`
+marks the BSP boot task idle in `kmain()` after spawning `housekeep` and
+`launcher`) and ordinary tasks may migrate.
 
 ## Process lifecycle
 
@@ -315,7 +317,7 @@ re-enables interrupts immediately because syscalls may block.
 | 0 | `SYS_EXIT` | `code` | does not return |
 | 1 | `SYS_WRITE` | `fd, buf, len` | bytes written; fd 1/2 = console |
 | 2 | `SYS_READ` | `fd, buf, len` | bytes read; fd 0 = console, blocks |
-| 3 | `SYS_OPEN` | `path, flags` | fd |
+| 3 | `SYS_OPEN` | `path, flags, exclude_fd` (third arg used only with `O_DISTINCT`) | fd / -1 / `K_OPEN_SAME_FILE` |
 | 4 | `SYS_CLOSE` | `fd` | 0 / -1 |
 | 5 | `SYS_SPAWN` | `path, argv` | pid |
 | 6 | `SYS_WAITPID` | `pid` | exit code, blocks |
@@ -387,13 +389,33 @@ Full details, struct layouts and error semantics: [ABI.md](ABI.md).
 KFS v3 is a fixed-layout inode filesystem with 4096-byte blocks: block 0 is
 the superblock (`KFS_MAGIC = 0x3353464B`), then the block bitmap, a checksummed
 33-block redo journal (up to 32 transaction blocks plus commit record covering
-both file data and metadata), inode table, and data blocks. Committed
-transactions replay cleanly on mount, and `SYS_RENAME` atomically updates source
-and target directory entries within one journaled transaction.
+both file data and metadata), inode table, and data blocks. Public `kfs_*` entry
+points serialize through a recursive FIFO ticket mutex (`fs_lock` in
+`kernel/kfs.c`) so 4-CPU contention makes forward progress without starvation.
+Committed transactions replay cleanly on mount, and `SYS_RENAME` atomically
+updates source and target directory entries within one journaled transaction.
 Host-side tools `tools/mkfs.py` (build a KFS v3 image from a directory tree)
 and `tools/kfsck.py` (validate, replay, and list) implement the exact format.
 
 Full on-disk format: [kfs.md](kfs.md).
+
+### Kernel `@krec` introspection devices (`/dev/*`)
+
+`kernel/devfs.c` renders consistent read-only (`0444`) `@krec` snapshots at
+`open()` time (supporting `read()` and `seek()`):
+
+| Device | Kernel source | `@krec` schema / role |
+|---|---|---|
+| `/dev/flight` (`DEV_FLIGHT = 11`) | `flight_render_krec()` (`kernel/flight.c`) | `@krec tick:u64 cpu:int pid:int cat:str event:str arg0:hex detail:str` (256-entry BSS ring across `proc`, `fs`, `vm`, `pulse`, `talon`, `net`; read by `/bin/flight` and `sysmon` Flight Deck) |
+| `/dev/procs` (`DEV_PROCS = 12`) | `proc_snapshot_krec()` (`kernel/proc.c`) | `@krec pid:int ppid:int uid:int cpu:int state:str name:str caps:hex` |
+| `/dev/sockets` (`DEV_SOCKETS = 13`) | `tcp_snapshot_krec()` (`kernel/tcp.c`) | `@krec slot:int pid:int state:str local_port:int peer_ip:str peer_port:int rx_bytes:int tx_bytes:int` |
+| `/dev/caps` (`DEV_CAPS = 14`) | `proc_caps_snapshot_krec()` (`kernel/proc.c`) | `@krec pid:int uid:int cap_mask:hex caps:str unveil:str` |
+| `/dev/parcels` (`DEV_PARCELS = 15`) | `parcel_snapshot_krec()` (`kernel/parcel.c`) | `@krec id:int uid:int pid:int type:str size:int mime:str label:str` |
+| `/dev/net`, `/dev/arp`, `/dev/dns` | Wave 9 network stack | Live RX/TX/protocol counters, ARP cache entries, and DNS TTL cache `@krec` telemetry consumed by `/bin/netstat` |
+
+Snapshotting collects compact records under the subsystem spinlock into a
+preallocated buffer (or bounded lock-free pass) and formats `@krec` text after
+dropping the lock so kernel locks never sleep or allocate while held.
 
 ## Network stack
 
@@ -420,9 +442,11 @@ Layers: PCI enumeration (`pci.c` / `bus_pci.c`) binds either RTL8139
 build/parse and ICMP echo in both directions; `dhcp.c` acquires IPv4/gateway/DNS
 leases over DHCP with static QEMU user-mode fallback (`10.0.2.15/24`, gateway
 `10.0.2.2`, DNS `10.0.2.3`); `udp.c` provides send plus 16 port bindings with
-short queues; `dns.c` resolves A records (compression-pointer aware); `tcp.c`
-and `tcp_reassembly.c` implement stateful TCP with out-of-order segment
-reassembly, exponential backoff retransmission, and SACK.
+short queues; `dns.c` resolves A records (compression-pointer aware, with a
+Wave 9 TTL cache); `tcp.c` and `tcp_reassembly.c` implement stateful TCP with
+out-of-order segment reassembly, exponential backoff retransmission, SACK, and
+`/dev/sockets` `@krec` snapshots alongside Wave 9 `/dev/net`, `/dev/arp`, and
+`/dev/dns` telemetry used by `/bin/netstat`.
 
 Full details, including the IRQ-context constraints: [net.md](net.md).
 
@@ -434,18 +458,18 @@ Full details, including the IRQ-context constraints: [net.md](net.md).
 |---|---|
 | `libc/` | `crt0.asm`, `syscall.asm`, `kestrel.c` (syscalls 0..77 + helpers), `stdio.c`, `stdlib.c` (`SYS_BRK` allocator), `string.c`, `krec.c` (`@krec` typed structured record parser/formatter) |
 | `libgui/` | Avionics 2.0 immediate-mode widget toolkit: rounded surfaces, gradients, shadows, sparklines, AA bitmap fonts, live `KEV_THEME`/`KEV_RESIZE` handling, Talon clipboard, and `gui_editor` (`editor.c`) |
-| `libweb/` | HTML5 parser, mutable DOM, CSS cascade/variables/`calc()`/`light-dark()`/`@media`/Grid/Flexbox, layout, multi-subpath SVG & paint, HTTP/1.1 Keep-Alive pool, Web Storage, Canvas 2D + rich Web APIs |
-| `libjs/` | ES6+ bytecode-free AST interpreter (`let`/`const` block scope + TDZ, `class`/`extends`/`super`, `async`/`await`, templates, destructuring, `Symbol`, `Map`/`Set`/`WeakMap`/`WeakSet`, `Uint8Array`, Web APIs) |
+| `libweb/` | HTML5 parser, mutable DOM, CSS cascade/variables/`calc()`/`light-dark()`/`@media`/Grid/Flexbox/`aspect-ratio`/`object-fit`/`outline`/2D `transform`/`text-overflow`, layout, multi-subpath SVG & paint, HTTP/1.1 Keep-Alive pool, Web Storage, Canvas 2D (`CanvasGradient`, `ImageData`) + rich Web APIs |
+| `libjs/` | ES6+ AST interpreter (`let`/`const` block scope + TDZ, `class`/`extends`/`super`, `async`/`await`, templates, destructuring, `Symbol`, `Map`/`Set`/`WeakMap`/`WeakSet`, all 9 TypedArrays + `DataView`, WHATWG `URL`, `structuredClone`, ES2022/2023 helpers, standalone `crypto.c` SHA-1/256/384/512 + `randomUUID`/`getRandomValues`, `AbortController`, `Blob`/`FormData`) |
 | `libtls/` | TLS 1.3 client, X.509 certificate validator (up to 128 SANs), SHA-2, ChaCha20/Poly1305, AES-GCM |
-| `libimg/` & `libz/` | PNG, GIF, BMP, baseline + progressive (`SOF2`) JPEG decoders; deflate/inflate, CRC32, Adler32 |
+| `libimg/` & `libz/` | PNG, GIF, BMP, baseline + progressive (`SOF2`) JPEG, ICO/CUR (PNG + 1/4/8/24/32-bpp DIB), standalone fixed-point SVG rasterizer, QOI, and Netpbm (`P1`–`P6`) decoders; deflate/inflate, CRC32, Adler32 |
 
 Headers live under `libc/include/` (plus library headers in `lib*/`).
 Applications in `apps/*.c` compile into static or dynamically linked (`ET_DYN`
 via `/lib/ld.so`) ELF64 binaries installed at `/bin/<name>`, including graphical
-applications (`desktop`, `terminal`, `browser`, `sysmon`, `settings`, `gfiles`,
-`gpaint`, `gcalc`, `gclock`, `notes`, `sight`, `about`) and 70+ CLI utilities
-with `@krec` `-r` record pipelines (`where`, `sortby`, `pick`, `talon`,
-`inspect`, `kjs`).
+applications (`desktop`, `terminal`, `browser`, `sysmon` with Flight Deck tab,
+`settings`, `gfiles`, `gpaint`, `gcalc`, `gclock`, `notes`, `sight`, `about`)
+and 70+ CLI utilities with `@krec` `-r` record pipelines (`where`, `sortby`,
+`pick`, `talon`, `inspect`, `flight`, `netstat`, `kjs`).
 
 The shell (`apps/sh.c`) supports pipe-backed multi-stage pipelines and appends
 `--cwd=<cwd>` to spawned commands so path-taking utilities can resolve relative
