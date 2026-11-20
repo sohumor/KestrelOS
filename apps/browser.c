@@ -8390,6 +8390,7 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         if (t) {
             t->focus_node = 0;
             t->addr_cur = t->addr_len;
+            select_close(t);
         }
         return;
     case 18:                                  /* ctrl-R */
@@ -8412,8 +8413,10 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         b->find_open = !b->find_open;
         b->addr_focus = 0;
         b->repl_focus = 0;
-        if (t)
+        if (t) {
             t->focus_node = 0;
+            select_close(t);
+        }
         if (!b->find_open)
             find_clear(b);
         else
@@ -8428,8 +8431,10 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         b->dev_open = !b->dev_open;
         b->addr_focus = 0;
         b->repl_focus = (b->dev_open && b->dev_tab == 1);
-        if (b->repl_focus && t)
+        if (b->repl_focus && t) {
             t->focus_node = 0;
+            select_close(t);
+        }
         tab_sync_active_view(b);
         return;
     case 27:                                  /* Esc */
