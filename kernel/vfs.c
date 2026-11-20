@@ -270,6 +270,12 @@ int vfs_init(void)
 
 struct file *vfs_open(const char *path, int flags)
 {
+    return vfs_open_guarded(path, flags, NULL);
+}
+
+struct file *vfs_open_guarded(const char *path, int flags,
+                              struct open_guard *guard)
+{
     const char *rel;
     struct mount *m;
     struct file *f;
@@ -279,7 +285,9 @@ struct file *vfs_open(const char *path, int flags)
     m = mount_resolve(path, &rel);
     if (m == NULL || m->type->ops->open == NULL)
         return NULL;
-    f = m->type->ops->open(m, rel, flags);
+    if (guard && guard->exclude->ops != m->type->ops)
+        guard = NULL;
+    f = m->type->ops->open(m, rel, flags, guard);
     if (f == NULL)
         return NULL;
     f->ops = m->type->ops;

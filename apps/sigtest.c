@@ -1,6 +1,7 @@
 /* sigtest - exercise handler delivery, masking, pending state and return. */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +104,10 @@ static int test_pipe_lifetime(void)
 
 int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "--startup-cwd") == 0)
+        return strcmp(kestrel_startup_cwd(), "/doc") != 0 ||
+               !((argc == 3 && strcmp(argv[2], "--cwd=/doc") == 0) ||
+                 (argc == 16 && strcmp(argv[15], "unused") == 0));
     if (argc > 1 && strcmp(argv[1], "--pipe-read") == 0)
         return test_pipe_read();
     if (argc > 2 && strcmp(argv[1], "--interrupt-reader") == 0)
@@ -127,6 +132,21 @@ int main(int argc, char **argv)
     }
     if (kill(getpid(), SIGUSR1) < 0 || seen != 2) {
         printf("sigtest: direct delivery failed\n");
+        return 1;
+    }
+    struct k_spawn_caps caps = { .cwd = "/doc" };
+    char *args[] = { "sigtest", "--startup-cwd", 0 };
+    int child = spawn_caps("/bin/sigtest", args, &caps);
+    if (child < 0 || waitpid(child) != 0) {
+        printf("sigtest: cwd metadata or legacy argument missing\n");
+        return 1;
+    }
+    char *full_args[17] = { "sigtest", "--startup-cwd" };
+    for (int i = 2; i < 16; i++)
+        full_args[i] = "unused";
+    child = spawn_caps("/bin/sigtest", full_args, &caps);
+    if (child < 0 || waitpid(child) != 0) {
+        printf("sigtest: cwd metadata missing with a full argument list\n");
         return 1;
     }
     printf("sigtest: handlers + masks + sigreturn verified\n");

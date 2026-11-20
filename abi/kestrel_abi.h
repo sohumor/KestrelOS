@@ -15,7 +15,7 @@
 #ifdef _WIN32
 #undef SYS_OPEN           /* Windows UCRT <stdio.h> defines SYS_OPEN */
 #endif
-#define SYS_OPEN      3   /* (path, flags) -> fd */
+#define SYS_OPEN      3   /* (path, flags, exclude_fd if O_DISTINCT) -> fd */
 #define SYS_CLOSE     4   /* (fd) */
 #define SYS_SPAWN     5   /* (path, argv) -> pid */
 #define SYS_WAITPID   6   /* (pid) -> exit code, blocks */
@@ -171,6 +171,9 @@ struct k_sigaction {
 #define O_CREAT  0x040
 #define O_TRUNC  0x200
 #define O_APPEND 0x400
+#define O_DISTINCT 0x800 /* reject the file already open at exclude_fd */
+
+#define K_OPEN_SAME_FILE (-2)
 
 /* task states reported by SYS_PSINFO */
 #define K_STATE_RUNNABLE 0

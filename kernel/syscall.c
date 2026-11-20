@@ -231,9 +231,10 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
     return (long)done;
 }
 
-static long sys_open(uint64_t upath, uint64_t flags)
+static long sys_open(uint64_t upath, uint64_t flags, uint64_t uexclude)
 {
     char path[UPROC_PATH_MAX];
+    struct open_guard guard = {0};
     if (!(current->cap_mask & KCAP_FS_READ))
         return -1;
     if ((flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
@@ -241,9 +242,15 @@ static long sys_open(uint64_t upath, uint64_t flags)
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
-    struct file *f = vfs_open(path, (int)flags);
+    if (flags & O_DISTINCT) {
+        guard.exclude = fd_file(uexclude);
+        if (!guard.exclude)
+            return -1;
+    }
+    struct file *f = vfs_open_guarded(path, (int)flags & ~O_DISTINCT,
+                                      guard.exclude ? &guard : NULL);
     if (!f)
-        return -1;
+        return guard.same_file ? K_OPEN_SAME_FILE : -1;
     for (int fd = 3; fd < MAX_OPEN_FILES; fd++) {
         if (!current->files[fd]) {
             current->files[fd] = f;
@@ -1030,7 +1037,7 @@ static void syscall_dispatch(struct regs *r)
         ret = sys_read(a1, a2, a3, 0);
         break;
     case SYS_OPEN:
-        ret = sys_open(a1, a2);
+        ret = sys_open(a1, a2, a3);
         break;
     case SYS_CLOSE:
         ret = sys_close(a1);

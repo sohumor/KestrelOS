@@ -15,6 +15,11 @@ int open(const char *path, int flags)
     return (int)syscall(SYS_OPEN, (long)path, flags, 0, 0);
 }
 
+int open_distinct(const char *path, int flags, int exclude_fd)
+{
+    return (int)syscall(SYS_OPEN, (long)path, flags | O_DISTINCT, exclude_fd, 0);
+}
+
 long read(int fd, void *buf, unsigned long len)
 {
     return syscall(SYS_READ, fd, (long)buf, (long)len, 0);
