@@ -102,15 +102,17 @@ void fb_init(struct bootinfo *bi)
         return;
     }
 
-    /* pmm_alloc_contig() panics when it cannot satisfy a request, so ask
-     * first and fall back to the text console rather than killing the
-     * machine over a cosmetic feature. */
     int npages = (int)((shadow + PAGE_SIZE - 1) / PAGE_SIZE);
+    /* Leave headroom for the rest of boot even if a run is available. */
     if (pmm_free_pages() < (uint64_t)npages + 256) {
         kprintf("fb: not enough memory for a %d-page shadow buffer\n", npages);
         return;
     }
-    uint64_t backphys = pmm_alloc_contig(npages);
+    uint64_t backphys = pmm_try_alloc_contig(npages);
+    if (!backphys) {
+        kprintf("fb: no contiguous memory for a %d-page shadow buffer\n", npages);
+        return;
+    }
     back = (uint32_t *)P2V(backphys);
 
     uint64_t mapped = (aperture + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
