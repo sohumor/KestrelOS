@@ -6,11 +6,11 @@
 
 #include <kestrel.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MAX_PATH 256
 #define BUFSZ    512
-#define LINESZ   512
 #define CTRL_D   4
 
 static const char *g_cwd = "/";
@@ -91,12 +91,23 @@ static void lr_init(struct lreader *r, int fd, int tty)
     r->tty = tty;
 }
 
-static int lr_line(struct lreader *r, char *out, int outsz)
+static int lr_line(struct lreader *r, char **out, unsigned long *cap)
 {
-    int n = 0, got = 0;
+    unsigned long n = 0;
+    int got = 0;
 
     for (;;) {
         char c;
+        if (n + 1 >= *cap) {
+            unsigned long size = *cap ? *cap * 2 : BUFSZ;
+            char *p = size > *cap ? realloc(*out, size) : 0;
+            if (!p) {
+                printf("grep: out of memory\n");
+                exit(1);
+            }
+            *out = p;
+            *cap = size;
+        }
         if (r->pos >= r->len) {
             long g = read(r->fd, r->buf, sizeof(r->buf));
             if (g <= 0)
@@ -110,10 +121,9 @@ static int lr_line(struct lreader *r, char *out, int outsz)
         got = 1;
         if (c == '\n')
             break;
-        if (n < outsz - 1)
-            out[n++] = c;
+        (*out)[n++] = c;
     }
-    out[n] = '\0';
+    (*out)[n] = '\0';
     return got;
 }
 
@@ -122,11 +132,12 @@ static int grep_fd(int fd, int tty, const char *pat, const char *label,
                    int show_num)
 {
     struct lreader r;
-    char line[LINESZ];
+    char *line = 0;
+    unsigned long cap = 0;
     int lineno = 0, hits = 0;
 
     lr_init(&r, fd, tty);
-    while (lr_line(&r, line, sizeof(line))) {
+    while (lr_line(&r, &line, &cap)) {
         lineno++;
         if (!contains(line, pat))
             continue;
@@ -137,6 +148,7 @@ static int grep_fd(int fd, int tty, const char *pat, const char *label,
             printf("%d:", lineno);
         printf("%s\n", line);
     }
+    free(line);
     return hits;
 }
 

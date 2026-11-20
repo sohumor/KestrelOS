@@ -555,6 +555,8 @@ def run_host_tests(tc):
         run_cmd([sys.executable, r("tools/kfsck.py"), b("fs.img")])
     print("=== Running test_kfs_journal.py ===")
     run_cmd([sys.executable, r("tools/test_kfs_journal.py")])
+    print("=== Running test_kfs_readdir.py ===")
+    run_cmd([sys.executable, r("tools/test_kfs_readdir.py"), "--cc", tc["cc"]])
 
 
 def generate_compile_commands(tc):
