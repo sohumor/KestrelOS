@@ -675,7 +675,9 @@ def generate_compile_commands(tc):
 def main():
     ap = argparse.ArgumentParser(description="KestrelOS cross-platform build runner")
     ap.add_argument("action", nargs="?", default="build",
-                    choices=["build", "clean", "debug", "gdb", "test-host", "fsck", "e2e", "smoke", "compdb", "all"])
+                    choices=["build", "clean", "debug", "gdb", "profile", "test-host", "fsck", "e2e", "smoke", "compdb", "all"])
+    ap.add_argument("--profile-flags", default=os.environ.get("PROFILE_FLAGS", ""),
+                    help="extra profiler arguments (default: PROFILE_FLAGS)")
     ap.add_argument("--qemu-flags", default=os.environ.get("QEMU_FLAGS", ""),
                     help="extra QEMU arguments for debug (default: QEMU_FLAGS)")
     ap.add_argument("--gdb-flags", default=os.environ.get("GDB_FLAGS", ""),
@@ -696,10 +698,13 @@ def main():
         return 0
 
     tc = detect_toolchain()
-    if args.action in ("build", "debug", "compdb", "all"):
+    if args.action in ("build", "debug", "profile", "compdb", "all"):
         generate_compile_commands(tc)
-    if args.action in ("build", "debug", "all"):
+    if args.action in ("build", "debug", "profile", "all"):
         build_all(tc)
+    if args.action == "profile":
+        return subprocess.call([sys.executable, r("tools/profile.py")]
+                               + shlex.split(args.profile_flags), cwd=ROOT)
     if args.action == "debug":
         qemu = find_tool([os.environ.get("QEMU", "qemu-system-x86_64")])
         return subprocess.call([

@@ -98,7 +98,7 @@ ROOTFS_SRC := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).repl
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
+.PHONY: all run run-headless debug gdb profile test test-e1000 test-net test-tcp test-checksum \
         test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
@@ -325,6 +325,9 @@ run-headless: all
 debug: all
 	$(QEMU) $(QEMU_BASE) -display none -serial stdio -s -S $(QEMU_FLAGS)
 
+profile: all
+	$(PY) tools/profile.py $(PROFILE_FLAGS)
+
 gdb:
 	$(GDB) -nx -x tools/.gdbinit $(GDB_FLAGS)
 
@@ -398,6 +401,7 @@ help:
 	@echo "  make run        boot it in QEMU (window + serial on stdio)"
 	@echo "  make run-headless   boot it with serial only"
 	@echo "  make debug      boot headless, paused with GDB stub on localhost:1234"
+	@echo "  make profile    profile a guest command (PROFILE_FLAGS for options)"
 	@echo "  make gdb        load kernel symbols and attach (GDB_FLAGS for batch options)"
 	@echo "  make test       run the end-to-end suite in headless QEMU"
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
