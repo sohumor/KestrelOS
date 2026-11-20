@@ -15,6 +15,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,7 +26,7 @@
 #define FIELD_MAX  128
 #define MAX_PATH   256
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 static int sc_chown(const char *path, int uid, int gid)
 {
@@ -163,6 +164,7 @@ int main(int argc, char **argv)
     int i;
     int rc = 0;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
     if (argc < 3) {
         printf("usage: chown <user>[:<group>] <file>...\n");

@@ -14,6 +14,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_flight.h>
 #include <krec.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,15 +165,8 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    int c_tick   = krec_find_col(&schema, "tick");
-    int c_cpu    = krec_find_col(&schema, "cpu");
-    int c_pid    = krec_find_col(&schema, "pid");
-    int c_cat    = krec_find_col(&schema, "cat");
-    int c_event  = krec_find_col(&schema, "event");
-    int c_arg0   = krec_find_col(&schema, "arg0");
-    int c_detail = krec_find_col(&schema, "detail");
-    if (c_tick < 0 || c_cpu < 0 || c_pid < 0 || c_cat < 0 ||
-        c_event < 0 || c_arg0 < 0 || c_detail < 0) {
+    struct flight_record_columns cols;
+    if (flight_record_bind(&schema, &cols) < 0) {
         close(fd);
         krec_err("flight: unexpected schema in %s\n", FLIGHT_DEV);
         return 1;
@@ -192,18 +186,15 @@ int main(int argc, char **argv)
     char *fields[KREC_MAX_COLS];
     int rc;
     while ((rc = krec_next(&r, line, sizeof(line), fields, KREC_MAX_COLS)) == 1) {
-        uint64_t tick = 0;
-        int64_t cpu = 0, pid = 0;
+        struct flight_record_view record;
 
         total_read++;
-        if (krec_parse_u64(fields[c_tick], &tick) < 0 ||
-            krec_parse_i64(fields[c_cpu], &cpu) < 0 ||
-            krec_parse_i64(fields[c_pid], &pid) < 0)
+        if (flight_record_decode(&cols, fields, &record) < 0)
             continue;
 
-        if (want_cat && strcmp(fields[c_cat], want_cat) != 0)
+        if (want_cat && strcmp(record.cat, want_cat) != 0)
             continue;
-        if (have_pid && (int)pid != want_pid)
+        if (have_pid && record.pid != want_pid)
             continue;
 
         if (matched >= cap) {
@@ -220,13 +211,13 @@ int main(int argc, char **argv)
         }
 
         struct flight_row *e = &rows[matched++];
-        e->tick = tick;
-        e->cpu = (int)cpu;
-        e->pid = (int)pid;
-        copy_str(e->cat, sizeof(e->cat), fields[c_cat]);
-        copy_str(e->event, sizeof(e->event), fields[c_event]);
-        copy_str(e->arg0, sizeof(e->arg0), fields[c_arg0]);
-        copy_str(e->detail, sizeof(e->detail), fields[c_detail]);
+        e->tick = record.tick;
+        e->cpu = record.cpu;
+        e->pid = record.pid;
+        copy_str(e->cat, sizeof(e->cat), record.cat);
+        copy_str(e->event, sizeof(e->event), record.event);
+        copy_str(e->arg0, sizeof(e->arg0), record.arg0);
+        copy_str(e->detail, sizeof(e->detail), record.detail);
     }
     close(fd);
 

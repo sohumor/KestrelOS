@@ -14,6 +14,7 @@
 
 #include "gui.h"
 
+#include <kestrel_talon.h>
 #include <string.h>
 
 #define DOUBLE_CLICK_MS 400
@@ -206,7 +207,7 @@ int gui_clipboard_copy(const char *text, int len, const char *label)
         return -1;
     if (len > K_PARCEL_MAX_BYTES)
         len = K_PARCEL_MAX_BYTES;
-    return parcel_put(K_PARCEL_TEXT, "text/plain",
+    return parcel_put(K_PARCEL_TEXT, talon_type_default_mime(K_PARCEL_TEXT),
                       label ? label : "Text", text, (uint32_t)len);
 }
 

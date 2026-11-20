@@ -12,6 +12,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -986,7 +987,7 @@ static int run_tui_editor(const char *cwd, const char *arg)
 
 int main(int argc, char *argv[])
 {
-    const char *cwd = "/";
+    const char *cwd = kestrel_startup_cwd();
     const char *arg = 0;
     int force_text = 0;
 

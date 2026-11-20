@@ -22,6 +22,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_pulse.h>
 #include <krec.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1308,21 +1309,15 @@ static int inspect_pulses(int rflag, int limit)
         { "tag",   KREC_STR },
     };
     struct k_pulse all[MAX_PULSES];
-    struct k_pulse_query q;
+    struct pulse_cursor cursor = { .topics = K_TOPIC_ALL };
     int total = 0, start = 0, i;
-
-    q.seq = 0;
-    q.topic_mask = K_TOPIC_ALL;
-    q.timeout_ms = 0;
-    q._pad = 0;
 
     while (total < MAX_PULSES) {
         int want = MAX_PULSES - total;
         int n;
         if (want > 64)
             want = 64;
-        q.max_out = (uint32_t)want;
-        n = pulse_poll(&q, &all[total]);
+        n = pulse_cursor_read(&cursor, &all[total], (uint32_t)want, 0);
         if (n <= 0)
             break;
         total += n;
@@ -1363,7 +1358,7 @@ static int inspect_pulses(int rflag, int limit)
     }
     if (total - start == 0)
         out_printf("(no pulses in ring; latest seq %llu)\n",
-                   (unsigned long long)q.seq);
+                   (unsigned long long)cursor.seq);
     return 0;
 }
 
@@ -1395,7 +1390,7 @@ static int inspect_sys(int rflag)
     struct k_modinfo mi;
     struct k_devinfo di;
     struct k_mountinfo mni;
-    struct k_pulse_query pq;
+    struct pulse_cursor cursor = { .topics = K_TOPIC_ALL };
     uint64_t mem_tot = 0, mem_free = 0, mem_used = 0;
     uint64_t sw_tot = 0, sw_used = 0;
     unsigned long up_ms = uptime_ms();
@@ -1439,12 +1434,7 @@ static int inspect_sys(int rflag)
     memset(&fb, 0, sizeof(fb));
     fbinfo_get(&fb);
 
-    pq.seq = 0;
-    pq.topic_mask = K_TOPIC_ALL;
-    pq.max_out = 0;
-    pq.timeout_ms = 0;
-    pq._pad = 0;
-    pulse_poll(&pq, 0);
+    pulse_cursor_follow(&cursor);
 
     if (rflag) {
         char up_s[24], co_s[16], ct_s[16], mu_s[24], mt_s[24];
@@ -1517,7 +1507,7 @@ static int inspect_sys(int rflag)
         snprintf(buf, sizeof(buf), "%d modules, %d devices, %d mounts",
                  nmods, ndevs, nmounts);
         card_kv("KERNEL", buf);
-        snprintf(buf, sizeof(buf), "seq %llu", (unsigned long long)pq.seq);
+        snprintf(buf, sizeof(buf), "seq %llu", (unsigned long long)cursor.seq);
         card_kv("PULSES", buf);
         printf("\n");
         printf("usage: inspect [sys|procs|proc:<pid>|wins|win:<wid>|"

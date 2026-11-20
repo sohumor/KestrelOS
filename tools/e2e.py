@@ -30,6 +30,7 @@ import base64
 import collections
 import http.client
 import http.server
+import json
 import math
 import os
 import re
@@ -141,6 +142,25 @@ def guest_timeout(seconds):
 # transport tests bind ephemeral host ports and reach them through this IP.
 QEMU_HOST = "10.0.2.2"
 HTTP_BODY_MARKER = "CONTROLLED-HTTP-BODY-OK"
+
+# A <select> with more options than its dropdown shows at once.  Each change
+# GETs /select-picked/<option>, so the host sees which option was chosen.
+SELECT_FIXTURE_OPTIONS = (
+    "one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+).split()
+SELECT_FIXTURE_PAGE = (
+    "<!doctype html><html><head><title>Kestrel select fixture</title>"
+    "</head><body><select id=pick>%s</select><script>"
+    "var pick=document.getElementById('pick');"
+    "pick.addEventListener('change',function(){"
+    "var opts=pick.getElementsByTagName('option');"
+    "for(var i=0;i<opts.length;i++)"
+    "if(opts[i].hasAttribute('selected'))"
+    "fetch('/select-picked/'+opts[i].textContent);"
+    "});</script></body></html>"
+    % "".join("<option>%s</option>" % o for o in SELECT_FIXTURE_OPTIONS)
+).encode("ascii")
 TLS_NEGATIVE_BODY_MARKER = "TLS-NEGATIVE-BODY-MUST-NOT-APPEAR"
 TLS_NEGATIVE_REPETITIONS = 10
 
@@ -187,6 +207,8 @@ class Harness:
         self._esc = ""                # half of an escape sequence, held back
         self.eof = False
         self._last_serial = 0
+        self.monitor_port = None
+        self._monitor = None
 
     def _use_win_tcp_serial(self):
         if sys.platform != "win32":
@@ -196,6 +218,16 @@ class Harness:
                 return True
         return False
 
+    def _qemu_args(self):
+        if self.monitor_port is None:
+            return list(self.cmd)
+        # The human monitor injects PS/2 mouse and keyboard input for tests
+        # that drive the GUI. It stays out of self.cmd so tests that boot a
+        # second guest from it do not try to bind the same port.
+        return self.cmd + [
+            "-monitor",
+            "tcp:127.0.0.1:%d,server=on,wait=off" % self.monitor_port]
+
     def start(self):
         if self._use_win_tcp_serial():
             # Windows QEMU char-win-stdio drops characters after the first
@@ -204,7 +236,7 @@ class Harness:
             srv.bind(("127.0.0.1", 0))
             srv.listen(1)
             port = srv.getsockname()[1]
-            cmd = list(self.cmd)
+            cmd = self._qemu_args()
             for i in range(len(cmd) - 1):
                 if cmd[i] == "-serial" and cmd[i + 1] == "stdio":
                     cmd[i + 1] = "tcp:127.0.0.1:%d" % port
@@ -224,7 +256,7 @@ class Harness:
                 srv.close()
         else:
             self.proc = subprocess.Popen(
-                self.cmd,
+                self._qemu_args(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -394,7 +426,25 @@ class Harness:
                 print(self._partial)
         print("---- end of tail ----")
 
+    def monitor(self, command):
+        """Send one QEMU human-monitor command (mouse_move, sendkey, ...)."""
+        if self._monitor is None:
+            if self.monitor_port is None:
+                raise TimeoutError("QEMU was started without a monitor")
+            self._monitor = socket.create_connection(
+                ("127.0.0.1", self.monitor_port), timeout=10)
+        self._monitor.sendall(command.encode("ascii") + b"\n")
+        # QEMU queues PS/2 packets in a small buffer; give the guest time
+        # to drain each one so no movement is dropped.
+        time.sleep(0.15)
+
     def kill(self):
+        if self._monitor is not None:
+            try:
+                self._monitor.close()
+            except OSError:
+                pass
+            self._monitor = None
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -478,7 +528,38 @@ def _marker_handler(marker):
                 return
             content_type = "text/html; charset=us-ascii"
             response = body
-            if path == "/compat":
+            if path == "/protected-inputs":
+                response = (
+                    "<!doctype html><html><body><h1>Protected text inputs</h1>"
+                    "<p>Disabled (must stay DISABLED)</p>"
+                    "<input id=d disabled value=DISABLED>"
+                    "<p>Readonly (must stay READONLY)</p>"
+                    "<form action=/readonly-submit>"
+                    "<input id=r name=r readonly value=READONLY></form>"
+                    "<p>Editable control</p><input id=e value=EDIT>"
+                    "<p><button onclick=\"fetch('/input-check/'+"
+                    "document.getElementById('d').value+'/'+"
+                    "document.getElementById('r').value+'/'+"
+                    "document.getElementById('e').value)\">Check values</button></p>"
+                    "</body></html>"
+                ).encode("ascii")
+            elif path == "/button-types":
+                response = (
+                    "<!doctype html><html><body>"
+                    "<h1>Button type regression</h1>"
+                    "<form action='/button-submitted'>"
+                    "<input name=field value=preserved style='position:absolute;left:20px;top:80px'>"
+                    "<button type=button style='position:absolute;left:20px;top:130px;width:180px;height:40px'>Plain button</button>"
+                    "<button type=reset style='position:absolute;left:220px;top:130px;width:180px;height:40px'>Reset button</button>"
+                    "<button type=submit style='position:absolute;left:20px;top:190px;width:180px;height:40px'>Submit button</button>"
+                    "<button style='position:absolute;left:220px;top:190px;width:180px;height:40px'>Missing type</button>"
+                    "<button type='' style='position:absolute;left:420px;top:190px;width:180px;height:40px'>Empty type</button>"
+                    "<button type=invalid style='position:absolute;left:620px;top:190px;width:180px;height:40px'>Invalid type</button>"
+                    "</form></body></html>"
+                ).encode('ascii')
+            elif path == "/button-submitted":
+                response = b"<html><body><h1>FORM SUBMITTED</h1></body></html>"
+            elif path == "/compat":
                 response = (
                     "<!doctype html><html><head>"
                     "<title>Kestrel compatibility fixture</title>"
@@ -1352,6 +1433,8 @@ def _marker_handler(marker):
                     7, 7, 1, 3, 97, 100, 100, 0, 0,
                     10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11,
                 ])
+            elif path == "/select":
+                response = SELECT_FIXTURE_PAGE
             elif path == "/modern":
                 response = (
                     "<!doctype html><html><head>"
@@ -1709,6 +1792,7 @@ class BrowserFixtureServers:
         self.http_url = None
         self.compat_url = None
         self.modern_url = None
+        self.select_url = None
         self.module_policy_url = None
         self.cors_url = None
         self.https_url = None
@@ -1771,6 +1855,8 @@ class BrowserFixtureServers:
         self.compat_url = "http://%s:%d/compat" % (
             QEMU_HOST, self.http.server_address[1])
         self.modern_url = "http://%s:%d/modern" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.select_url = "http://%s:%d/select" % (
             QEMU_HOST, self.http.server_address[1])
         self.module_policy_url = "http://%s:%d/module-policy" % (
             QEMU_HOST, self.http.server_address[1])
@@ -2726,6 +2812,156 @@ def _validate_tls_negative_block(block, attempt):
         % attempt)
 
 
+def t_browser_protected_inputs(h):
+    """Exercise the GUI key path, not the text-mode renderer."""
+    monitor = socket.create_connection(("127.0.0.1", h.monitor_port))
+    monitor.settimeout(2)
+
+    def cmd(command):
+        monitor.sendall((command + "\n").encode("ascii"))
+        time.sleep(0.15)
+        monitor.recv(65536)
+
+    def click(x, y):
+        for _ in range(12):
+            cmd("mouse_move -200 -200")
+        cx = cy = 0
+        while (cx, cy) != (x, y):
+            dx = max(-100, min(100, int((x - cx) * 2 / 3)))
+            dy = max(-100, min(100, int((y - cy) * 2 / 3)))
+            dx = dx or (1 if x > cx else -1) if x != cx else 0
+            dy = dy or (1 if y > cy else -1) if y != cy else 0
+            cmd("mouse_move %d %d" % (dx, dy))
+            cx += int(dx * 3 / 2)
+            cy += int(dy * 3 / 2)
+        cmd("mouse_button 1")
+        cmd("mouse_button 0")
+
+    try:
+        h.send("/bin/desktop &")
+        time.sleep(3)
+        url = browser_fixtures.http_url.replace("/plain", "/protected-inputs")
+        h.send("/bin/browser %s &" % url)
+        time.sleep(6)
+        shot = os.environ.get("E2E_INPUT_SCREENSHOT")
+        if shot:
+            cmd("screendump %s.loaded.ppm" % shot)
+        for x, y in [(100, 239), (100, 317), (100, 395)]:
+            click(x, y)
+            for key in ("x", "backspace", "x", "ctrl-c", "ctrl-v"):
+                cmd("sendkey " + key)
+        if shot:
+            cmd("screendump %s.ppm" % shot)
+        click(90, 436)
+        time.sleep(3)
+        with browser_fixtures.http._get_count_lock:
+            paths = [p for p in browser_fixtures.http._path_counts
+                     if p.startswith("/input-check/")]
+        print("  protected input values: %r" % paths)
+        if paths != ["/input-check/DISABLED/READONLY/EDITxEDITx"]:
+            raise TimeoutError("protected values changed or GUI editing did not execute")
+        submissions = browser_fixtures.http.path_count("/readonly-submit")
+        click(100, 317)
+        cmd("sendkey ret")
+        time.sleep(3)
+        if browser_fixtures.http.path_count("/readonly-submit") != submissions + 1:
+            raise TimeoutError("Enter in readonly input did not submit its form")
+        print("  readonly input Enter submitted its form")
+    finally:
+        cmd("sendkey ctrl-q")
+        monitor.close()
+
+
+def t_browser_button_types(h):
+    """Real pointer clicks must not submit non-submit form buttons."""
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    with tempfile.TemporaryDirectory(prefix="kestrel-buttons-") as tmp:
+        monitor = os.path.join(tmp, "qmp")
+        vm = Harness(qemu_command("e1000", 2) +
+                     ["-qmp", "unix:%s,server=on,wait=off" % monitor])
+        vm.start()
+        try:
+            t_boot(vm)
+            t_login(vm)
+            t_prompt(vm)
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(monitor)
+            stream = sock.makefile("rwb", buffering=0)
+            json.loads(stream.readline())
+
+            def qmp(command, arguments=None):
+                stream.write((json.dumps({"execute": command,
+                                          "arguments": arguments or {}}) + "\n").encode())
+                while True:
+                    reply = json.loads(stream.readline())
+                    if "error" in reply:
+                        raise TimeoutError(str(reply))
+                    if "return" in reply:
+                        return reply["return"]
+
+            qmp("qmp_capabilities")
+            url = browser_fixtures.http_url.rsplit('/', 1)[0]
+            before = browser_fixtures.http.path_count("/button-types")
+            vm.send("browser %s/button-types" % url)
+            deadline = time.monotonic() + NET_TIMEOUT
+            while browser_fixtures.http.path_count("/button-types") == before:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("button fixture was not loaded")
+                time.sleep(0.1)
+            time.sleep(2)
+
+            pointer = [0, 0]
+
+            def click(x, y):
+                if pointer == [0, 0]:
+                    for _ in range(30):
+                        qmp("input-send-event", {"events": [
+                            {"type": "rel", "data": {"axis": "x", "value": -100}},
+                            {"type": "rel", "data": {"axis": "y", "value": -100}}]})
+                        time.sleep(0.04)
+                dx, dy = (x - pointer[0]) * 2 // 3, (y - pointer[1]) * 2 // 3
+                while dx or dy:
+                    sx, sy = max(-80, min(80, dx)), max(-80, min(80, dy))
+                    qmp("input-send-event", {"events": [
+                        {"type": "rel", "data": {"axis": "x", "value": sx}},
+                        {"type": "rel", "data": {"axis": "y", "value": sy}}]})
+                    dx, dy = dx - sx, dy - sy
+                    time.sleep(0.04)
+                pointer[:] = [x, y]
+                time.sleep(0.2)
+                qmp("input-send-event", {"events": [
+                    {"type": "btn", "data": {"button": "left", "down": True}}]})
+                time.sleep(0.2)
+                qmp("input-send-event", {"events": [
+                    {"type": "btn", "data": {"button": "left", "down": False}}]})
+                time.sleep(1)
+
+            submitted = browser_fixtures.http.path_count("/button-submitted")
+            click(140, 290)
+            screenshot = os.environ.get("E2E_BUTTON_SCREENSHOT")
+            if screenshot:
+                qmp("screendump", {"filename": os.path.abspath(screenshot)})
+            if browser_fixtures.http.path_count("/button-submitted") != submitted:
+                raise TimeoutError("type=button submitted the form")
+            click(340, 290)
+            if browser_fixtures.http.path_count("/button-submitted") != submitted:
+                raise TimeoutError("type=reset submitted the form")
+            click(140, 350)
+            if browser_fixtures.http.path_count("/button-submitted") != submitted + 1:
+                raise TimeoutError("type=submit did not submit the form")
+            for x, kind in ((340, "missing"), (540, "empty"), (740, "invalid")):
+                click(65, 80)
+                submitted = browser_fixtures.http.path_count("/button-submitted")
+                click(x, 350)
+                if browser_fixtures.http.path_count("/button-submitted") != submitted + 1:
+                    raise TimeoutError("%s button type did not default to submit" % kind)
+            stream.close()
+            sock.close()
+        finally:
+            vm.kill()
+
+
 def t_browser_text(h):
     """The browser pipeline, run over a styled local page in text mode.
 
@@ -2945,6 +3181,125 @@ def t_browser_modern_web(h):
     if re.findall(r"(?m)^BROWSER-VS-STATUS-(-?\d+)$", vs_block) != ["0"]:
         raise TimeoutError("browser view-source returned non-zero status")
     wait_prompt(h, timeout=NET_TIMEOUT)
+
+
+def _mouse_sensitivity():
+    vals = {}
+    with open(os.path.join("kernel", "mouse.c")) as f:
+        for line in f:
+            m = re.match(r"#define MOUSE_SENSITIVITY_(NUM|DEN)\s+(\d+)", line)
+            if m:
+                vals[m.group(1)] = int(m.group(2))
+    return vals.get("NUM", 1), vals.get("DEN", 1)
+
+
+class _GuestMouse:
+    """Absolute pointer moves built from relative PS/2 packets."""
+
+    STEP = 100      # a PS/2 delta past +/-255 overflows and is dropped
+
+    def __init__(self, h):
+        self.h = h
+        self.num, self.den = _mouse_sensitivity()
+        for _ in range(30):     # the driver clamps at the screen origin
+            h.monitor("mouse_move -%d -%d" % (self.STEP, self.STEP))
+        self.x = self.y = 0
+
+    def move(self, x, y):
+        while (self.x, self.y) != (x, y):
+            # The driver applies trunc(delta * num / den) to each packet.
+            rx = int((x - self.x) * self.den / self.num)
+            ry = int((y - self.y) * self.den / self.num)
+            if rx == 0 and x != self.x:
+                rx = 1 if x > self.x else -1
+            if ry == 0 and y != self.y:
+                ry = 1 if y > self.y else -1
+            rx = max(-self.STEP, min(self.STEP, rx))
+            ry = max(-self.STEP, min(self.STEP, ry))
+            self.h.monitor("mouse_move %d %d" % (rx, ry))
+            self.x += int(rx * self.num / self.den)
+            self.y += int(ry * self.num / self.den)
+
+    def click(self, x, y):
+        self.move(x, y)
+        self.h.monitor("mouse_button 1")
+        self.h.monitor("mouse_button 0")
+        time.sleep(1.5)
+
+    def wheel_down(self, notches):
+        for _ in range(notches):
+            self.h.monitor("mouse_move 0 0 -1")
+        time.sleep(1)
+
+
+def _wait_path(server, path, before, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if server.path_count(path) > before:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def t_browser_select_menu(h):
+    """Every option of a long <select> is reachable by wheel and keyboard.
+
+    The windowed browser is driven through the QEMU monitor's PS/2 mouse
+    and keyboard.  The fixture page reports each chosen option back to the
+    host, so the test checks what was picked rather than pixels.  The
+    coordinates are those of the first browser window on the default
+    2560x1440 VGA mode: the <select> box, and the eighth (last visible)
+    dropdown row below it.
+    """
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    srv = browser_fixtures.http
+    select_at, last_row_at = (140, 142), (140, 322)
+
+    def pick(label):
+        return srv.path_count("/select-picked/%s" % label)
+
+    loads = srv.path_count("/select")
+    h.send("browser %s &" % browser_fixtures.select_url)
+    wait_prompt(h)
+    try:
+        if not _wait_path(srv, "/select", loads, NET_TIMEOUT):
+            raise TimeoutError("browser never loaded the select fixture")
+        time.sleep(4)               # let the first frame reach the screen
+        mouse = _GuestMouse(h)
+        problems = []
+
+        # Wheel: two notches move the list six options down, so the last
+        # visible row becomes the fourteenth option.
+        before = {o: pick(o) for o in ("eight", "fourteen")}
+        mouse.click(*select_at)
+        mouse.wheel_down(2)
+        mouse.click(*last_row_at)
+        if not _wait_path(srv, "/select-picked/fourteen",
+                          before["fourteen"], 10):
+            got = "eight" if pick("eight") > before["eight"] else "nothing"
+            problems.append("wheel then last row picked %s, not fourteen"
+                            % got)
+            h.monitor("sendkey esc")
+
+        # Keyboard: End highlights the final option and Enter chooses it.
+        before = pick("twenty")
+        mouse.click(*select_at)
+        h.monitor("sendkey end")
+        h.monitor("sendkey ret")
+        if not _wait_path(srv, "/select-picked/twenty", before, 10):
+            problems.append("End then Enter did not pick twenty")
+        if problems:
+            raise TimeoutError("; ".join(problems))
+    finally:
+        # Ctrl-Q quits the focused browser window; Esc first closes any
+        # dropdown left open, which would otherwise take the key.
+        h.monitor("sendkey esc")
+        h.monitor("sendkey ctrl-q")
+        time.sleep(2)
+        h.send("echo BROWSER-SELECT-END")
+        h.expect("\nBROWSER-SELECT-END", timeout=WALK_TIMEOUT)
+        wait_prompt(h)
 
 
 def t_browser_module_policy(h):
@@ -3223,11 +3578,14 @@ TESTS = [
     ("service-list", t_service_list),
     ("service-lifecycle", t_service_lifecycle),
     ("permissions", t_permissions),
+    ("browser-protected-inputs", t_browser_protected_inputs),
     ("browser-text", t_browser_text),
+    ("browser-button-types", t_browser_button_types),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
     ("browser-web-compat", t_browser_web_compat),
     ("browser-modern-web", t_browser_modern_web),
+    ("browser-select-menu", t_browser_select_menu),
     ("browser-module-policy", t_browser_module_policy),
     ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),
@@ -3631,8 +3989,19 @@ def main():
                 fixtures.close()
             return 1
 
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        monitor_port = probe.getsockname()[1]
     h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    if any(name == "browser-protected-inputs" for name, _ in tests):
+        with socket.socket() as port:
+            port.bind(("127.0.0.1", 0))
+            h.monitor_port = port.getsockname()[1]
+        h.cmd.extend(["-monitor", "tcp:127.0.0.1:%d,server=on,wait=off"
+                      % h.monitor_port, "-m", "512M", "-device",
+                      "VGA,vgamem_mb=32"])
     h.disk = args.disk
+    h.monitor_port = monitor_port
     try:
         h.start()
     except FileNotFoundError:

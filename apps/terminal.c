@@ -16,6 +16,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,7 +83,7 @@ static int csi_len;
 
 static gui_window *g_win;
 static gui_ui g_ui;
-static char cwd[MAX_PATH] = "/";
+static char cwd[MAX_PATH];
 static int want_exit;
 
 static int shell_in = -1;       /* write end: keystrokes to /bin/sh      */
@@ -1099,6 +1100,7 @@ int main(int argc, char **argv)
     struct k_event ev;
     int i;
 
+    snprintf(cwd, sizeof(cwd), "%s", kestrel_startup_cwd());
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             strncpy(cwd, argv[i] + 6, sizeof(cwd) - 1);

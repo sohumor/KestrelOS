@@ -6,6 +6,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -19,7 +20,7 @@
 #define BOX_BAR    "|   "
 #define BOX_GAP    "    "
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 static char g_path[MAX_PATH];
 static char g_prefix[PREFIX_SZ];
 static int g_dirs, g_files;
@@ -130,6 +131,7 @@ int main(int argc, char **argv)
     const char *root = 0;
     int i;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
 
     for (i = 1; i < argc; i++) {

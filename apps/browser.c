@@ -15,6 +15,9 @@
  */
 
 #include <kestrel.h>
+#ifndef JS_HOST
+#include <kestrel_cwd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,6 +70,7 @@ TLS_ASSERT_TRANSPORT_LAYOUT();
 #define REPL_H  24
 #define STAT_H  20
 #define SB_W    12
+#define SELECT_SB_W 8
 #define PAD     6
 #define GLYPH_W GUI_FONT_W
 #define GLYPH_H GUI_FONT_H
@@ -197,6 +201,7 @@ struct browser_tab {
     struct dom_node *active_node;
     struct dom_node *select_open_node;
     int select_hover;
+    int select_top;
     int reader_mode;
     char *raw_source;
     unsigned long raw_len;
@@ -6057,6 +6062,74 @@ static int select_dropdown_rect(const struct bstate *b, int *ox, int *oy,
     return 1;
 }
 
+static int select_selected_index(struct dom_node *sel)
+{
+    struct dom_node *c;
+    int idx = 0;
+
+    for (c = sel->first_child; c; c = dom_next_within(c, sel)) {
+        if (c->type == DOM_ELEMENT && c->tag && !strcmp(c->tag, "option")) {
+            if (dom_has_attr(c, "selected"))
+                return idx;
+            idx++;
+        }
+    }
+    return 0;
+}
+
+/* Clamp the first visible option so a full page of rows stays in view. */
+static void select_set_top(struct browser_tab *t, int top, int vis)
+{
+    int max_top = select_option_count(t->select_open_node) - vis;
+
+    if (top > max_top)
+        top = max_top;
+    if (top < 0)
+        top = 0;
+    t->select_top = top;
+}
+
+static void select_reveal(struct browser_tab *t, int idx, int vis)
+{
+    if (idx < t->select_top)
+        select_set_top(t, idx, vis);
+    else if (idx >= t->select_top + vis)
+        select_set_top(t, idx - vis + 1, vis);
+}
+
+static void select_open(struct bstate *b, struct dom_node *sel)
+{
+    struct browser_tab *t = active_tab(b);
+    int dx, dy, dw, dh, vis;
+
+    t->select_open_node = sel;
+    t->select_hover = -1;
+    t->select_top = 0;
+    if (select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis))
+        select_reveal(t, select_selected_index(sel), vis);
+}
+
+static void select_close(struct browser_tab *t)
+{
+    t->select_open_node = 0;
+    t->select_hover = -1;
+}
+
+/* Row under (x, y) as an option index, or -1 outside the option rows. */
+static int select_option_at(const struct bstate *b, int x, int y)
+{
+    struct browser_tab *t = active_tab(b);
+    int dx, dy, dw, dh, vis, row;
+
+    if (!select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis) ||
+        !pt_in_rect(x, y, dx, dy, dw, dh))
+        return -1;
+    row = (y - dy - 2) / (GLYPH_H + 6);
+    if (row < 0 || row >= vis)
+        return -1;
+    return t->select_top + row;
+}
+
 static int dev_collect_elem_line(struct browser_page *p, int target_idx,
                                  char *out, unsigned long outsz,
                                  int *total_out)
@@ -6556,27 +6629,42 @@ static void draw_form_caret(struct bstate *b, const gui_theme *th)
 static void draw_select_dropdown(struct bstate *b, const gui_theme *th)
 {
     struct browser_tab *t = active_tab(b);
-    int dx, dy, dw, dh, vis, i, row_h = GLYPH_H + 6;
+    int dx, dy, dw, dh, vis, n, i, row_h = GLYPH_H + 6;
+    int row_w, sb_w = 0;
 
     if (!select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis))
         return;
+    n = select_option_count(t->select_open_node);
     ui_box(b->win, dx, dy, dw, dh, th->surface, th->accent);
+    if (n > vis) {
+        int track_h = dh - 2;
+        int thumb_h = mul_div_i(track_h, vis, n);
+        int thumb_y = dy + 1 + mul_div_i(track_h - thumb_h, t->select_top,
+                                         n - vis);
+
+        sb_w = SELECT_SB_W;
+        gui_rect(b->win, dx + dw - 1 - sb_w, dy + 1, sb_w, track_h, th->panel);
+        ui_box(b->win, dx + dw - 1 - sb_w, thumb_y, sb_w, thumb_h,
+               th->surface_alt, th->border);
+    }
+    row_w = dw - 2 - sb_w;
     for (i = 0; i < vis; i++) {
-        struct dom_node *opt = select_option_nth(t->select_open_node, i);
+        int idx = t->select_top + i;
+        struct dom_node *opt = select_option_nth(t->select_open_node, idx);
         int ry = dy + 2 + i * row_h;
         int selected = opt && dom_has_attr(opt, "selected");
-        int hover = (i == t->select_hover);
+        int hover = (idx == t->select_hover);
         unsigned bg = hover ? th->accent : (selected ? th->panel_hi : th->surface);
         unsigned fg = hover ? th->text_inv : th->text;
         char *label;
 
         if (!opt)
             break;
-        gui_rect(b->win, dx + 1, ry, dw - 2, row_h, bg);
+        gui_rect(b->win, dx + 1, ry, row_w, row_h, bg);
         label = dom_text_content(opt, 0);
         if (label) {
             if (*label)
-                ui_text_maxw(b->win, dx + 6, ry + 3, label, dw - 12, fg,
+                ui_text_maxw(b->win, dx + 6, ry + 3, label, row_w - 10, fg,
                              selected);
             free(label);
         }
@@ -7788,8 +7876,11 @@ static struct dom_node *element_ancestor(struct dom_node *n, int tag)
 
 static const char *control_type(struct dom_node *n)
 {
-    const char *t = n && n->tag_id == HTAG_INPUT
+    const char *t = n && (n->tag_id == HTAG_INPUT || n->tag_id == HTAG_BUTTON)
         ? dom_get_attr(n, "type") : 0;
+    if (n && n->tag_id == HTAG_BUTTON)
+        return t && (str_ci_eq(t, "button") || str_ci_eq(t, "reset"))
+            ? t : "submit";
     return t && *t ? t : "text";
 }
 
@@ -8081,6 +8172,8 @@ static int edit_focused_control(struct bstate *b, unsigned int key)
 
     if (!p || !n || (n->tag_id != HTAG_INPUT && n->tag_id != HTAG_TEXTAREA))
         return 0;
+    if (dom_has_attr(n, "disabled"))
+        return 1;
     if (n->tag_id == HTAG_INPUT &&
         !(str_ci_eq(control_type(n), "text") ||
           str_ci_eq(control_type(n), "search") ||
@@ -8097,6 +8190,12 @@ static int edit_focused_control(struct bstate *b, unsigned int key)
     if (key == 3) {
         if (len > 0)
             gui_clipboard_copy(old, (int)len, "Browser input");
+        free(old);
+        return 1;
+    }
+    if (dom_has_attr(n, "readonly") && key != KEY_LEFT && key != KEY_RIGHT &&
+        key != KEY_HOME && key != KEY_END &&
+        !(n->tag_id == HTAG_INPUT && (key == '\n' || key == '\r'))) {
         free(old);
         return 1;
     }
@@ -8226,6 +8325,51 @@ static int handle_line_edit_key(char *buf, int cap, int *len, int *cur,
     }
 }
 
+static void select_choose_option(struct bstate *b, struct dom_node *select,
+                                 struct dom_node *opt);
+
+/* Keyboard navigation for an open <select> dropdown.  Returns 1 when the
+ * key was consumed. */
+static int select_dropdown_key(struct bstate *b, unsigned int key)
+{
+    struct browser_tab *t = active_tab(b);
+    struct dom_node *sel = t ? t->select_open_node : 0;
+    int dx, dy, dw, dh, vis, n, idx;
+
+    if (!sel || !select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis))
+        return 0;
+    n = select_option_count(sel);
+    idx = t->select_hover >= 0 ? t->select_hover : select_selected_index(sel);
+    switch (key) {
+    case KEY_UP:   idx--;        break;
+    case KEY_DOWN: idx++;        break;
+    case KEY_PGUP: idx -= vis;   break;
+    case KEY_PGDN: idx += vis;   break;
+    case KEY_HOME: idx = 0;      break;
+    case KEY_END:  idx = n - 1;  break;
+    case '\n':
+    case '\r':
+    case ' ': {
+        struct dom_node *opt = select_option_nth(sel, t->select_hover);
+
+        if (opt)
+            select_choose_option(b, sel, opt);
+        else
+            select_close(t);
+        return 1;
+    }
+    default:
+        return 0;
+    }
+    if (idx < 0)
+        idx = 0;
+    if (idx > n - 1)
+        idx = n - 1;
+    t->select_hover = idx;
+    select_reveal(t, idx, vis);
+    return 1;
+}
+
 static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
 {
     struct browser_tab *t = active_tab(b);
@@ -8234,6 +8378,8 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
 
     if (page_step < GLYPH_H)
         page_step = GLYPH_H;
+    if (select_dropdown_key(b, key))
+        return;
     switch (key) {
     case 17:                                  /* ctrl-Q */
         b->quit = 1;
@@ -8258,6 +8404,7 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         if (t) {
             t->focus_node = 0;
             t->addr_cur = t->addr_len;
+            select_close(t);
         }
         return;
     case 18:                                  /* ctrl-R */
@@ -8280,8 +8427,10 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         b->find_open = !b->find_open;
         b->addr_focus = 0;
         b->repl_focus = 0;
-        if (t)
+        if (t) {
             t->focus_node = 0;
+            select_close(t);
+        }
         if (!b->find_open)
             find_clear(b);
         else
@@ -8296,8 +8445,10 @@ static BROWSER_NOINLINE void on_key(struct bstate *b, unsigned int key)
         b->dev_open = !b->dev_open;
         b->addr_focus = 0;
         b->repl_focus = (b->dev_open && b->dev_tab == 1);
-        if (b->repl_focus && t)
+        if (b->repl_focus && t) {
             t->focus_node = 0;
+            select_close(t);
+        }
         tab_sync_active_view(b);
         return;
     case 27:                                  /* Esc */
@@ -8451,23 +8602,19 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
     int dev_y, dev_h, find_y, stat_y;
 
     if (t && t->select_open_node) {
-        int dx, dy, dw, dh, vis;
+        int dx, dy, dw, dh;
 
-        if (select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis) &&
+        if (select_dropdown_rect(b, &dx, &dy, &dw, &dh, 0) &&
             pt_in_rect(x, y, dx, dy, dw, dh)) {
-            int row_h = GLYPH_H + 6;
-            int idx = (y - dy - 2) / row_h;
+            struct dom_node *opt =
+                select_option_nth(t->select_open_node,
+                                  select_option_at(b, x, y));
 
-            if (idx >= 0 && idx < vis) {
-                struct dom_node *opt = select_option_nth(t->select_open_node,
-                                                         idx);
-                if (opt)
-                    select_choose_option(b, t->select_open_node, opt);
-            }
+            if (opt)
+                select_choose_option(b, t->select_open_node, opt);
             return;
         }
-        t->select_open_node = 0;
-        t->select_hover = -1;
+        select_close(t);
     }
 
     if (y < TAB_H) {
@@ -8684,6 +8831,7 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
             action = node;
         t->active_node = action;
         if (action && action->type == DOM_ELEMENT &&
+            !dom_has_attr(action, "disabled") &&
             (action->tag_id == HTAG_INPUT ||
              action->tag_id == HTAG_TEXTAREA ||
              action->tag_id == HTAG_SELECT ||
@@ -8717,9 +8865,10 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
                     jsdom_dispatch(p->js, action, "change",
                                    event_error, sizeof(event_error));
             } else if (action->tag_id == HTAG_SELECT) {
-                t->select_open_node = (t->select_open_node == action)
-                                          ? 0 : action;
-                t->select_hover = -1;
+                if (t->select_open_node == action)
+                    select_close(t);
+                else
+                    select_open(b, action);
             } else if (action->tag_id == HTAG_SUMMARY && action->parent &&
                        action->parent->tag_id == HTAG_DETAILS) {
                 struct dom_node *det = action->parent;
@@ -8738,9 +8887,8 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
                 return;
         }
         if (allow && action && action->type == DOM_ELEMENT &&
-            (action->tag_id == HTAG_BUTTON ||
-             (action->tag_id == HTAG_INPUT &&
-              str_ci_eq(control_type(action), "submit")))) {
+            (action->tag_id == HTAG_BUTTON || action->tag_id == HTAG_INPUT) &&
+            str_ci_eq(control_type(action), "submit")) {
             form = element_ancestor(action, HTAG_FORM);
             if (form) {
                 submit_form(b, form, action);
@@ -8781,14 +8929,8 @@ static BROWSER_NOINLINE int gui_update_hover(struct bstate *b, int x, int y)
     if (!t)
         return 0;
     if (t->select_open_node) {
-        int dx, dy, dw, dh, vis, hover_idx = -1;
+        int hover_idx = select_option_at(b, x, y);
 
-        if (select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis) &&
-            pt_in_rect(x, y, dx, dy, dw, dh)) {
-            hover_idx = (y - dy - 2) / (GLYPH_H + 6);
-            if (hover_idx < 0 || hover_idx >= vis)
-                hover_idx = -1;
-        }
         if (hover_idx != t->select_hover) {
             t->select_hover = hover_idx;
             return 1;
@@ -8935,9 +9077,13 @@ gui_mode(struct browser_runtime *rt, const char *start_url, int allow_restore)
             if (t) {
                 int dev_y, dev_h, find_y, stat_y;
                 int delta = (int32_t)ev.key;
+                int dx, dy, dw, dh, vis;
 
                 recompute_layout_dims(b, &dev_y, &dev_h, &find_y, &stat_y);
-                if (b->dev_open && ev.y >= dev_y + DEV_HDR_H &&
+                if (select_dropdown_rect(b, &dx, &dy, &dw, &dh, &vis)) {
+                    select_set_top(t, t->select_top - delta * 3, vis);
+                    t->select_hover = select_option_at(b, ev.x, ev.y);
+                } else if (b->dev_open && ev.y >= dev_y + DEV_HDR_H &&
                     ev.y < dev_y + dev_h) {
                     if (b->dev_tab == 0)
                         t->elem_scroll -= delta * 2;
@@ -9015,6 +9161,9 @@ int main(int argc, char **argv)
     int text = 0, cols = TEXT_COLS, links = 0, verbose = 0;
     int i, rc, allow_restore = 0;
 
+#ifndef JS_HOST
+    g_cwd = kestrel_startup_cwd();
+#endif
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             g_cwd = argv[i] + 6;
