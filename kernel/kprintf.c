@@ -5,6 +5,7 @@
 #include "string.h"
 #include "klog.h"
 #include "spinlock.h"
+#include "testmode.h"
 
 static spinlock_t print_lock = SPINLOCK_INIT;
 static void kputc(char c)
@@ -174,5 +175,6 @@ void panic(const char *fmt, ...)
     kvprintf(fmt, ap);
     va_end(ap);
     kprintf(" ***\n");
+    testmode_exit(TEST_EXIT_FAILURE);
     hang();
 }
