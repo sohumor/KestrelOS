@@ -43,6 +43,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from unittest import mock
 
 def find_qemu():
@@ -82,14 +83,22 @@ def find_openssl():
 QEMU_NICS = {
     "rtl8139": "rtl8139",
     "e1000": "e1000",
+    "virtio": "virtio-net-pci",
 }
 
 
-def qemu_command(nic, cpus, disk="ata"):
+def qemu_command(nic, cpus, disk="ata", virtio_mode="default"):
+    suffix = {"default": "", "legacy": ",disable-modern=on",
+              "modern": ",disable-legacy=on"}[virtio_mode]
     storage = (["-machine", "q35", "-drive",
                 "if=none,id=d0,file=build/os.img,format=raw",
                 "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
                ["-drive", "file=build/os.img,format=raw"])
+    if disk == "virtio":
+        suffix = {"default": "", "legacy": ",disable-modern=on",
+                  "modern": ",disable-legacy=on"}[virtio_mode]
+        storage = ["-drive", "if=none,id=d0,file=build/os.img,format=raw",
+                   "-device", "virtio-blk-pci,drive=d0" + suffix]
     return [
         find_qemu(),
         "-accel", "tcg",
@@ -105,8 +114,11 @@ def qemu_command(nic, cpus, disk="ata"):
         "-serial", "stdio",
         "-m", "128M",
         "-smp", str(cpus),
-        "-device", "%s,netdev=n0" % QEMU_NICS[nic],
-        "-netdev", "user,id=n0",
+        "-device", "%s,netdev=n0" % QEMU_NICS[nic] + (suffix if nic == "virtio" else ""),
+        # Both families are slirp's default, but the IPv6 tests depend on its
+        # router advertisements (prefix fec0::/64, host fec0::2, DNS
+        # fec0::3), so spell them out. Naming only ipv6=on turns IPv4 off.
+        "-netdev", "user,id=n0,ipv4=on,ipv6=on",
     ]
 
 
@@ -1906,11 +1918,31 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
+    if getattr(h, "disk", "ata") == "virtio":
+        mode = getattr(h, "virtio_mode", "default")
+        transport = "legacy" if mode == "legacy" else "modern"
+        line = h.expect("virtio: " + transport + " transport", timeout=BOOT_TIMEOUT)
+        print("  virtio: " + transport + " transport")
+        line = h.expect(r"virtio-blk: vda: [0-9]+ sectors",
+                        timeout=BOOT_TIMEOUT, regex=True)
+        print("  " + line.group(0))
     if getattr(h, "disk", "ata") == "ahci":
         line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
                         timeout=BOOT_TIMEOUT, regex=True)
         print("  " + line.group(0))
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+    if getattr(h, "nic", "rtl8139") == "virtio":
+        transport = "legacy" if h.virtio_mode == "legacy" else "modern"
+        if "virtio-net: " + transport + ", mac " not in h.boot_output:
+            raise AssertionError("VirtIO network device was not initialized")
+        if "(dhcp)" not in h.boot_output:
+            raise AssertionError("VirtIO network device did not obtain a DHCP lease")
+        for line in h.boot_output.splitlines():
+            if "virtio-net:" in line or "(dhcp)" in line:
+                print("  " + line)
+    if getattr(h, "disk", "ata") == "virtio":
+        if "ata: primary master:" in h.boot_output or "ahci: port " in h.boot_output:
+            raise AssertionError("ATA/AHCI claimed a disk in VirtIO mode")
     if getattr(h, "disk", "ata") == "ahci":
         if "ata: primary master:" in h.boot_output:
             raise AssertionError("ATA claimed a disk in AHCI mode")
@@ -2072,6 +2104,72 @@ def t_ping(h):
     wait_prompt(h)
     if got == "network unavailable":
         return "SKIP"
+
+
+QEMU_HOST6 = "fec0::2"
+IPV6_BODY_MARKER = "CONTROLLED-IPV6-BODY-OK"
+
+
+def t_ipv6_slaac(h):
+    """SLAAC from slirp's router advertisement: a fec0::/64 address."""
+    if not re.search(r"net6: global fec0:", h.boot_output):
+        raise AssertionError("no SLAAC address in boot log")
+    h.send("netstat")
+    h.expect(r"inet6\s+fe80::[0-9a-f:]+/64 \(link\)", regex=True)
+    h.expect(r"inet6\s+fec0:[0-9a-f:]+/64 \(slaac\)", regex=True)
+    wait_prompt(h)
+
+
+def t_ping6(h):
+    """ICMPv6 echo to the slirp host, after neighbor discovery."""
+    h.send("ping %s 2" % QEMU_HOST6)
+    h.expect("reply from %s" % QEMU_HOST6, timeout=NET_TIMEOUT)
+    wait_prompt(h)
+
+
+class _IPv6HTTPServer(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+    daemon_threads = True
+
+
+class _IPv6Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ("<html><body>%s %s</body></html>"
+                % (IPV6_BODY_MARKER, self.client_address[0])).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def t_tcp6(h):
+    """HTTP over TCP over IPv6: slirp maps fec0::2 to the host's ::1."""
+    try:
+        srv = _IPv6HTTPServer(("::1", 0), _IPv6Handler)
+    except OSError:
+        return "SKIP"
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        url = "http://[%s]:%d/v6" % (QEMU_HOST6, srv.server_address[1])
+        h.send("curl -s %s" % url)
+        h.expect(IPV6_BODY_MARKER, timeout=NET_TIMEOUT)
+        wait_prompt(h)
+        # The browser goes through libweb's transport, not libc's client.
+        h.send("/bin/browser -t %s; echo BROWSER6-STATUS-$?" % url)
+        block = h.capture_until(r"\nBROWSER6-STATUS-\d+\n",
+                                timeout=NET_TIMEOUT, regex=True)
+        if IPV6_BODY_MARKER not in block or "BROWSER6-STATUS-0" not in block:
+            raise AssertionError("browser IPv6 fetch failed")
+        wait_prompt(h)
+    finally:
+        srv.shutdown()
+        srv.server_close()
 
 
 def t_nslookup(h):
@@ -3012,6 +3110,31 @@ def t_browser_home(h):
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
 
+def t_wget_origin_index(h):
+    """Default wget filenames exclude the authority and query string."""
+    origin = "http://%s:%d" % (
+        QEMU_HOST, browser_fixtures.http.server_address[1])
+    for suffix, filename in (("", "index.html"), ("/", "index.html"),
+                             ("/dir/", "index.html"),
+                             ("?q=/ignored", "index.html"),
+                             ("/dir/?q=/ignored", "index.html"),
+                             ("/plain?q=/ignored", "plain")):
+        h.send("wget %s%s; echo WGET-STATUS-$?; "
+               "cat /%s; echo WGET-END" %
+               (origin, suffix, filename))
+        block = h.capture_until(r"\nWGET-END\n", timeout=NET_TIMEOUT,
+                                regex=True)
+        print("wget transcript (%s):\n%s" % (origin + suffix, block))
+        if ("WGET-STATUS-0\n" not in block or
+                "to /%s\n" % filename not in block or
+                HTTP_BODY_MARKER not in block):
+            raise TimeoutError("wget did not save the expected /%s body"
+                               % filename)
+        wait_prompt(h, timeout=NET_TIMEOUT)
+        h.send("rm /%s" % filename)
+        wait_prompt(h)
+
+
 def t_browser_http_controlled(h):
     """Plain HTTP through /bin/browser against a deterministic host page."""
     if not browser_fixtures:
@@ -3449,6 +3572,40 @@ def t_curl_https(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def t_telnet_peer_reset(h):
+    """An idle connection survives receive timeouts, but not a peer reset."""
+    for reset in (True, False):
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(NET_TIMEOUT)
+            port = listener.getsockname()[1]
+            h.send("telnet %s %d; echo TELNET-STATUS-$?" % (QEMU_HOST, port))
+            with listener.accept()[0] as peer:
+                h.expect('connected. ctrl-D or "quit" to close.')
+                # Keep the socket idle across several receive slices before
+                # proving the client still receives data.
+                time.sleep(0.5)
+                peer.sendall(b"TELNET-IDLE-DATA-OK\n")
+                h.expect("\nTELNET-IDLE-DATA-OK\n")
+                if reset:
+                    peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                                    struct.pack("ii", 1, 0))
+            print("  peer sent %s after idle/data check" %
+                  ("RST" if reset else "FIN"))
+            block = h.capture_until(r"(?m)^TELNET-STATUS-\d+\n",
+                                    timeout=10, regex=True)
+            print(block.strip())
+            message = ("telnet: receive failed, connection closed" if reset
+                       else "telnet: connection closed by peer")
+            status = 1 if reset else 0
+            if message not in block or not re.search(
+                    r"(?m)^TELNET-STATUS-%d$" % status, block):
+                raise TimeoutError("telnet did not report %s with status %d"
+                                   % (message, status))
+            wait_prompt(h)
+
+
 def t_tcp_curl(h):
     """A real TCP fetch. SKIPs like the other network tests: the host may
     have no route out, and that is not a KestrelOS bug."""
@@ -3609,6 +3766,15 @@ def t_kjs_cli(h):
     wait_prompt(h)
 
 
+def t_hda_absent(h):
+    h.send("cat /dev/audio")
+    h.expect("cat: cannot open /dev/audio")
+    wait_prompt(h)
+    h.send("cat /dev/mixer")
+    h.expect("cat: cannot open /dev/mixer")
+    wait_prompt(h)
+
+
 TESTS = [
     ("boot", t_boot),
     ("login", t_login),
@@ -3632,6 +3798,9 @@ TESTS = [
     ("dynamic-linking", t_dynamic_linking),
     ("ping", t_ping),
     ("nslookup", t_nslookup),
+    ("ipv6-slaac", t_ipv6_slaac),
+    ("ping6", t_ping6),
+    ("tcp6", t_tcp6),
     ("uptime", t_uptime),
     ("calc", t_calc),
     ("calc-divzero", t_calc_divzero),
@@ -3667,6 +3836,7 @@ TESTS = [
     ("inspect-cli", t_inspect_cli),
     ("kjs-cli", t_kjs_cli),
     ("dev", t_dev),
+    ("hda-absent", t_hda_absent),
     ("flight", t_flight),
     ("aerie-krec", t_aerie_krec),
     ("dmesg", t_dmesg),
@@ -3678,6 +3848,7 @@ TESTS = [
     ("browser-button-types", t_browser_button_types),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
+    ("wget-origin-index", t_wget_origin_index),
     ("browser-web-compat", t_browser_web_compat),
     ("browser-modern-web", t_browser_modern_web),
     ("browser-select-menu", t_browser_select_menu),
@@ -3693,6 +3864,7 @@ TESTS = [
     ("kpkg-verify", t_kpkg_verify),
     ("lsmod", t_lsmod),
     ("tcp-curl", t_tcp_curl),
+    ("telnet-peer-reset", t_telnet_peer_reset),
 ]
 
 # boot + login + a prompt: the least that proves the machine came up.
@@ -4018,12 +4190,172 @@ def fixture_selftest():
     return True
 
 
+def usb_hid_test(nic, cpus, machine):
+    """Exercise real USB input; disable PS/2 where QEMU supports it."""
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    properties = subprocess.run([find_qemu(), "-machine", machine + ",help"],
+                                capture_output=True, text=True, check=True).stdout
+    no_ps2 = "i8042=" in properties
+    cmd = qemu_command(nic, cpus, "ahci" if machine == "q35" else "ata")
+    if "-machine" in cmd:
+        cmd[cmd.index("-machine") + 1] = machine + (",i8042=off" if no_ps2 else "")
+    else:
+        cmd += ["-machine", machine + (",i8042=off" if no_ps2 else "")]
+    cmd += [
+        "-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-mouse",
+        "-qmp", "tcp:127.0.0.1:%d,server=on,wait=off" % port,
+    ]
+    h = Harness(cmd)
+    monitor = None
+    stream = None
+    try:
+        h.start()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                monitor = socket.create_connection(("127.0.0.1", port), timeout=2)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("QMP monitor did not start")
+                time.sleep(0.05)
+        monitor.settimeout(5)
+        stream = monitor.makefile("rwb")
+        greeting = json.loads(stream.readline())
+        if "QMP" not in greeting:
+            raise RuntimeError("invalid QMP greeting")
+
+        def qmp(execute, arguments=None):
+            request = {"execute": execute}
+            if arguments is not None:
+                request["arguments"] = arguments
+            stream.write((json.dumps(request) + "\n").encode("ascii"))
+            stream.flush()
+            while True:
+                reply = json.loads(stream.readline())
+                if "error" in reply:
+                    raise RuntimeError("QMP error: %s" % reply["error"])
+                if "return" in reply:
+                    return reply["return"]
+
+        qmp("qmp_capabilities")
+        boot = h.capture_until("KESTREL READY", timeout=BOOT_TIMEOUT)
+        for pattern in (r"xhci: controller [^\n]+", r"usb: port \d+ slot \d+ keyboard \(boot\)",
+                        r"usb: port \d+ slot \d+ mouse \(boot\)"):
+            match = re.search(pattern, boot)
+            if not match:
+                raise RuntimeError("missing USB enumeration: " + pattern)
+            print(match.group(0))
+        t_login(h)
+        t_prompt(h)
+        # Only monitor events supply this command, never the serial harness.
+        for char in "echo usbinputok\n":
+            key = {" ": "spc", "\n": "ret"}.get(char, char)
+            qmp("human-monitor-command", {"command-line": "sendkey %s 30" % key})
+            time.sleep(0.08)
+        h.expect(r"\nusbinputok\n", regex=True)
+        wait_prompt(h)
+        print("PASS usb-keyboard-monitor-input")
+        qmp("human-monitor-command", {"command-line": "mouse_move 17 9"})
+        qmp("human-monitor-command", {"command-line": "mouse_button 1"})
+        mouse = h.expect(r"usb: mouse input dx -?\d+ dy -?\d+ buttons \d+",
+                         regex=True)
+        print(mouse.group(0))
+        qmp("human-monitor-command", {"command-line": "mouse_button 0"})
+        print("PASS usb-mouse-monitor-input")
+        print("summary: USB HID input passed (%s, %s)" %
+              (machine, "no PS/2 controller" if no_ps2 else
+               "QEMU lacks i8042=off; monitor targets USB"))
+        return 0
+    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+        print("FAIL usb-hid: %s" % exc)
+        h.print_tail()
+        return 1
+    finally:
+        if stream:
+            stream.close()
+        if monitor:
+            monitor.close()
+        h.kill()
+
+
+def check_audio_wav(path):
+    with wave.open(path, "rb") as wav:
+        if wav.getsampwidth() != 2 or wav.getnchannels() != 2:
+            raise ValueError("expected stereo s16 WAV")
+        rate = wav.getframerate()
+        raw = wav.readframes(wav.getnframes())
+    samples = [s[0] for s in struct.iter_unpack("<hh", raw)]
+    active = [i for i, s in enumerate(samples) if abs(s) > 500]
+    if not active:
+        raise ValueError("WAV contains no non-silent playback samples")
+    signal = samples[active[0]:active[-1] + 1]
+    rms = math.sqrt(sum(s * s for s in signal) / len(signal))
+    crossings = sum(a <= 0 < b for a, b in zip(signal, signal[1:]))
+    frequency = crossings * rate / len(signal)
+    if rms < 1000 or not 420 <= frequency <= 460 or len(signal) < rate * 0.8:
+        raise ValueError("bad playback: RMS=%.1f frequency=%.1f Hz duration=%.3f s" %
+                         (rms, frequency, len(signal) / rate))
+    print("PASS hda-wav: non-silent RMS=%.1f frequency=%.1f Hz duration=%.3f s" %
+          (rms, frequency, len(signal) / rate))
+
+
+def run_audio_test(nic, cpus):
+    path = os.path.abspath("build/hda-playback.wav")
+    if os.path.exists(path):
+        os.unlink(path)
+    cmd = qemu_command(nic, cpus) + [
+        "-audiodev", "wav,id=snd0,path=%s,out.frequency=48000" % path,
+        "-device", "intel-hda", "-device", "hda-duplex,audiodev=snd0"]
+    h = Harness(cmd)
+    try:
+        h.start()
+        match = h.expect(r"hda: codec \d+ dac nid=\d+ pin nid=\d+", regex=True, timeout=30)
+        print(match.group(0))
+        for _, fn in TESTS[:SMOKE_TESTS]:
+            fn(h)
+        h.send("echo 63 > /dev/mixer")
+        wait_prompt(h)
+        h.send("cat /dev/mixer")
+        h.expect("\nvolume=63\n")
+        wait_prompt(h)
+        h.send("audiotest")
+        h.expect("audio: empty, invalid, exclusive-open and mixer checks passed")
+        wait_prompt(h)
+        h.send("cat /doc/tone.pcm > /dev/audio")
+        wait_prompt(h, timeout=20)
+        h.send("echo AUDIO-DRAINED")
+        h.expect("\nAUDIO-DRAINED\n")
+        wait_prompt(h)
+        h.send("sleep 1")
+        wait_prompt(h)
+    except (OSError, TimeoutError, ValueError) as e:
+        print("FAIL hda-audio: %s" % e)
+        h.print_tail()
+        return False
+    finally:
+        h.kill()
+    try:
+        check_audio_wav(path)
+    except (OSError, ValueError, wave.Error) as e:
+        print("FAIL hda-audio: %s" % e)
+        return False
+    print("PASS hda-audio")
+    return True
+
+
 def main():
     global browser_fixtures
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
                     help="check boot, login and shell prompt, then guest exit code")
+    ap.add_argument("--usb-hid", action="store_true",
+                    help="opt-in xHCI monitor test (disables PS/2 on supported QEMU)")
+    ap.add_argument("--usb-machine", choices=["pc", "q35"], default="pc",
+                    help="machine for --usb-hid (default: pc)")
     ap.add_argument("--only", action="append", metavar="NAME",
                     help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
@@ -4034,7 +4366,8 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
-    ap.add_argument("--disk", choices=["ata", "ahci"], default="ata",
+    ap.add_argument("--virtio-mode", choices=["default", "legacy", "modern"], default="default")
+    ap.add_argument("--disk", choices=["ata", "ahci", "virtio"], default="ata",
                     help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
@@ -4051,6 +4384,7 @@ def main():
     if args.list:
         for name, _ in TESTS:
             print(name)
+        print("hda-audio")
         return 0
 
     if args.selftest:
@@ -4062,8 +4396,11 @@ def main():
         print("error: build/os.img not found (run make first)")
         return 1
 
+    if args.usb_hid:
+        return usb_hid_test(args.nic, args.cpus, args.usb_machine)
+
     if args.only:
-        available = dict(TESTS)
+        available = dict(TESTS, **{"hda-audio": run_audio_test})
         missing = [name for name in args.only if name not in available]
         if missing:
             ap.error("unknown --only test(s): %s" % ", ".join(missing))
@@ -4087,7 +4424,7 @@ def main():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         monitor_port = probe.getsockname()[1]
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk, args.virtio_mode))
     if any(name == "browser-protected-inputs" for name, _ in tests):
         with socket.socket() as port:
             port.bind(("127.0.0.1", 0))
@@ -4096,6 +4433,8 @@ def main():
                       % h.monitor_port, "-m", "512M", "-device",
                       "VGA,vgamem_mb=32"])
     h.disk = args.disk
+    h.nic = args.nic
+    h.virtio_mode = args.virtio_mode
     h.monitor_port = monitor_port
     try:
         h.start()
@@ -4117,7 +4456,10 @@ def main():
         if fixtures:
             fixtures.close()
             browser_fixtures = None
-    return 0 if summarize(results) else 1
+    ok = summarize(results)
+    if not args.smoke and (not args.only or "hda-audio" in args.only):
+        ok = run_audio_test(args.nic, args.cpus) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

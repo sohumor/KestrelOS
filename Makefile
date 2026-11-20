@@ -98,8 +98,8 @@ ROOTFS_SRC := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).repl
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless debug gdb profile test test-e1000 test-net test-tcp test-checksum \
-        test-console-scroll test-hangar test-hangar-host \
+.PHONY: all run run-headless debug gdb profile test test-e1000 test-net test-tcp test-checksum test-dns \
+        test-console-scroll test-hangar test-hangar-host test-usb-hid \
         test-random test-mission test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
@@ -288,14 +288,16 @@ $(BUILD)/repo/index.kpi: $(KPKGS) tools/mkrepo.py
 # ---------------- filesystem image ----------------
 
 $(BUILD)/fs.img: $(APP_BINS) $(DYNAMIC_LIB) $(MOD_BINS) tools/mkfs.py $(ROOTFS_SRC) $(KPKGS) \
-                 $(BUILD)/repo/index.kpi
+                 $(BUILD)/repo/index.kpi tools/mkaudio.py tools/mkchime.py
 	rm -rf $(BUILD)/rootfs
-	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run \
+	mkdir -p $(BUILD)/rootfs/bin $(BUILD)/rootfs/dev $(BUILD)/rootfs/run $(BUILD)/rootfs/media \
 	         $(BUILD)/rootfs/tmp $(BUILD)/rootfs/var/log \
 	         $(BUILD)/rootfs/lib/modules \
 	         $(BUILD)/rootfs/var/pkg/repo $(BUILD)/rootfs/var/pkg/db \
 	         $(BUILD)/rootfs/var/pkg/cache
 	if [ -d rootfs ]; then cp -r rootfs/. $(BUILD)/rootfs/; fi
+	$(PY) tools/mkaudio.py $(BUILD)/rootfs/doc/tone.pcm
+	$(PY) tools/mkchime.py $(BUILD)/rootfs/media/chime.wav
 	cp $(APP_BINS) $(BUILD)/rootfs/bin/
 	# Keep symbol-bearing build artifacts for debugging, but do not spend KFS
 	# file blocks on DWARF sections that the target loader never reads.
@@ -344,7 +346,10 @@ test-tcp:
 test-checksum:
 	sh tools/run-net-checksum-tests.sh
 
-test-net: test-tcp test-checksum
+test-dns:
+	sh tools/run-dns-tests.sh
+
+test-net: test-tcp test-checksum test-dns
 
 test-random:
 	sh tools/run-random-tests.sh
@@ -370,6 +375,18 @@ test-hangar-host:
 test-hangar: all test-hangar-host
 	$(PY) tools/test_hangar_reboot.py
 
+test-usb-hid:
+	@mkdir -p $(BUILD)
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
+	  -Ikernel/include kernel/usb_hid_core.c tools/test_usb_hid.c -o $(BUILD)/test_usb_hid
+	$(BUILD)/test_usb_hid
+
+.PHONY: test-virtio
+test-virtio:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined -Ikernel/include kernel/virtio_ring.c kernel/virtio_net_core.c tools/test_virtio_ring.c -o $(BUILD)/host-tests/test_virtio_ring
+	$(BUILD)/host-tests/test_virtio_ring
+
 test-jpeg-prog:
 	@mkdir -p $(BUILD)
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -Ilibimg -Ilibz \
@@ -387,6 +404,13 @@ test-img-formats:
 test-browser-host: test-jpeg-prog test-img-formats
 	sh tools/run-jsdom-tests.sh
 	sh tools/run-browser-stack.sh
+
+.PHONY: test-play
+test-play:
+	mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
+	  -fno-omit-frame-pointer tools/test_play.c -o $(BUILD)/host-tests/test_play
+	$(BUILD)/host-tests/test_play
 
 test-gui-host:
 	sh tools/run-gui-tests.sh
@@ -427,8 +451,9 @@ help:
 	@echo "  make gdb        load kernel symbols and attach (GDB_FLAGS for batch options)"
 	@echo "  make test       run the end-to-end suite in headless QEMU"
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
-	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
-	@echo "  make test-net   run host TCP + network checksum tests"
+	@echo "  make test-tcp   run host TCP reassembly and RST tests with sanitizers"
+	@echo "  make test-dns   run host DNS response validation tests with sanitizers"
+	@echo "  make test-net   run host TCP + network checksum + DNS tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-console-scroll   run host console scroll regression tests"
 	@echo "  make test-mission  run mission grant and enforcement core tests"

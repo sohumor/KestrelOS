@@ -72,7 +72,7 @@
 /* --- TCP --- */
 #define SYS_TCP_CONNECT 48 /* (ip_be, port, timeout_ms) -> handle/-1 */
 #define SYS_TCP_SEND    49 /* (handle, buf, len) -> sent/-1 */
-#define SYS_TCP_RECV    50 /* (handle, buf, max, timeout_ms) -> n, 0 = closed */
+#define SYS_TCP_RECV    50 /* (handle, buf, max, timeout_ms) -> n, 0 = closed, -1 = error, -2 = timeout */
 #define SYS_TCP_CLOSE   51 /* (handle) -> 0/-1 */
 #define SYS_SYNC        52 /* () -> flush filesystem caches */
 
@@ -111,6 +111,13 @@
 #define SYS_MISSION_SPAWN 90 /* (path, argv, const struct k_mission_grant*, u32 *id_or_NULL) -> pid/-1 */
 #define SYS_MISSION_CTL   91 /* (id, op, arg) -> 0/-1 */
 #define SYS_MISSION_INFO  92 /* (index, struct k_mission_info*) -> 0/-1 */
+
+/* --- IPv6: addresses are 16 network-order bytes passed by pointer --- */
+#define SYS_NETINFO6     78 /* (struct k_netinfo6*) -> 0 / -1 if no nic */
+#define SYS_DNS6         79 /* (name, u8 ip6[16]) -> 0/-1 (AAAA or literal) */
+#define SYS_PING6        80 /* (const u8 ip6[16], timeout_ms) -> rtt ms / -1 */
+#define SYS_TCP_CONNECT6 81 /* (const u8 ip6[16], port, timeout_ms) -> handle/-1 */
+#define SYS_UDP_SEND6    82 /* (const u8 ip6[16], dport<<16|sport, buf, len) */
 
 /* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
  * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
@@ -260,6 +267,21 @@ struct k_netinfo {
     uint8_t mac[6];
     uint8_t up;       /* 1 if the NIC was found and initialized */
     uint8_t _pad;
+};
+
+#define K_NET6_LINKLOCAL 0x01 /* link_local is configured */
+#define K_NET6_GLOBAL    0x02 /* global was formed by SLAAC */
+#define K_NET6_ROUTER    0x04 /* router is a usable default route */
+#define K_NET6_DNS       0x08 /* dns came from an RA RDNSS option */
+
+struct k_netinfo6 {
+    uint8_t link_local[16];
+    uint8_t global[16];
+    uint8_t router[16];
+    uint8_t dns[16];
+    uint8_t prefix_len;   /* on-link prefix length of global */
+    uint8_t flags;        /* K_NET6_* */
+    uint8_t _pad[6];
 };
 
 /* Special key codes delivered through SYS_READ on fd 0 (values >= 0x80).

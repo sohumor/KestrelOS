@@ -440,11 +440,15 @@ def build_all(tc):
     rootfs_stage = b("rootfs")
     if os.path.exists(rootfs_stage):
         shutil.rmtree(rootfs_stage)
-    for d in ("bin", "dev", "run", "tmp", "var/log", "lib/modules",
+    for d in ("bin", "dev", "run", "tmp", "media", "var/log", "lib/modules",
               "var/pkg/repo", "var/pkg/db", "var/pkg/cache"):
         os.makedirs(os.path.join(rootfs_stage, d), exist_ok=True)
     if os.path.isdir(r("rootfs")):
         shutil.copytree(r("rootfs"), rootfs_stage, dirs_exist_ok=True)
+    run_cmd([sys.executable, r("tools/mkaudio.py"),
+             os.path.join(rootfs_stage, "doc", "tone.pcm")])
+    run_cmd([sys.executable, r("tools/mkchime.py"),
+             os.path.join(rootfs_stage, "media", "chime.wav")])
     for app in app_bins:
         dst = os.path.join(rootfs_stage, "bin", os.path.basename(app))
         shutil.copyfile(app, dst)
@@ -500,13 +504,23 @@ def run_host_tests(tc):
          ["-Ikernel/include", "-Iabi"]),
         ("test_mission_manifest", [r("libc/mission.c"), r("tools/test_mission_manifest.c")],
          ["-Iabi", "-idirafter", "libc/include"]),
+        ("test_usb_hid", [r("kernel/usb_hid_core.c"), r("tools/test_usb_hid.c")],
+         ["-Ikernel/include"]),
+        ("test_virtio_ring", [r("kernel/virtio_ring.c"), r("kernel/virtio_net_core.c"), r("tools/test_virtio_ring.c")],
+         ["-Ikernel/include"]),
+        ("test_play", [r("tools/test_play.c")], []),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
          ["-Ikernel/include"]),
         ("test_hangar", [r("kernel/hangar_fmt.c"), r("tools/test_hangar.c")],
          ["-Ikernel/include"]),
+        ("test_tcp_rst", [r("kernel/tcp_reassembly.c"), r("kernel/net_checksum.c"), r("tools/test_tcp_rst.c")],
+         ["-Ikernel/include", "-Iabi", "-ffunction-sections", "-fdata-sections",
+          "-Wl,/opt:ref" if sys.platform == "win32" else "-Wl,--gc-sections"]),
         ("test_net_checksum", [r("kernel/net_checksum.c"), r("tools/test_net_checksum.c")],
+         ["-Ikernel/include", "-Iabi"]),
+        ("test_dns", [r("kernel/dns.c"), r("tools/test_dns.c")],
          ["-Ikernel/include", "-Iabi"]),
         ("test_gui_primitives", [r("tools/test_gui_primitives.c"), r("libgui/draw.c"), r("libgui/font_data.c")],
          ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
@@ -658,10 +672,14 @@ def generate_compile_commands(tc):
         ("tools/test_console_scroll.c", ["-Ikernel/include", "-Iabi", "-ffunction-sections", "-fdata-sections"]),
         ("tools/test_mission.c", ["-Ikernel/include", "-Iabi"]),
         ("tools/test_mission_manifest.c", ["-Iabi", "-idirafter", "libc/include"]),
+        ("tools/test_usb_hid.c", ["-Ikernel/include"]),
+        ("tools/test_virtio_ring.c", ["-Ikernel/include"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_hangar.c", ["-Ikernel/include"]),
+        ("tools/test_tcp_rst.c", ["-Ikernel/include", "-Iabi"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),
+        ("tools/test_dns.c", ["-Ikernel/include", "-Iabi"]),
         ("tools/test_gui_primitives.c", ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
         ("tools/test_cryptosym.c", ["-Ilibtls"]),
         ("tools/test_jpeg_prog.c", ["-Ilibimg", "-Ilibz"]),

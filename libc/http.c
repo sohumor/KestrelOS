@@ -143,10 +143,22 @@ static int url_split(const char *url, char *host, unsigned long hostsz,
         return strstr(url, "://") ? HTTP_ESCHEME : HTTP_EURL;
     }
 
-    p = h;
-    while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#')
+    if (*h == '[') {
+        /* IPv6 literal: the brackets are URL syntax, not part of the host. */
+        p = strchr(h, ']');
+        if (!p)
+            return HTTP_EURL;
+        h++;
+        n = (unsigned long)(p - h);
         p++;
-    n = (unsigned long)(p - h);
+        if (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#')
+            return HTTP_EURL;
+    } else {
+        p = h;
+        while (*p && *p != '/' && *p != ':' && *p != '?' && *p != '#')
+            p++;
+        n = (unsigned long)(p - h);
+    }
     if (n == 0 || n >= hostsz)
         return HTTP_EURL;
     memcpy(host, h, n);
@@ -521,7 +533,7 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
     struct hconn c;
     uint16_t port = 80;
     int secure = 0;
-    uint32_t ip = 0;
+    char hosthdr[HTTP_HOST_MAX + 2];
     unsigned long clen = 0;
     int have_clen = 0, chunked = 0, have_loc = 0;
     int code = 0, rc, n;
@@ -549,17 +561,17 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
         g_http_tls_error[0] = '\0';
         c.secure = 1;
     } else {
-        ip = ip_aton(host);
-        if (ip == 0 && dns_resolve(host, &ip) < 0)
+        struct net_addr addr;
+        if (net_resolve(host, NET_AF_ANY, &addr) < 0)
             return HTTP_EDNS;
-        if (ip == 0)
-            return HTTP_EDNS;
-        c.handle = (int)syscall(SYS_TCP_CONNECT, (long)ip, port,
-                                HTTP_CONNECT_MS, 0);
+        c.handle = net_tcp_connect(&addr, port, HTTP_CONNECT_MS);
         if (c.handle < 0)
             return HTTP_ECONNECT;
     }
 
+    /* An IPv6 literal goes back in brackets in the Host header. */
+    snprintf(hosthdr, sizeof(hosthdr), strchr(host, ':') ? "[%s]" : "%s",
+             host);
     if ((!secure && port == 80) || (secure && port == 443))
         n = snprintf(req, sizeof(req),
                      "GET %s HTTP/1.1\r\n"
@@ -567,7 +579,7 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
                      "User-Agent: KestrelOS-http/1.0\r\n"
                      "Accept: */*\r\n"
                      "Connection: close\r\n\r\n",
-                     path, host);
+                     path, hosthdr);
     else
         n = snprintf(req, sizeof(req),
                      "GET %s HTTP/1.1\r\n"
@@ -575,7 +587,7 @@ static int fetch_once(const char *url, struct hbuf *body, int *status,
                      "User-Agent: KestrelOS-http/1.0\r\n"
                      "Accept: */*\r\n"
                      "Connection: close\r\n\r\n",
-                     path, host, (unsigned)port);
+                     path, hosthdr, (unsigned)port);
     if (n < 0 || (unsigned long)n >= sizeof(req)) {
         hc_close(&c);
         return HTTP_EURL;

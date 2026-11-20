@@ -9,6 +9,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <http.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +18,7 @@
 #define PATH_MAX_  256
 #define IO_CHUNK   4096
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 /* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
 static int strip_cwd_arg(int argc, char **argv)
@@ -53,6 +54,10 @@ static void name_from_url(const char *url, char *out, unsigned long outsz)
 
     if (strncmp(p, "http://", 7) == 0)
         p += 7;
+    else if (strncmp(p, "https://", 8) == 0)
+        p += 8;
+    while (*p && *p != '/' && *p != '?' && *p != '#')
+        p++;
     start = p;
     while (*p && *p != '?' && *p != '#') {
         if (*p == '/')
@@ -108,6 +113,7 @@ int main(int argc, char **argv)
     unsigned long start, elapsed;
     int status = 0, quiet = 0, rc, i;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
 
     for (i = 1; i < argc; i++) {

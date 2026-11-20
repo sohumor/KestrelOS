@@ -37,7 +37,11 @@
 #define DEV_SOCKETS  13         /* active TCP sockets @krec snapshot */
 #define DEV_CAPS     14         /* process capability & unveil @krec snapshot */
 #define DEV_PARCELS  15         /* active Talon parcels @krec snapshot */
-#define DEV_MISSIONS 16         /* mission grants and counters @krec snapshot */
+#define DEV_NET      16         /* network telemetry counters @krec snapshot */
+#define DEV_ARP      17         /* ARP neighbor cache @krec snapshot */
+#define DEV_DNS      18         /* DNS TTL cache @krec snapshot */
+/* 19-20 are DEV_AUDIO/DEV_MIXER, defined privately in devfs.c. */
+#define DEV_MISSIONS 21         /* mission grants and counters @krec snapshot */
 
 /* Register the "devfs" filesystem type. Idempotent. */
 void devfs_init(void);

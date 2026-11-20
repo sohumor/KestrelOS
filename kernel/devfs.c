@@ -24,6 +24,12 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "tcp.h"
 #include "parcel.h"
 #include "mission.h"
+#include "net.h"
+#include "hda.h"
+
+/* 16-18 are DEV_NET/DEV_ARP/DEV_DNS in devfs.h. */
+#define DEV_AUDIO 19
+#define DEV_MIXER 20
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -79,6 +85,11 @@ static const struct devdesc devtab[] = {
     { "caps",    DEV_CAPS,    0444 },
     { "parcels", DEV_PARCELS, 0444 },
     { "missions", DEV_MISSIONS, 0444 },
+    { "net",     DEV_NET,     0444 },
+    { "arp",     DEV_ARP,     0444 },
+    { "dns",     DEV_DNS,     0444 },
+    { "audio",   DEV_AUDIO,   0666 },
+    { "mixer",   DEV_MIXER,   0666 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -128,7 +139,8 @@ static const struct devdesc *dev_lookup(const char *path)
     if (name == NULL)
         return NULL;
     for (int i = 0; i < DEVTAB_COUNT; i++)
-        if (strcmp(name, devtab[i].name) == 0)
+        if (strcmp(name, devtab[i].name) == 0 &&
+            ((devtab[i].id != DEV_AUDIO && devtab[i].id != DEV_MIXER) || hda_ready()))
             return &devtab[i];
     return NULL;
 }
@@ -269,7 +281,8 @@ static uint32_t blk_size_bytes(struct blockdev *bd)
 static bool is_krec_dev(int id)
 {
     return id == DEV_FLIGHT || id == DEV_PROCS || id == DEV_SOCKETS ||
-           id == DEV_CAPS || id == DEV_PARCELS || id == DEV_MISSIONS;
+           id == DEV_CAPS || id == DEV_PARCELS || id == DEV_MISSIONS ||
+           id == DEV_NET || id == DEV_ARP || id == DEV_DNS;
 }
 
 static uint32_t krec_dev_cap(int id)
@@ -305,6 +318,25 @@ static uint32_t render_krec_view(int id, char *buf, uint32_t cap)
         return parcel_snapshot_krec(buf, cap);
     case DEV_MISSIONS:
         return mission_snapshot_krec(buf, cap);
+    case DEV_NET:
+        return net_snapshot_krec(buf, cap);
+    case DEV_ARP:
+        return arp_snapshot_krec(buf, cap);
+    case DEV_DNS:
+#ifdef CONFIG_DNS
+        return dns_snapshot_krec(buf, cap);
+#else
+    {
+        struct krec_kbuf b;
+        if (cap == 0)
+            return 0;
+        krec_kbuf_init(&b, buf, cap);
+        krec_kbuf_puts(&b, "@krec name:str ip:ip ttl_s:int hits:int\n");
+        if (b.overflow)
+            b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+#endif
     default:
         return 0;
     }
@@ -414,7 +446,22 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags,
         df = devfile_new(d->id, flags);
         if (df == NULL)
             return NULL;
-        if (d->id == DEV_MOUNTS || d->id == DEV_BLOCKS) {
+        if (d->id == DEV_AUDIO && hda_open() < 0) {
+            devfile_free(df);
+            return NULL;
+        }
+        if (d->id == DEV_MIXER) {
+            df->text = kmalloc(32);
+            if (df->text == NULL) {
+                devfile_free(df);
+                return NULL;
+            }
+            struct sbuf b = { df->text, 0, 32 };
+            sb_puts(&b, "volume=");
+            sb_putu(&b, hda_volume());
+            sb_putc(&b, '\n');
+            df->textlen = b.len;
+        } else if (d->id == DEV_MOUNTS || d->id == DEV_BLOCKS) {
             df->text = kmalloc(DEVFS_TEXT_MAX);
             if (df->text == NULL) {
                 devfile_free(df);
@@ -433,6 +480,8 @@ static struct file *devfs_op_open(struct mount *m, const char *path, int flags,
             df->textlen = render_krec_view(d->id, df->text, cap);
         }
         if (handle_register(df) < 0) {
+            if (d->id == DEV_AUDIO)
+                hda_close();
             devfile_free(df);
             return NULL;
         }
@@ -485,6 +534,8 @@ static void devfs_op_close(struct file *f)
 
     if (df == NULL)
         return;
+    if (df->dev == DEV_AUDIO)
+        hda_close();
     if (df->dev == DEV_BLOCKDEV && df->bd != NULL)
         owner = df->bd->owner;
     handle_unregister(df);
@@ -602,6 +653,10 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocki
         return 0;
 
     switch (df->dev) {
+    case DEV_AUDIO:
+        return 0;
+    case DEV_MIXER:
+        return read_text(df, buf, n);
     case DEV_NULL:
         return 0;                   /* immediate EOF */
     case DEV_ZERO:
@@ -631,6 +686,9 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocki
     case DEV_CAPS:
     case DEV_PARCELS:
     case DEV_MISSIONS:
+    case DEV_NET:
+    case DEV_ARP:
+    case DEV_DNS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);
@@ -718,6 +776,21 @@ static long devfs_op_write(struct file *f, const void *buf, unsigned long n)
         return 0;
 
     switch (df->dev) {
+    case DEV_AUDIO:
+        return hda_write(buf, n);
+    case DEV_MIXER: {
+        const char *s = buf;
+        unsigned long i = 0;
+        int value = 0;
+        if (n > 4)
+            return -1;
+        while (i < n && s[i] >= '0' && s[i] <= '9') {
+            value = value * 10 + s[i++] - '0';
+        }
+        if (!i || value > 100 || (i < n && (s[i] != '\n' || i + 1 != n)))
+            return -1;
+        return hda_set_volume(value) == 0 ? (long)n : -1;
+    }
     case DEV_NULL:
     case DEV_ZERO:
         df->f.pos += (uint32_t)n;
@@ -838,14 +911,19 @@ static int devfs_op_readdir(struct mount *m, const char *path, int index,
     memset(de, 0, sizeof(*de));
     de->mtime = rtc_unix_time();
 
-    if (index < DEVTAB_COUNT) {
-        const struct devdesc *d = &devtab[index];
+    int visible = 0;
+    for (int i = 0; i < DEVTAB_COUNT; i++) {
+        const struct devdesc *d = &devtab[i];
+        if ((d->id == DEV_AUDIO || d->id == DEV_MIXER) && !hda_ready())
+            continue;
+        if (visible++ != index)
+            continue;
         strncpy(de->name, d->name, sizeof(de->name) - 1);
         de->size = dev_size(d->id);
         de->mode = d->mode;
         return 0;
     }
-    if (blockdev_list(index - DEVTAB_COUNT, &bd) < 0)
+    if (blockdev_list(index - visible, &bd) < 0)
         return -1;
     strncpy(de->name, bd->name, sizeof(de->name) - 1);
     de->size = blk_size_bytes(bd);

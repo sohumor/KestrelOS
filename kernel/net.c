@@ -5,6 +5,7 @@
 #include "netdev.h"
 #include "rtl8139.h"
 #include "e1000.h"
+#include "virtio_net.h"
 #include "net.h"
 #include "dhcp.h"
 #include "tcp.h"
@@ -20,6 +21,7 @@
 
 #define ETHERTYPE_IP  0x0800
 #define ETHERTYPE_ARP 0x0806
+#define ETHERTYPE_IPV6 0x86DD
 
 #define IP_PROTO_ICMP 1
 #define IP_PROTO_TCP  6
@@ -68,6 +70,77 @@ static bool ready;
 static uint32_t cfg_ip, cfg_mask, cfg_gw, cfg_dns;   /* network order */
 
 static const uint8_t bcast_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+/* ---- telemetry counters ---- */
+
+struct net_stats {
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_drops;
+    uint64_t arp_hits;
+    uint64_t arp_misses;
+    uint64_t icmp_rx;
+    uint64_t icmp_tx;
+    uint64_t udp_rx;
+    uint64_t udp_tx;
+    uint64_t tcp_rx;
+    uint64_t tcp_tx;
+    uint64_t dns_hits;
+    uint64_t dns_misses;
+};
+
+static struct net_stats net_stats;
+
+void net_stat_inc(int kind, uint32_t bytes)
+{
+    switch (kind) {
+    case NET_STAT_RX_PKT:
+        __atomic_add_fetch(&net_stats.rx_packets, 1ULL, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&net_stats.rx_bytes, (uint64_t)bytes, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_TX_PKT:
+        __atomic_add_fetch(&net_stats.tx_packets, 1ULL, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&net_stats.tx_bytes, (uint64_t)bytes, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_RX_DROP:
+        __atomic_add_fetch(&net_stats.rx_drops, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_ARP_HIT:
+        __atomic_add_fetch(&net_stats.arp_hits, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_ARP_MISS:
+        __atomic_add_fetch(&net_stats.arp_misses, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_ICMP_RX:
+        __atomic_add_fetch(&net_stats.icmp_rx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_ICMP_TX:
+        __atomic_add_fetch(&net_stats.icmp_tx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_UDP_RX:
+        __atomic_add_fetch(&net_stats.udp_rx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_UDP_TX:
+        __atomic_add_fetch(&net_stats.udp_tx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_TCP_RX:
+        __atomic_add_fetch(&net_stats.tcp_rx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_TCP_TX:
+        __atomic_add_fetch(&net_stats.tcp_tx, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_DNS_HIT:
+        __atomic_add_fetch(&net_stats.dns_hits, 1ULL, __ATOMIC_RELAXED);
+        break;
+    case NET_STAT_DNS_MISS:
+        __atomic_add_fetch(&net_stats.dns_misses, 1ULL, __ATOMIC_RELAXED);
+        break;
+    default:
+        break;
+    }
+}
 
 /* ---- netdev registry: the single active NIC ---- */
 
@@ -139,7 +212,16 @@ static int eth_send(const uint8_t *dst_mac, uint16_t ethertype,
     memcpy(eh->src, nd->mac, 6);
     eh->type = htons(ethertype);
     memcpy(frame + sizeof(*eh), payload, len);
-    return nd->send(frame, (int)sizeof(*eh) + len);
+    int rc = nd->send(frame, (int)sizeof(*eh) + len);
+    if (rc >= 0)
+        net_stat_inc(NET_STAT_TX_PKT, (uint32_t)(sizeof(*eh) + len));
+    return rc;
+}
+
+int net_eth_send(const uint8_t *dst_mac, uint16_t ethertype,
+                 const void *payload, int len)
+{
+    return eth_send(dst_mac, ethertype, payload, len);
 }
 
 /* ---- ARP ---- */
@@ -149,6 +231,7 @@ static int eth_send(const uint8_t *dst_mac, uint16_t ethertype,
 struct arp_entry {
     uint32_t ip;         /* network order */
     uint8_t  mac[6];
+    uint64_t updated_tick;
     bool     valid;
 };
 
@@ -161,10 +244,12 @@ static void arp_learn(uint32_t ip, const uint8_t *mac)
 {
     if (ip == 0)
         return;
+    uint64_t now = timer_ticks();
     uint64_t f = spin_lock_irqsave(&arp_lock);
     for (int i = 0; i < ARP_CACHE_SIZE; i++) {
         if (arp_cache[i].valid && arp_cache[i].ip == ip) {
             memcpy(arp_cache[i].mac, mac, 6);
+            arp_cache[i].updated_tick = now;
             spin_unlock_irqrestore(&arp_lock, f);
             return;
         }
@@ -174,6 +259,7 @@ static void arp_learn(uint32_t ip, const uint8_t *mac)
     e->valid = false;
     e->ip = ip;
     memcpy(e->mac, mac, 6);
+    e->updated_tick = now;
     e->valid = true;
     spin_unlock_irqrestore(&arp_lock, f);
 }
@@ -219,8 +305,11 @@ static int arp_resolve(uint32_t ip, uint8_t *mac_out)
 
     uint32_t target = same_subnet(ip) ? ip : cfg_gw;
 
-    if (arp_lookup(target, mac_out))
+    if (arp_lookup(target, mac_out)) {
+        net_stat_inc(NET_STAT_ARP_HIT, 0);
         return 0;
+    }
+    net_stat_inc(NET_STAT_ARP_MISS, 0);
 
     for (int attempt = 0; attempt < 3; attempt++) {
         arp_send_request(target);
@@ -240,12 +329,16 @@ static int arp_resolve(uint32_t ip, uint8_t *mac_out)
 /* IRQ context. */
 static void arp_input(const uint8_t *pkt, int len)
 {
-    if (len < (int)sizeof(struct arp_pkt))
+    if (len < (int)sizeof(struct arp_pkt)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     const struct arp_pkt *a = (const struct arp_pkt *)pkt;
     if (ntohs(a->htype) != 1 || ntohs(a->ptype) != ETHERTYPE_IP ||
-        a->hlen != 6 || a->plen != 4)
+        a->hlen != 6 || a->plen != 4) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
 
     arp_learn(a->spa, a->sha);
 
@@ -322,10 +415,15 @@ static spinlock_t ping_lock = SPINLOCK_INIT;
 static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
                        const uint8_t *pkt, int len)
 {
-    if (len < (int)sizeof(struct icmp_hdr))
+    if (len < (int)sizeof(struct icmp_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
-    if (net_checksum(pkt, len) != 0)
+    }
+    if (net_checksum(pkt, len) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
+    net_stat_inc(NET_STAT_ICMP_RX, (uint32_t)len);
     const struct icmp_hdr *ic = (const struct icmp_hdr *)pkt;
 
     if (ic->type == 8 && ic->code == 0) {
@@ -341,7 +439,8 @@ static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
         rh->type = 0;
         rh->csum = 0;
         rh->csum = net_checksum(reply, len);
-        ip_send_mac(src_mac, src_ip, IP_PROTO_ICMP, reply, len);
+        if (ip_send_mac(src_mac, src_ip, IP_PROTO_ICMP, reply, len) >= 0)
+            net_stat_inc(NET_STAT_ICMP_TX, (uint32_t)len);
         return;
     }
 
@@ -400,6 +499,7 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
         spin_unlock_irqrestore(&ping_lock, f);
         return -1;
     }
+    net_stat_inc(NET_STAT_ICMP_TX, (uint32_t)sizeof(pkt));
 
     /* Sample the clock only once the request is on the wire: net_ip_send
      * can spend up to 3 s in arp_resolve, which would otherwise be charged
@@ -432,24 +532,36 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
 /* IRQ context. */
 static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
 {
-    if (len < (int)sizeof(struct ip_hdr))
+    if (len < (int)sizeof(struct ip_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     const struct ip_hdr *ip = (const struct ip_hdr *)pkt;
 
     int ihl = (ip->ver_ihl & 0x0F) * 4;
-    if ((ip->ver_ihl >> 4) != 4 || ihl < 20 || ihl > len)
+    if ((ip->ver_ihl >> 4) != 4 || ihl < 20 || ihl > len) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
-    if (net_checksum(ip, ihl) != 0)
+    }
+    if (net_checksum(ip, ihl) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     if (ip->dst != cfg_ip && ip->dst != 0xFFFFFFFFu &&
-        ip->dst != (cfg_ip | ~cfg_mask))
+        ip->dst != (cfg_ip | ~cfg_mask)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
-    if (ntohs(ip->frag) & 0x3FFF)    /* MF set or nonzero offset: drop */
+    }
+    if (ntohs(ip->frag) & 0x3FFF) {  /* MF set or nonzero offset: drop */
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
 
     int total = ntohs(ip->total_len);
-    if (total < ihl || total > len)
+    if (total < ihl || total > len) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
 
     /* Learn sender's MAC so replies never block on ARP in IRQ context. */
     arp_learn(ip->src, eh->src);
@@ -463,14 +575,19 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
         udp_input(ip->src, ip->dst, payload, plen);
     else if (ip->proto == IP_PROTO_TCP)
         tcp_input(ip->src, payload, plen);
+    else
+        net_stat_inc(NET_STAT_RX_DROP, 0);
 }
 
 /* ---- frame entry point (IRQ context) ---- */
 
 void net_rx(const uint8_t *frame, int len)
 {
-    if (len < (int)sizeof(struct eth_hdr))
+    if (!frame || len < (int)sizeof(struct eth_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
+    net_stat_inc(NET_STAT_RX_PKT, (uint32_t)len);
     const struct eth_hdr *eh = (const struct eth_hdr *)frame;
     uint16_t type = ntohs(eh->type);
     const uint8_t *payload = frame + sizeof(*eh);
@@ -480,6 +597,8 @@ void net_rx(const uint8_t *frame, int len)
         arp_input(payload, plen);
     else if (type == ETHERTYPE_IP)
         ipv4_input(eh, payload, plen);
+    else if (type == ETHERTYPE_IPV6)
+        ipv6_input(eh->src, payload, plen);
 }
 
 void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
@@ -494,7 +613,7 @@ void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
 
 void net_init(void)
 {
-    if (!rtl8139_init() && !e1000_init()) {
+    if (!rtl8139_init() && !e1000_init() && !virtio_net_init()) {
         kprintf("net: no NIC found, networking disabled\n");
         return;
     }
@@ -525,6 +644,7 @@ void net_init(void)
                 m[0], m[1], m[2], m[3], m[4], m[5]);
         kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static fallback)\n");
     }
+    net6_init();
 }
 
 void net_get_info(struct k_netinfo *out)
@@ -538,4 +658,141 @@ void net_get_info(struct k_netinfo *out)
     out->dns = cfg_dns;
     memcpy(out->mac, netdev_current()->mac, 6);
     out->up = 1;
+}
+
+/* ---- @krec snapshots for /dev/net and /dev/arp ---- */
+
+struct arp_snap_row {
+    uint32_t ip;
+    uint8_t  mac[6];
+    int64_t  age_s;
+};
+
+static void krec_put_mac(struct krec_kbuf *b, const uint8_t mac[6])
+{
+    static const char hex[] = "0123456789abcdef";
+
+    for (int i = 0; i < 6; i++) {
+        if (i > 0)
+            krec_kbuf_putc(b, ':');
+        krec_kbuf_putc(b, hex[(mac[i] >> 4) & 0xF]);
+        krec_kbuf_putc(b, hex[mac[i] & 0xF]);
+    }
+}
+
+uint32_t arp_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+    struct arp_snap_row snap[ARP_CACHE_SIZE];
+    int n = 0;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec ip:ip mac:str age_s:int\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    uint64_t now = timer_ticks();
+    uint64_t f = spin_lock_irqsave(&arp_lock);
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        const struct arp_entry *e = &arp_cache[i];
+        if (!e->valid)
+            continue;
+        snap[n].ip = e->ip;
+        memcpy(snap[n].mac, e->mac, 6);
+        snap[n].age_s = (now >= e->updated_tick)
+                            ? (int64_t)((now - e->updated_tick) / TIMER_HZ)
+                            : 0;
+        n++;
+    }
+    spin_unlock_irqrestore(&arp_lock, f);
+
+    for (int i = 0; i < n; i++) {
+        uint32_t mark = b.len;
+        krec_kbuf_put_ip4(&b, snap[i].ip);
+        krec_kbuf_putc(&b, '\t');
+        krec_put_mac(&b, snap[i].mac);
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_i64(&b, snap[i].age_s);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow) {
+            b.len = mark;
+            break;
+        }
+    }
+
+    return krec_kbuf_finish(&b);
+}
+
+static void emit_net_metric_row(struct krec_kbuf *b, const char *metric,
+                                uint64_t val)
+{
+    uint32_t mark = b->len;
+    krec_kbuf_puts(b, metric);
+    krec_kbuf_putc(b, '\t');
+    krec_kbuf_put_u64(b, val);
+    krec_kbuf_putc(b, '\n');
+    if (b->overflow)
+        b->len = mark;
+}
+
+uint32_t net_snapshot_krec(char *buf, uint32_t cap)
+{
+    struct krec_kbuf b;
+
+    if (cap == 0)
+        return 0;
+
+    krec_kbuf_init(&b, buf, cap);
+    krec_kbuf_puts(&b, "@krec metric:str count:u64\n");
+    if (b.overflow) {
+        b.len = 0;
+        return krec_kbuf_finish(&b);
+    }
+
+    const struct netdev *nd = netdev_current();
+    {
+        uint32_t mark = b.len;
+        krec_kbuf_puts(&b, "nic_");
+        krec_kbuf_escape(&b, (nd && nd->name) ? nd->name : "none");
+        krec_kbuf_putc(&b, '\t');
+        krec_kbuf_put_u64(&b, nd ? 1ULL : 0ULL);
+        krec_kbuf_putc(&b, '\n');
+        if (b.overflow)
+            b.len = mark;
+    }
+
+    static const struct {
+        const char *name;
+        const uint64_t *ptr;
+    } rows[] = {
+        { "rx_pkts",    &net_stats.rx_packets },
+        { "tx_pkts",    &net_stats.tx_packets },
+        { "rx_bytes",   &net_stats.rx_bytes   },
+        { "tx_bytes",   &net_stats.tx_bytes   },
+        { "rx_drops",   &net_stats.rx_drops   },
+        { "arp_hits",   &net_stats.arp_hits   },
+        { "arp_misses", &net_stats.arp_misses },
+        { "icmp_rx",    &net_stats.icmp_rx    },
+        { "icmp_tx",    &net_stats.icmp_tx    },
+        { "udp_rx",     &net_stats.udp_rx     },
+        { "udp_tx",     &net_stats.udp_tx     },
+        { "tcp_rx",     &net_stats.tcp_rx     },
+        { "tcp_tx",     &net_stats.tcp_tx     },
+        { "dns_hits",   &net_stats.dns_hits   },
+        { "dns_misses", &net_stats.dns_misses },
+    };
+
+    if (!b.overflow)
+        emit_net_metric_row(&b, "up", net_ready() ? 1ULL : 0ULL);
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]) && !b.overflow; i++) {
+        uint64_t v = __atomic_load_n(rows[i].ptr, __ATOMIC_RELAXED);
+        emit_net_metric_row(&b, rows[i].name, v);
+    }
+
+    return krec_kbuf_finish(&b);
 }

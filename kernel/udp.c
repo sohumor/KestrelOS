@@ -146,34 +146,29 @@ void udp_unbind(uint16_t port)
     spin_unlock_irqrestore(&udp_lock, f);
 }
 
-/* IRQ context: parse a UDP segment and queue it on its binding. */
-void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
-               const uint8_t *seg, int len)
+/* IRQ context: queue a checksum-verified UDP segment on its binding. */
+static void udp_queue(uint32_t src_ip_be, const uint8_t *seg, int ulen)
 {
-    if (!seg || len < (int)sizeof(struct udp_hdr))
-        return;
     const struct udp_hdr *uh = (const struct udp_hdr *)seg;
-
-    int ulen = ntohs(uh->len);
-    if (ulen < (int)sizeof(*uh) || ulen > len)
-        return;
-    if (uh->csum != 0 &&
-        net_transport_checksum(src_ip_be, dst_ip_be, 17, seg, ulen) != 0)
-        return;
     int plen = ulen - (int)sizeof(*uh);
-    if (plen > NET_UDP_MAX)
+    if (plen > NET_UDP_MAX) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
+    net_stat_inc(NET_STAT_UDP_RX, (uint32_t)ulen);
 
     uint64_t f = spin_lock_irqsave(&udp_lock);
     struct udp_bind *b = bind_find_locked(ntohs(uh->dport));
     if (!b || b->count >= UDP_QUEUE) {
         spin_unlock_irqrestore(&udp_lock, f);
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;                          /* unbound or full: drop */
     }
 
     struct udp_slot *s = &b->q[(b->head + b->count) % UDP_QUEUE];
     if (!s->data) {
         spin_unlock_irqrestore(&udp_lock, f);
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
     }
     memcpy(s->data, seg + sizeof(*uh), plen);
@@ -182,6 +177,78 @@ void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
     s->src_port = ntohs(uh->sport);
     b->count++;
     spin_unlock_irqrestore(&udp_lock, f);
+}
+
+/* IRQ context: parse a UDP segment and queue it on its binding. */
+void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
+               const uint8_t *seg, int len)
+{
+    if (!seg || len < (int)sizeof(struct udp_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    const struct udp_hdr *uh = (const struct udp_hdr *)seg;
+
+    int ulen = ntohs(uh->len);
+    if (ulen < (int)sizeof(*uh) || ulen > len) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    if (uh->csum != 0 &&
+        net_transport_checksum(src_ip_be, dst_ip_be, 17, seg, ulen) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    udp_queue(src_ip_be, seg, ulen);
+}
+
+/* IRQ context: IPv6 UDP; the checksum is mandatory (RFC 8200 8.1). The
+ * IPv4-only source field of the queue slot is left zero. */
+void udp_input6(const uint8_t src[16], const uint8_t dst[16],
+                const uint8_t *seg, int len)
+{
+    if (!seg || len < (int)sizeof(struct udp_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    const struct udp_hdr *uh = (const struct udp_hdr *)seg;
+
+    int ulen = ntohs(uh->len);
+    if (ulen < (int)sizeof(*uh) || ulen > len || uh->csum == 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    if (net_transport_checksum6(src, dst, 17, seg, ulen) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    udp_queue(0, seg, ulen);
+}
+
+int udp_send6(const uint8_t dst[16], uint16_t sport, uint16_t dport,
+              const void *buf, int len)
+{
+    uint8_t pkt[sizeof(struct udp_hdr) + NET6_UDP_MAX];
+    struct udp_hdr *uh = (struct udp_hdr *)pkt;
+    uint8_t src[16];
+
+    if (!net_ready() || !buf || len < 0 || len > NET6_UDP_MAX ||
+        !net6_source_for(dst, src))
+        return -1;
+
+    uh->sport = htons(sport);
+    uh->dport = htons(dport);
+    uh->len = htons((uint16_t)(sizeof(*uh) + len));
+    uh->csum = 0;
+    memcpy(pkt + sizeof(*uh), buf, len);
+    uh->csum = net_transport_checksum6(src, dst, 17, pkt,
+                                       (int)sizeof(*uh) + len);
+    if (uh->csum == 0)
+        uh->csum = 0xFFFF;
+    int rc = net6_send(dst, 17, pkt, (int)sizeof(*uh) + len);
+    if (rc >= 0)
+        net_stat_inc(NET_STAT_UDP_TX, (uint32_t)(sizeof(*uh) + len));
+    return rc;
 }
 
 int udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
@@ -202,7 +269,10 @@ int udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
                                       (int)sizeof(*uh) + len);
     if (uh->csum == 0)
         uh->csum = 0xFFFF;  /* RFC 768: computed zero is sent as all ones. */
-    return net_ip_send(ip_be, 17, pkt, (int)sizeof(*uh) + len);
+    int rc = net_ip_send(ip_be, 17, pkt, (int)sizeof(*uh) + len);
+    if (rc >= 0)
+        net_stat_inc(NET_STAT_UDP_TX, (uint32_t)(sizeof(*uh) + len));
+    return rc;
 }
 
 int udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms)

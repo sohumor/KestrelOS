@@ -344,20 +344,17 @@ int http_tcp_transport(const char *host, int port, int timeout_ms,
                        void *user, struct http_transport *out)
 {
     struct tcp_ctx *t;
-    uint32_t ip;
+    struct net_addr addr;
     int handle;
 
     (void)user;
     if (host == 0 || port <= 0 || out == 0)
         return HTTP_E_INVAL;
-    ip = ip_aton(host);
-    if (ip == 0 && dns_resolve(host, &ip) < 0)
-        return HTTP_E_DNS;
-    if (ip == 0)
+    if (net_resolve(host, NET_AF_ANY, &addr) < 0)
         return HTTP_E_DNS;
 
-    handle = (int)syscall(SYS_TCP_CONNECT, (long)ip, port,
-                          timeout_ms > 0 ? timeout_ms : HTTP_T_CONNECT, 0);
+    handle = net_tcp_connect(&addr, port,
+                             timeout_ms > 0 ? timeout_ms : HTTP_T_CONNECT);
     if (handle < 0)
         return HTTP_E_CONNECT;
 
