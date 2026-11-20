@@ -401,7 +401,7 @@ help:
 	@echo "  make gdb        load kernel symbols and attach (GDB_FLAGS for batch options)"
 	@echo "  make test       run the end-to-end suite in headless QEMU"
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
-	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"
+	@echo "  make test-tcp   run host TCP reassembly and RST tests with sanitizers"
 	@echo "  make test-net   run host TCP + network checksum tests"
 	@echo "  make test-random   run SHA-256 and ChaCha20 CSPRNG core vectors"
 	@echo "  make test-gui-host   run libgui raster regression tests"

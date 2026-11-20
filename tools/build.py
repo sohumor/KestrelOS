@@ -498,6 +498,9 @@ def run_host_tests(tc):
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
          ["-Ikernel/include"]),
+        ("test_tcp_rst", [r("kernel/tcp_reassembly.c"), r("kernel/net_checksum.c"), r("tools/test_tcp_rst.c")],
+         ["-Ikernel/include", "-Iabi", "-ffunction-sections", "-fdata-sections",
+          "-Wl,/opt:ref" if sys.platform == "win32" else "-Wl,--gc-sections"]),
         ("test_net_checksum", [r("kernel/net_checksum.c"), r("tools/test_net_checksum.c")],
          ["-Ikernel/include", "-Iabi"]),
         ("test_gui_primitives", [r("tools/test_gui_primitives.c"), r("libgui/draw.c"), r("libgui/font_data.c")],
@@ -649,6 +652,7 @@ def generate_compile_commands(tc):
     host_suites = [
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
+        ("tools/test_tcp_rst.c", ["-Ikernel/include", "-Iabi"]),
         ("tools/test_net_checksum.c", ["-Ikernel/include", "-Iabi"]),
         ("tools/test_gui_primitives.c", ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
         ("tools/test_cryptosym.c", ["-Ilibtls"]),
