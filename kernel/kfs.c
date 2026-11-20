@@ -1725,7 +1725,6 @@ static struct file *kfs_op_open(struct mount *m, const char *path, int flags)
         return NULL;
     }
     kf->fs = fs;
-    kf->f.type = FILE_KFS;
     kf->f.inum = (uint32_t)ino;
     kf->f.pos = 0;
     kf->f.flags = flags;
@@ -1746,8 +1745,9 @@ static void kfs_op_close(struct file *f)
     instance_release(fs);
 }
 
-static long kfs_op_read(struct file *f, void *buf, unsigned long n)
+static long kfs_op_read(struct file *f, void *buf, unsigned long n, int blocking)
 {
+    (void)blocking;
     struct kfs_file *kf = (struct kfs_file *)f;
     long r = kfs_read(kf->fs, kf->f.inum, kf->f.pos, buf, (uint32_t)n);
 
