@@ -3,6 +3,7 @@
 
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -51,7 +52,8 @@ def main():
             h.send("/bin/pulse-wait-probe")
             for expected in ("PASS Pulse matching event and unrelated-topic timeout",
                              "PASS Pulse SIGKILL cancellation"):
-                line = h.expect_any([expected, r"FAIL Pulse [^\n]+"], regex=True)
+                line = h.expect(r"(?:%s|FAIL Pulse [^\n]+)\n" %
+                                re.escape(expected), regex=True).group(0).rstrip("\n")
                 if line != expected:
                     raise AssertionError(line)
                 print(line)
