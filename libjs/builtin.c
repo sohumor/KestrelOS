@@ -5676,6 +5676,7 @@ static int bi_console_log(js_ctx *ctx, js_value t, int argc, js_value *argv,
 
 static int this_symbol(js_ctx *ctx, js_value t, js_value *out)
 {
+    *out = js_undefined();
     if (t.type == JS_SYMBOL) {
         *out = t;
         return JS_OK;

@@ -1433,9 +1433,12 @@ static uint32_t s_hsl_to_rgb(int64_t h, int64_t s, int64_t l, int alpha)
     r = ((r + m) * 255 + 500) / 1000;
     g = ((g + m) * 255 + 500) / 1000;
     b = ((b + m) * 255 + 500) / 1000;
-    if (r < 0) r = 0; if (r > 255) r = 255;
-    if (g < 0) g = 0; if (g > 255) g = 255;
-    if (b < 0) b = 0; if (b > 255) b = 255;
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
     return ((uint32_t)(alpha & 0xFF) << 24) | ((uint32_t)r << 16) |
            ((uint32_t)g << 8) | (uint32_t)b;
 }
