@@ -108,6 +108,9 @@ int main(int argc, char **argv)
     assert(writei(&fs, 1, 64, &de, sizeof(de), 0) == sizeof(de));
     assert(journal_commit(&fs) == 0);
     assert(kfs_readdir(&fs, 1, 1, &de) == 0 && de.ino == 3);
+    assert(kfs_readdir(&fs, 1, 0, &de) == 0);
+    assert(writei(&fs, 1, 64, &empty, sizeof(empty), 0) == sizeof(empty));
+    assert(kfs_readdir(&fs, 1, 1, &de) == 0 && de.ino == 4);
     setup(&fs, 0);
     assert(kfs_readdir(&fs, 1, 0, &de) == -1);
     setup(&fs, 3);

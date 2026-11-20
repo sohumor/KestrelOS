@@ -58,6 +58,7 @@ _Static_assert(sizeof(struct kfs_journal_header) <= KFS_BLOCK_SIZE,
                "kfs journal header must fit one block");
 
 #define KFS_MAX_MOUNTS 4
+#define KFS_DIR_CURSORS 16
 
 static struct kfs_fs instances[KFS_MAX_MOUNTS];
 
@@ -69,11 +70,11 @@ static struct {
     uint32_t ino;
     uint32_t off;
     int index;
-} dir_cursor[16];
+} dir_cursor[KFS_DIR_CURSORS];
 
 static void dir_cursor_invalidate(struct kfs_fs *fs)
 {
-    for (unsigned i = 0; i < 16; i++)
+    for (unsigned i = 0; i < KFS_DIR_CURSORS; i++)
         if (fs == NULL || dir_cursor[i].fs == fs)
             dir_cursor[i].fs = NULL;
 }
@@ -347,8 +348,10 @@ static void journal_abort(void)
 
 static int journal_stage(struct kfs_fs *fs, uint32_t blk, const void *buf)
 {
-    if (!journal_tx.active || journal_tx.fs != fs)
+    if (!journal_tx.active || journal_tx.fs != fs) {
+        dir_cursor_invalidate(fs);
         return bwrite(fs, blk, buf);
+    }
 
     for (uint32_t i = 0; i < journal_tx.count; i++) {
         if (journal_tx.entry[i].blk == blk) {
@@ -1198,7 +1201,7 @@ static int readdir_locked(struct kfs_fs *fs, uint32_t ino, int index,
     if (iget(fs, ino, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return -1;
     int seen = 0;
-    unsigned slot = ino % 16;
+    unsigned slot = ino % KFS_DIR_CURSORS;
     uint32_t off = 0;
     if (!journal_tx.active && dir_cursor[slot].fs == fs &&
         dir_cursor[slot].ino == ino && dir_cursor[slot].index == index) {
@@ -1214,7 +1217,7 @@ static int readdir_locked(struct kfs_fs *fs, uint32_t ino, int index,
             continue;
         if (seen == index) {
             memcpy(out, &de, sizeof(de));
-            if (!journal_tx.active && index < __INT_MAX__) {
+            if (!journal_tx.active) {
                 dir_cursor[slot].fs = fs;
                 dir_cursor[slot].ino = ino;
                 dir_cursor[slot].index = index + 1;
@@ -1451,6 +1454,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
     part_lba = (uint64_t)KFS_PART_LBA * KFS_SECTOR_SIZE / bd->block_size;
 
     fs_lock();
+    bcache_invalidate(fs);
     ok = try_offset(fs, 0, 0);
     if (!ok && part_lba != 0)
         ok = try_offset(fs, part_lba, 0);
