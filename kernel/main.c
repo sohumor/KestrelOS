@@ -13,6 +13,7 @@
 #include "kheap.h"
 #include "proc.h"
 #include "ata.h"
+#include "ahci.h"
 #include "vfs.h"
 #include "net.h"
 #include "uproc.h"
@@ -32,6 +33,7 @@
 #include "vm.h"
 #include "smp.h"
 #include "flight.h"
+#include "testmode.h"
 
 struct bootinfo *boot_info;
 
@@ -78,6 +80,7 @@ static void housekeeper(void *arg)
 void kmain(uint64_t bootinfo_phys)
 {
     serial_init();
+    testmode_init();
     console_init();
     klog_init();
     flight_init();
@@ -135,6 +138,7 @@ void kmain(uint64_t bootinfo_phys)
     initcall_run_level(INITCALL_CORE);
 
     ata_init();
+    ahci_init();
     swap_init();
     vfs_init();              /* reports success or failure itself */
     devfs_init();
@@ -161,6 +165,7 @@ void kmain(uint64_t bootinfo_phys)
     klog_hook_kprintf();
 
     kprintf("\nKESTREL READY\n\n");
+    testmode_ready();
 
     kthread_create(housekeeper, NULL, "housekeep");
     kthread_create(init_launcher, NULL, "launcher");
