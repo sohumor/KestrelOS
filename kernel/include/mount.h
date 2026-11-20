@@ -53,7 +53,8 @@ struct fs_statfs {
 struct fs_ops {
     struct file *(*open)(struct mount *m, const char *path, int flags);
     void (*close)(struct file *f);
-    long (*read)(struct file *f, void *buf, unsigned long n);
+    long (*read)(struct file *f, void *buf, unsigned long n, int blocking);
+    int read_once;              /* do not retry even after a full chunk */
     long (*write)(struct file *f, const void *buf, unsigned long n);
     long (*seek)(struct file *f, long off, int whence);
     int  (*stat)(struct mount *m, const char *path, struct k_stat *st);

@@ -94,6 +94,9 @@ static void tail_fd(int fd, int tty, int nlines)
     long total = 0;
     int i, first, count;
 
+    if (nlines == 0)
+        return;
+
     /* Read into a scratch buffer: lr_line terminates "out" even on the
      * final call that returns 0 at EOF, so writing straight into the
      * ring would blank the oldest slot we are about to print. */
@@ -124,7 +127,7 @@ int main(int argc, char **argv)
                 return 1;
             }
             nlines = atoi(argv[++i]);
-            if (nlines < 1)
+            if (nlines < 0)
                 nlines = 1;
             if (nlines > MAX_LINES)
                 nlines = MAX_LINES;

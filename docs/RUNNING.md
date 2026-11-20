@@ -6,6 +6,7 @@ Everything here is verified against the sources in this repository:
 - [Prerequisites](#prerequisites)
 - [Building](#building)
 - [Running in QEMU](#running-in-qemu)
+- [Debugging on Linux/WSL](#debugging-on-linuxwsl)
 - [Running in VirtualBox](#running-in-virtualbox)
 - [Running in VMware](#running-in-vmware)
 - [Running in Bochs](#running-in-bochs)
@@ -17,6 +18,29 @@ Everything here is verified against the sources in this repository:
 ---
 
 ## Prerequisites
+
+### QEMU test exit status
+
+`python3 tools/e2e.py --smoke` (also `make smoke` and
+`python3 tools/build.py smoke`) uses TCG and checks boot readiness, login
+and the shell prompt over serial, then sends `halt` and requires QEMU
+exit **33** for success. Panic at any stage fails immediately with exit **35**.
+Timeouts still bound guests that hang without reporting a result.
+
+The harness supplies `-device isa-debug-exit,iobase=0xf4,iosize=0x04`
+and `-fw_cfg name=opt/kestrel-test,string=2`. The custom BIOS boot protocol
+has no kernel command line, so the kernel reads this runtime option from
+QEMU's fw_cfg directory. Value `1` exits successfully at readiness; value
+`2` keeps running for interactive tests and reports success on `halt`.
+Both modes report panic/fatal kernel exceptions as exit **35**. Other
+exit statuses are errors. Serial assertions still validate test content;
+both smoke and the full suite request `halt` after their assertions and check exit 33.
+Normal boots without the option are unchanged. No new userspace syscall
+is needed: the existing privileged halt path reports completion.
+
+The guest writes `0x10` (success) or `0x11` (failure) to port `0xf4`;
+QEMU returns `(value << 1) | 1`. The debug-exit device alone does not
+enable test mode.
 
 The build is a Linux build. On Windows use **WSL2 with Ubuntu**; the
 repository can live on the Windows filesystem and be built from
@@ -40,6 +64,7 @@ Optional extras:
 | Package        | Needed for                                             |
 |----------------|--------------------------------------------------------|
 | `qemu-utils`   | `qemu-img`, used by `tools/mkvm.sh` to make a VMDK      |
+| `gdb`          | kernel debugging with `make debug` / `make gdb`          |
 | `zip`          | the compressed image produced by `tools/mkvm.sh`        |
 | VirtualBox     | `VBoxManage`, used by `tools/mkvm.sh` to make a VDI      |
 
@@ -82,12 +107,66 @@ Useful targets (`make help` prints the same list):
 | `make`             | build `build/os.img`                                  |
 | `make run`         | boot in QEMU, VGA window plus serial on stdio         |
 | `make run-headless`| boot in QEMU, serial only                             |
+| `make debug`       | headless QEMU, paused, GDB stub on port 1234           |
+| `make gdb`         | load kernel symbols and attach to the debug VM        |
 | `make test`        | full end-to-end suite in headless QEMU                |
-| `make smoke`       | boot-only quick check                                 |
+| `make smoke`       | boot, login, shell prompt and guest exit status        |
 | `make fsck`        | validate and list `build/fs.img`                      |
 | `make screenshot`  | capture the VGA console to a PNG                      |
 | `make vm-images`   | run `tools/mkvm.sh` (VDI / VMDK / zip)                |
 | `make clean`       | remove `build/`                                       |
+
+## Debugging on Linux/WSL
+
+Install `gdb` (`sudo apt install gdb`) in addition to the build prerequisites.
+No Windows MCP servers or GDB auto-load safe-path changes are required.
+From the repository root, use two terminals:
+
+```sh
+# Terminal 1: builds the image, starts headless QEMU paused at reset
+make debug
+# Terminal 2: loads build/kernel.elf and connects to localhost:1234
+make gdb
+```
+
+The equivalent Python runner commands are `python3 tools/build.py debug`
+and `python3 tools/build.py gdb`. The debug targets use the same disk,
+two CPUs and RTL8139 networking as `make run`, plus `-display none -s -S`.
+Both GDB targets use `-nx -x tools/.gdbinit` explicitly, so local/user
+initialization files are not needed. Start only one debug VM at a time;
+QEMU's `-s` opens TCP port 1234, so use it only on a trusted machine/network
+(do not expose the stub to untrusted clients).
+
+At the GDB prompt:
+
+```gdb
+hbreak kmain
+continue
+bt
+```
+
+Use a **hardware** breakpoint for the initial stop: the higher-half kernel
+address is not mapped at reset, so a software breakpoint may fail to insert.
+The kernel is built with `-g`; optimized locals may still be unavailable.
+The CPU remains paused until `continue`. After the breakpoint, `continue`
+boots normally. Ctrl-C in GDB interrupts execution; `detach` resumes the VM
+and `quit` exits GDB. Stop QEMU with Ctrl-C in its terminal after detaching.
+Do not rebuild the image/symbols while a debugging session is running.
+
+For a noninteractive breakpoint/backtrace check (with the debug VM running):
+
+```sh
+make gdb GDB_FLAGS="-batch -ex 'hbreak kmain' -ex continue -ex bt -ex detach"
+# Or, with python3 tools/build.py debug running instead:
+python3 tools/build.py gdb --gdb-flags="-batch -ex 'hbreak kmain' -ex continue -ex bt -ex detach"
+```
+
+`GDB` and `QEMU` override executable paths in both runners. `GDB_FLAGS`
+adds GDB arguments; `QEMU_FLAGS` adds debug QEMU arguments, e.g.
+`QEMU_FLAGS='-d int,cpu_reset -D build/int.log'`. Python also accepts
+`--gdb-flags` and `--qemu-flags`. A connection error usually means the
+debug VM has not started or another process occupies port 1234; a missing
+`build/kernel.elf` means you need to build/start the debug target first.
 
 ## Running in QEMU
 
@@ -213,7 +292,7 @@ Bochs has no RTL8139 either, so networking is unavailable there too.
 
 ```sh
 make test           # equivalent to: python3 tools/e2e.py
-make smoke          # boot + shell prompt only
+make smoke          # boot + login + shell prompt + guest exit status
 python3 tools/e2e.py --list      # list test names
 python3 tools/e2e.py --selftest  # check the harness itself, no image needed
 ```

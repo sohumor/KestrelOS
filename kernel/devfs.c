@@ -574,8 +574,9 @@ static long read_blockdev(struct devfile *df, void *buf, unsigned long n)
     return (long)done;
 }
 
-static long devfs_op_read(struct file *f, void *buf, unsigned long n)
+static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocking)
 {
+    (void)blocking;
     struct devfile *df = (struct devfile *)f;
 
     if (df == NULL || buf == NULL)
