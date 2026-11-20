@@ -483,7 +483,7 @@ static long sys_pipe(uint64_t ufds)
     struct file *rd, *wr;
     int fds[2];
 
-    if (pipe_create(&rd, &wr) < 0)
+    if (vfs_pipe(&rd, &wr) < 0)
         return -1;
 
     fds[0] = fd_alloc_from(3, rd);
