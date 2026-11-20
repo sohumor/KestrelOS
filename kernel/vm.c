@@ -426,3 +426,8 @@ void vm_release_task(struct task *t)
     }
     t->vm_file_count = 0;
 }
+
+int vm_page_is_managed(struct task *t, uint64_t va)
+{
+    return t ? page_is_managed(t, va & ~(PAGE_SIZE - 1)) : 0;
+}

@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: System Monitor
+exec: /bin/sysmon
+mission: Observe system activity and processes
+display: yes
+fs.read: /bin /lib /etc /doc ~
+fs.write: none
+net: any
+device: none
+ipc: pulse signal
+spawn: yes

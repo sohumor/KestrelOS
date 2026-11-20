@@ -13,6 +13,7 @@
 #include "wm.h"
 
 #include "pulse.h"
+#include "hangar_fmt.h"
 
 /* KestrelOS window manager / compositor.
  *
@@ -147,7 +148,8 @@ struct rect {
 struct window {
     bool      used;          /* slot allocated */
     bool      dying;         /* unlinked; frames not released yet */
-    uint32_t  wid;           /* == slot index; fixes the user VA */
+    uint32_t  wid;           /* == slot index, the compositor's id */
+    uint32_t  uwid;          /* id the owner uses; fixes the user VA */
     int       pid;           /* owning process */
     uint32_t  uid;           /* desktop controls stay within this uid */
     uint64_t *pml4;          /* owner address space, for the unmap */
@@ -435,6 +437,23 @@ static void win_title_rects(const struct window *win, struct rect *bar,
     }
 }
 
+/* Hangar caption button, left of maximize. Hidden on narrow windows so
+ * the title keeps some room. */
+static void win_park_rect(const struct window *win, const struct rect *maximize,
+                          struct rect *park)
+{
+    park->x = maximize->x - WM_BUTTON_GAP - WM_BUTTON_SZ;
+    park->y = maximize->y;
+    park->w = WM_BUTTON_SZ;
+    park->h = WM_BUTTON_SZ;
+    if (!maximize->w || (win->flags & K_WIN_DESKTOP) ||
+        win->w < 4 * WM_BUTTON_SZ + 3 * WM_BUTTON_GAP +
+                 2 * WM_BUTTON_PAD + 96) {
+        park->w = 0;
+        park->h = 0;
+    }
+}
+
 /* Keep the frame on screen. A window larger than the screen is allowed to
  * hang off the far edge but never off the near one, so its top-left corner
  * (and therefore its title bar) is always reachable. */
@@ -497,6 +516,10 @@ static void z_insert(int idx)
 {
     int at = (wins[idx].flags & K_WIN_DESKTOP) ? z_desktop_count() : nz;
 
+    if (!(wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)))
+        while (at > 0 && (wins[zord[at - 1]].flags & K_WIN_OVERLAY))
+            at--;
+
     for (int i = nz; i > at; i--)
         zord[i] = zord[i - 1];
     zord[at] = (uint8_t)idx;
@@ -524,7 +547,7 @@ static int z_top_focusable(void)
 {
     for (int i = nz - 1; i >= 0; i--) {
         const struct window *win = &wins[zord[i]];
-        if (!(win->flags & K_WIN_DESKTOP) && win_visible(win))
+        if (!(win->flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) && win_visible(win))
             return zord[i];
     }
     return -1;
@@ -595,7 +618,7 @@ static void set_focus(int idx)
     int old;
 
     if (idx >= 0 &&
-        ((wins[idx].flags & K_WIN_DESKTOP) || !win_visible(&wins[idx])))
+        ((wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) || !win_visible(&wins[idx])))
         return;                       /* the desktop layer never takes focus */
     if (focus == idx)
         return;
@@ -762,7 +785,7 @@ static void paint_shadow(const struct window *win, const struct rect *clip)
 
 static void paint_decor(const struct window *win, const struct rect *clip)
 {
-    struct rect frame, bar, maximize, minimize, close, tclip, o;
+    struct rect frame, bar, maximize, minimize, close, tclip, o, park;
     bool foc = (focus == win_index(win));
     uint32_t border = foc ? wm_theme.border_active : wm_theme.border_inactive;
     uint32_t barbg  = foc ? wm_theme.title_active  : wm_theme.title_inactive;
@@ -782,6 +805,7 @@ static void paint_decor(const struct window *win, const struct rect *clip)
               frame.h, border);
 
     win_title_rects(win, &bar, &maximize, &minimize, &close);
+    win_park_rect(win, &maximize, &park);
     fill_clip(clip, bar.x, bar.y, bar.w, bar.h, barbg);
     fill_clip(clip, bar.x, bar.y + bar.h - 2, bar.w, 2, edge);
 
@@ -790,7 +814,8 @@ static void paint_decor(const struct window *win, const struct rect *clip)
     tclip.x = bar.x + WM_TITLE_PAD;
     tclip.y = bar.y;
     tclip.h = bar.h - 1;
-    tclip.w = (maximize.w ? maximize.x - 8 :
+    tclip.w = (park.w ? park.x - 8 :
+               maximize.w ? maximize.x - 8 :
                minimize.w ? minimize.x - 8 :
                close.w ? close.x - 8 : bar.x + bar.w - 4) - tclip.x;
     if (tclip.w > 0 && rect_isect(&tclip, clip, &o))
@@ -812,6 +837,20 @@ static void paint_decor(const struct window *win, const struct rect *clip)
             fill_clip(clip, maximize.x + 5, maximize.y + 5, 1, 8, mfg);
             fill_clip(clip, maximize.x + 12, maximize.y + 5, 1, 8, mfg);
         }
+    }
+
+    if (park.w) {
+        /* Hangar: an arrow settling onto a bay floor. */
+        int cx = park.x + park.w / 2;
+
+        caption_button(clip, &park, mbg);
+        fill_clip(clip, cx - 1, park.y + 4, 2, park.h - 10, mfg);
+        for (int i = 1; i <= 3; i++)
+            fill_clip(clip, cx - 1 - i, park.y + park.h - 7 - i,
+                      2 + 2 * i, 1, mfg);
+        fill_clip(clip, park.x + 4, park.y + park.h - 4, park.w - 8, 1, mfg);
+        fill_clip(clip, park.x + 4, park.y + park.h - 7, 1, 3, mfg);
+        fill_clip(clip, park.x + park.w - 5, park.y + park.h - 7, 1, 3, mfg);
     }
 
     if (minimize.w) {
@@ -910,6 +949,7 @@ enum {
     HIT_CLIENT,
     HIT_TITLE,
     HIT_MAXIMIZE,
+    HIT_PARK,
     HIT_MINIMIZE,
     HIT_CLOSE,
     HIT_FRAME,
@@ -923,7 +963,7 @@ static int hit_test(int mx, int my, int *region)
     for (int i = nz - 1; i >= 0; i--) {
         int idx = zord[i];
         struct window *win = &wins[idx];
-        struct rect frame, client, bar, maximize, minimize, close;
+        struct rect frame, client, bar, maximize, minimize, close, park;
 
         if (!win_visible(win))
             continue;
@@ -940,6 +980,11 @@ static int hit_test(int mx, int my, int *region)
         }
         if (win_decorated(win)) {
             win_title_rects(win, &bar, &maximize, &minimize, &close);
+            win_park_rect(win, &maximize, &park);
+            if (park.w && rect_contains(&park, mx, my)) {
+                *region = HIT_PARK;
+                return idx;
+            }
             if (close.w && rect_contains(&close, mx, my)) {
                 *region = HIT_CLOSE;
                 return idx;
@@ -1105,7 +1150,7 @@ static void focus_next_window(void)
             pos += nz;
         idx = zord[pos];
         if (wins[idx].used && !wins[idx].dying &&
-            !(wins[idx].flags & K_WIN_DESKTOP) &&
+            !(wins[idx].flags & (K_WIN_DESKTOP | K_WIN_OVERLAY)) &&
             ((wins[idx].flags & K_WIN_NODECOR) || wins[idx].pinned ||
              (int)wins[idx].workspace == current_ws)) {
             restore_window(idx, true);
@@ -1147,6 +1192,19 @@ static void on_press(int mx, int my, uint32_t buttons)
     switch (region) {
     case HIT_CLOSE:
         evq_push(win, KEV_CLOSE, 0, 0, 0, buttons);
+        break;
+    case HIT_PARK:
+        /* The shell owns Hangar policy and feedback: it asks the kernel
+         * to park the window's process and reports why if it cannot. */
+        if (buttons & K_MOUSE_LEFT) {
+            for (int i = nz - 1; i >= 0; i--) {
+                struct window *d = &wins[zord[i]];
+                if (d->used && !d->dying && (d->flags & K_WIN_DESKTOP)) {
+                    evq_push(d, KEV_HANGAR, 0, 0, win->wid, 0);
+                    break;
+                }
+            }
+        }
         break;
     case HIT_MAXIMIZE:
         if (buttons & K_MOUSE_LEFT)
@@ -1284,7 +1342,7 @@ static void pump_keyboard(void)
             switch_workspace(c - KEY_WM_WS1);
             continue;
         }
-        if (c == KEY_LAUNCHER) {
+        if (c == KEY_LAUNCHER || c == KEY_MISSION) {
             route_to_desktop((uint32_t)c);
             continue;
         }
@@ -1603,18 +1661,44 @@ void wm_cleanup_task(int pid)
 
 /* Never trust a wid: bounds-check it, require the slot to be live, and
  * require the caller to be the process that created it. */
+/* The process-visible id for a new window: its slot, unless the process
+ * already holds that id through a window resumed from the Hangar. */
+static uint32_t owner_free_uwid(int pid, uint32_t slot)
+{
+    for (uint32_t cand = slot; cand < slot + WM_MAX_WINDOWS; cand++) {
+        uint32_t u = cand % WM_MAX_WINDOWS;
+        bool taken = false;
+        for (int i = 0; i < WM_MAX_WINDOWS; i++)
+            if ((uint32_t)i != slot && wins[i].used && wins[i].pid == pid &&
+                wins[i].uwid == u)
+                taken = true;
+        if (!taken)
+            return u;
+    }
+    return slot;
+}
+
 static struct window *win_lookup(uint64_t wid)
 {
     struct window *win;
 
     if (wid >= WM_MAX_WINDOWS)
         return NULL;
+    if (!current)
+        return NULL;
     win = &wins[wid];
-    if (!win->used || win->dying || !win->pix)
-        return NULL;
-    if (!current || win->pid != current->pid)
-        return NULL;
-    return win;
+    if (win->used && !win->dying && win->pix &&
+        win->pid == current->pid && win->uwid == wid)
+        return win;
+    /* A window resumed from the Hangar keeps the id its process knew,
+     * which need not be the slot it landed in. */
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        win = &wins[i];
+        if (win->used && !win->dying && win->pix &&
+            win->pid == current->pid && win->uwid == wid)
+            return win;
+    }
+    return NULL;
 }
 
 static void sanitize_title(char *dst, const char *src)
@@ -1645,7 +1729,10 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
         return -1;
     if (copy_from_user(&req, (const void *)ureq, sizeof(req)) < 0)
         return -1;
-    if (req.flags & ~(uint32_t)(K_WIN_NODECOR | K_WIN_DESKTOP))
+    if (req.flags & ~(uint32_t)(K_WIN_NODECOR | K_WIN_DESKTOP | K_WIN_OVERLAY))
+        return -1;
+    if ((req.flags & K_WIN_OVERLAY) &&
+        (!(req.flags & K_WIN_NODECOR) || (req.flags & K_WIN_DESKTOP)))
         return -1;
     if (!user_range_ok((const void *)uout, sizeof(info)))
         return -1;
@@ -1700,6 +1787,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
             wins[i].wid = (uint32_t)i;
             wins[i].pid = current->pid;
             wins[i].uid = current->uid;
+            wins[i].uwid = owner_free_uwid(current->pid, (uint32_t)i);
             break;
         }
     }
@@ -1715,7 +1803,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     win->h = (int)h;
     win->flags = req.flags;
     win->npages = npages;
-    win->uva = USER_WIN_BASE + (uint64_t)slot * USER_WIN_STRIDE;
+    win->uva = USER_WIN_BASE + (uint64_t)win->uwid * USER_WIN_STRIDE;
     win->x = req.x;
     win->y = req.y;
     sanitize_title(win->title, req.title);
@@ -1736,7 +1824,7 @@ long wm_sys_create(uint64_t ureq, uint64_t uout)
     win->phys = phys;
     win->pix = (uint32_t *)P2V(phys);
 
-    info.wid = (uint32_t)slot;
+    info.wid = win->uwid;
     info.width = w;
     info.height = h;
     info.buffer = win->uva;
@@ -1844,6 +1932,10 @@ long wm_sys_event(uint64_t wid, uint64_t uevent, uint64_t timeout_ms)
         wm_unlock();
         if (task_event_wait_locked(&window_events[wid].channel, 1, deadline,
                                    &window_event_lock, f) < 0)
+            return 0;
+        /* A pending kill or park is only acted on when the task leaves a
+         * syscall, so a woken wait must not loop back to sleep on it. */
+        if (current->kill_pending || current->park_state)
             return 0;
         wm_lock();
         win = win_lookup(wid);
@@ -2062,11 +2154,175 @@ long wm_sys_resize(uint64_t wid, uint64_t w, uint64_t h)
         return -1;
 
     wm_lock();
-    if (!win_lookup(wid)) {
+    struct window *win = win_lookup(wid);
+    if (!win) {
         wm_unlock();
         return -1;
     }
-    rc = wm_resize_window((int)wid, (int)w, (int)h);
+    rc = wm_resize_window(win_index(win), (int)w, (int)h);
     wm_unlock();
     return rc;
+}
+
+/* ------------------------------------------------------------- Hangar */
+
+int wm_hangar_window(int pid, int index, struct hangar_win *meta,
+                     const uint32_t **pix)
+{
+    int seen = 0, rc = 0;
+
+    wm_lock();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        struct window *win = &wins[i];
+        if (!win->used || win->dying || win->pid != pid || !win->pix)
+            continue;
+        if (win->flags & K_WIN_DESKTOP) {
+            rc = -1;
+            break;
+        }
+        if (seen++ != index)
+            continue;
+        memset(meta, 0, sizeof(*meta));
+        meta->uwid = win->uwid;
+        meta->flags = win->flags;
+        meta->x = win->x;
+        meta->y = win->y;
+        meta->w = win->w;
+        meta->h = win->h;
+        meta->orig_x = win->orig_x;
+        meta->orig_y = win->orig_y;
+        meta->orig_w = win->orig_w;
+        meta->orig_h = win->orig_h;
+        meta->minimized = win->minimized;
+        meta->maximized = win->maximized;
+        meta->pinned = win->pinned;
+        meta->workspace = win->workspace;
+        memcpy(meta->title, win->title, sizeof(meta->title));
+        meta->title[sizeof(meta->title) - 1] = '\0';
+        *pix = win->pix;
+        rc = 1;
+        break;
+    }
+    wm_unlock();
+    return rc;
+}
+
+int wm_hangar_count(int pid)
+{
+    int n = 0;
+
+    wm_lock();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++)
+        if (wins[i].used && !wins[i].dying && wins[i].pid == pid)
+            n++;
+    wm_unlock();
+    return n;
+}
+
+uint32_t *wm_hangar_restore(const struct hangar_win *meta, int *slot_out)
+{
+    struct window *win;
+    uint64_t need, phys, f;
+    int npages, slot = -1;
+
+    if (!fb_present() || !current || meta->uwid >= WM_MAX_WINDOWS ||
+        meta->w <= 0 || meta->h <= 0 || meta->w > WM_MAX_W ||
+        meta->h > WM_MAX_H)
+        return NULL;
+    npages = (int)(((uint64_t)meta->w * (uint64_t)meta->h * 4 + PAGE_SIZE - 1)
+                   / PAGE_SIZE);
+    need = (uint64_t)npages + (uint64_t)npages / 512 + 8 + WM_PMM_RESERVE;
+    if (pmm_free_pages() < need)
+        return NULL;
+
+    wm_lock();
+    f = irq_save();
+    for (int i = 0; i < WM_MAX_WINDOWS; i++) {
+        if (!wins[i].used) {
+            slot = i;
+            memset(&wins[i], 0, sizeof(wins[i]));
+            wins[i].used = true;
+            wins[i].wid = (uint32_t)i;
+            wins[i].pid = current->pid;
+            wins[i].uid = current->uid;
+            wins[i].uwid = meta->uwid;
+            break;
+        }
+    }
+    irq_restore(f);
+    if (slot < 0) {
+        wm_unlock();
+        return NULL;
+    }
+    win = &wins[slot];
+    win->pml4 = current->pml4;
+    win->w = meta->w;
+    win->h = meta->h;
+    win->flags = meta->flags & K_WIN_NODECOR;
+    win->npages = npages;
+    win->uva = USER_WIN_BASE + (uint64_t)meta->uwid * USER_WIN_STRIDE;
+    win->x = meta->x;
+    win->y = meta->y;
+    sanitize_title(win->title, meta->title);
+    win_clamp(win);
+    win->orig_x = meta->orig_x;
+    win->orig_y = meta->orig_y;
+    win->orig_w = meta->orig_w;
+    win->orig_h = meta->orig_h;
+    win->maximized = meta->maximized;
+    win->pinned = meta->pinned;
+    win->workspace = meta->workspace < K_WM_MAX_WORKSPACES
+                   ? meta->workspace : (uint8_t)current_ws;
+
+    phys = pmm_alloc_contig(npages);
+    for (int i = 0; i < npages; i++)
+        vmm_map_page(win->pml4, win->uva + (uint64_t)i * PAGE_SIZE,
+                     phys + (uint64_t)i * PAGE_SIZE, PTE_U | PTE_W);
+    win->phys = phys;
+    win->pix = (uint32_t *)P2V(phys);
+    memset(win->pix, 0, (size_t)npages * PAGE_SIZE);
+    wm_unlock();
+    *slot_out = slot;
+    return win->pix;
+}
+
+void wm_hangar_show(int slot, bool minimized)
+{
+    struct k_mouse pointer;
+    struct rect frame;
+    struct window *win;
+    uint64_t f;
+
+    if (slot < 0 || slot >= WM_MAX_WINDOWS)
+        return;
+    memset(&pointer, 0, sizeof(pointer));
+    mouse_get(&pointer);
+
+    wm_lock();
+    win = &wins[slot];
+    if (!win->used || win->dying || !current || win->pid != current->pid) {
+        wm_unlock();
+        return;
+    }
+    f = irq_save();
+    if (!active) {
+        __atomic_store_n(&active, true, __ATOMIC_RELEASE);
+        ndmg = 0;
+        full_repaint = true;
+        ptr_x = pointer.x;
+        ptr_y = pointer.y;
+    }
+    z_insert(slot);
+    irq_restore(f);
+    pulse_emit(K_TOPIC_WIN, K_PULSE_WIN_OPEN, win->wid,
+               (uint32_t)win->pid, win->title);
+    sync_window_visibility(slot);
+    if (minimized)
+        minimize_window(slot);
+    else if (win->workspace == current_ws || win->pinned)
+        set_focus(slot);
+    win_bounds(win, &frame);
+    damage(frame.x, frame.y, frame.w, frame.h);
+    evq_push(win, KEV_THEME, 0, 0, 0, 0);
+    wm_unlock();
 }

@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: KJS Demo
+exec: /bin/kjs
+mission: Run the Flight HUD JavaScript demo
+display: yes
+fs.read: /lib /etc /doc ~ /tmp
+fs.write: ~ /tmp
+net: any
+device: random
+ipc: talon pulse signal pipe
+spawn: yes

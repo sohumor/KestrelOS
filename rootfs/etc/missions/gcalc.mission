@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Calculator
+exec: /bin/gcalc
+mission: Calculate on the desktop
+display: yes
+fs.read: none
+fs.write: none
+net: none
+device: none
+ipc: none
+spawn: no

@@ -23,6 +23,7 @@ extern bool wm_keyboard_captured(void) __attribute__((weak));
 #include "flight.h"
 #include "tcp.h"
 #include "parcel.h"
+#include "mission.h"
 
 /* /dev pseudo-filesystem. See devfs.h for what it publishes.
  *
@@ -77,6 +78,7 @@ static const struct devdesc devtab[] = {
     { "sockets", DEV_SOCKETS, 0444 },
     { "caps",    DEV_CAPS,    0444 },
     { "parcels", DEV_PARCELS, 0444 },
+    { "missions", DEV_MISSIONS, 0444 },
 };
 
 #define DEVTAB_COUNT ((int)(sizeof(devtab) / sizeof(devtab[0])))
@@ -267,7 +269,7 @@ static uint32_t blk_size_bytes(struct blockdev *bd)
 static bool is_krec_dev(int id)
 {
     return id == DEV_FLIGHT || id == DEV_PROCS || id == DEV_SOCKETS ||
-           id == DEV_CAPS || id == DEV_PARCELS;
+           id == DEV_CAPS || id == DEV_PARCELS || id == DEV_MISSIONS;
 }
 
 static uint32_t krec_dev_cap(int id)
@@ -301,6 +303,8 @@ static uint32_t render_krec_view(int id, char *buf, uint32_t cap)
         return proc_caps_snapshot_krec(buf, cap);
     case DEV_PARCELS:
         return parcel_snapshot_krec(buf, cap);
+    case DEV_MISSIONS:
+        return mission_snapshot_krec(buf, cap);
     default:
         return 0;
     }
@@ -626,6 +630,7 @@ static long devfs_op_read(struct file *f, void *buf, unsigned long n, int blocki
     case DEV_SOCKETS:
     case DEV_CAPS:
     case DEV_PARCELS:
+    case DEV_MISSIONS:
         return read_text(df, buf, n);
     case DEV_BLOCKDEV:
         return read_blockdev(df, buf, n);

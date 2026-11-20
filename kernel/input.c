@@ -61,7 +61,7 @@ int input_trygetc_wm_hotkey(void)
         return -1;
     }
     uint8_t c = buf[tail];
-    if (c < KEY_WM_NEXT || c > KEY_WM_WS4) {
+    if (c < KEY_WM_NEXT || c > KEY_MISSION) {
         spin_unlock_irqrestore(&input_lock, flags);
         return -1;
     }

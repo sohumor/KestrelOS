@@ -27,6 +27,7 @@ struct file {
     uint32_t pos;               /* byte offset */
     int flags;                  /* open() flags */
     int refs;                   /* dup / spawn share a struct file */
+    char path[96];              /* as opened, "" if unknown/too long */
 };
 
 /* Optional open guard. Only passed to the owning filesystem type, which

@@ -3509,6 +3509,98 @@ def t_inspect_cli(h):
     wait_prompt(h)
 
 
+def mission_command(h, command):
+    h.send(command)
+    return h.capture_until(SHELL_PROMPT, regex=True)
+
+
+def mission_probe_start(h, denied="-", host="-"):
+    block = mission_command(
+        h, "mission run missionprobe --fs-read /tmp/mission-allowed "
+        "--net-host 127.0.0.1 --bg -- /tmp/mission-allowed %s %s" % (denied, host))
+    match = re.search(r"mission (\d+) pid (\d+)", block)
+    assert match, block
+    mid, pid = map(int, match.groups())
+    assert mid > 0 and pid > 0, block
+    initial = r"missionprobe pid=%d read=allow file=deny net=deny" % pid
+    if not re.search(initial, block):
+        h.expect(initial, regex=True)
+    return mid, pid
+
+
+def mission_probe_end(h, mid):
+    block = mission_command(h, "mission end %d" % mid)
+    assert "mission %d: ending" % mid in block, block
+    # End wakes a sleeping task. Await scheduler progress via guest commands,
+    # rather than assuming the control syscall synchronously reaps it.
+    for _ in range(20):
+        block = mission_command(h, "mission ps")
+        if not re.search(r"mission %d app=" % mid, block):
+            return
+    raise AssertionError("ended mission remained live: " + block)
+
+
+def t_mission_grant(h):
+    block = mission_command(h, "mission list")
+    for name in ("sight", "notes", "kjs", "edit", "browser", "terminal", "gfiles",
+                 "sysmon", "gpaint", "gcalc", "gclock", "settings", "about",
+                 "cat", "curl", "ping", "sh", "missionprobe"):
+        assert re.search(r"\n%s:" % name, block), block
+    block = mission_command(h, "mission show sh")
+    assert "exec: /bin/sh" in block and "spawn" in block, block
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    block = mission_command(h, "mission run cat --fs-read /tmp/mission-allowed -- /tmp/mission-allowed")
+    assert re.search(r"\nMISSION-ALLOWED-READ\n", block), block
+    assert "cannot open" not in block and "[exit 1]" not in block, block
+    block = mission_command(h, "mission run missionprobe --fs-read /etc/passwd --bg -- /tmp/mission-allowed - -")
+    assert "grant widens filesystem paths" in block and " pid " not in block, block
+    # Even a child that exits immediately has a race-free mission id result.
+    block = mission_command(h, "mission run cat --fs-read /tmp/mission-allowed --bg -- /tmp/mission-allowed")
+    assert re.search(r"mission [1-9]\d* pid [1-9]\d*", block), block
+
+
+def t_mission_deny(h):
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    mid, pid = mission_probe_start(h, denied="/etc/passwd")
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read active uses=[1-9]\d* denies=[1-9]\d*", block), block
+        assert "last_deny=/etc/passwd" in block, block
+        block = mission_command(h, "cat /dev/missions")
+        assert "@krec id:int" in block and "/etc/passwd" in block, block
+    finally:
+        mission_probe_end(h, mid)
+    mid, pid = mission_probe_start(h, host="10.0.2.2")
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"net active uses=[1-9]\d* denies=[1-9]\d*", block), block
+        assert "last_deny=10.0.2.2" in block, block
+        assert "host:0 127.0.0.1" in block, block
+    finally:
+        mission_probe_end(h, mid)
+
+
+def t_mission_revoke_live(h):
+    mission_command(h, "echo MISSION-ALLOWED-READ > /tmp/mission-allowed")
+    mid, pid = mission_probe_start(h)
+    try:
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*tasks=1 pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read active uses=[1-9]\d* denies=0", block), block
+        block = mission_command(h, "mission revoke %d fs.read" % mid)
+        assert "mission %d: revoked fs.read" % mid in block, block
+        changed = "missionprobe pid=%d read=deny file=deny net=deny" % pid
+        if changed not in block:
+            h.expect(changed)
+        block = mission_command(h, "mission ps")
+        assert re.search(r"mission %d app=.*tasks=1 pids=%d\b" % (mid, pid), block), block
+        assert re.search(r"fs.read revoked uses=[1-9]\d* denies=[1-9]\d*", block), block
+        print("  live revoke: mission %d, same pid %d changed read=allow -> read=deny" % (mid, pid))
+    finally:
+        mission_probe_end(h, mid)
+
+
 def t_kjs_cli(h):
     h.send('kjs -e "var m = Kestrel.memInfo(); '
            "Kestrel.parcelPut('text', 'kjs', 'JS-OK-' + (m.totalKb > 0)); "
@@ -3521,6 +3613,9 @@ TESTS = [
     ("boot", t_boot),
     ("login", t_login),
     ("shell-prompt", t_prompt),
+    ("mission-grant", t_mission_grant),
+    ("mission-deny", t_mission_deny),
+    ("mission-revoke-live", t_mission_revoke_live),
     ("help", t_help),
     ("echo", t_echo),
     ("ls-bin", t_ls_bin),

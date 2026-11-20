@@ -7,6 +7,28 @@
 #include <kestrel.h>
 #include <stdio.h>
 #include <string.h>
+#include <mission.h>
+
+int mission_spawn(const char *path, char *const argv[], const struct k_mission_grant *grant)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, 0);
+}
+
+int mission_spawn_id(const char *path, char *const argv[], const struct k_mission_grant *grant,
+                     uint32_t *id)
+{
+    return (int)syscall(SYS_MISSION_SPAWN, (long)path, (long)argv, (long)grant, (long)id);
+}
+
+int mission_ctl(uint32_t id, unsigned op, unsigned arg)
+{
+    return (int)syscall(SYS_MISSION_CTL, id, op, arg, 0);
+}
+
+int mission_info(unsigned index, struct k_mission_info *out)
+{
+    return (int)syscall(SYS_MISSION_INFO, index, (long)out, 0, 0);
+}
 
 /* ---- files ---- */
 
@@ -204,6 +226,31 @@ int wm_theme(const struct k_wm_theme *theme)
 int win_resize(uint32_t wid, int w, int h)
 {
     return (int)syscall(SYS_WIN_RESIZE, (long)wid, (long)w, (long)h, 0);
+}
+
+int hangar_park(int pid, char *reason)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_PARK, (long)pid, (long)reason, 0);
+}
+
+int hangar_list(int index, struct k_hangar_info *out)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_LIST, (long)index, (long)out, 0);
+}
+
+int hangar_thumb(int bay, uint32_t *pixels)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_THUMB, (long)bay, (long)pixels, 0);
+}
+
+int hangar_resume(int bay, char *reason)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_RESUME, (long)bay, (long)reason, 0);
+}
+
+int hangar_discard(int bay)
+{
+    return (int)syscall(SYS_HANGAR, K_HANGAR_DISCARD, (long)bay, 0, 0);
 }
 
 void sleep_ms(unsigned long ms)

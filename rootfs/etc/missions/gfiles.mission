@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Files
+exec: /bin/gfiles
+mission: Browse and manage personal files
+display: yes
+fs.read: /bin /lib /etc /share /doc ~ /tmp
+fs.write: ~ /tmp
+net: none
+device: none
+ipc: talon pulse
+spawn: yes

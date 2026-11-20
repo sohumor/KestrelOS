@@ -106,6 +106,11 @@
 #define SYS_PARCEL_LIST 75 /* (index, struct k_parcel_info*) -> 0/-1 */
 #define SYS_WM_THEME    76 /* (const struct k_wm_theme*) -> 0/-1 */
 #define SYS_WIN_RESIZE  77 /* (wid, new_w, new_h) -> 0/-1 */
+/* 78..82 stay reserved for IPv6 (see docs/ABI.md); Hangar takes 83. */
+#define SYS_HANGAR      83 /* (op, a, b, c): park/resume, see K_HANGAR_* */
+#define SYS_MISSION_SPAWN 90 /* (path, argv, const struct k_mission_grant*, u32 *id_or_NULL) -> pid/-1 */
+#define SYS_MISSION_CTL   91 /* (id, op, arg) -> 0/-1 */
+#define SYS_MISSION_INFO  92 /* (index, struct k_mission_info*) -> 0/-1 */
 
 /* SYS_GETRANDOM flags. Both devices use the same ChaCha20 CSPRNG after its
  * initial seed threshold; GRND_RANDOM requests the blocking random policy. */
@@ -277,6 +282,7 @@ struct k_netinfo {
 #define KEY_WM_WS2   0x8D  /* Alt-2 */
 #define KEY_WM_WS3   0x8E  /* Alt-3 */
 #define KEY_WM_WS4   0x8F  /* Alt-4 */
+#define KEY_MISSION  0x90  /* Ctrl-M */
 
 /* --- kernel log ---------------------------------------------------- */
 
@@ -360,6 +366,7 @@ struct k_mouse {
  * row (no padding). The kernel maps the buffer into the caller and keeps
  * it until SYS_WIN_DESTROY or process exit. */
 #define K_WIN_NODECOR 1    /* no title bar or border (desktop, panels) */
+#define K_WIN_OVERLAY 4    /* above normal windows; never takes keyboard focus */
 #define K_WIN_DESKTOP 2    /* full-screen background layer, never focused */
 
 struct k_wincreate {
@@ -416,12 +423,44 @@ struct k_winsummary {
 #define KEV_RESIZE      7  /* .x = new_w, .y = new_h */
 #define KEV_MOUSE_WHEEL 8  /* .x/.y client coords, (int32_t).key = delta (+ up) */
 #define KEV_THEME       9  /* compositor/system theme updated */
+#define KEV_HANGAR      10 /* desktop only: park requested for window .key */
 
 struct k_event {
     uint32_t type;
     int32_t  x, y;         /* client-relative for mouse events */
     uint32_t key;
     uint32_t buttons;
+};
+
+/* --- Hangar: park a running app to disk, resume it later ------------
+ * SYS_HANGAR(op, a, b, c). A parked app keeps its memory, registers, FPU
+ * state, open files, signal state and windows; it survives reboots.
+ * Ops that can fail for a reason the user should see fill `reason`
+ * (K_HANGAR_REASON_MAX bytes, NUL-terminated) and return -1. */
+#define K_HANGAR_PARK    0  /* (pid, reason) -> bay / -1              */
+#define K_HANGAR_LIST    1  /* (index, struct k_hangar_info *) -> 0/-1 */
+#define K_HANGAR_THUMB   2  /* (bay, uint32_t[W*H]) -> 0/-1            */
+#define K_HANGAR_RESUME  3  /* (bay, reason) -> pid / -1               */
+#define K_HANGAR_DISCARD 4  /* (bay) -> 0/-1                           */
+
+#define K_HANGAR_BAYS       12
+#define K_HANGAR_THUMB_W    160
+#define K_HANGAR_THUMB_H    100
+#define K_HANGAR_REASON_MAX 128
+
+struct k_hangar_info {
+    uint32_t bay;
+    uint32_t uid;
+    uint32_t parked_at;     /* Unix seconds */
+    uint32_t pages;         /* resident pages stored */
+    uint64_t bytes;         /* image size on disk */
+    int32_t  orig_pid;
+    uint32_t nwins;
+    uint32_t nfiles;
+    int32_t  x, y;          /* first window's client origin */
+    uint32_t width, height;
+    char     name[32];      /* process name */
+    char     title[64];     /* first window's title */
 };
 
 /* --- capabilities & capability spawn -------------------------------- */
@@ -460,7 +499,8 @@ struct k_spawn_caps {
 #define K_TOPIC_FS     0x08U
 #define K_TOPIC_NET    0x10U
 #define K_TOPIC_PARCEL 0x20U
-#define K_TOPIC_ALL    0x3FU
+#define K_TOPIC_MISSION 0x40U
+#define K_TOPIC_ALL    0x7FU
 
 #define K_PULSE_PROC_SPAWN  1
 #define K_PULSE_PROC_EXIT   2
@@ -472,6 +512,75 @@ struct k_spawn_caps {
 #define K_PULSE_FS_CHANGE   8
 #define K_PULSE_NET_CHANGE  9
 #define K_PULSE_PARCEL_NEW  10
+#define K_PULSE_MISSION_START  11
+#define K_PULSE_MISSION_USE    12
+#define K_PULSE_MISSION_DENY   13
+#define K_PULSE_MISSION_REVOKE 14
+#define K_PULSE_MISSION_END    15
+
+#define K_MISSION_MAX 16
+#define K_MISSION_PATHS 8
+#define K_MISSION_HOSTS 4
+#define K_MISSION_PIDS 32
+#define K_MISSION_READ 1U
+#define K_MISSION_WRITE 2U
+#define K_MISSION_NET_NONE 0U
+#define K_MISSION_NET_ANY 1U
+#define K_MISSION_NET_HOSTS 2U
+#define K_MISSION_IPC_TALON  1U
+#define K_MISSION_IPC_PULSE  2U
+#define K_MISSION_IPC_SIGNAL 4U
+#define K_MISSION_IPC_PIPE   8U
+#define K_MISSION_IPC_ALL    15U
+enum k_mission_channel {
+    K_MISSION_FS_READ, K_MISSION_FS_WRITE, K_MISSION_NET,
+    K_MISSION_DISPLAY, K_MISSION_SPAWN, K_MISSION_IPC,
+    K_MISSION_AUDIO, K_MISSION_CAMERA, K_MISSION_INPUT, K_MISSION_RANDOM,
+    K_MISSION_CHANNELS
+};
+#define K_MISSION_DEVICE_AUDIO  1U
+#define K_MISSION_DEVICE_CAMERA 2U
+#define K_MISSION_DEVICE_INPUT  4U
+#define K_MISSION_DEVICE_RANDOM 8U
+#define K_MISSION_REVOKE_CAP  1
+#define K_MISSION_REVOKE_PATH 2
+#define K_MISSION_REVOKE_HOST 3
+#define K_MISSION_END         4
+
+struct k_mission_path {
+    char prefix[64];
+    uint32_t mode;
+    uint32_t revoked;
+};
+struct k_mission_host {
+    uint32_t ip_be;
+    uint32_t revoked;
+};
+struct k_mission_grant {
+    char app[24];
+    char title[48];
+    uint64_t cap_mask;
+    uint32_t path_count;
+    uint32_t net_mode;
+    uint32_t host_count;
+    uint32_t device_bits;
+    uint32_t ipc_bits;
+    uint32_t reserved;
+    struct k_mission_path paths[K_MISSION_PATHS];
+    struct k_mission_host hosts[K_MISSION_HOSTS];
+};
+struct k_mission_counter {
+    uint64_t uses, denies, last_use_tick, last_deny_tick;
+};
+struct k_mission_info {
+    uint32_t id, owner_uid;
+    struct k_mission_grant grant;
+    uint64_t revoked; /* channel bitmap */
+    struct k_mission_counter counters[K_MISSION_CHANNELS];
+    char last_deny[40];
+    uint32_t task_count, pid_count;
+    int32_t pids[K_MISSION_PIDS]; /* truncated at K_MISSION_PIDS */
+};
 
 struct k_pulse {
     uint64_t seq;

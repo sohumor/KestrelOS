@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: Terminal
+exec: /bin/terminal
+mission: Run commands and shell helpers
+display: yes
+fs.read: /bin /lib /etc /share /doc ~ /tmp
+fs.write: ~ /tmp
+net: any
+device: random
+ipc: talon pulse signal pipe
+spawn: yes

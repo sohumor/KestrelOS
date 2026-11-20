@@ -1,0 +1,11 @@
+# Kestrel mission manifest
+app: curl
+exec: /bin/curl
+mission: Transfer data from selected web hosts
+display: no
+fs.read: /lib /etc /doc ~ /tmp
+fs.write: ~ /tmp
+net: any
+device: random
+ipc: none
+spawn: no
