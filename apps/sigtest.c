@@ -102,6 +102,29 @@ static int test_pipe_lifetime(void)
     return 0;
 }
 
+enum { WAITANY_CHILD_STATUS = 37 };
+
+static int test_waitany_bad_pointer(void)
+{
+    char *args[] = { "sigtest", "--waitany-child", 0 };
+    int child = spawn("/bin/sigtest", args);
+    if (child < 0) {
+        printf("sigtest: waitany child spawn failed\n");
+        return 1;
+    }
+
+    int bad = waitany((int *)1);
+    int pid = 0;
+    int status = waitany(&pid);
+    if (bad != -1 || pid != child || status != WAITANY_CHILD_STATUS) {
+        printf("sigtest: waitany failed: bad=%d retry=(%d, %d) expected=(%d, %d)\n",
+               bad, pid, status, child, WAITANY_CHILD_STATUS);
+        return 1;
+    }
+    printf("sigtest: waitany preserved child PID and status after bad pointer\n");
+    return 0;
+}
+
 static int test_cwd_consumers(void)
 {
     static const char expected[] = "--cwd=/literal\n";
@@ -146,6 +169,10 @@ int main(int argc, char **argv)
         return interrupt_reader(atoi(argv[2]));
     if (argc > 1 && strcmp(argv[1], "--pipe-lifetime") == 0)
         return test_pipe_lifetime();
+    if (argc > 1 && strcmp(argv[1], "--waitany-bad-pointer") == 0)
+        return test_waitany_bad_pointer();
+    if (argc > 1 && strcmp(argv[1], "--waitany-child") == 0)
+        return WAITANY_CHILD_STATUS;
 
     uint64_t bit = 1ULL << (SIGUSR1 - 1);
 
