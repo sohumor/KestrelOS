@@ -2,13 +2,14 @@
  * a file with a single vfs write. Prints the byte count written. */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_PATH 256
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 /* Pull the shell-injected trailing "--cwd=<path>" argument, if any. */
 static int strip_cwd_arg(int argc, char **argv)
@@ -40,6 +41,7 @@ int main(int argc, char **argv)
     long n;
     int fd;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
     if (argc != 2) {
         printf("usage: writefile <path>\n");

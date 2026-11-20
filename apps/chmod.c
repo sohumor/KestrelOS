@@ -10,12 +10,13 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <string.h>
 
 #define MAX_PATH 256
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 static int sc_chmod(const char *path, int mode)
 {
@@ -142,6 +143,7 @@ int main(int argc, char **argv)
     int i;
     int rc = 0;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
 
     first = 1;
