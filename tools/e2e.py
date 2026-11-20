@@ -17,7 +17,7 @@ program prints are the three tricks used throughout.
 
 Usage:
     python3 tools/e2e.py            # full test sequence
-    python3 tools/e2e.py --smoke    # boot ready + guest exit code
+    python3 tools/e2e.py --smoke    # boot + login + prompt + guest exit code
     python3 tools/e2e.py --nic e1000
     python3 tools/e2e.py --list     # list tests without running
     python3 tools/e2e.py --selftest # exercise expect/send plumbing
@@ -82,7 +82,7 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus, disk="ata", smoke=False):
+def qemu_command(nic, cpus, disk="ata"):
     storage = (["-machine", "q35", "-drive",
                 "if=none,id=d0,file=build/os.img,format=raw",
                 "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
@@ -91,7 +91,7 @@ def qemu_command(nic, cpus, disk="ata", smoke=False):
         find_qemu(),
         "-accel", "tcg",
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
-        "-fw_cfg", "name=opt/kestrel-test,string=%d" % (1 if smoke else 2),
+        "-fw_cfg", "name=opt/kestrel-test,string=2",
         *storage,
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
@@ -1791,9 +1791,6 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
-    if getattr(h, "smoke", False):
-        h.wait_exit()
-        return
     if getattr(h, "disk", "ata") == "ahci":
         line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
                         timeout=BOOT_TIMEOUT, regex=True)
@@ -3233,7 +3230,7 @@ def main():
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
-                    help="check kernel readiness via guest exit code")
+                    help="check boot, login and shell prompt, then guest exit code")
     ap.add_argument("--only", action="append", metavar="NAME",
                     help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
@@ -3288,12 +3285,8 @@ def main():
                 fixtures.close()
             return 1
 
-    smoke = args.smoke and not args.only
-    if smoke:
-        tests = [("boot", t_boot)]
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk, smoke=smoke))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
     h.disk = args.disk
-    h.smoke = smoke
     try:
         h.start()
     except FileNotFoundError:
@@ -3304,7 +3297,7 @@ def main():
         return 1
     try:
         results = run_tests(h, tests)
-        if not smoke and all(status != "FAIL" for _, status in results):
+        if all(status != "FAIL" for _, status in results):
             def finish(h):
                 h.send("halt")
                 h.wait_exit()
