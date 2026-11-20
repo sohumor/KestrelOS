@@ -1,8 +1,6 @@
 #include "kernel.h"
 #include "mount.h"
 #include "blockdev.h"
-#include "config.h"
-#include "module.h"
 #include "proc.h"
 #include "string.h"
 #include "spinlock.h"
@@ -225,18 +223,11 @@ int mount_add(const char *path, const char *fstype, const char *devname)
         return -1;
     }
     if (devname != NULL && devname[0] != '\0') {
-        bd = blockdev_find(devname);
+        bd = blockdev_acquire(devname);
         if (bd == NULL) {
-            kprintf("mount: no block device '%s'\n", devname);
+            kprintf("mount: no available block device '%s'\n", devname);
             return -1;
         }
-#ifdef CONFIG_MODULES
-        if (bd->owner != NULL && module_get(bd->owner) != 0) {
-            kprintf("mount: module '%s' for '%s' is unavailable\n",
-                    bd->owner, devname);
-            return -1;
-        }
-#endif
     }
 
     /* Reserve the slot with priv still NULL: mount_resolve() skips such
@@ -245,10 +236,7 @@ int mount_add(const char *path, const char *fstype, const char *devname)
     for (int i = 0; i < MOUNT_MAX; i++) {
         if (mounts[i].used && strcmp(mounts[i].path, mp) == 0) {
             spin_unlock_irqrestore(&mount_lock, f);
-#ifdef CONFIG_MODULES
-            if (bd != NULL && bd->owner != NULL)
-                module_put(bd->owner);
-#endif
+            blockdev_release(bd);
             kprintf("mount: %s is already a mount point\n", mp);
             return -1;
         }
@@ -261,10 +249,7 @@ int mount_add(const char *path, const char *fstype, const char *devname)
     }
     if (m == NULL) {
         spin_unlock_irqrestore(&mount_lock, f);
-#ifdef CONFIG_MODULES
-        if (bd != NULL && bd->owner != NULL)
-            module_put(bd->owner);
-#endif
+        blockdev_release(bd);
         kprintf("mount: table full\n");
         return -1;
     }
@@ -281,10 +266,7 @@ int mount_add(const char *path, const char *fstype, const char *devname)
         f = spin_lock_irqsave(&mount_lock);
         memset(m, 0, sizeof(*m));
         spin_unlock_irqrestore(&mount_lock, f);
-#ifdef CONFIG_MODULES
-        if (bd != NULL && bd->owner != NULL)
-            module_put(bd->owner);
-#endif
+        blockdev_release(bd);
         return -1;
     }
 
@@ -329,9 +311,6 @@ int mount_remove(const char *path)
 
     if (type->unmount != NULL)
         type->unmount(priv);
-#ifdef CONFIG_MODULES
-    if (bd != NULL && bd->owner != NULL)
-        module_put(bd->owner);
-#endif
+    blockdev_release(bd);
     return 0;
 }
