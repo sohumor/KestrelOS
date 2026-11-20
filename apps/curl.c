@@ -13,6 +13,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +27,7 @@
 
 #define PATH_LIM 256
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
@@ -99,6 +100,7 @@ int main(int argc, char **argv)
     int inc_hdr = 0, silent = 0;
     int i;
 
+    g_cwd = kestrel_startup_cwd();
     for (i = 1; i < argc; i++) {
         if (strncmp(argv[i], "--cwd=", 6) == 0) {
             g_cwd = argv[i] + 6;

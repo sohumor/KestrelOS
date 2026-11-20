@@ -19,6 +19,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <http.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1320,7 +1321,7 @@ static int install_by_name(struct instate *st, const char *name)
 
 /* ---- commands ------------------------------------------------------------ */
 
-static const char *g_cwd = "/";
+static const char *g_cwd;
 
 static void resolve_path(const char *tok, char *out, unsigned long outsz)
 {
@@ -1762,6 +1763,7 @@ int main(int argc, char **argv)
     const char *cmd;
     int force = 0, i, out = 1;
 
+    g_cwd = kestrel_startup_cwd();
     argc = strip_cwd_arg(argc, argv);
     conf_load();
 

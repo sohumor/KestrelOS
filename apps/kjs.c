@@ -11,6 +11,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1448,7 +1449,8 @@ int main(int argc, char **argv)
     int i, rc = 0;
 
     memset(&g_rt, 0, sizeof(g_rt));
-    strcpy(g_rt.cwd, "/");
+    snprintf(g_rt.cwd, sizeof(g_rt.cwd), "%s", kestrel_startup_cwd());
+    normalize_path(g_rt.cwd);
 
     /* Strip --cwd=<path> first, preserving order of script and user args. */
     {
