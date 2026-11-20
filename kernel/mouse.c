@@ -171,6 +171,17 @@ static void handle_packet(void)
     int dx = (flags & 0x10) ? (int)ms.pkt[1] - 256 : (int)ms.pkt[1];
     int dy = (flags & 0x20) ? (int)ms.pkt[2] - 256 : (int)ms.pkt[2];
 
+    int dz = 0;
+    if (ms.packet_size == 4) {
+        dz = (int)(ms.pkt[3] & 0x0F);
+        if (dz & 8)
+            dz -= 16;
+    }
+    mouse_report(dx, dy, dz, flags);
+}
+
+void mouse_report(int dx, int dy, int dz, uint32_t buttons)
+{
     uint64_t f = spin_lock_irqsave(&mouse_lock);
 
     int nx = ms.x + (dx * MOUSE_SENSITIVITY_NUM) / MOUSE_SENSITIVITY_DEN;
@@ -186,7 +197,7 @@ static void handle_packet(void)
     ms.y = ny;
 
     uint32_t old = ms.buttons;
-    uint32_t now = flags & (K_MOUSE_LEFT | K_MOUSE_RIGHT | K_MOUSE_MIDDLE);
+    uint32_t now = buttons & (K_MOUSE_LEFT | K_MOUSE_RIGHT | K_MOUSE_MIDDLE);
     ms.buttons = now;
 
     if (moved)
@@ -199,13 +210,8 @@ static void handle_packet(void)
         ev_push((now & bit) ? KEV_MOUSE_DOWN : KEV_MOUSE_UP, nx, ny, 0, now);
     }
 
-    if (ms.packet_size == 4) {
-        int dz = (int)(ms.pkt[3] & 0x0F);
-        if (dz & 8)
-            dz -= 16;
-        if (dz != 0)
-            ev_push(KEV_MOUSE_WHEEL, nx, ny, (uint32_t)(int32_t)(-dz), now);
-    }
+    if (dz != 0)
+        ev_push(KEV_MOUSE_WHEEL, nx, ny, (uint32_t)(int32_t)(-dz), now);
 
     spin_unlock_irqrestore(&mouse_lock, f);
 }
@@ -313,6 +319,13 @@ fail:
 bool mouse_present(void)
 {
     return ms.present;
+}
+
+void mouse_set_present(void)
+{
+    uint64_t f = spin_lock_irqsave(&mouse_lock);
+    ms.present = true;
+    spin_unlock_irqrestore(&mouse_lock, f);
 }
 
 void mouse_get(struct k_mouse *out)

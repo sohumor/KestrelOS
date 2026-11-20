@@ -26,6 +26,8 @@ void     pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t off,
 
 /* Find the first device matching vendor/device. Returns false if absent. */
 bool pci_find(uint16_t vendor, uint16_t device, struct pci_dev *out);
+bool pci_find_class(uint8_t cls, uint8_t sub, uint8_t prog,
+                    struct pci_dev *out);
 
 /* Set the bus-master (and I/O space) bits in the command register. */
 void pci_enable_bus_master(const struct pci_dev *d);

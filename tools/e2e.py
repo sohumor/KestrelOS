@@ -30,6 +30,7 @@ import base64
 import collections
 import http.client
 import http.server
+import json
 import os
 import re
 import shutil
@@ -3132,12 +3133,109 @@ def fixture_selftest():
     return True
 
 
+def usb_hid_test(nic, cpus, machine):
+    """Exercise real USB input; disable PS/2 where QEMU supports it."""
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    properties = subprocess.run([find_qemu(), "-machine", machine + ",help"],
+                                capture_output=True, text=True, check=True).stdout
+    no_ps2 = "i8042=" in properties
+    cmd = qemu_command(nic, cpus) + [
+        "-machine", machine + (",i8042=off" if no_ps2 else ""),
+        "-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-mouse",
+        "-qmp", "tcp:127.0.0.1:%d,server=on,wait=off" % port,
+    ]
+    if machine == "q35":
+        # The kernel has legacy ATA, not AHCI. Keep the same disk path usable
+        # while testing xHCI on the PCIe chipset.
+        cmd[cmd.index("-drive") + 1] += ",if=none,id=usbdisk"
+        cmd += ["-device", "piix3-ide,id=usbide",
+                "-device", "ide-hd,drive=usbdisk,bus=usbide.0"]
+    h = Harness(cmd)
+    monitor = None
+    stream = None
+    try:
+        h.start()
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                monitor = socket.create_connection(("127.0.0.1", port), timeout=2)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("QMP monitor did not start")
+                time.sleep(0.05)
+        monitor.settimeout(5)
+        stream = monitor.makefile("rwb")
+        greeting = json.loads(stream.readline())
+        if "QMP" not in greeting:
+            raise RuntimeError("invalid QMP greeting")
+
+        def qmp(execute, arguments=None):
+            request = {"execute": execute}
+            if arguments is not None:
+                request["arguments"] = arguments
+            stream.write((json.dumps(request) + "\n").encode("ascii"))
+            stream.flush()
+            while True:
+                reply = json.loads(stream.readline())
+                if "error" in reply:
+                    raise RuntimeError("QMP error: %s" % reply["error"])
+                if "return" in reply:
+                    return reply["return"]
+
+        qmp("qmp_capabilities")
+        boot = h.capture_until("KESTREL READY", timeout=BOOT_TIMEOUT)
+        for pattern in (r"xhci: controller [^\n]+", r"usb: port \d+ slot \d+ keyboard \(boot\)",
+                        r"usb: port \d+ slot \d+ mouse \(boot\)"):
+            match = re.search(pattern, boot)
+            if not match:
+                raise RuntimeError("missing USB enumeration: " + pattern)
+            print(match.group(0))
+        t_login(h)
+        t_prompt(h)
+        # Only monitor events supply this command, never the serial harness.
+        for char in "echo usbinputok\n":
+            key = {" ": "spc", "\n": "ret"}.get(char, char)
+            qmp("human-monitor-command", {"command-line": "sendkey %s 30" % key})
+            time.sleep(0.08)
+        h.expect(r"\nusbinputok\n", regex=True)
+        wait_prompt(h)
+        print("PASS usb-keyboard-monitor-input")
+        qmp("human-monitor-command", {"command-line": "mouse_move 17 9"})
+        qmp("human-monitor-command", {"command-line": "mouse_button 1"})
+        mouse = h.expect(r"usb: mouse input dx -?\d+ dy -?\d+ buttons \d+",
+                         regex=True)
+        print(mouse.group(0))
+        qmp("human-monitor-command", {"command-line": "mouse_button 0"})
+        print("PASS usb-mouse-monitor-input")
+        print("summary: USB HID input passed (%s, %s)" %
+              (machine, "no PS/2 controller" if no_ps2 else
+               "QEMU lacks i8042=off; monitor targets USB"))
+        return 0
+    except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
+        print("FAIL usb-hid: %s" % exc)
+        h.print_tail()
+        return 1
+    finally:
+        if stream:
+            stream.close()
+        if monitor:
+            monitor.close()
+        h.kill()
+
+
 def main():
     global browser_fixtures
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
                     help="run boot + prompt tests only")
+    ap.add_argument("--usb-hid", action="store_true",
+                    help="opt-in xHCI monitor test (disables PS/2 on supported QEMU)")
+    ap.add_argument("--usb-machine", choices=["pc", "q35"], default="pc",
+                    help="machine for --usb-hid (default: pc)")
     ap.add_argument("--only", action="append", metavar="NAME",
                     help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
@@ -3167,6 +3265,9 @@ def main():
     if not os.path.exists("build/os.img"):
         print("error: build/os.img not found (run make first)")
         return 1
+
+    if args.usb_hid:
+        return usb_hid_test(args.nic, args.cpus, args.usb_machine)
 
     if args.only:
         available = dict(TESTS)

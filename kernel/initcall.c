@@ -99,6 +99,7 @@ INITCALL_EXTERN(bus_platform_init);
 INITCALL_EXTERN(bus_pci_init);
 INITCALL_EXTERN(ps2kbd_drv_init);
 INITCALL_EXTERN(ps2mouse_drv_init);
+INITCALL_EXTERN(xhci_drv_init);
 INITCALL_EXTERN(rtl8139_drv_init);
 INITCALL_EXTERN(e1000_drv_init);
 
@@ -117,6 +118,7 @@ static const struct initcall_static static_table[] = {
      * the alphabet. */
     INITCALL_ENTRY(INITCALL_DRIVER, ps2kbd_drv_init),
     INITCALL_ENTRY(INITCALL_DRIVER, ps2mouse_drv_init),
+    INITCALL_ENTRY(INITCALL_DRIVER, xhci_drv_init),
     INITCALL_ENTRY(INITCALL_DRIVER, rtl8139_drv_init),
     INITCALL_ENTRY(INITCALL_DRIVER, e1000_drv_init),
 };

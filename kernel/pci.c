@@ -112,3 +112,18 @@ void pci_enable_bus_master(const struct pci_dev *d)
     v = (v & 0xFFFF0000u) | cmd;
     pci_write32(d->bus, d->dev, d->fn, 0x04, v);
 }
+
+bool pci_find_class(uint8_t cls, uint8_t sub, uint8_t prog,
+                    struct pci_dev *out)
+{
+    pci_init();
+    for (int i = 0; i < ndevs; i++) {
+        struct pci_dev *d = &devs[i];
+        uint32_t code = pci_read32(d->bus, d->dev, d->fn, 8);
+        if ((code >> 8) == (((uint32_t)cls << 16) | ((uint32_t)sub << 8) | prog)) {
+            *out = *d;
+            return true;
+        }
+    }
+    return false;
+}

@@ -96,7 +96,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
 .PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
-        test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
+        test-random test-usb-hid test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
 
@@ -335,6 +335,12 @@ test-net: test-tcp test-checksum
 
 test-random:
 	sh tools/run-random-tests.sh
+
+test-usb-hid:
+	@mkdir -p $(BUILD)
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
+	  -Ikernel/include kernel/usb_hid_core.c tools/test_usb_hid.c -o $(BUILD)/test_usb_hid
+	$(BUILD)/test_usb_hid
 
 test-jpeg-prog:
 	@mkdir -p $(BUILD)
