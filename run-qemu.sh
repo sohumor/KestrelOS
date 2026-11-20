@@ -6,6 +6,7 @@
 #   --headless      no VGA window; the serial console on stdio is the only UI
 #   --image PATH    disk image to boot (default: build/os.img)
 #   --memory SIZE   guest RAM, QEMU syntax (default: 256M)
+#   --disk MODE     ata (default) or ahci (q35); also set via DISK
 #
 # Anything after "--" (or any unrecognised argument) is passed straight
 # through to qemu-system-x86_64.
@@ -19,6 +20,7 @@ set -u
 QEMU="${QEMU:-qemu-system-x86_64}"
 IMAGE="build/os.img"
 MEMORY="256M"
+DISK="${DISK:-ata}"
 HEADLESS=0
 EXTRA=""
 
@@ -36,6 +38,11 @@ while [ $# -gt 0 ]; do
     --memory)
         [ $# -ge 2 ] || { echo "run-qemu: --memory needs a size" >&2; exit 2; }
         MEMORY="$2"
+        shift 2
+        ;;
+    --disk)
+        [ $# -ge 2 ] || { echo "run-qemu: --disk needs ata or ahci" >&2; exit 2; }
+        DISK="$2"
         shift 2
         ;;
     -h|--help)
@@ -74,7 +81,12 @@ if [ "$HEADLESS" -eq 1 ]; then
     DISPLAY_ARGS=" -display none"
 fi
 
-CMD="$QEMU -drive file=$IMAGE,format=raw -m $MEMORY -no-reboot"
+case "$DISK" in
+ata) STORAGE="-drive file=$IMAGE,format=raw" ;;
+ahci) STORAGE="-machine q35 -drive if=none,id=d0,file=$IMAGE,format=raw -device ide-hd,drive=d0,bus=ide.0" ;;
+*) echo "run-qemu: invalid disk mode: $DISK" >&2; exit 2 ;;
+esac
+CMD="$QEMU $STORAGE -m $MEMORY -no-reboot"
 CMD="$CMD -device rtl8139,netdev=n0 -netdev user,id=n0"
 CMD="$CMD -serial stdio$DISPLAY_ARGS$EXTRA"
 
