@@ -19,6 +19,7 @@
 #define FACE_R 118
 #define CX     (WIN_W / 2)
 #define CY     (FACE_R + 12)
+#define READOUT_Y (CY + FACE_R + 12)
 
 /* Point on the dial: angle in tenths of a degree clockwise from 12. */
 static void dial_point(int angle, int radius, int *x, int *y)
@@ -85,9 +86,8 @@ static void draw_hands(gui_window *win, const struct gui_tm *tm)
 static void draw_readout(gui_window *win, const struct gui_tm *tm)
 {
     char line[64];
-    int y = CY + FACE_R + 16;
+    int y = 4;
 
-    gui_rect(win, 0, y - 4, WIN_W, WIN_H - y + 4, GUI_SURFACE);
     snprintf(line, sizeof(line), "%02d:%02d:%02d UTC", tm->hour, tm->min,
              tm->sec);
     gui_text(win, (WIN_W - gui_text_w(line)) / 2, y, line, GUI_ACCENT,
@@ -96,6 +96,24 @@ static void draw_readout(gui_window *win, const struct gui_tm *tm)
              tm->day, gui_month_name(tm->mon), tm->year);
     gui_text(win, (WIN_W - gui_text_w(line)) / 2, y + GUI_FONT_H + 4, line,
              GUI_TEXT_DIM, GUI_TRANSPARENT);
+}
+
+static void paint_clock(gui_window *win, const struct gui_tm *tm)
+{
+    int w = win->w < WIN_W ? win->w : WIN_W;
+    int h = win->h < WIN_H ? win->h : WIN_H;
+    int face_h = h < READOUT_Y ? h : READOUT_Y;
+    gui_window face, readout;
+
+    gui_clear(win, GUI_SURFACE);
+    if (gui_paint_view(&face, win, gui_mkrc(0, 0, w, face_h)) == 0) {
+        draw_face(&face);
+        draw_hands(&face, tm);
+    }
+    if (h > READOUT_Y &&
+        gui_paint_view(&readout, win,
+                       gui_mkrc(0, READOUT_Y, w, h - READOUT_Y)) == 0)
+        draw_readout(&readout, tm);
 }
 
 int main(int argc, char **argv)
@@ -121,10 +139,7 @@ int main(int argc, char **argv)
         if (now != last) {
             last = now;
             gui_gmtime(now, &tm);
-            gui_clear(win, GUI_SURFACE);
-            draw_face(win);
-            draw_hands(win, &tm);
-            draw_readout(win, &tm);
+            paint_clock(win, &tm);
             if (gui_flush(win) != 0)
                 break;
         }
