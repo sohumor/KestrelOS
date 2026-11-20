@@ -1898,6 +1898,22 @@ def t_fs_roundtrip(h):
     wait_prompt(h)
 
 
+def t_fs_hole(h):
+    h.send("kfshole")
+    probe = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("wc -c /run/kfs-hole-test")
+    count = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("cat /run/kfs-hole-test | wc -c")
+    copied = h.capture_until(SHELL_PROMPT, regex=True)
+    h.send("rm /run/kfs-hole-test")
+    wait_prompt(h)
+    if ("\nkfshole: zero-filled gap, tail and EOF verified\n" not in probe or
+            not re.search(r"\n *45064 /run/kfs-hole-test\n", count) or
+            not re.search(r"\n *45064\n", copied)):
+        raise TimeoutError("sparse file: unexpected guest output:\n" +
+                           "\n".join((probe, count, copied)))
+
+
 def t_ps(h):
     h.send("ps")
     h.expect("sh")
@@ -3127,6 +3143,7 @@ TESTS = [
     ("ls-many", t_ls_many),
     ("cat-motd", t_cat_motd),
     ("fs-roundtrip", t_fs_roundtrip),
+    ("fs-hole", t_fs_hole),
     ("ps", t_ps),
     ("free", t_free),
     ("smp", t_smp),
