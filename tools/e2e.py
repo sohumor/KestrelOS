@@ -2721,6 +2721,31 @@ def t_browser_home(h):
     wait_prompt(h, timeout=WALK_TIMEOUT)
 
 
+def t_wget_origin_index(h):
+    """Default wget filenames exclude the authority and query string."""
+    origin = "http://%s:%d" % (
+        QEMU_HOST, browser_fixtures.http.server_address[1])
+    for suffix, filename in (("", "index.html"), ("/", "index.html"),
+                             ("/dir/", "index.html"),
+                             ("?q=/ignored", "index.html"),
+                             ("/dir/?q=/ignored", "index.html"),
+                             ("/plain?q=/ignored", "plain")):
+        h.send("wget %s%s; echo WGET-STATUS-$?; "
+               "cat /%s; echo WGET-END" %
+               (origin, suffix, filename))
+        block = h.capture_until(r"\nWGET-END\n", timeout=NET_TIMEOUT,
+                                regex=True)
+        print("wget transcript (%s):\n%s" % (origin + suffix, block))
+        if ("WGET-STATUS-0\n" not in block or
+                "to /%s\n" % filename not in block or
+                HTTP_BODY_MARKER not in block):
+            raise TimeoutError("wget did not save the expected /%s body"
+                               % filename)
+        wait_prompt(h, timeout=NET_TIMEOUT)
+        h.send("rm /%s" % filename)
+        wait_prompt(h)
+
+
 def t_browser_http_controlled(h):
     """Plain HTTP through /bin/browser against a deterministic host page."""
     if not browser_fixtures:
@@ -3169,6 +3194,7 @@ TESTS = [
     ("browser-text", t_browser_text),
     ("browser-home", t_browser_home),
     ("browser-http-controlled", t_browser_http_controlled),
+    ("wget-origin-index", t_wget_origin_index),
     ("browser-web-compat", t_browser_web_compat),
     ("browser-modern-web", t_browser_modern_web),
     ("browser-module-policy", t_browser_module_policy),
