@@ -1277,3 +1277,14 @@ uint32_t tcp_snapshot_krec(char *buf, uint32_t cap)
 
     return krec_kbuf_finish(&b);
 }
+
+int tcp_count_owned(int pid)
+{
+    int n = 0;
+    uint64_t f = spin_lock_irqsave(&tcp_lock);
+    for (int i = 0; i < TCP_CONNS; i++)
+        if (conns[i].used && !conns[i].detached && conns[i].owner_pid == pid)
+            n++;
+    spin_unlock_irqrestore(&tcp_lock, f);
+    return n;
+}

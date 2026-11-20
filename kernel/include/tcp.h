@@ -35,3 +35,6 @@ void tcp_tick(void);
 
 /* Render active TCP socket table as a @krec stream (buf may be NULL to measure). */
 uint32_t tcp_snapshot_krec(char *buf, uint32_t cap);
+
+/* Live (non-detached) connections owned by `pid`; Hangar refuses those. */
+int tcp_count_owned(int pid);

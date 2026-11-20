@@ -60,3 +60,14 @@ long wm_sys_list(uint64_t index, uint64_t uout);
 long wm_sys_ctl(uint64_t wid, uint64_t action);
 long wm_sys_theme(uint64_t utheme);
 long wm_sys_resize(uint64_t wid, uint64_t w, uint64_t h);
+
+/* Hangar support. wm_hangar_window() describes the index-th window of
+ * `pid` (1 found, 0 none left, -1 the process owns the desktop layer).
+ * wm_hangar_restore() recreates a parked window, invisible and zeroed, in
+ * the current process; wm_hangar_show() links it once pixels are back. */
+struct hangar_win;
+int wm_hangar_window(int pid, int index, struct hangar_win *meta,
+                     const uint32_t **pix);
+int wm_hangar_count(int pid);
+uint32_t *wm_hangar_restore(const struct hangar_win *meta, int *slot_out);
+void wm_hangar_show(int slot, bool minimized);

@@ -104,6 +104,14 @@ int  parcel_list(int index, struct k_parcel_info *info);
 int  wm_theme(const struct k_wm_theme *theme);
 int  win_resize(uint32_t wid, int w, int h);
 
+/* ---- Hangar: park running apps to disk, resume them later ---- */
+/* reason (K_HANGAR_REASON_MAX bytes, may be 0) explains a -1. */
+int  hangar_park(int pid, char *reason);                 /* -> bay / -1 */
+int  hangar_list(int index, struct k_hangar_info *out);  /* 0 / -1 end */
+int  hangar_thumb(int bay, uint32_t *pixels);            /* W*H ARGB */
+int  hangar_resume(int bay, char *reason);               /* -> pid / -1 */
+int  hangar_discard(int bay);
+
 /* ---- terminal helpers (ANSI escapes on fd 1) ---- */
 #define TERM_BLACK   30
 #define TERM_RED     31

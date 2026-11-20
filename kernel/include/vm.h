@@ -23,3 +23,6 @@ int vm_fault_in_range(struct task *task, uint64_t address, size_t len,
 
 /* Release swap slots owned by a task before its page tables are destroyed. */
 void vm_release_task(struct task *task);
+
+/* 1 if `va` lies in a demand-paged region of `t` (ELF area, heap, stack). */
+int vm_page_is_managed(struct task *task, uint64_t va);
