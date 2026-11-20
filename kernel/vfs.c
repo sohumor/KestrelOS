@@ -3,7 +3,6 @@
 #include "mount.h"
 #include "kfs.h"
 #include "devfs.h"
-#include "pipe.h"
 #include "kheap.h"
 #include "proc.h"
 #include "rtc.h"
@@ -233,33 +232,6 @@ static int unveil_allows(const char *path)
     size_t plen = strlen(prefix);
     return strncmp(canon, prefix, plen) == 0 &&
            (canon[plen] == '\0' || canon[plen] == '/');
-}
-
-/* --- pipes as ordinary handles ---------------------------------------
- * pipe.c owns the ring buffer; the ops vector below is what lets a pipe
- * end travel the same read/write path as a file. Seek is absent, so
- * vfs_seek() answers -1 for a pipe without knowing what a pipe is. */
-
-static void pipe_op_close(struct file *f)
-{
-    pipe_close(f);
-    kfree(f);
-}
-
-static struct fs_ops pipe_ops = {
-    .read  = pipe_read,
-    .read_once = 1,
-    .write = pipe_write,
-    .close = pipe_op_close,
-};
-
-int vfs_pipe(struct file **read_end, struct file **write_end)
-{
-    if (pipe_create(read_end, write_end) < 0)
-        return -1;
-    (*read_end)->ops = &pipe_ops;
-    (*write_end)->ops = &pipe_ops;
-    return 0;
 }
 
 /* --- mounting -------------------------------------------------------- */

@@ -1,9 +1,10 @@
 #include "kernel.h"
-#include "pipe.h"
 #include "vfs.h"
+#include "mount.h"
 #include "kheap.h"
 #include "proc.h"
 #include "signal.h"
+#include "spinlock.h"
 #include "string.h"
 
 /* Anonymous pipes.
@@ -18,51 +19,23 @@
  * Writing to a pipe with no readers currently returns an error; SIGPIPE is
  * not yet wired into this VFS operation. */
 
-int pipe_create(struct file **read_end, struct file **write_end)
-{
-    struct pipe *p;
-    struct file *r, *w;
+#define PIPE_BUF_SIZE 4096
 
-    if (read_end == NULL || write_end == NULL)
-        return -1;
+struct pipe {
+    spinlock_t lock;
+    uint8_t *buf;               /* PIPE_BUF_SIZE bytes */
+    uint32_t head;              /* next byte to read */
+    uint32_t tail;              /* next byte to write */
+    uint32_t count;             /* bytes currently buffered */
+    int readers;                /* open read ends */
+    int writers;                /* open write ends */
+};
 
-    p = kzalloc(sizeof(struct pipe));
-    r = kzalloc(sizeof(struct file));
-    w = kzalloc(sizeof(struct file));
-    if (p == NULL || r == NULL || w == NULL)
-        goto fail;
-
-    p->buf = kmalloc(PIPE_BUF_SIZE);
-    if (p->buf == NULL)
-        goto fail;
-    p->readers = 1;
-    p->writers = 1;
-
-    r->type = FILE_PIPE;
-    r->pipe = p;
-    r->writable = 0;
-    r->flags = O_RDONLY;
-    r->refs = 1;
-
-    w->type = FILE_PIPE;
-    w->pipe = p;
-    w->writable = 1;
-    w->flags = O_WRONLY;
-    w->refs = 1;
-
-    *read_end = r;
-    *write_end = w;
-    return 0;
-
-fail:
-    if (p)
-        kfree(p);
-    if (r)
-        kfree(r);
-    if (w)
-        kfree(w);
-    return -1;
-}
+struct pipe_end {
+    struct file f;
+    struct pipe *pipe;
+    int writable;
+};
 
 /* Copy out of the ring. Caller holds interrupts off and has checked that
  * there is something to copy. */
@@ -105,17 +78,15 @@ static unsigned long ring_put(struct pipe *p, const uint8_t *src,
     return done;
 }
 
-long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
+static long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
 {
-    struct pipe *p;
+    struct pipe_end *end = (struct pipe_end *)f;
+    struct pipe *p = end->pipe;
     unsigned long got;
     uint64_t fl;
 
-    if (f == NULL || f->type != FILE_PIPE || f->pipe == NULL || buf == NULL)
-        return -1;
-    if (f->writable)
+    if (end->writable)
         return -1;              /* wrong end */
-    p = f->pipe;
     if (n == 0)
         return 0;
 
@@ -139,17 +110,15 @@ long pipe_read(struct file *f, void *buf, unsigned long n, int blocking)
     }
 }
 
-long pipe_write(struct file *f, const void *buf, unsigned long n)
+static long pipe_write(struct file *f, const void *buf, unsigned long n)
 {
-    struct pipe *p;
+    struct pipe_end *end = (struct pipe_end *)f;
+    struct pipe *p = end->pipe;
     unsigned long done = 0;
     uint64_t fl;
 
-    if (f == NULL || f->type != FILE_PIPE || f->pipe == NULL || buf == NULL)
-        return -1;
-    if (!f->writable)
+    if (!end->writable)
         return -1;              /* wrong end */
-    p = f->pipe;
     if (n == 0)
         return 0;
 
@@ -174,18 +143,15 @@ long pipe_write(struct file *f, const void *buf, unsigned long n)
     return (long)done;
 }
 
-void pipe_close(struct file *f)
+static void pipe_close(struct file *f)
 {
-    struct pipe *p;
+    struct pipe_end *end = (struct pipe_end *)f;
+    struct pipe *p = end->pipe;
     int dead = 0;
     uint64_t fl;
 
-    if (f == NULL || f->type != FILE_PIPE || f->pipe == NULL)
-        return;
-    p = f->pipe;
-
     fl = spin_lock_irqsave(&p->lock);
-    if (f->writable) {
+    if (end->writable) {
         if (p->writers > 0)
             p->writers--;
     } else {
@@ -194,7 +160,6 @@ void pipe_close(struct file *f)
     }
     if (p->readers <= 0 && p->writers <= 0)
         dead = 1;
-    f->pipe = NULL;
     spin_unlock_irqrestore(&p->lock, fl);
 
     if (dead) {
@@ -202,4 +167,57 @@ void pipe_close(struct file *f)
         kfree(p->buf);
         kfree(p);
     }
+    kfree(end);
+}
+
+static const struct fs_ops pipe_ops = {
+    .read = pipe_read,
+    .read_once = 1,
+    .write = pipe_write,
+    .close = pipe_close,
+};
+
+int vfs_pipe(struct file **read_end, struct file **write_end)
+{
+    struct pipe *p;
+    struct pipe_end *r, *w;
+
+    if (read_end == NULL || write_end == NULL)
+        return -1;
+
+    p = kzalloc(sizeof(*p));
+    r = kzalloc(sizeof(*r));
+    w = kzalloc(sizeof(*w));
+    if (p == NULL || r == NULL || w == NULL)
+        goto fail;
+
+    p->buf = kmalloc(PIPE_BUF_SIZE);
+    if (p->buf == NULL)
+        goto fail;
+    p->readers = 1;
+    p->writers = 1;
+
+    r->pipe = p;
+    r->f.ops = &pipe_ops;
+    r->f.flags = O_RDONLY;
+    r->f.refs = 1;
+
+    w->pipe = p;
+    w->writable = 1;
+    w->f.ops = &pipe_ops;
+    w->f.flags = O_WRONLY;
+    w->f.refs = 1;
+
+    *read_end = &r->f;
+    *write_end = &w->f;
+    return 0;
+
+fail:
+    if (p)
+        kfree(p);
+    if (r)
+        kfree(r);
+    if (w)
+        kfree(w);
+    return -1;
 }
