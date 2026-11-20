@@ -29,6 +29,13 @@ struct file {
     int refs;                   /* dup / spawn share a struct file */
 };
 
+/* Optional open guard. Only passed to the owning filesystem type, which
+ * sets same_file and rejects the open before modifying that object. */
+struct open_guard {
+    const struct file *exclude;
+    int same_file;
+};
+
 /* Permission bits used with the vfs_* access helpers. */
 #define VFS_R 4
 #define VFS_W 2
@@ -36,6 +43,8 @@ struct file {
 
 int  vfs_init(void);   /* register the filesystems and mount / and /dev */
 struct file *vfs_open(const char *path, int flags);
+struct file *vfs_open_guarded(const char *path, int flags,
+                              struct open_guard *guard);
 struct file *vfs_file_dup(struct file *f);
 void vfs_close(struct file *f);
 long vfs_read(struct file *f, void *buf, unsigned long n);
