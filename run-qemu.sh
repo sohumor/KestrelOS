@@ -11,6 +11,8 @@
 #
 # Anything after "--" (or any unrecognised argument) is passed straight
 # through to qemu-system-x86_64.
+# KVM is preferred when /dev/kvm is accessible; otherwise QEMU uses TCG.
+# To force software emulation, pass -- -accel tcg.
 #
 # Networking: an RTL8139 NIC on QEMU user-mode networking. The kernel
 # configures itself statically for that setup (10.0.2.15/24, gw 10.0.2.2,
@@ -53,7 +55,7 @@ while [ $# -gt 0 ]; do
         shift 2
         ;;
     -h|--help)
-        sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
         exit 0
         ;;
     --)
@@ -95,6 +97,14 @@ virtio) STORAGE="-drive if=none,id=d0,file=$IMAGE,format=raw -device virtio-blk-
 *) echo "run-qemu: invalid disk mode: $DISK" >&2; exit 2 ;;
 esac
 CMD="$QEMU $STORAGE -m $MEMORY -no-reboot"
+case "$EXTRA " in
+    *" -accel "*|*" --accel "*) ;; # Explicit -accel cannot mix with -machine accel=.
+    *)
+        if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            CMD="$CMD -machine accel=kvm:tcg"
+        fi
+        ;;
+esac
 case "$NIC" in
 rtl8139|e1000) NIC_DEVICE="$NIC" ;;
 virtio) NIC_DEVICE="virtio-net-pci" ;;

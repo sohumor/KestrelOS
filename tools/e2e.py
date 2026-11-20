@@ -87,7 +87,11 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus, disk="ata", virtio_mode="default"):
+def qemu_command(nic, cpus, disk="ata", virtio_mode="default", accel="auto"):
+    if accel == "auto":
+        accel = "tcg"
+        if sys.platform == "linux" and os.access("/dev/kvm", os.R_OK | os.W_OK):
+            accel = "kvm:tcg"
     suffix = {"default": "", "legacy": ",disable-modern=on",
               "modern": ",disable-legacy=on"}[virtio_mode]
     storage = (["-machine", "q35", "-drive",
@@ -101,7 +105,7 @@ def qemu_command(nic, cpus, disk="ata", virtio_mode="default"):
                    "-device", "virtio-blk-pci,drive=d0" + suffix]
     return [
         find_qemu(),
-        "-accel", "tcg",
+        "-machine", "accel=" + accel,
         "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-fw_cfg", "name=opt/kestrel-test,string=2",
         *storage,
@@ -4371,6 +4375,8 @@ def main():
                     help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
+    ap.add_argument("--accel", choices=["auto", "kvm", "tcg"], default="auto",
+                    help="QEMU accelerator (default: try KVM, fall back to TCG)")
     args = ap.parse_args()
     try:
         scale = timeout_scale(os.environ.get("KESTREL_E2E_TIMEOUT_SCALE", "1"))
@@ -4424,7 +4430,8 @@ def main():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         monitor_port = probe.getsockname()[1]
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk, args.virtio_mode))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk, args.virtio_mode,
+                             args.accel))
     if any(name == "browser-protected-inputs" for name, _ in tests):
         with socket.socket() as port:
             port.bind(("127.0.0.1", 0))
