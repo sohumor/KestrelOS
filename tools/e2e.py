@@ -83,10 +83,14 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus):
+def qemu_command(nic, cpus, disk="ata"):
+    storage = (["-machine", "q35", "-drive",
+                "if=none,id=d0,file=build/os.img,format=raw",
+                "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
+               ["-drive", "file=build/os.img,format=raw"])
     return [
         find_qemu(),
-        "-drive", "file=build/os.img,format=raw",
+        *storage,
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
         # image produced by make and never contaminate build/os.img.
@@ -155,6 +159,7 @@ class Harness:
         self.proc = None
         self._sock = None
         self.buf = ""                 # cleaned, unconsumed text
+        self.boot_output = ""
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.tail = collections.deque(maxlen=TAIL_LINES)
@@ -232,6 +237,8 @@ class Harness:
                 continue
             with self.cond:
                 self.buf += text
+                if "KESTREL READY" not in self.boot_output:
+                    self.boot_output += text
                 self._partial += text
                 lines = self._partial.split("\n")
                 self._partial = lines.pop()
@@ -1756,7 +1763,14 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
+    if getattr(h, "disk", "ata") == "ahci":
+        line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
+                        timeout=BOOT_TIMEOUT, regex=True)
+        print("  " + line.group(0))
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+    if getattr(h, "disk", "ata") == "ahci":
+        if "ata: primary master:" in h.boot_output:
+            raise AssertionError("ATA claimed a disk in AHCI mode")
 
 
 def t_login(h):
@@ -2101,6 +2115,18 @@ def t_pipe(h):
     if got != r"\n *\d+\n":
         return "SKIP"
     have_pipes = True
+
+
+def t_pipe_read(h):
+    h.send("sigtest --pipe-read")
+    h.expect("sigtest: pipe read modes + interruption + EOF verified")
+    wait_prompt(h)
+
+
+def t_pipe_lifetime(h):
+    h.send("sigtest --pipe-lifetime")
+    h.expect("sigtest: pipe dup + spawn + peer close verified")
+    wait_prompt(h)
 
 
 def t_dev(h):
@@ -2881,6 +2907,8 @@ TESTS = [
     ("id", t_id),
     ("redirect", t_redirect),
     ("pipe", t_pipe),
+    ("pipe-read", t_pipe_read),
+    ("pipe-lifetime", t_pipe_lifetime),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
@@ -3141,17 +3169,15 @@ def usb_hid_test(nic, cpus, machine):
     properties = subprocess.run([find_qemu(), "-machine", machine + ",help"],
                                 capture_output=True, text=True, check=True).stdout
     no_ps2 = "i8042=" in properties
-    cmd = qemu_command(nic, cpus) + [
-        "-machine", machine + (",i8042=off" if no_ps2 else ""),
+    cmd = qemu_command(nic, cpus, "ahci" if machine == "q35" else "ata")
+    if "-machine" in cmd:
+        cmd[cmd.index("-machine") + 1] = machine + (",i8042=off" if no_ps2 else "")
+    else:
+        cmd += ["-machine", machine + (",i8042=off" if no_ps2 else "")]
+    cmd += [
         "-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-mouse",
         "-qmp", "tcp:127.0.0.1:%d,server=on,wait=off" % port,
     ]
-    if machine == "q35":
-        # The kernel has legacy ATA, not AHCI. Keep the same disk path usable
-        # while testing xHCI on the PCIe chipset.
-        cmd[cmd.index("-drive") + 1] += ",if=none,id=usbdisk"
-        cmd += ["-device", "piix3-ide,id=usbide",
-                "-device", "ide-hd,drive=usbdisk,bus=usbide.0"]
     h = Harness(cmd)
     monitor = None
     stream = None
@@ -3246,6 +3272,8 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
+    ap.add_argument("--disk", choices=["ata", "ahci"], default="ata",
+                    help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
     args = ap.parse_args()
@@ -3291,7 +3319,8 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    h.disk = args.disk
     try:
         h.start()
     except FileNotFoundError:

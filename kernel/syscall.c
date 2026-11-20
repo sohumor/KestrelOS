@@ -12,7 +12,6 @@
 #include "timer.h"
 #include "rtc.h"
 #include "power.h"
-#include "pipe.h"
 #include "klog.h"
 #include "fb.h"
 #include "mouse.h"
@@ -210,9 +209,8 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
         uint64_t n = len - done;
         if (n > chunk_sz)
             n = chunk_sz;
-        long g = (f->type == FILE_PIPE)
-                     ? pipe_read_ex(f, chunk, n, blocking)
-                     : vfs_read(f, chunk, n);
+        int read_once;
+        long g = vfs_read_ex(f, chunk, n, blocking, &read_once);
         if (g < 0) {
             if (chunk != small) kfree(chunk);
             return done ? (long)done : -1;
@@ -224,7 +222,7 @@ static long sys_read(uint64_t fd, uint64_t ubuf, uint64_t len, int blocking)
             return done ? (long)done : -1;
         }
         done += (uint64_t)g;
-        if (f->type == FILE_PIPE || (uint64_t)g < n)
+        if (read_once || (uint64_t)g < n)
             break;
     }
     if (chunk != small)
@@ -483,7 +481,7 @@ static long sys_pipe(uint64_t ufds)
     struct file *rd, *wr;
     int fds[2];
 
-    if (pipe_create(&rd, &wr) < 0)
+    if (vfs_pipe(&rd, &wr) < 0)
         return -1;
 
     fds[0] = fd_alloc_from(3, rd);
