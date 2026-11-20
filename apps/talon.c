@@ -9,6 +9,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_talon.h>
 #include <krec.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,48 +42,6 @@ static int write_all(int fd, const void *buf, unsigned long len)
         off += (unsigned long)w;
     }
     return 0;
-}
-
-static const char *parcel_type_name(uint32_t t)
-{
-    switch (t) {
-    case K_PARCEL_TEXT:   return "text";
-    case K_PARCEL_PATH:   return "path";
-    case K_PARCEL_URL:    return "url";
-    case K_PARCEL_COLOR:  return "color";
-    case K_PARCEL_NUMBER: return "number";
-    case K_PARCEL_KREC:   return "krec";
-    case K_PARCEL_IMAGE:  return "image";
-    default:              return "?";
-    }
-}
-
-static int parse_parcel_type(const char *s, uint32_t *out)
-{
-    if (!s || !out)
-        return -1;
-    if (strcmp(s, "text") == 0)   { *out = K_PARCEL_TEXT;   return 0; }
-    if (strcmp(s, "path") == 0)   { *out = K_PARCEL_PATH;   return 0; }
-    if (strcmp(s, "url") == 0)    { *out = K_PARCEL_URL;    return 0; }
-    if (strcmp(s, "color") == 0)  { *out = K_PARCEL_COLOR;  return 0; }
-    if (strcmp(s, "number") == 0) { *out = K_PARCEL_NUMBER; return 0; }
-    if (strcmp(s, "krec") == 0)   { *out = K_PARCEL_KREC;   return 0; }
-    if (strcmp(s, "image") == 0)  { *out = K_PARCEL_IMAGE;  return 0; }
-    return -1;
-}
-
-static const char *default_mime(uint32_t t)
-{
-    switch (t) {
-    case K_PARCEL_TEXT:   return "text/plain";
-    case K_PARCEL_PATH:   return "text/x-path";
-    case K_PARCEL_URL:    return "text/uri-list";
-    case K_PARCEL_COLOR:  return "text/x-color";
-    case K_PARCEL_NUMBER: return "text/x-number";
-    case K_PARCEL_KREC:   return "text/x-krec";
-    case K_PARCEL_IMAGE:  return "application/octet-stream";
-    default:              return "application/octet-stream";
-    }
 }
 
 static int parse_u32(const char *s, uint32_t *out)
@@ -261,11 +220,11 @@ static int cmd_list(int argc, char **argv)
             snprintf(size_s, sizeof(size_s), "%u", info.size);
             snprintf(time_s, sizeof(time_s), "%u", info.time);
             snprintf(pid_s, sizeof(pid_s), "%d", info.src_pid);
-            krec_row(1, 8, slot_s, id_s, parcel_type_name(info.type),
+            krec_row(1, 8, slot_s, id_s, talon_type_name(info.type),
                      size_s, time_s, pid_s, info.mime, info.label);
         } else {
             printf("%-4d %-5u %-7s %7u %5d  %-18s %s\n",
-                   i, info.id, parcel_type_name(info.type), info.size,
+                   i, info.id, talon_type_name(info.type), info.size,
                    info.src_pid,
                    info.mime[0] ? info.mime : "-",
                    info.label[0] ? info.label : "-");
@@ -314,7 +273,7 @@ static int cmd_put(int argc, char **argv)
         if (!end_opts && strcmp(argv[i], "--") == 0) {
             end_opts = 1;
         } else if (!end_opts && strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            if (parse_parcel_type(argv[++i], &type) < 0) {
+            if (talon_type_parse(argv[++i], &type) < 0) {
                 krec_err("talon: unknown parcel type '%s'\n", argv[i]);
                 return 1;
             }
@@ -385,7 +344,7 @@ static int cmd_put(int argc, char **argv)
     if (!has_type)
         type = detect_type(data, size, !from_stdin);
     if (!mime)
-        mime = default_mime(type);
+        mime = talon_type_default_mime(type);
     if (!label) {
         make_label_from_payload(data, size, auto_label, sizeof(auto_label));
         label = auto_label;
@@ -397,7 +356,7 @@ static int cmd_put(int argc, char **argv)
         krec_err("talon: parcel_put failed\n");
         return 1;
     }
-    printf("parcel %d (%s, %u bytes)\n", id, parcel_type_name(type), size);
+    printf("parcel %d (%s, %u bytes)\n", id, talon_type_name(type), size);
     return 0;
 }
 
@@ -459,11 +418,11 @@ static int cmd_get(int argc, char **argv)
             snprintf(size_s, sizeof(size_s), "%u", info.size);
             snprintf(time_s, sizeof(time_s), "%u", info.time);
             snprintf(pid_s, sizeof(pid_s), "%d", info.src_pid);
-            krec_row(1, 7, id_s, parcel_type_name(info.type), size_s,
+            krec_row(1, 7, id_s, talon_type_name(info.type), size_s,
                      time_s, pid_s, info.mime, info.label);
         } else {
             printf("id:      %u\n", info.id);
-            printf("type:    %s\n", parcel_type_name(info.type));
+            printf("type:    %s\n", talon_type_name(info.type));
             printf("size:    %u\n", info.size);
             printf("time:    %u\n", info.time);
             printf("src_pid: %d\n", info.src_pid);
@@ -508,7 +467,7 @@ static int cmd_copy(int argc, char **argv)
 
     for (i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            if (parse_parcel_type(argv[++i], &type) < 0) {
+            if (talon_type_parse(argv[++i], &type) < 0) {
                 krec_err("talon: unknown parcel type '%s'\n", argv[i]);
                 return 1;
             }
@@ -580,7 +539,7 @@ static int cmd_copy(int argc, char **argv)
         type = is_krec_payload(buf, (uint32_t)got) ? K_PARCEL_KREC
                                                   : K_PARCEL_TEXT;
     if (!mime)
-        mime = default_mime(type);
+        mime = talon_type_default_mime(type);
     if (!label) {
         base = strrchr(path, '/');
         label = base ? base + 1 : path;
@@ -592,7 +551,7 @@ static int cmd_copy(int argc, char **argv)
         krec_err("talon: parcel_put failed\n");
         return 1;
     }
-    printf("parcel %d (%s, %ld bytes)\n", id, parcel_type_name(type), got);
+    printf("parcel %d (%s, %ld bytes)\n", id, talon_type_name(type), got);
     return 0;
 }
 
@@ -644,7 +603,7 @@ static int cmd_promote(int argc, char **argv)
         return 1;
     }
     printf("parcel %d (%s, %ld bytes, promoted from %u)\n",
-           id, parcel_type_name(info.type), got, info.id);
+           id, talon_type_name(info.type), got, info.id);
     return 0;
 }
 

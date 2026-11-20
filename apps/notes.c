@@ -18,6 +18,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_talon.h>
 #include <krec.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -506,7 +507,6 @@ static void send_note_to_talon(void)
     char *buf = 0;
     int len = 0;
     uint32_t ptype = K_PARCEL_TEXT;
-    const char *mime = "text/plain";
     int pid;
 
     if (ed->sel_active) {
@@ -562,12 +562,10 @@ static void send_note_to_talon(void)
         return;
     }
     if (len >= 6 && strncmp(buf, "@krec", 5) == 0 &&
-        (buf[5] == ' ' || buf[5] == '\t')) {
+        (buf[5] == ' ' || buf[5] == '\t'))
         ptype = K_PARCEL_KREC;
-        mime = "text/x-krec";
-    }
-    pid = parcel_put(ptype, mime, cur_name[0] ? cur_name : "Notes",
-                     buf, (uint32_t)len);
+    pid = parcel_put(ptype, talon_type_default_mime(ptype),
+                     cur_name[0] ? cur_name : "Notes", buf, (uint32_t)len);
     free(buf);
     if (pid >= 0)
         snprintf(status_msg, sizeof(status_msg),

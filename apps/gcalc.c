@@ -10,6 +10,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_talon.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -438,8 +439,8 @@ static void copy_to_talon(struct calc_state *st)
     else
         snprintf(label, sizeof(label), "Calculator");
 
-    if (parcel_put(K_PARCEL_NUMBER, "text/x-number", label, dec,
-                   (uint32_t)strlen(dec)) >= 0) {
+    if (parcel_put(K_PARCEL_NUMBER, talon_type_default_mime(K_PARCEL_NUMBER),
+                   label, dec, (uint32_t)strlen(dec)) >= 0) {
         snprintf(st->toast, sizeof(st->toast), "Copied %s to Talon", dec);
         st->toast_until = uptime_ms() + 2500;
     } else {
