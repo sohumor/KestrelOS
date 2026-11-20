@@ -2018,6 +2018,46 @@ def t_mv_rm(h):
     wait_prompt(h)
 
 
+def check_same_file(h, command, status):
+    h.send("mkdir /tmp/same-file-dir")
+    wait_prompt(h)
+    h.send("echo keep-original-bytes > /tmp/same-file-dir/a")
+    wait_prompt(h)
+    for dst in ("/tmp/same-file-dir/./a", "/tmp//same-file-dir/../same-file-dir/a",
+                "/tmp/same-file-dir/."):
+        h.send(f"{command} /tmp/same-file-dir/a {dst}; echo SAME-FILE-$?; "
+               "cat /tmp/same-file-dir/a")
+        lines = h.capture_until(SHELL_PROMPT, regex=True).splitlines()
+        if f"SAME-FILE-{status}" not in lines or "keep-original-bytes" not in lines:
+            raise TimeoutError(f"{dst}: expected status {status} and preserved bytes")
+    h.send("rm /tmp/same-file-dir/a")
+    wait_prompt(h)
+    h.send("rm /tmp/same-file-dir")
+    wait_prompt(h)
+
+
+def t_cp_same_file(h):
+    check_same_file(h, "cp", 1)
+
+
+def t_mv_same_file(h):
+    check_same_file(h, "mv", 0)
+
+
+def t_same_device(h):
+    # A second devfs mount forces mv to take its copy + unlink fallback.
+    h.send('mount -t devfs "" /tmp/same-file-dev; echo MOUNT-$?')
+    h.expect(r"\nMOUNT-0\n", regex=True)
+    wait_prompt(h)
+    for command, status in (("cp", 1), ("mv", 0)):
+        h.send(f"{command} /dev/null /tmp/same-file-dev/null; echo SAME-DEVICE-$?")
+        h.expect(rf"\nSAME-DEVICE-{status}\n", regex=True)
+        wait_prompt(h)
+    h.send("mount -u /tmp/same-file-dev; echo UNMOUNT-$?")
+    h.expect(r"\nUNMOUNT-0\n", regex=True)
+    wait_prompt(h)
+
+
 def t_mkdir_ls(h):
     h.send("mkdir /d1")
     wait_prompt(h)
@@ -3092,6 +3132,9 @@ TESTS = [
     ("cp-wc", t_cp_wc),
     ("wc-stdin", t_wc_stdin),
     ("mv-rm", t_mv_rm),
+    ("cp-same-file", t_cp_same_file),
+    ("mv-same-file", t_mv_same_file),
+    ("same-device", t_same_device),
     ("mkdir-ls", t_mkdir_ls),
     ("grep", t_grep),
     ("head", t_head),
