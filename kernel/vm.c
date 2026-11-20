@@ -60,6 +60,8 @@ void swap_init(void)
     swap_dev = blockdev_find("hda");
     if (!swap_dev)
         swap_dev = blockdev_find("sda");
+    if (!swap_dev)
+        swap_dev = blockdev_find("vda");
     if (!swap_dev || swap_dev->block_size != 512) {
         swap_dev = NULL;
         kprintf("vm: no valid swap extent; demand paging remains enabled\n");

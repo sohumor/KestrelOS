@@ -80,14 +80,22 @@ def find_openssl():
 QEMU_NICS = {
     "rtl8139": "rtl8139",
     "e1000": "e1000",
+    "virtio": "virtio-net-pci",
 }
 
 
-def qemu_command(nic, cpus, disk="ata"):
+def qemu_command(nic, cpus, disk="ata", virtio_mode="default"):
+    suffix = {"default": "", "legacy": ",disable-modern=on",
+              "modern": ",disable-legacy=on"}[virtio_mode]
     storage = (["-machine", "q35", "-drive",
                 "if=none,id=d0,file=build/os.img,format=raw",
                 "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
                ["-drive", "file=build/os.img,format=raw"])
+    if disk == "virtio":
+        suffix = {"default": "", "legacy": ",disable-modern=on",
+                  "modern": ",disable-legacy=on"}[virtio_mode]
+        storage = ["-drive", "if=none,id=d0,file=build/os.img,format=raw",
+                   "-device", "virtio-blk-pci,drive=d0" + suffix]
     return [
         find_qemu(),
         "-accel", "tcg",
@@ -103,7 +111,7 @@ def qemu_command(nic, cpus, disk="ata"):
         "-serial", "stdio",
         "-m", "128M",
         "-smp", str(cpus),
-        "-device", "%s,netdev=n0" % QEMU_NICS[nic],
+        "-device", "%s,netdev=n0" % QEMU_NICS[nic] + (suffix if nic == "virtio" else ""),
         # Both families are slirp's default, but the IPv6 tests depend on its
         # router advertisements (prefix fec0::/64, host fec0::2, DNS
         # fec0::3), so spell them out. Naming only ipv6=on turns IPv4 off.
@@ -1795,11 +1803,31 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
+    if getattr(h, "disk", "ata") == "virtio":
+        mode = getattr(h, "virtio_mode", "default")
+        transport = "legacy" if mode == "legacy" else "modern"
+        line = h.expect("virtio: " + transport + " transport", timeout=BOOT_TIMEOUT)
+        print("  virtio: " + transport + " transport")
+        line = h.expect(r"virtio-blk: vda: [0-9]+ sectors",
+                        timeout=BOOT_TIMEOUT, regex=True)
+        print("  " + line.group(0))
     if getattr(h, "disk", "ata") == "ahci":
         line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
                         timeout=BOOT_TIMEOUT, regex=True)
         print("  " + line.group(0))
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+    if getattr(h, "nic", "rtl8139") == "virtio":
+        transport = "legacy" if h.virtio_mode == "legacy" else "modern"
+        if "virtio-net: " + transport + ", mac " not in h.boot_output:
+            raise AssertionError("VirtIO network device was not initialized")
+        if "(dhcp)" not in h.boot_output:
+            raise AssertionError("VirtIO network device did not obtain a DHCP lease")
+        for line in h.boot_output.splitlines():
+            if "virtio-net:" in line or "(dhcp)" in line:
+                print("  " + line)
+    if getattr(h, "disk", "ata") == "virtio":
+        if "ata: primary master:" in h.boot_output or "ahci: port " in h.boot_output:
+            raise AssertionError("ATA/AHCI claimed a disk in VirtIO mode")
     if getattr(h, "disk", "ata") == "ahci":
         if "ata: primary master:" in h.boot_output:
             raise AssertionError("ATA claimed a disk in AHCI mode")
@@ -3662,7 +3690,8 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
-    ap.add_argument("--disk", choices=["ata", "ahci"], default="ata",
+    ap.add_argument("--virtio-mode", choices=["default", "legacy", "modern"], default="default")
+    ap.add_argument("--disk", choices=["ata", "ahci", "virtio"], default="ata",
                     help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
@@ -3709,8 +3738,10 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk, args.virtio_mode))
     h.disk = args.disk
+    h.nic = args.nic
+    h.virtio_mode = args.virtio_mode
     try:
         h.start()
     except FileNotFoundError:

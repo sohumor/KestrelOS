@@ -496,6 +496,8 @@ def run_host_tests(tc):
     suites = [
         ("test_usb_hid", [r("kernel/usb_hid_core.c"), r("tools/test_usb_hid.c")],
          ["-Ikernel/include"]),
+        ("test_virtio_ring", [r("kernel/virtio_ring.c"), r("kernel/virtio_net_core.c"), r("tools/test_virtio_ring.c")],
+         ["-Ikernel/include"]),
         ("test_random_core", [r("kernel/random_core.c"), r("tools/test_random_core.c")],
          ["-Ikernel/include"]),
         ("test_tcp_reassembly", [r("kernel/tcp_reassembly.c"), r("tools/test_tcp_reassembly.c")],
@@ -655,6 +657,7 @@ def generate_compile_commands(tc):
 
     host_suites = [
         ("tools/test_usb_hid.c", ["-Ikernel/include"]),
+        ("tools/test_virtio_ring.c", ["-Ikernel/include"]),
         ("tools/test_random_core.c", ["-Ikernel/include"]),
         ("tools/test_tcp_reassembly.c", ["-Ikernel/include"]),
         ("tools/test_tcp_rst.c", ["-Ikernel/include", "-Iabi"]),

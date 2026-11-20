@@ -6,7 +6,8 @@
 #   --headless      no VGA window; the serial console on stdio is the only UI
 #   --image PATH    disk image to boot (default: build/os.img)
 #   --memory SIZE   guest RAM, QEMU syntax (default: 256M)
-#   --disk MODE     ata (default) or ahci (q35); also set via DISK
+#   --disk MODE     ata (default), ahci (q35), or virtio; also set via DISK
+#   --nic MODE      rtl8139 (default), e1000, or virtio; also set via NIC
 #
 # Anything after "--" (or any unrecognised argument) is passed straight
 # through to qemu-system-x86_64.
@@ -21,6 +22,7 @@ QEMU="${QEMU:-qemu-system-x86_64}"
 IMAGE="build/os.img"
 MEMORY="256M"
 DISK="${DISK:-ata}"
+NIC="${NIC:-rtl8139}"
 HEADLESS=0
 EXTRA=""
 
@@ -41,8 +43,13 @@ while [ $# -gt 0 ]; do
         shift 2
         ;;
     --disk)
-        [ $# -ge 2 ] || { echo "run-qemu: --disk needs ata or ahci" >&2; exit 2; }
+        [ $# -ge 2 ] || { echo "run-qemu: --disk needs ata, ahci, or virtio" >&2; exit 2; }
         DISK="$2"
+        shift 2
+        ;;
+    --nic)
+        [ $# -ge 2 ] || { echo "run-qemu: --nic needs rtl8139, e1000, or virtio" >&2; exit 2; }
+        NIC="$2"
         shift 2
         ;;
     -h|--help)
@@ -84,10 +91,16 @@ fi
 case "$DISK" in
 ata) STORAGE="-drive file=$IMAGE,format=raw" ;;
 ahci) STORAGE="-machine q35 -drive if=none,id=d0,file=$IMAGE,format=raw -device ide-hd,drive=d0,bus=ide.0" ;;
+virtio) STORAGE="-drive if=none,id=d0,file=$IMAGE,format=raw -device virtio-blk-pci,drive=d0" ;;
 *) echo "run-qemu: invalid disk mode: $DISK" >&2; exit 2 ;;
 esac
 CMD="$QEMU $STORAGE -m $MEMORY -no-reboot"
-CMD="$CMD -device rtl8139,netdev=n0 -netdev user,id=n0"
+case "$NIC" in
+rtl8139|e1000) NIC_DEVICE="$NIC" ;;
+virtio) NIC_DEVICE="virtio-net-pci" ;;
+*) echo "run-qemu: invalid NIC mode: $NIC" >&2; exit 2 ;;
+esac
+CMD="$CMD -device $NIC_DEVICE,netdev=n0 -netdev user,id=n0"
 CMD="$CMD -serial stdio$DISPLAY_ARGS$EXTRA"
 
 echo "+ $CMD"

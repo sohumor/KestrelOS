@@ -14,6 +14,7 @@
 #include "proc.h"
 #include "ata.h"
 #include "ahci.h"
+#include "virtio_blk.h"
 #include "vfs.h"
 #include "net.h"
 #include "uproc.h"
@@ -139,6 +140,7 @@ void kmain(uint64_t bootinfo_phys)
 
     ata_init();
     ahci_init();
+    virtio_blk_init();
     swap_init();
     vfs_init();              /* reports success or failure itself */
     devfs_init();

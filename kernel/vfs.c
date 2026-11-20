@@ -250,6 +250,8 @@ int vfs_init(void)
     if (!rooted)
         rooted = (mount_add("/", "kfs", "sda") == 0);
     if (!rooted)
+        rooted = (mount_add("/", "kfs", "vda") == 0);
+    if (!rooted)
         kprintf("vfs: no root filesystem, running diskless\n");
     else
         kprintf("vfs: root filesystem mounted\n");
