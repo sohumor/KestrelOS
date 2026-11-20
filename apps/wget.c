@@ -54,6 +54,10 @@ static void name_from_url(const char *url, char *out, unsigned long outsz)
 
     if (strncmp(p, "http://", 7) == 0)
         p += 7;
+    else if (strncmp(p, "https://", 8) == 0)
+        p += 8;
+    while (*p && *p != '/' && *p != '?' && *p != '#')
+        p++;
     start = p;
     while (*p && *p != '?' && *p != '#') {
         if (*p == '/')
