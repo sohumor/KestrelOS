@@ -7,9 +7,10 @@
 
 static volatile uint64_t ticks;
 
-static void timer_irq(struct regs *r)
+static void timer_irq(struct regs *r, void *context)
 {
     (void)r;
+    (void)context;
     ticks++;
     entropy_pool_add_interrupt(ENTROPY_TIMER, (uint32_t)ticks);
     smp_broadcast_reschedule();
@@ -21,7 +22,8 @@ void timer_init(uint32_t hz)
     outb(0x43, 0x36);                    /* channel 0, lo/hi, mode 3 */
     outb(0x40, divisor & 0xFF);
     outb(0x40, (divisor >> 8) & 0xFF);
-    irq_install_handler(0, timer_irq);
+    if (irq_subscribe(0, timer_irq, NULL) < 0)
+        panic("timer: cannot subscribe to IRQ 0");
     pic_clear_mask(0);
 }
 

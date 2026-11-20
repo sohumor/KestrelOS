@@ -3,6 +3,10 @@
 #include "gdt.h"
 #include "console.h"
 #include "smp.h"
+#include "spinlock.h"
+
+#define PIC_IRQ_COUNT 16
+#define IRQ_SUBSCRIBERS 4
 
 struct idt_entry {
     uint16_t off_lo;
@@ -23,7 +27,19 @@ extern uint64_t isr_table[256];
 
 static struct idt_entry idt[256];
 static struct idtr idtr;
-static irq_handler_t irq_handlers[16];
+static irq_handler_t irq_handlers[PIC_IRQ_COUNT];
+
+struct irq_subscriber {
+    irq_listener_t listener;
+    void *context;
+};
+
+struct irq_line {
+    spinlock_t lock;
+    struct irq_subscriber subscribers[IRQ_SUBSCRIBERS];
+};
+
+static struct irq_line irq_lines[PIC_IRQ_COUNT];
 
 /* Optional hook the syscall layer installs for vector 0x80. */
 void (*syscall_entry_hook)(struct regs *r);
@@ -70,7 +86,64 @@ void idt_load(void)
 
 void irq_install_handler(int irq, irq_handler_t handler)
 {
-    irq_handlers[irq] = handler;
+    if ((unsigned)irq < PIC_IRQ_COUNT)
+        __atomic_store_n(&irq_handlers[irq], handler, __ATOMIC_RELEASE);
+}
+
+int irq_subscribe(unsigned irq, irq_listener_t listener, void *context)
+{
+    if (irq >= PIC_IRQ_COUNT || !listener)
+        return -1;
+    struct irq_line *line = &irq_lines[irq];
+    struct irq_subscriber *slot = NULL;
+    uint64_t flags = spin_lock_irqsave(&line->lock);
+    for (unsigned i = 0; i < IRQ_SUBSCRIBERS; i++) {
+        struct irq_subscriber *sub = &line->subscribers[i];
+        if (sub->listener == listener && sub->context == context) {
+            spin_unlock_irqrestore(&line->lock, flags);
+            return -1;
+        }
+        if (!sub->listener && !slot)
+            slot = sub;
+    }
+    if (slot)
+        *slot = (struct irq_subscriber){ listener, context };
+    spin_unlock_irqrestore(&line->lock, flags);
+    return slot ? 0 : -1;
+}
+
+int irq_unsubscribe(unsigned irq, irq_listener_t listener, void *context)
+{
+    if (irq >= PIC_IRQ_COUNT || !listener)
+        return -1;
+    struct irq_line *line = &irq_lines[irq];
+    uint64_t flags = spin_lock_irqsave(&line->lock);
+    for (unsigned i = 0; i < IRQ_SUBSCRIBERS; i++) {
+        struct irq_subscriber *sub = &line->subscribers[i];
+        if (sub->listener == listener && sub->context == context) {
+            *sub = (struct irq_subscriber){ 0 };
+            spin_unlock_irqrestore(&line->lock, flags);
+            return 0;
+        }
+    }
+    spin_unlock_irqrestore(&line->lock, flags);
+    return -1;
+}
+
+static void dispatch_irq(unsigned irq, struct regs *r)
+{
+    irq_handler_t handler = __atomic_load_n(&irq_handlers[irq], __ATOMIC_ACQUIRE);
+    if (handler)
+        handler(r);
+
+    struct irq_line *line = &irq_lines[irq];
+    spin_lock(&line->lock);
+    for (unsigned i = 0; i < IRQ_SUBSCRIBERS; i++) {
+        struct irq_subscriber *sub = &line->subscribers[i];
+        if (sub->listener)
+            sub->listener(r, sub->context);
+    }
+    spin_unlock(&line->lock);
 }
 
 static void dump_exception(struct regs *r)
@@ -109,12 +182,11 @@ void isr_dispatch(struct regs *r)
         panic("unhandled exception");
     }
 
-    if (r->vector >= 32 && r->vector < 48) {
+    if (r->vector >= 32 && r->vector < 32 + PIC_IRQ_COUNT) {
         int irq = r->vector - 32;
         if ((irq == 7 || irq == 15) && pic_is_spurious(irq))
             return;
-        if (irq_handlers[irq])
-            irq_handlers[irq](r);
+        dispatch_irq(irq, r);
         pic_send_eoi(irq);
         if (irq_preempt_hook)
             irq_preempt_hook(r);
