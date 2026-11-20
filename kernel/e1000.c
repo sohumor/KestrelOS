@@ -2,6 +2,7 @@
 #include "string.h"
 #include "random.h"
 #include "pci.h"
+#include "device.h"
 #include "pmm.h"
 #include "vmm.h"
 #include "interrupts.h"
@@ -288,23 +289,20 @@ static struct netdev e1000_netdev = {
     .poll = e1000_poll,
 };
 
-bool e1000_init(void)
-{
-    struct pci_dev d;
-    bool found = false;
+static bool e1000_attempted;
 
-    for (unsigned i = 0;
-         i < sizeof(e1000_devices) / sizeof(e1000_devices[0]); i++) {
-        if (pci_find(E1000_VENDOR, e1000_devices[i], &d)) {
-            found = true;
-            break;
-        }
-    }
-    if (!found)
-        return false;
+static int e1000_probe(struct device *dev)
+{
+    const struct pci_devinfo *pd = dev->bus_data;
+    struct pci_dev d;
+
+    if (e1000_attempted)
+        return -1;
+    e1000_attempted = true;
+    pci_devinfo_to_pci_dev(pd, &d);
     if (d.bar0 & 1) {
         kprintf("e1000: BAR0 is not a memory BAR, skipping\n");
-        return false;
+        return -1;
     }
 
     /* Enable memory space decode (bit 1) + bus mastering (bit 2). */
@@ -332,7 +330,7 @@ bool e1000_init(void)
 
     if (!read_mac()) {
         kprintf("e1000: could not read MAC address\n");
-        return false;
+        return -1;
     }
     reg_write(REG_RAL, (uint32_t)mac[0] | ((uint32_t)mac[1] << 8) |
                        ((uint32_t)mac[2] << 16) | ((uint32_t)mac[3] << 24));
@@ -356,7 +354,7 @@ bool e1000_init(void)
     uint64_t tx_buf_phys = pmm_alloc_contig(TX_NDESC * BUF_SIZE / PAGE_SIZE);
     if (!rx_ring_phys || !tx_ring_phys || !rx_buf_phys || !tx_buf_phys) {
         kprintf("e1000: out of contiguous memory for DMA buffers\n");
-        return false;
+        return -1;
     }
     rx_ring = P2V(rx_ring_phys);
     tx_ring = P2V(tx_ring_phys);
@@ -399,8 +397,35 @@ bool e1000_init(void)
     present = true;
     memcpy(e1000_netdev.mac, mac, 6);
     netdev_register(&e1000_netdev);
+    dev->drv_data = &e1000_netdev;
     kprintf("e1000: mmio 0x%x, irq %d, mac %02x:%02x:%02x:%02x:%02x:%02x\n",
             (uint32_t)mmio_phys, irq,
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    return true;
+    return 0;
+}
+
+bool e1000_init(void)
+{
+    static struct pci_device_id match[2];
+    static struct driver driver = {
+        .name = "e1000",
+        .probe = e1000_probe,
+        .match_table = match,
+    };
+
+    driver.bus = bus_find("pci");
+    if (!driver.bus)
+        return false;
+
+    for (unsigned i = 0;
+         i < sizeof(e1000_devices) / sizeof(e1000_devices[0]); i++) {
+        match[0] = (struct pci_device_id){ E1000_VENDOR, e1000_devices[i] };
+        int bound = driver_register(&driver);
+        if (bound != 0)
+            return bound > 0;
+        driver_unregister(&driver);
+        if (e1000_attempted)
+            return false;
+    }
+    return false;
 }
