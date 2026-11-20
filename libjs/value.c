@@ -152,19 +152,46 @@ int js_sb_finish(js_sbuf *b, js_value *out)
     return JS_OK;
 }
 
+void js_execution_budget_init(js_execution_budget *budget, unsigned long steps)
+{
+    budget->remaining = steps;
+}
+
+unsigned long js_execution_budget_remaining(const js_execution_budget *budget)
+{
+    return __atomic_load_n(&budget->remaining, __ATOMIC_RELAXED);
+}
+
+static int take_execution_step(js_execution_budget *budget)
+{
+    unsigned long left = js_execution_budget_remaining(budget);
+    while (left) {
+        if (__atomic_compare_exchange_n(&budget->remaining, &left, left - 1,
+                                        1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 0;
+}
+
 int js_step(js_ctx *ctx)
 {
+    const char *limit;
     if (ctx->fatal)
         return JS_THROW;
-    ctx->steps++;
-    if (ctx->cfg.max_steps && ctx->steps > ctx->cfg.max_steps) {
-        ctx->fatal = 1;
-        ctx->fatal_msg = "script step limit exceeded";
-        ctx->has_exception = 1;
-        ctx->exception = js_undefined();
-        return JS_THROW;
+    if (ctx->cfg.max_steps && ctx->steps >= ctx->cfg.max_steps) {
+        limit = "script step limit exceeded";
+    } else if (ctx->cfg.execution_budget &&
+               !take_execution_step(ctx->cfg.execution_budget)) {
+        limit = "shared script execution budget exhausted";
+    } else {
+        ctx->steps++;
+        return JS_OK;
     }
-    return JS_OK;
+    ctx->fatal = 1;
+    ctx->fatal_msg = limit;
+    ctx->has_exception = 1;
+    ctx->exception = js_undefined();
+    return JS_THROW;
 }
 
 int js_fatal(js_ctx *ctx) { return ctx->fatal; }
