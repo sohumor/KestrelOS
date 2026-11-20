@@ -23,6 +23,12 @@ static struct task *reap_list;   /* stacks safe after scheduler handoff */
 static int next_pid = 1;
 static spinlock_t sched_lock = SPINLOCK_INIT;
 
+struct task_event_waiter {
+    struct task_event_waiter *next;
+    struct task *task;
+    uint32_t mask;
+};
+
 extern void ctx_switch(uint64_t *save_rsp, uint64_t new_rsp);
 extern void ctx_switch_unlock(uint64_t *save_rsp, uint64_t new_rsp,
                               volatile uint32_t *lock);
@@ -308,6 +314,66 @@ void task_sleep_ticks(uint64_t t)
     current->cpu = -1;
     current->sleep_until = timer_ticks() + t;
     schedule_locked(f);
+}
+
+static bool event_wait_cancelled(const struct task *task)
+{
+    return task->kill_pending ||
+           (__atomic_load_n(&task->sig_pending, __ATOMIC_SEQ_CST) &
+            (1ULL << (SIGKILL - 1)));
+}
+
+static int event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                             uint64_t deadline, spinlock_t *lock,
+                             uint64_t flags, bool interruptible)
+{
+    struct task_event_waiter waiter = { .task = current, .mask = mask };
+
+    spin_lock(&sched_lock);
+    if (event_wait_cancelled(waiter.task) ||
+        (interruptible && signal_interrupt_pending(waiter.task))) {
+        spin_unlock(&sched_lock);
+        spin_unlock_irqrestore(lock, flags);
+        return -1;
+    }
+    waiter.next = channel->waiters;
+    channel->waiters = &waiter;
+    waiter.task->state = TASK_SLEEPING;
+    waiter.task->cpu = -1;
+    waiter.task->sleep_until = deadline;
+    spin_unlock(lock);
+    schedule_locked(flags);
+
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    struct task_event_waiter **link = &channel->waiters;
+    while (*link != &waiter)
+        link = &(*link)->next;
+    *link = waiter.next;
+    bool cancelled = !interruptible && event_wait_cancelled(waiter.task);
+    spin_unlock_irqrestore(&sched_lock, f);
+    return cancelled ? -1 : 0;
+}
+
+int task_event_wait_locked(struct task_event_channel *channel, uint32_t mask,
+                           uint64_t deadline, spinlock_t *lock, uint64_t flags)
+{
+    return event_wait_locked(channel, mask, deadline, lock, flags, false);
+}
+
+int task_event_wait_interruptible_locked(struct task_event_channel *channel,
+                                         uint32_t mask, spinlock_t *lock,
+                                         uint64_t flags)
+{
+    return event_wait_locked(channel, mask, UINT64_MAX, lock, flags, true);
+}
+
+void task_event_notify(struct task_event_channel *channel, uint32_t mask)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    for (struct task_event_waiter *w = channel->waiters; w; w = w->next)
+        if ((w->mask & mask) && w->task->state == TASK_SLEEPING)
+            w->task->state = TASK_RUNNABLE;
+    spin_unlock_irqrestore(&sched_lock, flags);
 }
 
 void task_stop_current(void)

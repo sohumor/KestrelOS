@@ -17,7 +17,7 @@ program prints are the three tricks used throughout.
 
 Usage:
     python3 tools/e2e.py            # full test sequence
-    python3 tools/e2e.py --smoke    # boot + prompt only
+    python3 tools/e2e.py --smoke    # boot + login + prompt + guest exit code
     python3 tools/e2e.py --nic e1000
     python3 tools/e2e.py --list     # list tests without running
     python3 tools/e2e.py --selftest # exercise expect/send plumbing
@@ -82,10 +82,17 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus):
+def qemu_command(nic, cpus, disk="ata"):
+    storage = (["-machine", "q35", "-drive",
+                "if=none,id=d0,file=build/os.img,format=raw",
+                "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
+               ["-drive", "file=build/os.img,format=raw"])
     return [
         find_qemu(),
-        "-drive", "file=build/os.img,format=raw",
+        "-accel", "tcg",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        "-fw_cfg", "name=opt/kestrel-test,string=2",
+        *storage,
         # Package/filesystem tests deliberately mutate the guest disk. Keep those
         # writes in a temporary overlay so repeated runs always start from the
         # image produced by make and never contaminate build/os.img.
@@ -151,9 +158,11 @@ def clean(text):
 class Harness:
     def __init__(self, cmd):
         self.cmd = list(cmd)
+        self.test_mode = any("name=opt/kestrel-test," in arg for arg in cmd)
         self.proc = None
         self._sock = None
         self.buf = ""                 # cleaned, unconsumed text
+        self.boot_output = ""
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.tail = collections.deque(maxlen=TAIL_LINES)
@@ -231,12 +240,16 @@ class Harness:
                 continue
             with self.cond:
                 self.buf += text
+                if "KESTREL READY" not in self.boot_output:
+                    self.boot_output += text
                 self._partial += text
                 lines = self._partial.split("\n")
                 self._partial = lines.pop()
                 for line in lines:
                     self.tail.append(line)
                 self.cond.notify_all()
+        if self.test_mode:
+            self.proc.wait()
         with self.cond:
             self._esc = ""            # nothing will ever complete it now
             if self._partial:
@@ -256,6 +269,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     self.buf = self.buf[m.end():]
@@ -273,6 +287,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 best = None
                 for p, rx in rxs:
                     m = rx.search(self.buf)
@@ -294,6 +309,7 @@ class Harness:
         deadline = time.monotonic() + timeout
         with self.cond:
             while True:
+                self.check_exit()
                 m = rx.search(self.buf)
                 if m:
                     block = self.buf[:m.end()]
@@ -305,6 +321,26 @@ class Harness:
                         "timeout capturing through %r (eof=%s)"
                         % (pattern, self.eof))
                 self.cond.wait(min(remaining, 0.5))
+
+    def check_exit(self):
+        if not self.test_mode:
+            return
+        code = self.proc.poll()
+        if code is not None:
+            if code == 35:
+                raise TimeoutError("guest failure (QEMU exit 35)")
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+
+    def wait_exit(self, timeout=BOOT_TIMEOUT):
+        try:
+            code = self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("timeout waiting for QEMU debug-exit") from None
+        if code == 35:
+            raise TimeoutError("guest failure (QEMU exit 35)")
+        if code != 33:
+            raise TimeoutError("unexpected QEMU exit %d" % code)
+        print("  QEMU exit 33 (guest success)")
 
     def send(self, line):
         self.send_raw(line + "\n")
@@ -1755,7 +1791,14 @@ def wait_prompt(h, timeout=DEFAULT_TIMEOUT):
 
 
 def t_boot(h):
+    if getattr(h, "disk", "ata") == "ahci":
+        line = h.expect(r"ahci: port [0-9]+: [0-9]+ sectors",
+                        timeout=BOOT_TIMEOUT, regex=True)
+        print("  " + line.group(0))
     h.expect("KESTREL READY", timeout=BOOT_TIMEOUT)
+    if getattr(h, "disk", "ata") == "ahci":
+        if "ata: primary master:" in h.boot_output:
+            raise AssertionError("ATA claimed a disk in AHCI mode")
 
 
 def t_login(h):
@@ -1952,6 +1995,22 @@ def t_tail(h):
     h.send("tail -n 1 /doc/welcome.md")
     # last line of welcome.md, and nothing after it but the prompt
     h.expect(r"for the release\.\nkestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 /doc/welcome.md")
+    h.expect(r"tail -n 0 /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 < /doc/welcome.md")
+    h.expect(r"tail -n 0 < /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("touch /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect(r"tail -n 0 /tail-empty\.txt\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("rm /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect("tail: cannot open /tail-empty.txt")
+    wait_prompt(h)
 
 
 def t_tree(h):
@@ -2100,6 +2159,18 @@ def t_pipe(h):
     if got != r"\n *\d+\n":
         return "SKIP"
     have_pipes = True
+
+
+def t_pipe_read(h):
+    h.send("sigtest --pipe-read")
+    h.expect("sigtest: pipe read modes + interruption + EOF verified")
+    wait_prompt(h)
+
+
+def t_pipe_lifetime(h):
+    h.send("sigtest --pipe-lifetime")
+    h.expect("sigtest: pipe dup + spawn + peer close verified")
+    wait_prompt(h)
 
 
 def t_dev(h):
@@ -2880,6 +2951,8 @@ TESTS = [
     ("id", t_id),
     ("redirect", t_redirect),
     ("pipe", t_pipe),
+    ("pipe-read", t_pipe_read),
+    ("pipe-lifetime", t_pipe_lifetime),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),
     ("inspect-cli", t_inspect_cli),
@@ -2949,6 +3022,42 @@ def summarize(results):
 
 def selftest():
     """Exercise expect/send plumbing against a fake python child."""
+    for code in (33, 35, 0):
+        h = Harness([sys.executable, "-c", "raise SystemExit(%d)" % code])
+        h.start()
+        try:
+            try:
+                h.wait_exit(timeout=5)
+            except TimeoutError as e:
+                if code == 33 or str(code) not in str(e):
+                    raise AssertionError(str(e))
+            else:
+                if code != 33:
+                    raise AssertionError("accepted QEMU exit %d" % code)
+            h.test_mode = True
+            for wait in (h.expect, h.expect_any, h.capture_until):
+                try:
+                    wait(["missing"] if wait == h.expect_any else "missing",
+                         timeout=5)
+                except TimeoutError as e:
+                    if str(code) not in str(e):
+                        raise AssertionError(str(e))
+                else:
+                    raise AssertionError("serial wait accepted exited guest")
+        finally:
+            h.kill()
+    h = Harness([sys.executable, "-c", "import time; time.sleep(30)"])
+    h.start()
+    try:
+        try:
+            h.wait_exit(timeout=0.01)
+        except TimeoutError:
+            pass
+        else:
+            raise AssertionError("accepted a guest that never exits")
+    finally:
+        h.kill()
+    print("PASS selftest: guest exit success, failure, unexpected and timeout")
     fake = (
         "import sys\n"
         "sys.stdout.write('\\x1b[32mKESTREL READY\\x1b[0m\\r\\n')\n"
@@ -3137,7 +3246,7 @@ def main():
 
     ap = argparse.ArgumentParser(description="KestrelOS e2e test harness")
     ap.add_argument("--smoke", action="store_true",
-                    help="run boot + prompt tests only")
+                    help="check boot, login and shell prompt, then guest exit code")
     ap.add_argument("--only", action="append", metavar="NAME",
                     help="run boot/login/prompt plus one named test; repeatable")
     ap.add_argument("--list", action="store_true",
@@ -3148,6 +3257,8 @@ def main():
                     help="test controlled HTTP/TLS servers without an image")
     ap.add_argument("--nic", choices=sorted(QEMU_NICS), default="rtl8139",
                     help="emulated NIC to test (default: rtl8139)")
+    ap.add_argument("--disk", choices=["ata", "ahci"], default="ata",
+                    help="disk controller (AHCI uses q35)")
     ap.add_argument("--cpus", type=int, default=2,
                     help="virtual CPU count (default: 2)")
     args = ap.parse_args()
@@ -3190,7 +3301,8 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus))
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    h.disk = args.disk
     try:
         h.start()
     except FileNotFoundError:
@@ -3201,6 +3313,11 @@ def main():
         return 1
     try:
         results = run_tests(h, tests)
+        if all(status != "FAIL" for _, status in results):
+            def finish(h):
+                h.send("halt")
+                h.wait_exit()
+            results += run_tests(h, [("guest-exit", finish)])
     finally:
         h.kill()
         if fixtures:

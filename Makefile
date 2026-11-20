@@ -5,10 +5,13 @@ OBJCOPY ?= objcopy
 NASM    ?= nasm
 PY      ?= $(shell command -v python3 >/dev/null 2>&1 && echo python3 || echo python)
 QEMU    ?= qemu-system-x86_64
+QEMU_FLAGS ?=
+GDB     ?= gdb
+GDB_FLAGS ?=
 AR      ?= ar
 
 IS_CLANG := $(findstring clang,$(shell $(CC) --version 2>/dev/null))
-TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,)
+TARGET_FLAGS := $(if $(IS_CLANG),--target=x86_64-unknown-none-elf,) -march=x86-64 -mtune=generic
 KREG_FLAGS   := $(if $(IS_CLANG),-mgeneral-regs-only,-mno-mmx -mno-sse -mno-sse2)
 LD_NOWARN_RWX := $(if $(shell $(LD) --help 2>&1 | grep -F -- '--no-warn-rwx-segments'),--no-warn-rwx-segments,)
 
@@ -95,7 +98,7 @@ ROOTFS_SRC := $(shell $(PY) -c "import os; print(' '.join(os.path.join(r,f).repl
 QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
              -device rtl8139,netdev=n0 -netdev user,id=n0
 
-.PHONY: all run run-headless test test-e1000 test-net test-tcp test-checksum \
+.PHONY: all run run-headless debug gdb test test-e1000 test-net test-tcp test-checksum \
         test-random test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
         screenshot vm-images clean help reconfig checkconfig
@@ -319,6 +322,12 @@ run: all
 run-headless: all
 	$(QEMU) $(QEMU_BASE) -display none -serial stdio
 
+debug: all
+	$(QEMU) $(QEMU_BASE) -display none -serial stdio -s -S $(QEMU_FLAGS)
+
+gdb:
+	$(GDB) -nx -x tools/.gdbinit $(GDB_FLAGS)
+
 test: all
 	$(PY) tools/e2e.py
 
@@ -385,6 +394,8 @@ help:
 	@echo "  make            build build/os.img (bootable raw disk image)"
 	@echo "  make run        boot it in QEMU (window + serial on stdio)"
 	@echo "  make run-headless   boot it with serial only"
+	@echo "  make debug      boot headless, paused with GDB stub on localhost:1234"
+	@echo "  make gdb        load kernel symbols and attach (GDB_FLAGS for batch options)"
 	@echo "  make test       run the end-to-end suite in headless QEMU"
 	@echo "  make test-e1000 run the end-to-end suite with the Intel NIC"
 	@echo "  make test-tcp   run host TCP reassembly tests with sanitizers"

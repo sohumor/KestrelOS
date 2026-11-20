@@ -66,6 +66,8 @@ def assemble(root, fs_path, disk_path):
 def boot_and_halt(disk_path):
     cmd = [
         find_qemu(),
+        "-accel", "tcg",
+        "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
         "-drive", "file=%s,format=raw" % disk_path,
         "-no-reboot",
         "-display", "none",
