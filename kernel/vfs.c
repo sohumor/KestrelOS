@@ -248,6 +248,7 @@ static void pipe_op_close(struct file *f)
 
 static struct fs_ops pipe_ops = {
     .read  = pipe_read,
+    .read_once = 1,
     .write = pipe_write,
     .close = pipe_op_close,
 };
@@ -451,7 +452,8 @@ void vfs_close(struct file *f)
         kfree(f);
 }
 
-long vfs_read(struct file *f, void *buf, unsigned long n)
+long vfs_read_ex(struct file *f, void *buf, unsigned long n, int blocking,
+                 int *read_once)
 {
     const struct fs_ops *ops;
 
@@ -464,7 +466,14 @@ long vfs_read(struct file *f, void *buf, unsigned long n)
         return -1;
     if (n > 0x7FFFFFFFUL)
         n = 0x7FFFFFFFUL;
-    return ops->read(f, buf, n);
+    if (read_once != NULL)
+        *read_once = ops->read_once;
+    return ops->read(f, buf, n, blocking);
+}
+
+long vfs_read(struct file *f, void *buf, unsigned long n)
+{
+    return vfs_read_ex(f, buf, n, 1, NULL);
 }
 
 long vfs_write(struct file *f, const void *buf, unsigned long n)
