@@ -4,6 +4,7 @@
 #include "interrupts.h"
 #include "io.h"
 #include "random.h"
+#include "spinlock.h"
 
 /* US QWERTY, scancode set 1 */
 static const char map_normal[0x40] = {
@@ -23,11 +24,10 @@ static const char map_shift[0x40] = {
 };
 
 static bool shift, ctrl, alt, caps, ext;
+static spinlock_t keyboard_lock = SPINLOCK_INIT;
 
-static void kbd_irq(struct regs *r)
+static void handle_scancode(uint8_t sc)
 {
-    (void)r;
-    uint8_t sc = inb(0x60);
     entropy_pool_add_interrupt(ENTROPY_KEYBOARD, sc);
 
     if (sc == 0xE0) {
@@ -107,6 +107,19 @@ static void kbd_irq(struct regs *r)
     else if (ctrl && (c >= 'A' && c <= 'Z'))
         c -= 64;
     input_push((uint8_t)c);
+}
+
+void keyboard_handle_scancode(uint8_t sc)
+{
+    uint64_t flags = spin_lock_irqsave(&keyboard_lock);
+    handle_scancode(sc);
+    spin_unlock_irqrestore(&keyboard_lock, flags);
+}
+
+static void kbd_irq(struct regs *r)
+{
+    (void)r;
+    keyboard_handle_scancode(inb(0x60));
 }
 
 void keyboard_init(void)
