@@ -1135,7 +1135,7 @@ int tcp_recv(int handle, void *buf, int max, int timeout_ms)
 
         conn_pump(c);
         if (timer_ticks() >= deadline)
-            return -1;
+            return -2;
         if (current && current->kill_pending)
             return -1;
         net_wait_tick();

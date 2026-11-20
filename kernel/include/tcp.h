@@ -21,7 +21,7 @@ int  tcp_connect(uint32_t ip_be, uint16_t port, int timeout_ms);
 /* Queue len bytes for transmission. Returns bytes queued or -1. */
 int  tcp_send(int handle, const void *buf, int len);
 
-/* >0 bytes read, 0 = peer closed cleanly, -1 = error or timeout. */
+/* >0 bytes read, 0 = peer closed cleanly, -1 = error, -2 = timeout. */
 int  tcp_recv(int handle, void *buf, int max, int timeout_ms);
 
 /* Graceful close (FIN handshake). Returns 0 / -1. */

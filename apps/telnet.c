@@ -153,6 +153,10 @@ int main(int argc, char **argv)
         } else if (got == 0) {
             printf("\ntelnet: connection closed by peer\n");
             break;
+        } else if (got != -2) {       /* -2 is a receive slice timeout */
+            printf("\ntelnet: receive failed, connection closed\n");
+            t_close(h);
+            return 1;
         }
 
         /* 2. take whatever the user typed since last time. read_nb keeps
