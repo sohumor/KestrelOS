@@ -1966,6 +1966,22 @@ def t_tail(h):
     h.send("tail -n 1 /doc/welcome.md")
     # last line of welcome.md, and nothing after it but the prompt
     h.expect(r"for the release\.\nkestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 /doc/welcome.md")
+    h.expect(r"tail -n 0 /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("tail -n 0 < /doc/welcome.md")
+    h.expect(r"tail -n 0 < /doc/welcome\.md\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("touch /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect(r"tail -n 0 /tail-empty\.txt\n"
+             r"(?:elf: [^\n]*\n)*kestrel:[^\n]*\$", regex=True)
+    h.send("rm /tail-empty.txt")
+    wait_prompt(h)
+    h.send("tail -n 0 /tail-empty.txt")
+    h.expect("tail: cannot open /tail-empty.txt")
+    wait_prompt(h)
 
 
 def t_tree(h):
