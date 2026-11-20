@@ -8081,6 +8081,8 @@ static int edit_focused_control(struct bstate *b, unsigned int key)
 
     if (!p || !n || (n->tag_id != HTAG_INPUT && n->tag_id != HTAG_TEXTAREA))
         return 0;
+    if (dom_has_attr(n, "disabled"))
+        return 1;
     if (n->tag_id == HTAG_INPUT &&
         !(str_ci_eq(control_type(n), "text") ||
           str_ci_eq(control_type(n), "search") ||
@@ -8097,6 +8099,11 @@ static int edit_focused_control(struct bstate *b, unsigned int key)
     if (key == 3) {
         if (len > 0)
             gui_clipboard_copy(old, (int)len, "Browser input");
+        free(old);
+        return 1;
+    }
+    if (dom_has_attr(n, "readonly") && key != KEY_LEFT && key != KEY_RIGHT &&
+        key != KEY_HOME && key != KEY_END) {
         free(old);
         return 1;
     }
@@ -8684,6 +8691,7 @@ static BROWSER_NOINLINE void on_click(struct bstate *b, int x, int y)
             action = node;
         t->active_node = action;
         if (action && action->type == DOM_ELEMENT &&
+            !dom_has_attr(action, "disabled") &&
             (action->tag_id == HTAG_INPUT ||
              action->tag_id == HTAG_TEXTAREA ||
              action->tag_id == HTAG_SELECT ||
