@@ -27,7 +27,7 @@
 #define TALON_H        496
 #define QUICK_W        396
 #define QUICK_H        382
-#define HANGAR_W       588
+#define HANGAR_W       760
 #define HANGAR_H       468
 
 #define CALC_LONG_MAX  __LONG_MAX__
@@ -2415,7 +2415,7 @@ static int paint_hangar(gui_window *win, gui_ui *ui)
     gui_draw_text_aa(win, 14, 12, "Hangar", FONT_BODY, FONT_BOLD,
                      FONT_ROMAN, GUI_TEXT, GUI_TRANSPARENT);
     snprintf(badge, sizeof(badge), "%d / %d bays", nhangar, K_HANGAR_BAYS);
-    gui_badge(win, gui_mkrc(win->w - 140, 8, 92, 24), badge, 0xF59E0BU);
+    gui_badge(win, gui_mkrc(win->w - 152, 8, 104, 24), badge, 0xF59E0BU);
     if (gui_icon_button(win, gui_mkrc(win->w - 40, 7, 30, 26),
                         GUI_ICON_CLOSE, 0, ui, 1, 0))
         return -2;
@@ -2580,7 +2580,7 @@ int main(int argc, char **argv)
     gui_ui ui;
     gui_settings settings, painted_settings;
     int sw, sh, wallpaper_dirty = 1, shell_dirty = 1, popup_dirty = 0;
-    unsigned long next_telemetry = 0, next_blink = 0;
+    unsigned long next_telemetry = 0, next_blink = 0, next_hangar = 0;
 
     (void)argc;
     (void)argv;
@@ -2706,6 +2706,13 @@ int main(int argc, char **argv)
             next_telemetry = now + 1000;
             reap_children();
             sample_telemetry();
+            /* Resumes finish asynchronously and the CLI can park too. */
+            if (now >= next_hangar) {
+                next_hangar = now + 3000;
+                refresh_hangar();
+                if (popup && popup_kind == POP_HANGAR)
+                    popup_dirty = 1;
+            }
             gui_settings_get(&settings);
             if (memcmp(&settings, &painted_settings, sizeof(settings)) != 0) {
                 painted_settings = settings;
