@@ -250,7 +250,10 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
 
     th->csum = net_transport_checksum(net_ip_addr(), c->peer_ip,
                                       IP_PROTO_TCP, pkt, hlen + dlen);
-    return net_ip_send(c->peer_ip, IP_PROTO_TCP, pkt, hlen + dlen);
+    int rc = net_ip_send(c->peer_ip, IP_PROTO_TCP, pkt, hlen + dlen);
+    if (rc >= 0)
+        net_stat_inc(NET_STAT_TCP_TX, (uint32_t)(hlen + dlen));
+    return rc;
 }
 
 /* Task context. Buffers are deliberately kept for reuse by the next
@@ -537,22 +540,31 @@ static void accept_peer_fin(struct tcp_conn *c)
 
 void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len)
 {
-    if (!seg || len < (int)sizeof(struct tcp_hdr))
+    if (!seg || len < (int)sizeof(struct tcp_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
 
     const struct tcp_hdr *th = (const struct tcp_hdr *)seg;
     int hlen = (th->off >> 4) * 4;
-    if (hlen < (int)sizeof(*th) || hlen > len)
+    if (hlen < (int)sizeof(*th) || hlen > len) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     if (net_transport_checksum(src_ip_be, net_ip_addr(), IP_PROTO_TCP,
-                               seg, len) != 0)
+                               seg, len) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
 
     uint64_t lock_flags = spin_lock_irqsave(&tcp_lock);
     struct tcp_conn *c = conn_lookup(src_ip_be, ntohs(th->sport),
                                      ntohs(th->dport));
-    if (!c || !c->rxbuf)
+    if (!c || !c->rxbuf) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         goto out;
+    }
+    net_stat_inc(NET_STAT_TCP_RX, (uint32_t)len);
 
     uint32_t seq = ntohl(th->seq);
     uint32_t ack = ntohl(th->ack);

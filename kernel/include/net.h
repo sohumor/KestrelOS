@@ -40,6 +40,28 @@ void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns);
 /* Resolve a hostname (or dotted quad) to an IPv4 address. 0 / -1. */
 int  dns_resolve(const char *name, uint32_t *ip_be);
 
+/* Telemetry counters and @krec snapshots for /dev/{net,arp,dns}. */
+enum net_stat_kind {
+    NET_STAT_RX_PKT = 0,
+    NET_STAT_TX_PKT,
+    NET_STAT_RX_DROP,
+    NET_STAT_ARP_HIT,
+    NET_STAT_ARP_MISS,
+    NET_STAT_ICMP_RX,
+    NET_STAT_ICMP_TX,
+    NET_STAT_UDP_RX,
+    NET_STAT_UDP_TX,
+    NET_STAT_TCP_RX,
+    NET_STAT_TCP_TX,
+    NET_STAT_DNS_HIT,
+    NET_STAT_DNS_MISS,
+};
+
+void net_stat_inc(int kind, uint32_t bytes);
+uint32_t net_snapshot_krec(char *buf, uint32_t cap);
+uint32_t arp_snapshot_krec(char *buf, uint32_t cap);
+uint32_t dns_snapshot_krec(char *buf, uint32_t cap);
+
 /* ICMP echo; returns round-trip time in ms (10ms granularity) or -1. */
 long icmp_ping(uint32_t ip_be, int timeout_ms);
 

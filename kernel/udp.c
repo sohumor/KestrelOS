@@ -150,30 +150,41 @@ void udp_unbind(uint16_t port)
 void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
                const uint8_t *seg, int len)
 {
-    if (!seg || len < (int)sizeof(struct udp_hdr))
+    if (!seg || len < (int)sizeof(struct udp_hdr)) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     const struct udp_hdr *uh = (const struct udp_hdr *)seg;
 
     int ulen = ntohs(uh->len);
-    if (ulen < (int)sizeof(*uh) || ulen > len)
+    if (ulen < (int)sizeof(*uh) || ulen > len) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     if (uh->csum != 0 &&
-        net_transport_checksum(src_ip_be, dst_ip_be, 17, seg, ulen) != 0)
+        net_transport_checksum(src_ip_be, dst_ip_be, 17, seg, ulen) != 0) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
     int plen = ulen - (int)sizeof(*uh);
-    if (plen > NET_UDP_MAX)
+    if (plen > NET_UDP_MAX) {
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
+    }
+    net_stat_inc(NET_STAT_UDP_RX, (uint32_t)ulen);
 
     uint64_t f = spin_lock_irqsave(&udp_lock);
     struct udp_bind *b = bind_find_locked(ntohs(uh->dport));
     if (!b || b->count >= UDP_QUEUE) {
         spin_unlock_irqrestore(&udp_lock, f);
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;                          /* unbound or full: drop */
     }
 
     struct udp_slot *s = &b->q[(b->head + b->count) % UDP_QUEUE];
     if (!s->data) {
         spin_unlock_irqrestore(&udp_lock, f);
+        net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
     }
     memcpy(s->data, seg + sizeof(*uh), plen);
@@ -202,7 +213,10 @@ int udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
                                       (int)sizeof(*uh) + len);
     if (uh->csum == 0)
         uh->csum = 0xFFFF;  /* RFC 768: computed zero is sent as all ones. */
-    return net_ip_send(ip_be, 17, pkt, (int)sizeof(*uh) + len);
+    int rc = net_ip_send(ip_be, 17, pkt, (int)sizeof(*uh) + len);
+    if (rc >= 0)
+        net_stat_inc(NET_STAT_UDP_TX, (uint32_t)(sizeof(*uh) + len));
+    return rc;
 }
 
 int udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms)
