@@ -82,7 +82,7 @@ QEMU_NICS = {
 }
 
 
-def qemu_command(nic, cpus, disk="ata"):
+def qemu_command(nic, cpus, disk="ata", monitor_port=None):
     storage = (["-machine", "q35", "-drive",
                 "if=none,id=d0,file=build/os.img,format=raw",
                 "-device", "ide-hd,drive=d0,bus=ide.0"] if disk == "ahci" else
@@ -104,7 +104,11 @@ def qemu_command(nic, cpus, disk="ata"):
         "-smp", str(cpus),
         "-device", "%s,netdev=n0" % QEMU_NICS[nic],
         "-netdev", "user,id=n0",
-    ]
+    ] + ([] if monitor_port is None else [
+        # The human monitor injects PS/2 mouse and keyboard input for
+        # tests that drive the GUI.
+        "-monitor", "tcp:127.0.0.1:%d,server=on,wait=off" % monitor_port,
+    ])
 
 
 DEFAULT_TIMEOUT = 20
@@ -124,6 +128,25 @@ TAIL_LINES = 40
 # transport tests bind ephemeral host ports and reach them through this IP.
 QEMU_HOST = "10.0.2.2"
 HTTP_BODY_MARKER = "CONTROLLED-HTTP-BODY-OK"
+
+# A <select> with more options than its dropdown shows at once.  Each change
+# GETs /select-picked/<option>, so the host sees which option was chosen.
+SELECT_FIXTURE_OPTIONS = (
+    "one two three four five six seven eight nine ten eleven twelve "
+    "thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+).split()
+SELECT_FIXTURE_PAGE = (
+    "<!doctype html><html><head><title>Kestrel select fixture</title>"
+    "</head><body><select id=pick>%s</select><script>"
+    "var pick=document.getElementById('pick');"
+    "pick.addEventListener('change',function(){"
+    "var opts=pick.getElementsByTagName('option');"
+    "for(var i=0;i<opts.length;i++)"
+    "if(opts[i].hasAttribute('selected'))"
+    "fetch('/select-picked/'+opts[i].textContent);"
+    "});</script></body></html>"
+    % "".join("<option>%s</option>" % o for o in SELECT_FIXTURE_OPTIONS)
+).encode("ascii")
 TLS_NEGATIVE_BODY_MARKER = "TLS-NEGATIVE-BODY-MUST-NOT-APPEAR"
 TLS_NEGATIVE_REPETITIONS = 10
 
@@ -169,6 +192,8 @@ class Harness:
         self._partial = ""
         self._esc = ""                # half of an escape sequence, held back
         self.eof = False
+        self.monitor_port = None
+        self._monitor = None
 
     def _use_win_tcp_serial(self):
         if sys.platform != "win32":
@@ -365,7 +390,25 @@ class Harness:
                 print(self._partial)
         print("---- end of tail ----")
 
+    def monitor(self, command):
+        """Send one QEMU human-monitor command (mouse_move, sendkey, ...)."""
+        if self._monitor is None:
+            if self.monitor_port is None:
+                raise TimeoutError("QEMU was started without a monitor")
+            self._monitor = socket.create_connection(
+                ("127.0.0.1", self.monitor_port), timeout=10)
+        self._monitor.sendall(command.encode("ascii") + b"\n")
+        # QEMU queues PS/2 packets in a small buffer; give the guest time
+        # to drain each one so no movement is dropped.
+        time.sleep(0.15)
+
     def kill(self):
+        if self._monitor is not None:
+            try:
+                self._monitor.close()
+            except OSError:
+                pass
+            self._monitor = None
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -1323,6 +1366,8 @@ def _marker_handler(marker):
                     7, 7, 1, 3, 97, 100, 100, 0, 0,
                     10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11,
                 ])
+            elif path == "/select":
+                response = SELECT_FIXTURE_PAGE
             elif path == "/modern":
                 response = (
                     "<!doctype html><html><head>"
@@ -1680,6 +1725,7 @@ class BrowserFixtureServers:
         self.http_url = None
         self.compat_url = None
         self.modern_url = None
+        self.select_url = None
         self.module_policy_url = None
         self.cors_url = None
         self.https_url = None
@@ -1742,6 +1788,8 @@ class BrowserFixtureServers:
         self.compat_url = "http://%s:%d/compat" % (
             QEMU_HOST, self.http.server_address[1])
         self.modern_url = "http://%s:%d/modern" % (
+            QEMU_HOST, self.http.server_address[1])
+        self.select_url = "http://%s:%d/select" % (
             QEMU_HOST, self.http.server_address[1])
         self.module_policy_url = "http://%s:%d/module-policy" % (
             QEMU_HOST, self.http.server_address[1])
@@ -2892,6 +2940,125 @@ def t_browser_modern_web(h):
     wait_prompt(h, timeout=NET_TIMEOUT)
 
 
+def _mouse_sensitivity():
+    vals = {}
+    with open(os.path.join("kernel", "mouse.c")) as f:
+        for line in f:
+            m = re.match(r"#define MOUSE_SENSITIVITY_(NUM|DEN)\s+(\d+)", line)
+            if m:
+                vals[m.group(1)] = int(m.group(2))
+    return vals.get("NUM", 1), vals.get("DEN", 1)
+
+
+class _GuestMouse:
+    """Absolute pointer moves built from relative PS/2 packets."""
+
+    STEP = 100      # a PS/2 delta past +/-255 overflows and is dropped
+
+    def __init__(self, h):
+        self.h = h
+        self.num, self.den = _mouse_sensitivity()
+        for _ in range(30):     # the driver clamps at the screen origin
+            h.monitor("mouse_move -%d -%d" % (self.STEP, self.STEP))
+        self.x = self.y = 0
+
+    def move(self, x, y):
+        while (self.x, self.y) != (x, y):
+            # The driver applies trunc(delta * num / den) to each packet.
+            rx = int((x - self.x) * self.den / self.num)
+            ry = int((y - self.y) * self.den / self.num)
+            if rx == 0 and x != self.x:
+                rx = 1 if x > self.x else -1
+            if ry == 0 and y != self.y:
+                ry = 1 if y > self.y else -1
+            rx = max(-self.STEP, min(self.STEP, rx))
+            ry = max(-self.STEP, min(self.STEP, ry))
+            self.h.monitor("mouse_move %d %d" % (rx, ry))
+            self.x += int(rx * self.num / self.den)
+            self.y += int(ry * self.num / self.den)
+
+    def click(self, x, y):
+        self.move(x, y)
+        self.h.monitor("mouse_button 1")
+        self.h.monitor("mouse_button 0")
+        time.sleep(1.5)
+
+    def wheel_down(self, notches):
+        for _ in range(notches):
+            self.h.monitor("mouse_move 0 0 -1")
+        time.sleep(1)
+
+
+def _wait_path(server, path, before, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if server.path_count(path) > before:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def t_browser_select_menu(h):
+    """Every option of a long <select> is reachable by wheel and keyboard.
+
+    The windowed browser is driven through the QEMU monitor's PS/2 mouse
+    and keyboard.  The fixture page reports each chosen option back to the
+    host, so the test checks what was picked rather than pixels.  The
+    coordinates are those of the first browser window on the default
+    2560x1440 VGA mode: the <select> box, and the eighth (last visible)
+    dropdown row below it.
+    """
+    if not browser_fixtures:
+        raise TimeoutError("controlled browser servers were not started")
+    srv = browser_fixtures.http
+    select_at, last_row_at = (140, 142), (140, 322)
+
+    def pick(label):
+        return srv.path_count("/select-picked/%s" % label)
+
+    loads = srv.path_count("/select")
+    h.send("browser %s &" % browser_fixtures.select_url)
+    wait_prompt(h)
+    try:
+        if not _wait_path(srv, "/select", loads, NET_TIMEOUT):
+            raise TimeoutError("browser never loaded the select fixture")
+        time.sleep(4)               # let the first frame reach the screen
+        mouse = _GuestMouse(h)
+        problems = []
+
+        # Wheel: two notches move the list six options down, so the last
+        # visible row becomes the fourteenth option.
+        before = {o: pick(o) for o in ("eight", "fourteen")}
+        mouse.click(*select_at)
+        mouse.wheel_down(2)
+        mouse.click(*last_row_at)
+        if not _wait_path(srv, "/select-picked/fourteen",
+                          before["fourteen"], 10):
+            got = "eight" if pick("eight") > before["eight"] else "nothing"
+            problems.append("wheel then last row picked %s, not fourteen"
+                            % got)
+            h.monitor("sendkey esc")
+
+        # Keyboard: End highlights the final option and Enter chooses it.
+        before = pick("twenty")
+        mouse.click(*select_at)
+        h.monitor("sendkey end")
+        h.monitor("sendkey ret")
+        if not _wait_path(srv, "/select-picked/twenty", before, 10):
+            problems.append("End then Enter did not pick twenty")
+        if problems:
+            raise TimeoutError("; ".join(problems))
+    finally:
+        # Ctrl-Q quits the focused browser window; Esc first closes any
+        # dropdown left open, which would otherwise take the key.
+        h.monitor("sendkey esc")
+        h.monitor("sendkey ctrl-q")
+        time.sleep(2)
+        h.send("echo BROWSER-SELECT-END")
+        h.expect("\nBROWSER-SELECT-END", timeout=WALK_TIMEOUT)
+        wait_prompt(h)
+
+
 def t_browser_module_policy(h):
     """ES modules reject invalid MIME types and cross-origin denial."""
     if not browser_fixtures:
@@ -3171,6 +3338,7 @@ TESTS = [
     ("browser-http-controlled", t_browser_http_controlled),
     ("browser-web-compat", t_browser_web_compat),
     ("browser-modern-web", t_browser_modern_web),
+    ("browser-select-menu", t_browser_select_menu),
     ("browser-module-policy", t_browser_module_policy),
     ("browser-tls-cert-negative", t_browser_tls_certificate_negative),
     ("browser-https", t_browser_https),
@@ -3503,8 +3671,12 @@ def main():
                 fixtures.close()
             return 1
 
-    h = Harness(qemu_command(args.nic, args.cpus, args.disk))
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        monitor_port = probe.getsockname()[1]
+    h = Harness(qemu_command(args.nic, args.cpus, args.disk, monitor_port))
     h.disk = args.disk
+    h.monitor_port = monitor_port
     try:
         h.start()
     except FileNotFoundError:
