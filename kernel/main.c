@@ -13,6 +13,7 @@
 #include "kheap.h"
 #include "proc.h"
 #include "ata.h"
+#include "ahci.h"
 #include "vfs.h"
 #include "net.h"
 #include "uproc.h"
@@ -135,6 +136,7 @@ void kmain(uint64_t bootinfo_phys)
     initcall_run_level(INITCALL_CORE);
 
     ata_init();
+    ahci_init();
     swap_init();
     vfs_init();              /* reports success or failure itself */
     devfs_init();
