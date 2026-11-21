@@ -2,11 +2,31 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+
+/* Word-sized copy/fill unit.  may_alias makes the word accesses legal
+ * against any object under strict aliasing and aligned(1) permits any
+ * alignment; x86-64 performs unaligned word loads/stores in hardware. */
+typedef unsigned long __attribute__((aligned(1), may_alias)) alias_ulong;
+#define WORD_BYTES (sizeof(alias_ulong))
 
 void *memset(void *dst, int c, unsigned long n)
 {
     unsigned char *d = (unsigned char *)dst;
+    unsigned long pattern;
 
+    /* head: byte stores until the destination is word-aligned */
+    while (n && (uintptr_t)d % WORD_BYTES) {
+        *d++ = (unsigned char)c;
+        n--;
+    }
+    /* broadcast the byte: 0xAB * 0x0101..01 == 0xABAB..AB on any width */
+    pattern = (unsigned long)(unsigned char)c * (~0UL / 0xFFUL);
+    while (n >= WORD_BYTES) {
+        *(alias_ulong *)d = pattern;
+        d += WORD_BYTES;
+        n -= WORD_BYTES;
+    }
     while (n--)
         *d++ = (unsigned char)c;
     return dst;
@@ -17,6 +37,18 @@ void *memcpy(void *dst, const void *src, unsigned long n)
     unsigned char *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
 
+    /* head: byte copies until the destination is word-aligned; the
+     * source may stay unaligned (loads go through alias_ulong) */
+    while (n && (uintptr_t)d % WORD_BYTES) {
+        *d++ = *s++;
+        n--;
+    }
+    while (n >= WORD_BYTES) {
+        *(alias_ulong *)d = *(const alias_ulong *)s;
+        d += WORD_BYTES;
+        s += WORD_BYTES;
+        n -= WORD_BYTES;
+    }
     while (n--)
         *d++ = *s++;
     return dst;

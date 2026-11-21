@@ -150,6 +150,69 @@ static void test_memory(void)
     named_result("memchr/memrchr pick correct duplicate", ok, 0);
 }
 
+/*
+ * The word-wise memset/memcpy paths split work into a misaligned head,
+ * an aligned word body and a tail.  Sweep dst/src offsets 0..15 and
+ * lengths 0..72 so every combination of the three phases is checked,
+ * including lengths shorter than one head or one word.
+ */
+static void test_word_paths(void)
+{
+    unsigned char dbuf[128];
+    unsigned char sbuf[128];
+    unsigned long i;
+    int off, soff;
+    unsigned long n;
+    int ok;
+
+    for (i = 0; i < sizeof(sbuf); i++)
+        sbuf[i] = (unsigned char)(i * 37 + 11);
+
+    ok = 1;
+    for (off = 0; off < 16 && ok; off++) {
+        for (n = 0; n <= 72 && ok; n++) {
+            k_memset(dbuf, 0x5a, sizeof(dbuf));
+            k_memset(dbuf + off, 0xa5, n);
+            for (i = 0; i < sizeof(dbuf); i++) {
+                unsigned char want =
+                    (i >= (unsigned long)off &&
+                     i < (unsigned long)off + n) ? 0xa5 : 0x5a;
+                if (dbuf[i] != want)
+                    ok = 0;
+            }
+        }
+    }
+    named_result("memset sweep: all offsets x lengths 0..72", ok,
+                 "mismatch in memset head/body/tail");
+
+    /* value truncation: only the low byte may be stored */
+    k_memset(dbuf, 0x1a5, sizeof(dbuf));
+    named_result("memset stores low byte of int",
+                 all_byte(dbuf, sizeof(dbuf), 0xa5), 0);
+
+    ok = 1;
+    for (off = 0; off < 16 && ok; off++) {
+        for (soff = 0; soff < 16 && ok; soff++) {
+            for (n = 0; n <= 72 && ok; n++) {
+                k_memset(dbuf, 0x5a, sizeof(dbuf));
+                k_memcpy(dbuf + off, sbuf + soff, n);
+                for (i = 0; i < sizeof(dbuf); i++) {
+                    unsigned char want =
+                        (i >= (unsigned long)off &&
+                         i < (unsigned long)off + n)
+                            ? sbuf[i - (unsigned long)off +
+                                   (unsigned long)soff]
+                            : 0x5a;
+                    if (dbuf[i] != want)
+                        ok = 0;
+                }
+            }
+        }
+    }
+    named_result("memcpy sweep: all dst x src offsets x lengths", ok,
+                 "mismatch in memcpy head/body/tail");
+}
+
 static void test_length_compare(void)
 {
     named_result("strlen basic", k_strlen("kestrel") == 7, 0);
@@ -318,6 +381,7 @@ int main(void)
 {
     printf("Kestrel target string.c regression\n");
     test_memory();
+    test_word_paths();
     test_length_compare();
     test_copy_concat();
     test_search();
