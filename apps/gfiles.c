@@ -7,6 +7,10 @@
  *   - Talon [Copy Path] button (K_PARCEL_PATH)
  *   - Smart Open (.html -> browser, .js -> kjs, .md/.txt -> notes/edit,
  *     .krec -> sight/edit, .kpx/.bmp -> gpaint/edit, fallback -> edit)
+ *   - Keyboard: arrows/PgUp/PgDn/Home/End navigate, Enter opens, Backspace
+ *     climbs to the parent, Del asks to delete the selection, and typing a
+ *     letter jumps the selection to the next entry starting with it
+ *     (wrapping, case-insensitive)
  *   - Dynamic KEV_RESIZE reflow, KEV_MOUSE_WHEEL + scrollbar, and sorting
  *
  * usage: gfiles [path]
@@ -627,8 +631,31 @@ static int draw_file_list(gui_window *win, gui_rc r, gui_ui *ui)
             if (sel_idx >= 0 && sel_idx < nentries)
                 activated = sel_idx;
             break;
+        case 8: /* Backspace: climb to the parent directory */
+            if (act_mode == ACT_NONE && cwd[1] != '\0')
+                enter_dir("..");
+            else
+                handled = 0;
+            break;
         default:
+            /* Type-ahead: jump to the next entry whose name starts with
+             * the typed character, wrapping around (case-insensitive).
+             * Inert while a banner action is open. */
             handled = 0;
+            if (ui->key >= 32 && ui->key < 127 && nentries > 0 &&
+                act_mode == ACT_NONE) {
+                int start = sel_idx >= 0 ? sel_idx : -1;
+
+                for (int off = 1; off <= nentries; off++) {
+                    int idx = (start + off) % nentries;
+                    if (lower_ch((unsigned char)entries[idx].name[0]) ==
+                        lower_ch(ui->key)) {
+                        sel_idx = idx;
+                        handled = 1;
+                        break;
+                    }
+                }
+            }
             break;
         }
         if (handled) {
@@ -920,6 +947,14 @@ int main(int argc, char **argv)
                 act_mode = ACT_NONE;
                 inputbox.focus = 0;
                 snprintf(status, sizeof(status), "Cancelled");
+            }
+            if (ev.type == KEV_KEY && ev.key == KEY_DELETE &&
+                act_mode == ACT_NONE && !pathbox.focus && !inputbox.focus &&
+                sel_idx >= 0 && sel_idx < nentries &&
+                strcmp(entries[sel_idx].name, "..") != 0) {
+                act_mode = ACT_DELETE;
+                snprintf(status, sizeof(status), "Confirm delete %s",
+                         entries[sel_idx].name);
             }
             dirty = 1;
         } else if (pathbox.focus || inputbox.focus) {

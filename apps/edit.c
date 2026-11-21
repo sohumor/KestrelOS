@@ -1,9 +1,10 @@
 /* edit.c - KestrelOS text & code editor.
  *
  * Uses libgui's syntax-aware gui_editor widget in a resizable desktop window
- * (line numbers, C/JS/HTML/CSS/SH/@krec highlighting, click/drag/double-click
- * selection, mouse wheel + scrollbar, Talon clipboard copy/cut/paste, Ctrl+S
- * save, Open / Save As toolbar, dirty indicator, and KEV_RESIZE reflow).
+ * (line numbers toggleable with Ctrl+L, C/JS/HTML/CSS/SH/@krec highlighting,
+ * click/drag/double-click selection, mouse wheel + scrollbar, Talon clipboard
+ * copy/cut/paste, Ctrl+S save, Ctrl+O open prompt, Ctrl+N new, Ctrl+Q quit,
+ * Open / Save As toolbar, dirty indicator, and KEV_RESIZE reflow).
  *
  * Falls back to the full-screen ANSI console editor when invoked with -t or
  * when no window manager is available.
@@ -533,6 +534,12 @@ static void paint_gui(gui_window *win, gui_ui *ui, struct gui_ed_app *app)
             ui->key = 0;
         } else if (k == 14) { /* Ctrl+N */
             trigger_new(app);
+            ed_ui.key = 0;
+            ui->key = 0;
+        } else if (k == 12) { /* Ctrl+L: toggle line numbers */
+            app->ed.show_lineno = !app->ed.show_lineno;
+            snprintf(app->status, sizeof(app->status), "Line numbers %s",
+                     app->ed.show_lineno ? "on" : "off");
             ed_ui.key = 0;
             ui->key = 0;
         }
