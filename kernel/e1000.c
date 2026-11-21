@@ -248,12 +248,14 @@ static int e1000_send(const void *frame, int len)
     int i = tx_next;
     volatile struct e1000_tx_desc *d = &tx_ring[i];
 
-    /* Wait for the previous transmit on this descriptor to complete. */
+    /* Wait for the previous transmit on this descriptor to complete.
+     * Check DD once more after the loop: it can land on the final
+     * polling iteration, where spin has already reached zero. */
     if (tx_used[i]) {
         int spin = 1000000;
         while (!(d->status & TXD_STAT_DD) && --spin > 0)
             ;
-        if (spin == 0) {
+        if (!(d->status & TXD_STAT_DD)) {
             spin_unlock_irqrestore(&tx_lock, f);
             kprintf("e1000: tx descriptor %d stuck\n", i);
             return -1;
@@ -319,11 +321,18 @@ static int e1000_probe(struct device *dev)
                      mmio_phys + off, PTE_W | PTE_PCD);
     mmio = (volatile uint32_t *)E1000_MMIO_VA;
 
-    /* Device reset: set CTRL.RST and wait for hardware auto-clear. */
+    /* Device reset: set CTRL.RST and wait for hardware auto-clear.
+     * Writes to a still-resetting chip are ignored, so a timeout here
+     * is fatal to the probe rather than something to ride through. */
     reg_write(REG_CTRL, reg_read(REG_CTRL) | CTRL_RST);
     for (int spin = 0; spin < 10000; spin++) {
         if (!(reg_read(REG_CTRL) & CTRL_RST))
             break;
+    }
+    if (reg_read(REG_CTRL) & CTRL_RST) {
+        kprintf("e1000: reset timed out (ctrl=0x%x)\n",
+                reg_read(REG_CTRL));
+        return -1;
     }
 
     reg_write(REG_IMC, 0xFFFFFFFFu);   /* mask + ack everything */
@@ -348,12 +357,28 @@ static int e1000_probe(struct device *dev)
             break;
     }
 
-    /* Rings + buffers: physically contiguous, zeroed, < 4 GiB. */
-    uint64_t rx_ring_phys = pmm_alloc_contig(1);
-    uint64_t tx_ring_phys = pmm_alloc_contig(1);
-    uint64_t rx_buf_phys = pmm_alloc_contig(RX_NDESC * BUF_SIZE / PAGE_SIZE);
-    uint64_t tx_buf_phys = pmm_alloc_contig(TX_NDESC * BUF_SIZE / PAGE_SIZE);
+    /* Rings + buffers: physically contiguous, zeroed. Descriptors
+     * carry full 64-bit addresses, so no low-memory placement check
+     * is needed. pmm_try_alloc_contig (not pmm_alloc_contig): a NIC
+     * that cannot get contiguous DMA pages should fail its probe, not
+     * panic the kernel. Earlier allocations are freed before bailing. */
+    uint64_t rx_ring_phys = pmm_try_alloc_contig(1);
+    uint64_t tx_ring_phys = pmm_try_alloc_contig(1);
+    uint64_t rx_buf_phys = pmm_try_alloc_contig(RX_NDESC * BUF_SIZE
+                                              / PAGE_SIZE);
+    uint64_t tx_buf_phys = pmm_try_alloc_contig(TX_NDESC * BUF_SIZE
+                                              / PAGE_SIZE);
     if (!rx_ring_phys || !tx_ring_phys || !rx_buf_phys || !tx_buf_phys) {
+        if (rx_ring_phys)
+            pmm_free_contig(rx_ring_phys, 1);
+        if (tx_ring_phys)
+            pmm_free_contig(tx_ring_phys, 1);
+        if (rx_buf_phys)
+            pmm_free_contig(rx_buf_phys,
+                            RX_NDESC * BUF_SIZE / PAGE_SIZE);
+        if (tx_buf_phys)
+            pmm_free_contig(tx_buf_phys,
+                            TX_NDESC * BUF_SIZE / PAGE_SIZE);
         kprintf("e1000: out of contiguous memory for DMA buffers\n");
         return -1;
     }
