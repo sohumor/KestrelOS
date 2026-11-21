@@ -43,7 +43,7 @@ static void bn_set_bytes(struct bn *a, uint8_t hi, int nbytes)
 
 static void test_bn_basics(void)
 {
-    struct bn a, b, r;
+    struct bn a, b;
 
     bn_zero(&a);
     assert(bn_is_zero(&a) && a.n == 0 && bn_bits(&a) == 0 && bn_bytes(&a) == 0);
@@ -97,9 +97,6 @@ static void test_bn_basics(void)
         assert(bn_from_bytes(&a, big, sizeof(big)) == 0);
         assert(bn_is_zero(&a));
     }
-
-    bn_zero(&r);
-    assert(bn_cmp(&r, &a) <= 0 || 1);   /* silence unused warnings path */
 }
 
 static void test_bn_arith(void)
