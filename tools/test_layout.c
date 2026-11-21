@@ -2904,6 +2904,7 @@ static void rnd_style(struct computed_style *cs)
     cs->word_break = (uint8_t)rnd(CSS_WORDBREAK_COUNT);
     cs->overflow_wrap = (uint8_t)rnd(CSS_OVERFLOWWRAP_COUNT);
     cs->letter_spacing = rnd(4) ? 0 : ((int32_t)rnd(7) - 2);
+    cs->word_spacing = rnd(4) ? 0 : ((int32_t)rnd(9) - 3);
     if (rnd(6) == 0) {
         cs->has_transform = 1;
         cs->translate_x = rnd_len(1);
@@ -4297,6 +4298,54 @@ static void test_text_modern_layout(void)
     tfree(t);
 }
 
+static void test_word_spacing(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *norm = st_block(t);
+    struct computed_style *wide = st_block(t);
+    struct computed_style *pre = st_block(t);
+    struct dom_node *d, *nn, *nw, *np;
+    struct lay_document *L;
+    struct lay_box *l, *tb;
+
+    GROUP("inline: word-spacing widens word separators");
+
+    root->width = LPX(200);
+    wide->word_spacing = 6;
+    pre->white_space = CSS_WHITESPACE_PRE;
+    pre->word_spacing = 4;
+
+    d = el(t, 0, "div", root);
+    nn = el(t, d, "div", norm);
+    txt(t, nn, "ab cd");
+    nw = el(t, d, "div", wide);
+    txt(t, nw, "ab cd");
+    np = el(t, d, "div", pre);
+    txt(t, np, "a  b");
+
+    L = run(t, d, 200, 200);
+
+    /* FONT_BODY w=8: "ab cd" is 5 glyph cells = 40px. */
+    l = first_line(lay_box_for_node(L, nn));
+    CHECK_EQ(l->w, 8 * 5);
+
+    /* word-spacing 6: the one collapsed space is 8+6 wide. Frags
+     * coalesce, so the whole run is one text box of 46px. */
+    l = first_line(lay_box_for_node(L, nw));
+    CHECK_EQ(l->w, 8 * 5 + 6);
+    tb = first_text(l);
+    CHECK(tb && tb->text_len == 5);
+    CHECK_EQ(tb->w, 8 * 5 + 6);
+
+    /* pre "a  b": both preserved spaces are separators, +4 each. */
+    l = first_line(lay_box_for_node(L, np));
+    CHECK_EQ(l->w, 8 * 4 + 2 * 4);
+
+    lay_free(L);
+    tfree(t);
+}
+
 static void test_transform_layout(void)
 {
     struct tctx *t = tnew();
@@ -4485,6 +4534,7 @@ int main(int argc, char **argv)
     test_flex_grid_modern();
     test_outline_paint();
     test_text_modern_layout();
+    test_word_spacing();
     test_transform_layout();
 
     render_pages();
