@@ -62,6 +62,12 @@ static bool tx_used[TX_NDESC];
 static spinlock_t rx_lock = SPINLOCK_INIT;
 static spinlock_t tx_lock = SPINLOCK_INIT;
 
+/* Recover from a bad rx entry: restart the receiver and put the
+ * software read position back at the ring start. CAPR has to be
+ * rewritten too -- it still held the pre-reset read position, so
+ * without this the hardware's view of consumed data is desynced from
+ * rx_pos and the BUFE check stalls or skips buffered packets.
+ * (rx_pos - 16) is the trailing offset rx_drain always writes. */
 static void rx_reset(void)
 {
     uint8_t cr = inb(io_base + REG_CR);
@@ -69,6 +75,7 @@ static void rx_reset(void)
     outb(io_base + REG_CR, cr | CR_RE);
     outl(io_base + REG_RCR, RCR_VAL);
     rx_pos = 0;
+    outw(io_base + REG_CAPR, (uint16_t)(rx_pos - 16));
 }
 
 /* Drain complete packets out of the RX ring. IRQ context: no sleeping. */
@@ -153,14 +160,31 @@ static int rtl8139_probe(struct device *dev)
     for (int i = 0; i < 6; i++)
         mac[i] = inb(io_base + REG_IDR0 + i);
 
-    /* RX ring: 3 pages cover 8192+16+1500. Phys < 4GB on our 128MB VM. */
-    uint64_t rx_phys = pmm_alloc_contig((RX_BUF_TOTAL + PAGE_SIZE - 1)
-                                        / PAGE_SIZE);
-    tx_phys = pmm_alloc_contig(TX_NDESC);
+    /* RX ring: 3 pages cover 8192+16+1500. Phys < 4GB on our 128MB VM.
+     * try_alloc, not pmm_alloc_contig: OOM should fail the probe, not
+     * panic the kernel; free the other buffer if only one succeeded. */
+    uint64_t rx_phys = pmm_try_alloc_contig((RX_BUF_TOTAL + PAGE_SIZE - 1)
+                                            / PAGE_SIZE);
+    tx_phys = pmm_try_alloc_contig(TX_NDESC);
     if (!rx_phys || !tx_phys) {
+        if (rx_phys)
+            pmm_free_contig(rx_phys,
+                            (RX_BUF_TOTAL + PAGE_SIZE - 1) / PAGE_SIZE);
+        if (tx_phys)
+            pmm_free_contig(tx_phys, TX_NDESC);
         kprintf("rtl8139: out of contiguous memory for DMA buffers\n");
         return -1;
     }
+    /* TSAD/RBSTART are 32-bit registers: buffers must live < 4 GiB. */
+    uint64_t rx_pages = (RX_BUF_TOTAL + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (rx_phys + rx_pages * PAGE_SIZE > (1ULL << 32) ||
+        tx_phys + TX_NDESC * PAGE_SIZE > (1ULL << 32)) {
+        pmm_free_contig(rx_phys, rx_pages);
+        pmm_free_contig(tx_phys, TX_NDESC);
+        kprintf("rtl8139: DMA buffers above 4 GiB\n");
+        return -1;
+    }
+
     rx_buf = P2V(rx_phys);
     rx_pos = 0;
 
@@ -226,7 +250,7 @@ static int rtl8139_send(const void *frame, int len)
         int spin = 1000000;
         while (!(inl(tsd) & TSD_OWN) && --spin > 0)
             ;
-        if (spin == 0) {
+        if (!(inl(tsd) & TSD_OWN)) {   /* may have set on final poll */
             spin_unlock_irqrestore(&tx_lock, f);
             kprintf("rtl8139: tx descriptor %d stuck\n", d);
             return -1;
