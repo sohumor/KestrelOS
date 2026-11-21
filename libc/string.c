@@ -55,6 +55,32 @@ int memcmp(const void *a, const void *b, unsigned long n)
     return 0;
 }
 
+void *memchr(const void *p, int c, unsigned long n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    unsigned char ch = (unsigned char)c;
+
+    while (n--) {
+        if (*b == ch)
+            return (void *)b;
+        b++;
+    }
+    return 0;
+}
+
+void *memrchr(const void *p, int c, unsigned long n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    unsigned char ch = (unsigned char)c;
+
+    while (n > 0) {
+        n--;
+        if (b[n] == ch)
+            return (void *)(b + n);
+    }
+    return 0;
+}
+
 unsigned long strlen(const char *s)
 {
     const char *p = s;
@@ -62,6 +88,15 @@ unsigned long strlen(const char *s)
     while (*p)
         p++;
     return (unsigned long)(p - s);
+}
+
+unsigned long strnlen(const char *s, unsigned long max)
+{
+    unsigned long n = 0;
+
+    while (n < max && s[n])
+        n++;
+    return n;
 }
 
 int strcmp(const char *a, const char *b)
@@ -153,6 +188,33 @@ char *strrchr(const char *s, int c)
     }
 }
 
+unsigned long strspn(const char *s, const char *accept)
+{
+    unsigned long n = 0;
+
+    while (s[n] && strchr(accept, s[n]))
+        n++;
+    return n;
+}
+
+unsigned long strcspn(const char *s, const char *reject)
+{
+    unsigned long n = 0;
+
+    while (s[n] && !strchr(reject, s[n]))
+        n++;
+    return n;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    for (; *s; s++) {
+        if (strchr(accept, *s))
+            return (char *)s;
+    }
+    return 0;
+}
+
 char *strstr(const char *hay, const char *needle)
 {
     unsigned long nlen = strlen(needle);
@@ -166,6 +228,29 @@ char *strstr(const char *hay, const char *needle)
     return 0;
 }
 
+char *strtok(char *s, const char *delim)
+{
+    static char *save;
+    char *tok;
+
+    if (s == 0)
+        s = save;
+    if (s == 0)
+        return 0;
+
+    s += strspn(s, delim);
+    if (*s == '\0') {
+        save = s;
+        return 0;
+    }
+    tok = s;
+    s += strcspn(s, delim);
+    if (*s != '\0')
+        *s++ = '\0';
+    save = s;
+    return tok;
+}
+
 char *strdup(const char *s)
 {
     unsigned long len = strlen(s);
@@ -173,5 +258,17 @@ char *strdup(const char *s)
 
     if (p)
         memcpy(p, s, len + 1);
+    return p;
+}
+
+char *strndup(const char *s, unsigned long n)
+{
+    unsigned long len = strnlen(s, n);
+    char *p = (char *)malloc(len + 1);
+
+    if (p) {
+        memcpy(p, s, len);
+        p[len] = '\0';
+    }
     return p;
 }

@@ -559,6 +559,8 @@ def run_host_tests(tc):
             r("libweb/html.c"), r("libweb/css.c"), r("libweb/url.c"),
             r("libweb/storage.c"), r("libweb/jsdom.c"), r("libtls/hash.c"),
         ] + rel_glob("libjs/*.c"), ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
+        ("test_libc_string", [r("tools/test_libc_string.c")],
+         ["-fno-builtin", "-Ilibc/include"]),
     ]
 
     for name, srcs, flags in suites:
@@ -691,6 +693,7 @@ def generate_compile_commands(tc):
         ("tools/test_layout.c", ["-DPAINT_WITH_STDIO", "-Ilibweb", "-Ilibimg", "-Ilibz", "-Ilibgui", "-Iabi"]),
         ("tools/test_jsdom.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("tools/test_browser_stack.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Itools/browser-host", "-Ilibgui", "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs"]),
+        ("tools/test_libc_string.c", ["-fno-builtin", "-Ilibc/include"]),
     ]
     for rel, extra in host_suites:
         if os.path.isfile(r(rel)):
