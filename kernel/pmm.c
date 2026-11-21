@@ -147,8 +147,12 @@ void pmm_free(uint64_t phys)
 
 void pmm_free_contig(uint64_t phys, int npages)
 {
-    if (npages <= 0)
-        panic("pmm: free_contig of %d pages at %lx", npages, phys);
+    /* Bound the entire run up front: a corrupted page count must panic
+     * before the run's first valid frames are handed back to the free
+     * pool, not halfway through when the bitmap check trips. */
+    if (npages <= 0 || phys >= MAX_PHYS ||
+        (uint64_t)npages > (MAX_PHYS - phys) / PAGE_SIZE)
+        panic("pmm: bad free_contig of %d pages at %lx", npages, phys);
     for (int i = 0; i < npages; i++)
         pmm_free(phys + (uint64_t)i * PAGE_SIZE);
 }

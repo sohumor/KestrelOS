@@ -33,6 +33,13 @@ static uint64_t *walk_create(uint64_t *table, int idx, uint64_t flags)
 
 void vmm_map_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 {
+    /* phys is OR-ed straight into the PTE: an unaligned or >52-bit frame
+     * would silently become flag bits, and an unaligned virt would map a
+     * neighbouring page. This symbol is exported to modules, so bad input
+     * must be a panic, not a mis-programmed page table. */
+    if (!pml4 || (virt & (PAGE_SIZE - 1)) ||
+        (phys & ~0x000FFFFFFFFFF000ULL))
+        panic("vmm: bad map %lx -> %lx", virt, phys);
     uint64_t irq = spin_lock_irqsave(&page_table_lock);
     int i4 = (virt >> 39) & 511;
     int i3 = (virt >> 30) & 511;
@@ -50,6 +57,9 @@ void vmm_map_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags)
 static void map_2mb(uint64_t *pml4, uint64_t virt, uint64_t phys,
                     uint64_t flags)
 {
+    if (!pml4 || (virt & (0x200000 - 1)) || (phys & (0x200000 - 1)) ||
+        (phys & ~0x000FFFFFFFFFF000ULL))
+        panic("vmm: bad 2M map %lx -> %lx", virt, phys);
     int i4 = (virt >> 39) & 511;
     int i3 = (virt >> 30) & 511;
     int i2 = (virt >> 21) & 511;
