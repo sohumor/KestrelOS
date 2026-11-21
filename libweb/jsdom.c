@@ -5104,7 +5104,9 @@ static int style_item(js_ctx *c, js_value t,
     X(text_transform,        "textTransform",         "text-transform") \
     X(text_overflow,         "textOverflow",          "text-overflow") \
     X(letter_spacing,        "letterSpacing",         "letter-spacing") \
+    X(word_spacing,          "wordSpacing",           "word-spacing") \
     X(word_break,            "wordBreak",             "word-break") \
+    X(table_layout,          "tableLayout",           "table-layout") \
     X(vertical_align,        "verticalAlign",         "vertical-align") \
     X(line_height,           "lineHeight",            "line-height") \
     X(list_style,            "listStyle",             "list-style") \

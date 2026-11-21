@@ -131,8 +131,8 @@ OPTIONS = [
            help="Stage the .kpkg repository into the disk image so "
                 "`kpkg install` works offline."),
     Option("CONFIG_APPS_GAMES", "y",
-           apps=["snake"],
-           help="Games: apps/snake.c."),
+           apps=["snake", "life"],
+           help="Games: apps/snake.c, apps/life.c."),
 ]
 
 BY_NAME = dict((o.name, o) for o in OPTIONS)

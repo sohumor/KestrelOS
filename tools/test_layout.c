@@ -1548,6 +1548,59 @@ static void test_table_fixed(void)
     tfree(t);
 }
 
+static void test_table_layout_property(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *tbf = st_disp(t, CSS_DISPLAY_TABLE);
+    struct computed_style *tba = st_disp(t, CSS_DISPLAY_TABLE);
+    struct computed_style *tr = st_disp(t, CSS_DISPLAY_TABLE_ROW);
+    struct computed_style *td = st_disp(t, CSS_DISPLAY_TABLE_CELL);
+    struct dom_node *d, *ftab, *atab, *r;
+    struct dom_node *fc1, *fc2, *ac1, *ac2;
+    struct lay_document *L;
+    struct lay_box *b1, *b2;
+
+    GROUP("tables: declared table-layout fixed splits free columns evenly");
+
+    /* No cell declares a width, so the shape heuristic would not fire.
+     * The declared fixed layout must split both columns evenly, while the
+     * identical auto table lets the wide text claim the second column. */
+    tbf->table_layout = CSS_TABLELAYOUT_FIXED;
+    tbf->width = LPX(300);
+    tba->width = LPX(300);
+
+    d = el(t, 0, "div", root);
+    ftab = el(t, d, "table", tbf);
+    r = el(t, ftab, "tr", tr);
+    fc1 = el(t, r, "td", td);
+    txt(t, fc1, "a");
+    fc2 = el(t, r, "td", td);
+    txt(t, fc2, "a very long piece of text that would otherwise widen this column");
+
+    atab = el(t, d, "table", tba);
+    r = el(t, atab, "tr", tr);
+    ac1 = el(t, r, "td", td);
+    txt(t, ac1, "a");
+    ac2 = el(t, r, "td", td);
+    txt(t, ac2, "a very long piece of text that would otherwise widen this column");
+
+    L = run(t, d, 600, 400);
+
+    b1 = box_nth(L, fc1, 0);
+    b2 = box_nth(L, fc2, 0);
+    CHECK_EQ(b1->w, 150);
+    CHECK_EQ(b2->w, 150);
+    CHECK_EQ(box_nth(L, ftab, 0)->w, 300);
+
+    b1 = box_nth(L, ac1, 0);
+    b2 = box_nth(L, ac2, 0);
+    CHECK(b2->w > b1->w);
+
+    lay_free(L);
+    tfree(t);
+}
+
 static void test_table_row_index_capacity(void)
 {
     GROUP("tables: configured row limit fits the public zero-based row index");
@@ -2904,6 +2957,7 @@ static void rnd_style(struct computed_style *cs)
     cs->word_break = (uint8_t)rnd(CSS_WORDBREAK_COUNT);
     cs->overflow_wrap = (uint8_t)rnd(CSS_OVERFLOWWRAP_COUNT);
     cs->letter_spacing = rnd(4) ? 0 : ((int32_t)rnd(7) - 2);
+    cs->word_spacing = rnd(4) ? 0 : ((int32_t)rnd(9) - 3);
     if (rnd(6) == 0) {
         cs->has_transform = 1;
         cs->translate_x = rnd_len(1);
@@ -4297,6 +4351,54 @@ static void test_text_modern_layout(void)
     tfree(t);
 }
 
+static void test_word_spacing(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *norm = st_block(t);
+    struct computed_style *wide = st_block(t);
+    struct computed_style *pre = st_block(t);
+    struct dom_node *d, *nn, *nw, *np;
+    struct lay_document *L;
+    struct lay_box *l, *tb;
+
+    GROUP("inline: word-spacing widens word separators");
+
+    root->width = LPX(200);
+    wide->word_spacing = 6;
+    pre->white_space = CSS_WHITESPACE_PRE;
+    pre->word_spacing = 4;
+
+    d = el(t, 0, "div", root);
+    nn = el(t, d, "div", norm);
+    txt(t, nn, "ab cd");
+    nw = el(t, d, "div", wide);
+    txt(t, nw, "ab cd");
+    np = el(t, d, "div", pre);
+    txt(t, np, "a  b");
+
+    L = run(t, d, 200, 200);
+
+    /* FONT_BODY w=8: "ab cd" is 5 glyph cells = 40px. */
+    l = first_line(lay_box_for_node(L, nn));
+    CHECK_EQ(l->w, 8 * 5);
+
+    /* word-spacing 6: the one collapsed space is 8+6 wide. Frags
+     * coalesce, so the whole run is one text box of 46px. */
+    l = first_line(lay_box_for_node(L, nw));
+    CHECK_EQ(l->w, 8 * 5 + 6);
+    tb = first_text(l);
+    CHECK(tb && tb->text_len == 5);
+    CHECK_EQ(tb->w, 8 * 5 + 6);
+
+    /* pre "a  b": both preserved spaces are separators, +4 each. */
+    l = first_line(lay_box_for_node(L, np));
+    CHECK_EQ(l->w, 8 * 4 + 2 * 4);
+
+    lay_free(L);
+    tfree(t);
+}
+
 static void test_transform_layout(void)
 {
     struct tctx *t = tnew();
@@ -4453,6 +4555,7 @@ int main(int argc, char **argv)
     test_table_auto();
     test_table_spacing_and_span();
     test_table_fixed();
+    test_table_layout_property();
     test_table_row_index_capacity();
 
     test_replaced();
@@ -4485,6 +4588,7 @@ int main(int argc, char **argv)
     test_flex_grid_modern();
     test_outline_paint();
     test_text_modern_layout();
+    test_word_spacing();
     test_transform_layout();
 
     render_pages();

@@ -311,6 +311,11 @@ enum { CSS_WORDBREAK_LIST(CSS_ENUM_X) CSS_WORDBREAK_COUNT };
     X(CSS_OVERFLOWWRAP_ANYWHERE,   "anywhere")
 enum { CSS_OVERFLOWWRAP_LIST(CSS_ENUM_X) CSS_OVERFLOWWRAP_COUNT };
 
+#define CSS_TABLELAYOUT_LIST(X) \
+    X(CSS_TABLELAYOUT_AUTO,  "auto") \
+    X(CSS_TABLELAYOUT_FIXED, "fixed")
+enum { CSS_TABLELAYOUT_LIST(CSS_ENUM_X) CSS_TABLELAYOUT_COUNT };
+
 /* font-size keywords survive parsing because "smaller" and "larger" need
  * the parent's font size, which only the cascade knows. */
 #define CSS_FONTSIZEKW_LIST(X) \
@@ -439,7 +444,9 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_WORD_BREAK,          "word-break") \
     X(CSS_PROP_OVERFLOW_WRAP,       "overflow-wrap") \
     X(CSS_PROP_LETTER_SPACING,      "letter-spacing") \
-    X(CSS_PROP_TRANSFORM,           "transform")
+    X(CSS_PROP_TRANSFORM,           "transform") \
+    X(CSS_PROP_WORD_SPACING,        "word-spacing") \
+    X(CSS_PROP_TABLE_LAYOUT,        "table-layout")
 enum { CSS_PROP_LIST(CSS_ENUM_X) CSS_PROP_COUNT };
 
 /* ------------------------------------------------------------------ *
@@ -731,6 +738,7 @@ struct computed_style {
     uint8_t flex_direction, flex_wrap, justify_content, align_items;
     uint8_t align_self, object_fit, outline_style;
     uint8_t text_overflow, word_break, overflow_wrap;
+    uint8_t table_layout;
     uint8_t box_sizing, color_scheme;
     uint8_t border_style[4];
     uint8_t z_auto;
@@ -750,6 +758,7 @@ struct computed_style {
     int32_t order;                       /* flex / grid item order      */
     int32_t aspect_ratio;                /* thousandths, 0 = auto       */
     int32_t letter_spacing;              /* px, 0 = normal              */
+    int32_t word_spacing;                /* px, 0 = normal              */
     int32_t vertical_align_px;           /* when vertical_align == LENGTH */
     int32_t flex_grow;                   /* unitless, thousandths        */
     int32_t flex_shrink;                 /* unitless, thousandths (1000) */

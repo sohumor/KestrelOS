@@ -73,12 +73,21 @@ def detect_toolchain():
     }
 
 
+def shell_join(cmd):
+    """Render a command list as a copy-pasteable shell line."""
+    try:
+        return shlex.join([str(c) for c in cmd])
+    except AttributeError:  # Python < 3.8
+        return " ".join(str(c) for c in cmd)
+
+
 def run_cmd(cmd, cwd=ROOT, env=None):
     p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0:
-        raise RuntimeError("Command failed (%d): %s\n%s" % (
-            p.returncode, " ".join(cmd), p.stdout))
+        raise RuntimeError("command failed (exit %d): %s%s%s" % (
+            p.returncode, shell_join(cmd),
+            "\n" if p.stdout.strip() else "", p.stdout))
     if p.stdout.strip():
         sys.stdout.write(p.stdout)
 
@@ -88,10 +97,20 @@ def parse_depfile(dep_path):
         return []
     with open(dep_path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
-    text = text.replace("\\\n", " ")
-    if ":" not in text:
+    # Normalize line endings (clang writes CRLF on Windows) and unwrap
+    # '\' line continuations so the whole first rule sits on one line.
+    text = text.replace("\r\n", "\n").replace("\\\n", " ")
+    # Keep only the first logical rule. With -MP the file then lists phony
+    # targets ('kernel/include/foo.h:'); reading those as dependencies
+    # would invent files that never exist and force a rebuild every time.
+    first_rule = text.split("\n", 1)[0]
+    # The target/dependency separator is the first ':' followed by
+    # whitespace or EOL. This skips the drive colon in absolute Windows
+    # targets like 'C:\repo\build\kernel/main.o: deps...'.
+    m = re.search(r":(?=\s|$)", first_rule)
+    if not m:
         return []
-    _, rhs = text.split(":", 1)
+    rhs = first_rule[m.end():]
     deps = []
     cur = []
     i = 0
@@ -126,14 +145,31 @@ def needs_rebuild(out_path, inputs, dep_path=None):
     return False
 
 
+# Overridable via `build.py --jobs N` (set by main); default = all cores.
+MAX_WORKERS = os.cpu_count() or 4
+
+
 def compile_jobs(jobs):
     if not jobs:
         return
-    workers = min(len(jobs), os.cpu_count() or 4)
+    workers = min(len(jobs), MAX_WORKERS)
+    # Run every job to completion (like `make -k`) so one bad translation
+    # unit does not hide failures in the others, then report them all.
+    failed = []  # (job index, exception)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(run_cmd, cmd) for cmd in jobs]
-        for fut in futs:
-            fut.result()
+        futs = {ex.submit(run_cmd, cmd): i for i, cmd in enumerate(jobs)}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                fut.result()
+            except Exception as exc:
+                failed.append((futs[fut], exc))
+    if failed:
+        reports = []
+        for i, exc in sorted(failed):
+            # exc already carries the failing command line + captured output.
+            reports.append("----- job %d/%d -----\n%s" % (i + 1, len(jobs), exc))
+        raise RuntimeError("%d of %d build jobs failed:\n\n%s" % (
+            len(failed), len(jobs), "\n\n".join(reports)))
 
 
 def parse_config_mk(path):
@@ -520,7 +556,7 @@ def run_host_tests(tc):
           "-Wl,/opt:ref" if sys.platform == "win32" else "-Wl,--gc-sections"]),
         ("test_net_checksum", [r("kernel/net_checksum.c"), r("tools/test_net_checksum.c")],
          ["-Ikernel/include", "-Iabi"]),
-        ("test_dns", [r("kernel/dns.c"), r("tools/test_dns.c")],
+        ("test_dns", [r("tools/test_dns.c")],
          ["-Ikernel/include", "-Iabi"]),
         ("test_gui_primitives", [r("tools/test_gui_primitives.c"), r("libgui/draw.c"), r("libgui/font_data.c")],
          ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
@@ -559,6 +595,16 @@ def run_host_tests(tc):
             r("libweb/html.c"), r("libweb/css.c"), r("libweb/url.c"),
             r("libweb/storage.c"), r("libweb/jsdom.c"), r("libtls/hash.c"),
         ] + rel_glob("libjs/*.c"), ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
+        ("test_libc_string", [r("tools/test_libc_string.c")],
+         ["-fno-builtin", "-Ilibc/include", "-Iabi"]),
+        ("test_kstring", [r("tools/test_kstring.c")],
+         ["-fno-builtin", "-Ilibc/include"]),
+        ("test_libz", [r("tools/test_libz.c"), r("libz/inflate.c"),
+                       r("libz/adler32.c"), r("libz/crc32.c")],
+         ["-Ilibz"]),
+        ("test_kcrypto", [r("tools/test_kcrypto.c"), r("libtls/bignum.c"),
+                          r("libtls/ecc.c")],
+         ["-Ilibtls"]),
     ]
 
     for name, srcs, flags in suites:
@@ -691,6 +737,10 @@ def generate_compile_commands(tc):
         ("tools/test_layout.c", ["-DPAINT_WITH_STDIO", "-Ilibweb", "-Ilibimg", "-Ilibz", "-Ilibgui", "-Iabi"]),
         ("tools/test_jsdom.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("tools/test_browser_stack.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Itools/browser-host", "-Ilibgui", "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs"]),
+        ("tools/test_libc_string.c", ["-fno-builtin", "-Ilibc/include", "-Iabi"]),
+        ("tools/test_kstring.c", ["-fno-builtin", "-Ilibc/include"]),
+        ("tools/test_libz.c", ["-Ilibz"]),
+        ("tools/test_kcrypto.c", ["-Ilibtls"]),
     ]
     for rel, extra in host_suites:
         if os.path.isfile(r(rel)):
@@ -714,7 +764,13 @@ def main():
                     help="extra GDB arguments, e.g. batch commands (default: GDB_FLAGS)")
     ap.add_argument("--nic", default="rtl8139")
     ap.add_argument("--cpus", type=int, default=2)
+    ap.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                    help="parallel compile/link workers (default: all cores)")
     args = ap.parse_args()
+
+    if args.jobs > 0:
+        global MAX_WORKERS
+        MAX_WORKERS = args.jobs
 
     if args.action == "gdb":
         gdb = find_tool([os.environ.get("GDB", "gdb")])
@@ -758,4 +814,13 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except RuntimeError as exc:
+        # Build/tooling errors are expected failures: report them without a
+        # Python traceback so the actual compiler output is what stands out.
+        print("build.py: error: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("build.py: interrupted", file=sys.stderr)
+        sys.exit(130)

@@ -251,6 +251,7 @@ static const char *const kw_alignself[]   = { CSS_ALIGNSELF_LIST(CSS_STR_X) 0 };
 static const char *const kw_textoverflow[]= { CSS_TEXTOVERFLOW_LIST(CSS_STR_X) 0 };
 static const char *const kw_wordbreak[]   = { CSS_WORDBREAK_LIST(CSS_STR_X) 0 };
 static const char *const kw_overflowwrap[]= { CSS_OVERFLOWWRAP_LIST(CSS_STR_X) 0 };
+static const char *const kw_tablelayout[] = { CSS_TABLELAYOUT_LIST(CSS_STR_X) 0 };
 
 /* ================================================================== *
  * initial values
@@ -344,12 +345,14 @@ void css_style_initial(struct computed_style *cs)
     cs->text_overflow = CSS_TEXTOVERFLOW_CLIP;
     cs->word_break = CSS_WORDBREAK_NORMAL;
     cs->overflow_wrap = CSS_OVERFLOWWRAP_NORMAL;
+    cs->table_layout = CSS_TABLELAYOUT_AUTO;
     cs->outline_width = 0;
     cs->outline_offset = 0;
     cs->outline_color = CSS_RGB(0, 0, 0);
     cs->order = 0;
     cs->aspect_ratio = 0;
     cs->letter_spacing = 0;
+    cs->word_spacing = 0;
     cs->has_transform = 0;
     cs->translate_x = len_px(0);
     cs->translate_y = len_px(0);
@@ -501,6 +504,8 @@ static void copy_prop(struct computed_style *d, const struct computed_style *s,
     case CSS_PROP_WORD_BREAK:      d->word_break = s->word_break; break;
     case CSS_PROP_OVERFLOW_WRAP:   d->overflow_wrap = s->overflow_wrap; break;
     case CSS_PROP_LETTER_SPACING:  d->letter_spacing = s->letter_spacing; break;
+    case CSS_PROP_WORD_SPACING:    d->word_spacing = s->word_spacing; break;
+    case CSS_PROP_TABLE_LAYOUT:    d->table_layout = s->table_layout; break;
     case CSS_PROP_TRANSFORM:
         d->has_transform = s->has_transform;
         d->translate_x = s->translate_x;
@@ -2427,7 +2432,8 @@ static int apply_direct_raw_prop(struct style_engine *se,
     case CSS_PROP_OBJECT_FIT:
     case CSS_PROP_TEXT_OVERFLOW:
     case CSS_PROP_WORD_BREAK:
-    case CSS_PROP_OVERFLOW_WRAP: {
+    case CSS_PROP_OVERFLOW_WRAP:
+    case CSS_PROP_TABLE_LAYOUT: {
         const char *const *tbl = 0;
         int k = -1;
         if (!buf[0]) return 0;
@@ -2467,6 +2473,7 @@ static int apply_direct_raw_prop(struct style_engine *se,
         case CSS_PROP_TEXT_OVERFLOW:  tbl = kw_textoverflow; break;
         case CSS_PROP_WORD_BREAK:     tbl = kw_wordbreak; break;
         case CSS_PROP_OVERFLOW_WRAP:  tbl = kw_overflowwrap; break;
+        case CSS_PROP_TABLE_LAYOUT:   tbl = kw_tablelayout; break;
         default: break;
         }
         if (k < 0 && tbl)
@@ -2496,6 +2503,7 @@ static int apply_direct_raw_prop(struct style_engine *se,
         case CSS_PROP_TEXT_OVERFLOW:  cs->text_overflow = (uint8_t)k; break;
         case CSS_PROP_WORD_BREAK:     cs->word_break = (uint8_t)k; break;
         case CSS_PROP_OVERFLOW_WRAP:  cs->overflow_wrap = (uint8_t)k; break;
+        case CSS_PROP_TABLE_LAYOUT:   cs->table_layout = (uint8_t)k; break;
         default: break;
         }
         return 1;
@@ -2907,6 +2915,16 @@ static int apply_direct_raw_prop(struct style_engine *se,
         if (!eval_len_str(se, s, len, cs->font_size, root_fs, 1, 0, 0, 0, &l))
             return 0;
         cs->letter_spacing = l.v;
+        return 1;
+
+    case CSS_PROP_WORD_SPACING:
+        if (buf[0] && s_stricmp(buf, "normal") == 0) {
+            cs->word_spacing = 0;
+            return 1;
+        }
+        if (!eval_len_str(se, s, len, cs->font_size, root_fs, 1, 0, 0, 0, &l))
+            return 0;
+        cs->word_spacing = l.v;
         return 1;
 
     case CSS_PROP_TRANSFORM:
@@ -3662,6 +3680,16 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
             cs->letter_spacing = 0;
         else if (v->type == CSS_VAL_LENGTH)
             cs->letter_spacing = resolve_px(se, v, fs, root_fs);
+        break;
+    case CSS_PROP_WORD_SPACING:
+        if (v->type == CSS_VAL_KEYWORD)
+            cs->word_spacing = 0;
+        else if (v->type == CSS_VAL_LENGTH)
+            cs->word_spacing = resolve_px(se, v, fs, root_fs);
+        break;
+    case CSS_PROP_TABLE_LAYOUT:
+        if (v->type == CSS_VAL_KEYWORD)
+            cs->table_layout = (uint8_t)v->kw;
         break;
     case CSS_PROP_Z_INDEX:
         if (v->type == CSS_VAL_AUTO) {

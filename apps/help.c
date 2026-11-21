@@ -52,6 +52,7 @@ static const struct cmd commands[] = {
     { "wc",        "count lines, words and bytes (-l, -w, -c)" },
     { "writefile", "type text into a file, finish with ctrl-D" },
     { "edit",      "full-screen text editor" },
+    { "banner",    "print large 5x5 ASCII-art text" },
 
     { "system", 0 },
     { "ps",        "list processes (PID, STATE, NAME)" },
@@ -70,6 +71,7 @@ static const struct cmd commands[] = {
 
     { "games", 0 },
     { "snake",     "the classic snake game" },
+    { "life",      "Conway's Game of Life with cell editor and stamps" },
 };
 
 int main(int argc, char **argv)

@@ -2363,6 +2363,17 @@ static void ifc_emit(struct lay_ifc *f, const struct lay_box *tb,
     f->pen += w;
 }
 
+/* The advance of the collapsed word separator awaiting emission: one
+ * character step plus the word-spacing of the element it belongs to.
+ * Clamped at zero - a negative-width separator would move the pen
+ * backwards and corrupt fragment metrics. */
+static int32_t ifc_space_advance(const struct lay_ifc *f)
+{
+    int32_t ws = f->sp_style ? f->sp_style->word_spacing : 0;
+    int32_t adv = text_char_step(f->sp_font, f->sp_style) + ws;
+    return adv > 0 ? adv : 0;
+}
+
 static void ifc_emit_space(struct lay_ifc *f)
 {
     struct lay_frag *fr;
@@ -2382,7 +2393,7 @@ static void ifc_emit_space(struct lay_ifc *f)
     fr->style = f->sp_style;
     fr->rec = f->sp_rec;
     fr->x = f->pen;
-    fr->w = text_char_step(f->sp_font, f->sp_style);
+    fr->w = ifc_space_advance(f);
     fr->is_space = 1;
     frag_metrics(f, fr, f->sp_style, f->sp_font, 0);
     f->pen += fr->w;
@@ -2397,8 +2408,7 @@ static void ifc_add_word(struct lay_ifc *f, struct lay_box *tb,
     int32_t step = text_char_step(font, tb->style);
     int32_t w_adv = text_width_adv(font, tb->style, n);
     int32_t w_vis = text_width_vis(font, tb->style, n);
-    int32_t sp = f->pending_space
-        ? text_char_step(f->sp_font, f->sp_style) : 0;
+    int32_t sp = f->pending_space ? ifc_space_advance(f) : 0;
     int break_all = tb->style->word_break == CSS_WORDBREAK_BREAK_ALL;
     int guard = 0;
 
@@ -2498,11 +2508,15 @@ static void ifc_add_text(struct lay_ifc *f, struct lay_box *tb)
                 j++;
             {
                 unsigned long len = j - i;
-                int32_t w = text_width_adv(tb->font, tb->style, len);
+                int32_t w = text_width_adv(tb->font, tb->style, len) +
+                            tb->style->word_spacing * (int32_t)len;
 
                 /* Preserved spaces are NOT trimmed at the end of a
                  * line - that is the whole point of `pre` - so they are
-                 * marked 2 rather than 1. */
+                 * marked 2 rather than 1. Each one is a word separator,
+                 * so word-spacing applies to all of them. */
+                if (w < 0)
+                    w = 0;
                 ifc_emit(f, tb, t + i, len, w, 2);
             }
             i = j;
@@ -2562,7 +2576,7 @@ static void ifc_add_atomic(struct lay_ifc *f, struct lay_box *b)
                           f->depth + 1);
     mb = lay_margin_rect(b);
     w = mb.w;
-    sp = f->pending_space ? f->sp_font->w : 0;
+    sp = f->pending_space ? ifc_space_advance(f) : 0;
     if (wrap && f->pen + sp + w > ifc_avail(f) && f->pen > 0 &&
         ifc_has_content(f)) {
         f->pending_space = 0;
@@ -5337,11 +5351,12 @@ static void table_intrinsic(struct lay_ctx *c, struct lay_box *t,
     *maxw = smax;
 }
 
-/* Is this a fixed-layout table? computed_style has no table-layout
- * property, so the decision is delegated; the fallback recognises the
- * shape a fixed table has - an explicit table width and an explicit
- * width on every cell of the first row - which is exactly the case where
- * the two algorithms are required to agree anyway. */
+/* Is this a fixed-layout table? An explicit `table-layout: fixed` wins;
+ * the opt callback can still override for callers with their own policy.
+ * The fallback recognises the shape a fixed table has - an explicit
+ * table width and an explicit width on every cell of the first row -
+ * which is exactly the case where the two algorithms are required to
+ * agree anyway. */
 static int table_is_fixed(struct lay_ctx *c, struct lay_box *t)
 {
     struct lay_box *g, *r, *cell;
@@ -5349,6 +5364,8 @@ static int table_is_fixed(struct lay_ctx *c, struct lay_box *t)
 
     if (c->L->opt.table_layout && t->node)
         return c->L->opt.table_layout(c->L->opt.table_ctx, t->node) != 0;
+    if (t->style->table_layout == CSS_TABLELAYOUT_FIXED)
+        return 1;
     if (len_is_auto(t->style->width))
         return 0;
     for (g = t->first_child; g; g = g->next) {

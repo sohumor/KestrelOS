@@ -3,6 +3,26 @@
 #include <stdio.h>
 #include <string.h>
 #include "net.h"
+#include "spinlock.h"
+
+/* dns.c takes dns_lock via spin_lock_irqsave(), whose host build would emit
+ * the privileged cli/sti pair (user-mode #GP).  Route irq locking through
+ * plain host spin_lock/unlock like test_tcp_rst.c does. */
+static uint64_t host_lock(spinlock_t *lock)
+{
+    spin_lock(lock);
+    return 0;
+}
+
+static void host_unlock(spinlock_t *lock, uint64_t flags)
+{
+    (void)flags;
+    spin_unlock(lock);
+}
+
+#define spin_lock_irqsave host_lock
+#define spin_unlock_irqrestore host_unlock
+#include "../kernel/dns.c"
 
 static uint8_t response[512];
 static int length, mode, checks, failures;

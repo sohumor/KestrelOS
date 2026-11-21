@@ -30,6 +30,23 @@ int blockdev_write(struct blockdev *bd, uint64_t lba, uint32_t n, const void *bu
     return 0;
 }
 
+/* Stubs for kernel deps kfs.c grew after this harness was written (VFS
+ * access policy, fs registration, heap).  The readdir path under test only
+ * touches the RAM disk; PE linkers still need every symbol resolved. */
+int fs_register(struct fs_type *t) { (void)t; return 0; }
+void kprintf(const char *fmt, ...) { (void)fmt; }
+uint32_t vfs_uid(void) { return 0; }          /* root: everything allowed */
+uint32_t vfs_gid(void) { return 0; }
+int vfs_perm_ok(uint32_t mode, uint32_t uid, uint32_t gid, int want)
+{
+    (void)mode; (void)uid; (void)gid; (void)want; return 1;
+}
+int vfs_flags_allow_read(int flags) { (void)flags; return 1; }
+int vfs_flags_allow_write(int flags) { (void)flags; return 1; }
+uint32_t vfs_now(void) { return 1700000000; }
+void *kzalloc(size_t size) { return calloc(1, size); }
+void kfree(void *ptr) { free(ptr); }
+
 static void setup(struct kfs_fs *fs, int entries)
 {
     bcache_invalidate(NULL);

@@ -84,8 +84,14 @@ char *strcpy(char *dst, const char *src)
 char *strncpy(char *dst, const char *src, size_t n)
 {
     char *d = dst;
-    while (n && (*d++ = *src++))
+    /* Copy up to n bytes, then zero-fill to exactly n. Testing *d (not
+     * *d++) keeps the source NUL from consuming a pad slot — the old loop
+     * wrote n+1 bytes whenever src was shorter than n. */
+    while (n && (*d = *src)) {
+        d++;
+        src++;
         n--;
+    }
     while (n--)
         *d++ = 0;
     return dst;

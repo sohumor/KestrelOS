@@ -232,8 +232,14 @@ void hda_init(void)
     uint16_t codecs = r16(0x0E);
     w8(0x4C, 0);
     w8(0x5C, 0);
-    cp = pmm_alloc_contig(1);
-    rp = pmm_alloc_contig(1);
+    /* try_alloc, not pmm_alloc_contig: a missing audio device must
+     * fail init, not panic the kernel; fail: frees the other page. */
+    cp = pmm_try_alloc_contig(1);
+    rp = pmm_try_alloc_contig(1);
+    if (!cp || !rp) {
+        kprintf("hda: no contiguous memory for corb/rirb\n");
+        goto fail;
+    }
     corb = P2V(cp);
     rirb = P2V(rp);
     w32(0x40, cp); w32(0x44, cp >> 32);
@@ -259,8 +265,16 @@ void hda_init(void)
     w8(sd, 0);
     if (!wait32(sd, 1, 0))
         goto fail;
-    uint64_t pp = pmm_alloc_contig(PCM_BYTES / PAGE_SIZE);
-    uint64_t bp = pmm_alloc_contig(1);
+    uint64_t pp = pmm_try_alloc_contig(PCM_BYTES / PAGE_SIZE);
+    uint64_t bp = pmm_try_alloc_contig(1);
+    if (!pp || !bp) {
+        if (pp)
+            pmm_free_contig(pp, PCM_BYTES / PAGE_SIZE);
+        if (bp)
+            pmm_free_contig(bp, 1);
+        kprintf("hda: no contiguous memory for pcm buffer\n");
+        goto fail;
+    }
     struct hda_bdl *bdl = P2V(bp);
     pcm = P2V(pp);
     for (unsigned int i = 0; i < PCM_BYTES / PAGE_SIZE; i++) {
