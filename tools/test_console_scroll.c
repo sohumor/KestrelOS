@@ -31,6 +31,17 @@ void fb_flush(void)
     assert(!"scroll must not request a full framebuffer flush");
 }
 
+/* Stubs for fb.h entry points used by console_init()/console_clear_locked().
+ * Those functions are never called here, but PE linkers ignore
+ * -Wl,--gc-sections so the symbols must still resolve on Windows. */
+bool fb_present(void) { return true; }
+uint32_t fb_width(void) { return CON_MAX_COLS * FONT_W; }
+uint32_t fb_height(void) { return CON_MAX_ROWS * FONT_H; }
+void fb_fill_rect(int x, int y, int w, int h, uint32_t rgb)
+{
+    (void)x; (void)y; (void)w; (void)h; (void)rgb;
+}
+
 static void verify(void)
 {
     for (int r = 0; r < con_h; r++)
