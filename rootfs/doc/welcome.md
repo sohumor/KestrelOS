@@ -34,6 +34,7 @@ Try these at the `kestrel:/$ ` prompt:
 ## Fun
 
     snake                   you know what this is
+    life                    Conway's Game of Life (space pauses, x edits)
 
 ## The shell
 

@@ -52,7 +52,7 @@
 /* Stage the .kpkg repository into the disk image so `kpkg install` works offline. */
 #define CONFIG_PACKAGES 1
 
-/* Games: apps/snake.c. */
+/* Games: apps/snake.c, apps/life.c. */
 #define CONFIG_APPS_GAMES 1
 
 #endif /* KESTREL_CONFIG_H */
