@@ -15,7 +15,7 @@
 - Store major milestones, subtle hardware/QEMU quirks, and bug root causes with `mem0.cmd add "..."` and retrieve context with `mem0.cmd search "..."`.
 
 ## Build, Verification & Budget Invariants
-- Keep `Makefile` and `tools/build.py` in lockstep when adding host tests or special link rules.
+- Keep `Makefile` and `tools/build.py` in lockstep when adding host tests or special link rules; new public `.PHONY` targets or build.py subcommands must also be accounted for in `tools/check_build_parity.py` `COMMANDS`/`MAKE_ONLY` (CI runs it first).
 - Budgets: `build/kernel.bin < 900 KiB` (hard limit 992 KiB); every file under `build/rootfs/` `< 3.7 MiB` (KFS per-file cap ~4.04 MiB); browser C call stacks under the 64 KiB guarded stack limit (heap-allocate large state structs via `calloc`, mark deep pipelines `BROWSER_NOINLINE`).
 - E2E invariants: do NOT alter `/compat` fixture behavior in `tools/e2e.py`; `rootfs/doc/home.html` rendered text must preserve `KestrelOS`, `HTML parser`, `Local pages`, and `TLS 1.3` in exact order.
 - PowerShell 5.1 does not support `&&`; chain commands with `; if ($LASTEXITCODE -eq 0) { ... }`.
