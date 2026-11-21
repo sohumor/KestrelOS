@@ -13,6 +13,8 @@ unsigned long strlen(const char *s);
 unsigned long strnlen(const char *s, unsigned long max);
 int strcmp(const char *a, const char *b);
 int strncmp(const char *a, const char *b, unsigned long n);
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, unsigned long n);
 char *strcpy(char *dst, const char *src);
 char *strncpy(char *dst, const char *src, unsigned long n);
 char *strcat(char *dst, const char *src);

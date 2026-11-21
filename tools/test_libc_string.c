@@ -28,6 +28,8 @@
 #define strnlen k_strnlen
 #define strcmp  k_strcmp
 #define strncmp k_strncmp
+#define strcasecmp  k_strcasecmp
+#define strncasecmp k_strncasecmp
 #define strcpy  k_strcpy
 #define strncpy k_strncpy
 #define strcat  k_strcat
@@ -43,6 +45,56 @@
 #define strndup k_strndup
 
 #include "../libc/string.c"
+
+/* Same treatment for the stdio wrappers under test.  <stdio.h> was
+ * included above before the renames took effect, so the reporting calls
+ * in this file keep resolving to the host printf while the target's
+ * public symbols become k_*. */
+#define printf    k_printf
+#define vprintf   k_vprintf
+#define snprintf  k_snprintf
+#define vsnprintf k_vsnprintf
+#define sprintf   k_sprintf
+#define vsprintf  k_vsprintf
+#define puts      k_puts
+#define putchar   k_putchar
+#define getchar   k_getchar
+#define write     k_write
+#define read      k_read
+
+#include "../libc/stdio.c"
+
+#undef printf
+
+/* The target console paths call kestrel read()/write(); the renames route
+ * them to these stubs.  Capturing k_printf keeps the fd-1 sink exercised. */
+static char g_capture_buf[512];
+static unsigned long g_capture_len;
+static int g_capturing;
+
+long k_write(int fd, const void *buf, unsigned long len)
+{
+    if (g_capturing && fd == 1) {
+        unsigned long room = sizeof(g_capture_buf) - 1 - g_capture_len;
+        unsigned long take = len < room ? len : room;
+        unsigned char *dst = (unsigned char *)g_capture_buf + g_capture_len;
+        const unsigned char *src = (const unsigned char *)buf;
+
+        while (take--)
+            *dst++ = *src++;
+        g_capture_len = (unsigned long)((char *)dst - g_capture_buf);
+        g_capture_buf[g_capture_len] = '\0';
+    }
+    return (long)len;
+}
+
+long k_read(int fd, void *buf, unsigned long len)
+{
+    (void)fd;
+    (void)buf;
+    (void)len;
+    return -1;
+}
 
 static int g_named;
 static int g_failed;
@@ -377,15 +429,75 @@ static void test_tok_dup(void)
     }
 }
 
+static void test_case_compare(void)
+{
+    named_result("strcasecmp equal after fold",
+                 k_strcasecmp("KeStReL", "kestrel") == 0, 0);
+    named_result("strcasecmp less", k_strcasecmp("abc", "ABD") < 0, 0);
+    named_result("strcasecmp greater", k_strcasecmp("b", "A") > 0, 0);
+    named_result("strcasecmp digits unchanged",
+                 k_strcasecmp("a1b2", "A1B2") == 0, 0);
+    named_result("strcasecmp high byte beats fold",
+                 k_strcasecmp("\xff", "z") > 0, 0);
+
+    named_result("strncasecmp equal within n",
+                 k_strncasecmp("aBc", "AbD", 2) == 0, 0);
+    named_result("strncasecmp differ within n",
+                 k_strncasecmp("aBc", "AbD", 3) < 0, 0);
+    named_result("strncasecmp n=0", k_strncasecmp("x", "y", 0) == 0, 0);
+    named_result("strncasecmp prefix then NUL",
+                 k_strncasecmp("ab", "ABC", 3) != 0, 0);
+    named_result("strncasecmp equal past NUL within n",
+                 k_strncasecmp("ab", "AB", 9) == 0, 0);
+}
+
+static void test_stdio_wrappers(void)
+{
+    char buf[64];
+    int rc;
+
+    rc = k_sprintf(buf, "%s %d %x", "kestrel", 42, 0xbeef);
+    named_result("sprintf returns length and writes string",
+                 rc == 15 && str_eq(buf, "kestrel 42 beef"), 0);
+    rc = k_sprintf(buf, "%c%c", 'h', 'i');
+    named_result("sprintf char conversion", rc == 2 && str_eq(buf, "hi"),
+                 0);
+
+    rc = k_snprintf(buf, 8, "%s", "abcdefgh");
+    named_result("snprintf still truncates and NUL-terminates",
+                 rc == 8 && str_eq(buf, "abcdefg"), 0);
+
+    g_capture_len = 0;
+    g_capture_buf[0] = '\0';
+    g_capturing = 1;
+    rc = k_printf("[%5d|%-4s]", 7, "x");
+    g_capturing = 0;
+    named_result("printf console path goes through write()",
+                 rc == 12 && str_eq(g_capture_buf, "[    7|x   ]"), 0);
+
+    g_capture_len = 0;
+    g_capture_buf[0] = '\0';
+    g_capturing = 1;
+    rc = k_puts("up");
+    g_capturing = 0;
+    named_result("puts appends newline via write()",
+                 rc == 3 && str_eq(g_capture_buf, "up\n"), 0);
+
+    named_result("getchar returns EOF on read error",
+                 k_getchar() == EOF, 0);
+}
+
 int main(void)
 {
-    printf("Kestrel target string.c regression\n");
+    printf("Kestrel target string.c + stdio wrappers regression\n");
     test_memory();
     test_word_paths();
     test_length_compare();
     test_copy_concat();
     test_search();
     test_tok_dup();
+    test_case_compare();
+    test_stdio_wrappers();
 
     printf("\nsummary: %d named assertions, %d failed\n", g_named, g_failed);
     return g_failed ? 1 : 0;

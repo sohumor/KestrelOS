@@ -18,6 +18,11 @@ int vprintf(const char *fmt, va_list ap);
 int snprintf(char *buf, unsigned long size, const char *fmt, ...)
     __attribute__((format(printf, 3, 4)));
 int vsnprintf(char *buf, unsigned long size, const char *fmt, va_list ap);
+/* Unbounded sprintf: writes into buf with no capacity check (as usual,
+ * the caller must guarantee the buffer is large enough). */
+int sprintf(char *buf, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+int vsprintf(char *buf, const char *fmt, va_list ap);
 
 int puts(const char *s);      /* writes s + '\n' to fd 1 */
 int putchar(int c);           /* writes one byte to fd 1, returns c */
