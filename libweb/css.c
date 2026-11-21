@@ -905,6 +905,7 @@ static const char *const kw_textoverflow[]= { CSS_TEXTOVERFLOW_LIST(CSS_STR_X) 0
 static const char *const kw_wordbreak[]   = { CSS_WORDBREAK_LIST(CSS_STR_X) 0 };
 static const char *const kw_overflowwrap[]= { CSS_OVERFLOWWRAP_LIST(CSS_STR_X) 0 };
 static const char *const kw_normal_only[] = { "normal", 0 };
+static const char *const kw_tablelayout[] = { CSS_TABLELAYOUT_LIST(CSS_STR_X) 0 };
 
 static const char *const prop_names[] = { CSS_PROP_LIST(CSS_STR_X) 0 };
 
@@ -1015,7 +1016,8 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_OVERFLOW_WRAP]       = { 1, 0, kw_overflowwrap },
     [CSS_PROP_LETTER_SPACING]      = { 1, PA_LEN|PA_NEG, kw_normal_only },
     [CSS_PROP_TRANSFORM]           = { 0, 0, kw_none_only },
-    [CSS_PROP_WORD_SPACING]        = { 1, PA_LEN|PA_NEG, kw_normal_only }
+    [CSS_PROP_WORD_SPACING]        = { 1, PA_LEN|PA_NEG, kw_normal_only },
+    [CSS_PROP_TABLE_LAYOUT]        = { 0, 0, kw_tablelayout }
 };
 
 static int css_stricmp_n(const char *a, const char *b, unsigned long n)

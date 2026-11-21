@@ -5351,11 +5351,12 @@ static void table_intrinsic(struct lay_ctx *c, struct lay_box *t,
     *maxw = smax;
 }
 
-/* Is this a fixed-layout table? computed_style has no table-layout
- * property, so the decision is delegated; the fallback recognises the
- * shape a fixed table has - an explicit table width and an explicit
- * width on every cell of the first row - which is exactly the case where
- * the two algorithms are required to agree anyway. */
+/* Is this a fixed-layout table? An explicit `table-layout: fixed` wins;
+ * the opt callback can still override for callers with their own policy.
+ * The fallback recognises the shape a fixed table has - an explicit
+ * table width and an explicit width on every cell of the first row -
+ * which is exactly the case where the two algorithms are required to
+ * agree anyway. */
 static int table_is_fixed(struct lay_ctx *c, struct lay_box *t)
 {
     struct lay_box *g, *r, *cell;
@@ -5363,6 +5364,8 @@ static int table_is_fixed(struct lay_ctx *c, struct lay_box *t)
 
     if (c->L->opt.table_layout && t->node)
         return c->L->opt.table_layout(c->L->opt.table_ctx, t->node) != 0;
+    if (t->style->table_layout == CSS_TABLELAYOUT_FIXED)
+        return 1;
     if (len_is_auto(t->style->width))
         return 0;
     for (g = t->first_child; g; g = g->next) {

@@ -327,9 +327,9 @@ static inline lay_rect lay_paint_rect(const struct lay_box *b)
  * height attributes, then to an alt-text sized placeholder. */
 typedef int (*lay_image_size_fn)(void *ctx, const char *url, int *w, int *h);
 
-/* 1 for `table-layout: fixed`, 0 for automatic. computed_style carries no
- * table-layout property today; when css.h grows one, wire it in here and
- * delete the heuristic in layout.c. */
+/* 1 for `table-layout: fixed`, 0 for automatic. When set, this callback
+ * overrides the computed table-layout property; with no callback the
+ * property wins and the layout.c heuristic is the last resort. */
 typedef int (*lay_table_layout_fn)(void *ctx, struct dom_node *table);
 
 struct lay_opts {

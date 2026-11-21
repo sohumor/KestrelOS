@@ -253,6 +253,7 @@ static const char *const d_alignself[] = { CSS_ALIGNSELF_LIST(X_STR) 0 };
 static const char *const d_textovf[]   = { CSS_TEXTOVERFLOW_LIST(X_STR) 0 };
 static const char *const d_wordbreak[] = { CSS_WORDBREAK_LIST(X_STR) 0 };
 static const char *const d_ovfwrap[]   = { CSS_OVERFLOWWRAP_LIST(X_STR) 0 };
+static const char *const d_tblayout[]  = { CSS_TABLELAYOUT_LIST(X_STR) 0 };
 
 static const char *kwname(const char *const *t, int v, int max)
 {
@@ -463,6 +464,10 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
         return 1;
     case CSS_PROP_WORD_SPACING:
         sprintf(out, "%dpx", (int)cs->word_spacing);
+        return 1;
+    case CSS_PROP_TABLE_LAYOUT:
+        strcpy(out, kwname(d_tblayout, cs->table_layout,
+                           CSS_TABLELAYOUT_COUNT));
         return 1;
     case CSS_PROP_TRANSFORM:
         if (!cs->has_transform) {
@@ -1345,6 +1350,22 @@ static const struct tcase cases[] = {
  "",
  "<p id=t style='word-spacing: 3px'/>", "t",
  "word-spacing=3px", 0},
+{"table-layout-fixed",
+ "#t { table-layout: fixed }",
+ "<table id=t/>", "t",
+ "table-layout=fixed", 0},
+{"table-layout-default-auto",
+ "#t { color: red }",
+ "<table id=t/>", "t",
+ "table-layout=auto", 0},
+{"table-layout-not-inherited",
+ "#a { table-layout: fixed }",
+ "<div id=a><table id=t/></div>", "t",
+ "table-layout=auto", 0},
+{"table-layout-inline-style",
+ "",
+ "<table id=t style='table-layout: fixed'/>", "t",
+ "table-layout=fixed", 0},
 {"transform-translate-pct-and-px",
  "#t { transform: translateX(-50%) translateY(-2px) }",
  "<div id=t/>", "t",

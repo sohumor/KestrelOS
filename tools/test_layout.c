@@ -1548,6 +1548,59 @@ static void test_table_fixed(void)
     tfree(t);
 }
 
+static void test_table_layout_property(void)
+{
+    struct tctx *t = tnew();
+    struct computed_style *root = st_block(t);
+    struct computed_style *tbf = st_disp(t, CSS_DISPLAY_TABLE);
+    struct computed_style *tba = st_disp(t, CSS_DISPLAY_TABLE);
+    struct computed_style *tr = st_disp(t, CSS_DISPLAY_TABLE_ROW);
+    struct computed_style *td = st_disp(t, CSS_DISPLAY_TABLE_CELL);
+    struct dom_node *d, *ftab, *atab, *r;
+    struct dom_node *fc1, *fc2, *ac1, *ac2;
+    struct lay_document *L;
+    struct lay_box *b1, *b2;
+
+    GROUP("tables: declared table-layout fixed splits free columns evenly");
+
+    /* No cell declares a width, so the shape heuristic would not fire.
+     * The declared fixed layout must split both columns evenly, while the
+     * identical auto table lets the wide text claim the second column. */
+    tbf->table_layout = CSS_TABLELAYOUT_FIXED;
+    tbf->width = LPX(300);
+    tba->width = LPX(300);
+
+    d = el(t, 0, "div", root);
+    ftab = el(t, d, "table", tbf);
+    r = el(t, ftab, "tr", tr);
+    fc1 = el(t, r, "td", td);
+    txt(t, fc1, "a");
+    fc2 = el(t, r, "td", td);
+    txt(t, fc2, "a very long piece of text that would otherwise widen this column");
+
+    atab = el(t, d, "table", tba);
+    r = el(t, atab, "tr", tr);
+    ac1 = el(t, r, "td", td);
+    txt(t, ac1, "a");
+    ac2 = el(t, r, "td", td);
+    txt(t, ac2, "a very long piece of text that would otherwise widen this column");
+
+    L = run(t, d, 600, 400);
+
+    b1 = box_nth(L, fc1, 0);
+    b2 = box_nth(L, fc2, 0);
+    CHECK_EQ(b1->w, 150);
+    CHECK_EQ(b2->w, 150);
+    CHECK_EQ(box_nth(L, ftab, 0)->w, 300);
+
+    b1 = box_nth(L, ac1, 0);
+    b2 = box_nth(L, ac2, 0);
+    CHECK(b2->w > b1->w);
+
+    lay_free(L);
+    tfree(t);
+}
+
 static void test_table_row_index_capacity(void)
 {
     GROUP("tables: configured row limit fits the public zero-based row index");
@@ -4502,6 +4555,7 @@ int main(int argc, char **argv)
     test_table_auto();
     test_table_spacing_and_span();
     test_table_fixed();
+    test_table_layout_property();
     test_table_row_index_capacity();
 
     test_replaced();
