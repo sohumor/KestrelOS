@@ -73,12 +73,21 @@ def detect_toolchain():
     }
 
 
+def shell_join(cmd):
+    """Render a command list as a copy-pasteable shell line."""
+    try:
+        return shlex.join([str(c) for c in cmd])
+    except AttributeError:  # Python < 3.8
+        return " ".join(str(c) for c in cmd)
+
+
 def run_cmd(cmd, cwd=ROOT, env=None):
     p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
                        stderr=subprocess.STDOUT, text=True)
     if p.returncode != 0:
-        raise RuntimeError("Command failed (%d): %s\n%s" % (
-            p.returncode, " ".join(cmd), p.stdout))
+        raise RuntimeError("command failed (exit %d): %s%s%s" % (
+            p.returncode, shell_join(cmd),
+            "\n" if p.stdout.strip() else "", p.stdout))
     if p.stdout.strip():
         sys.stdout.write(p.stdout)
 
@@ -130,10 +139,23 @@ def compile_jobs(jobs):
     if not jobs:
         return
     workers = min(len(jobs), os.cpu_count() or 4)
+    # Run every job to completion (like `make -k`) so one bad translation
+    # unit does not hide failures in the others, then report them all.
+    failed = []  # (job index, exception)
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = [ex.submit(run_cmd, cmd) for cmd in jobs]
-        for fut in futs:
-            fut.result()
+        futs = {ex.submit(run_cmd, cmd): i for i, cmd in enumerate(jobs)}
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                fut.result()
+            except Exception as exc:
+                failed.append((futs[fut], exc))
+    if failed:
+        reports = []
+        for i, exc in sorted(failed):
+            # exc already carries the failing command line + captured output.
+            reports.append("----- job %d/%d -----\n%s" % (i + 1, len(jobs), exc))
+        raise RuntimeError("%d of %d build jobs failed:\n\n%s" % (
+            len(failed), len(jobs), "\n\n".join(reports)))
 
 
 def parse_config_mk(path):
@@ -758,4 +780,13 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except RuntimeError as exc:
+        # Build/tooling errors are expected failures: report them without a
+        # Python traceback so the actual compiler output is what stands out.
+        print("build.py: error: %s" % exc, file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("build.py: interrupted", file=sys.stderr)
+        sys.exit(130)
