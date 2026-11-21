@@ -439,7 +439,8 @@ enum { CSS_FONTWEIGHTKW_LIST(CSS_ENUM_X) CSS_FONTWEIGHTKW_COUNT };
     X(CSS_PROP_WORD_BREAK,          "word-break") \
     X(CSS_PROP_OVERFLOW_WRAP,       "overflow-wrap") \
     X(CSS_PROP_LETTER_SPACING,      "letter-spacing") \
-    X(CSS_PROP_TRANSFORM,           "transform")
+    X(CSS_PROP_TRANSFORM,           "transform") \
+    X(CSS_PROP_WORD_SPACING,        "word-spacing")
 enum { CSS_PROP_LIST(CSS_ENUM_X) CSS_PROP_COUNT };
 
 /* ------------------------------------------------------------------ *
@@ -750,6 +751,7 @@ struct computed_style {
     int32_t order;                       /* flex / grid item order      */
     int32_t aspect_ratio;                /* thousandths, 0 = auto       */
     int32_t letter_spacing;              /* px, 0 = normal              */
+    int32_t word_spacing;                /* px, 0 = normal              */
     int32_t vertical_align_px;           /* when vertical_align == LENGTH */
     int32_t flex_grow;                   /* unitless, thousandths        */
     int32_t flex_shrink;                 /* unitless, thousandths (1000) */

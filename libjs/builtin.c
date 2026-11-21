@@ -4583,6 +4583,70 @@ static int bi_math_imul(js_ctx *ctx, js_value t, int argc, js_value *argv,
     return JS_OK;
 }
 
+static int bi_math_cbrt(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    double d = 0.0, a;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    a = js_pow(js_fabs(d), 1.0 / 3.0);
+    /* The cube root is odd: cbrt(-x) = -cbrt(x), and -0 -> -0. */
+    if (d < 0.0 || (d == 0.0 && 1.0 / d < 0.0))
+        a = -a;
+    *ret = js_number(a);
+    return JS_OK;
+}
+
+static int bi_math_log2(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                        js_value *ret)
+{
+    double d = 0.0;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    *ret = js_number(js_log(d) / 0.6931471805599453);
+    return JS_OK;
+}
+
+static int bi_math_log10(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    double d = 0.0;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    *ret = js_number(js_log(d) / 2.302585092994046);
+    return JS_OK;
+}
+
+static int bi_math_fround(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    double d = 0.0;
+
+    (void)t;
+    if (js_to_number(ctx, arg(argc, argv, 0), &d) != JS_OK) return JS_THROW;
+    *ret = js_number((double)(float)d);
+    return JS_OK;
+}
+
+static int bi_math_clz32(js_ctx *ctx, js_value t, int argc, js_value *argv,
+                         js_value *ret)
+{
+    uint32_t u = 0;
+    int bits = 0;
+
+    (void)t;
+    if (js_to_uint32(ctx, arg(argc, argv, 0), &u) != JS_OK) return JS_THROW;
+    while (u) {
+        bits++;
+        u >>= 1;
+    }
+    *ret = js_number((double)(32 - bits));
+    return JS_OK;
+}
+
 /* ================================================================== */
 /* JSON                                                                */
 /* ================================================================== */
@@ -9582,13 +9646,18 @@ int js_init_builtins(js_ctx *ctx)
         DEFN(m, "asin", bi_math_asin, 1);
         DEFN(m, "atan", bi_math_atan, 1);
         DEFN(m, "atan2", bi_math_atan2, 2);
+        DEFN(m, "cbrt", bi_math_cbrt, 1);
         DEFN(m, "ceil", bi_math_ceil, 1);
+        DEFN(m, "clz32", bi_math_clz32, 1);
         DEFN(m, "cos", bi_math_cos, 1);
         DEFN(m, "exp", bi_math_exp, 1);
         DEFN(m, "floor", bi_math_floor, 1);
+        DEFN(m, "fround", bi_math_fround, 1);
         DEFN(m, "hypot", bi_math_hypot, 2);
         DEFN(m, "imul", bi_math_imul, 2);
         DEFN(m, "log", bi_math_log, 1);
+        DEFN(m, "log10", bi_math_log10, 1);
+        DEFN(m, "log2", bi_math_log2, 1);
         DEFN(m, "max", bi_math_max, 2);
         DEFN(m, "min", bi_math_min, 2);
         DEFN(m, "pow", bi_math_pow, 2);

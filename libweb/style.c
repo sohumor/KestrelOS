@@ -350,6 +350,7 @@ void css_style_initial(struct computed_style *cs)
     cs->order = 0;
     cs->aspect_ratio = 0;
     cs->letter_spacing = 0;
+    cs->word_spacing = 0;
     cs->has_transform = 0;
     cs->translate_x = len_px(0);
     cs->translate_y = len_px(0);
@@ -501,6 +502,7 @@ static void copy_prop(struct computed_style *d, const struct computed_style *s,
     case CSS_PROP_WORD_BREAK:      d->word_break = s->word_break; break;
     case CSS_PROP_OVERFLOW_WRAP:   d->overflow_wrap = s->overflow_wrap; break;
     case CSS_PROP_LETTER_SPACING:  d->letter_spacing = s->letter_spacing; break;
+    case CSS_PROP_WORD_SPACING:    d->word_spacing = s->word_spacing; break;
     case CSS_PROP_TRANSFORM:
         d->has_transform = s->has_transform;
         d->translate_x = s->translate_x;
@@ -2909,6 +2911,16 @@ static int apply_direct_raw_prop(struct style_engine *se,
         cs->letter_spacing = l.v;
         return 1;
 
+    case CSS_PROP_WORD_SPACING:
+        if (buf[0] && s_stricmp(buf, "normal") == 0) {
+            cs->word_spacing = 0;
+            return 1;
+        }
+        if (!eval_len_str(se, s, len, cs->font_size, root_fs, 1, 0, 0, 0, &l))
+            return 0;
+        cs->word_spacing = l.v;
+        return 1;
+
     case CSS_PROP_TRANSFORM:
         return apply_transform_str(se, cs, s, len, root_fs);
 
@@ -3662,6 +3674,12 @@ static void apply_value(struct style_engine *se, struct computed_style *cs,
             cs->letter_spacing = 0;
         else if (v->type == CSS_VAL_LENGTH)
             cs->letter_spacing = resolve_px(se, v, fs, root_fs);
+        break;
+    case CSS_PROP_WORD_SPACING:
+        if (v->type == CSS_VAL_KEYWORD)
+            cs->word_spacing = 0;
+        else if (v->type == CSS_VAL_LENGTH)
+            cs->word_spacing = resolve_px(se, v, fs, root_fs);
         break;
     case CSS_PROP_Z_INDEX:
         if (v->type == CSS_VAL_AUTO) {

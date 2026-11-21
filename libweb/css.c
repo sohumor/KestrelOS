@@ -1014,7 +1014,8 @@ static const struct prop_info props[CSS_PROP_COUNT] = {
     [CSS_PROP_WORD_BREAK]          = { 1, 0, kw_wordbreak },
     [CSS_PROP_OVERFLOW_WRAP]       = { 1, 0, kw_overflowwrap },
     [CSS_PROP_LETTER_SPACING]      = { 1, PA_LEN|PA_NEG, kw_normal_only },
-    [CSS_PROP_TRANSFORM]           = { 0, 0, kw_none_only }
+    [CSS_PROP_TRANSFORM]           = { 0, 0, kw_none_only },
+    [CSS_PROP_WORD_SPACING]        = { 1, PA_LEN|PA_NEG, kw_normal_only }
 };
 
 static int css_stricmp_n(const char *a, const char *b, unsigned long n)

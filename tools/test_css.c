@@ -461,6 +461,9 @@ static int describe(const struct computed_style *cs, const char *prop, char *out
     case CSS_PROP_LETTER_SPACING:
         sprintf(out, "%dpx", (int)cs->letter_spacing);
         return 1;
+    case CSS_PROP_WORD_SPACING:
+        sprintf(out, "%dpx", (int)cs->word_spacing);
+        return 1;
     case CSS_PROP_TRANSFORM:
         if (!cs->has_transform) {
             strcpy(out, "none");
@@ -1318,6 +1321,30 @@ static const struct tcase cases[] = {
  "#t { letter-spacing: 4px; letter-spacing: normal }",
  "<div id=t/>", "t",
  "letter-spacing=0px", 0},
+{"word-spacing-px",
+ "#t { word-spacing: 8px }",
+ "<div id=t/>", "t",
+ "word-spacing=8px", 0},
+{"word-spacing-inherits",
+ "#a { word-spacing: 6px }",
+ "<div id=a><p id=t/></div>", "t",
+ "word-spacing=6px", 0},
+{"word-spacing-negative-and-em",
+ "#t { word-spacing: -2px } #e { font-size: 20px; word-spacing: 0.5em }",
+ "<div id=t><span id=e/></div>", "e",
+ "word-spacing=10px", 0},
+{"word-spacing-negative",
+ "#t { word-spacing: -2px }",
+ "<div id=t/>", "t",
+ "word-spacing=-2px", 0},
+{"word-spacing-normal-reset",
+ "#t { word-spacing: 5px; word-spacing: normal }",
+ "<div id=t/>", "t",
+ "word-spacing=0px", 0},
+{"word-spacing-inline-style",
+ "",
+ "<p id=t style='word-spacing: 3px'/>", "t",
+ "word-spacing=3px", 0},
 {"transform-translate-pct-and-px",
  "#t { transform: translateX(-50%) translateY(-2px) }",
  "<div id=t/>", "t",
