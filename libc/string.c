@@ -2,11 +2,31 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
+
+/* Word-sized copy/fill unit.  may_alias makes the word accesses legal
+ * against any object under strict aliasing and aligned(1) permits any
+ * alignment; x86-64 performs unaligned word loads/stores in hardware. */
+typedef unsigned long __attribute__((aligned(1), may_alias)) alias_ulong;
+#define WORD_BYTES (sizeof(alias_ulong))
 
 void *memset(void *dst, int c, unsigned long n)
 {
     unsigned char *d = (unsigned char *)dst;
+    unsigned long pattern;
 
+    /* head: byte stores until the destination is word-aligned */
+    while (n && (uintptr_t)d % WORD_BYTES) {
+        *d++ = (unsigned char)c;
+        n--;
+    }
+    /* broadcast the byte: 0xAB * 0x0101..01 == 0xABAB..AB on any width */
+    pattern = (unsigned long)(unsigned char)c * (~0UL / 0xFFUL);
+    while (n >= WORD_BYTES) {
+        *(alias_ulong *)d = pattern;
+        d += WORD_BYTES;
+        n -= WORD_BYTES;
+    }
     while (n--)
         *d++ = (unsigned char)c;
     return dst;
@@ -17,6 +37,18 @@ void *memcpy(void *dst, const void *src, unsigned long n)
     unsigned char *d = (unsigned char *)dst;
     const unsigned char *s = (const unsigned char *)src;
 
+    /* head: byte copies until the destination is word-aligned; the
+     * source may stay unaligned (loads go through alias_ulong) */
+    while (n && (uintptr_t)d % WORD_BYTES) {
+        *d++ = *s++;
+        n--;
+    }
+    while (n >= WORD_BYTES) {
+        *(alias_ulong *)d = *(const alias_ulong *)s;
+        d += WORD_BYTES;
+        s += WORD_BYTES;
+        n -= WORD_BYTES;
+    }
     while (n--)
         *d++ = *s++;
     return dst;
@@ -55,6 +87,32 @@ int memcmp(const void *a, const void *b, unsigned long n)
     return 0;
 }
 
+void *memchr(const void *p, int c, unsigned long n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    unsigned char ch = (unsigned char)c;
+
+    while (n--) {
+        if (*b == ch)
+            return (void *)b;
+        b++;
+    }
+    return 0;
+}
+
+void *memrchr(const void *p, int c, unsigned long n)
+{
+    const unsigned char *b = (const unsigned char *)p;
+    unsigned char ch = (unsigned char)c;
+
+    while (n > 0) {
+        n--;
+        if (b[n] == ch)
+            return (void *)(b + n);
+    }
+    return 0;
+}
+
 unsigned long strlen(const char *s)
 {
     const char *p = s;
@@ -62,6 +120,15 @@ unsigned long strlen(const char *s)
     while (*p)
         p++;
     return (unsigned long)(p - s);
+}
+
+unsigned long strnlen(const char *s, unsigned long max)
+{
+    unsigned long n = 0;
+
+    while (n < max && s[n])
+        n++;
+    return n;
 }
 
 int strcmp(const char *a, const char *b)
@@ -153,6 +220,33 @@ char *strrchr(const char *s, int c)
     }
 }
 
+unsigned long strspn(const char *s, const char *accept)
+{
+    unsigned long n = 0;
+
+    while (s[n] && strchr(accept, s[n]))
+        n++;
+    return n;
+}
+
+unsigned long strcspn(const char *s, const char *reject)
+{
+    unsigned long n = 0;
+
+    while (s[n] && !strchr(reject, s[n]))
+        n++;
+    return n;
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+    for (; *s; s++) {
+        if (strchr(accept, *s))
+            return (char *)s;
+    }
+    return 0;
+}
+
 char *strstr(const char *hay, const char *needle)
 {
     unsigned long nlen = strlen(needle);
@@ -166,6 +260,29 @@ char *strstr(const char *hay, const char *needle)
     return 0;
 }
 
+char *strtok(char *s, const char *delim)
+{
+    static char *save;
+    char *tok;
+
+    if (s == 0)
+        s = save;
+    if (s == 0)
+        return 0;
+
+    s += strspn(s, delim);
+    if (*s == '\0') {
+        save = s;
+        return 0;
+    }
+    tok = s;
+    s += strcspn(s, delim);
+    if (*s != '\0')
+        *s++ = '\0';
+    save = s;
+    return tok;
+}
+
 char *strdup(const char *s)
 {
     unsigned long len = strlen(s);
@@ -173,5 +290,17 @@ char *strdup(const char *s)
 
     if (p)
         memcpy(p, s, len + 1);
+    return p;
+}
+
+char *strndup(const char *s, unsigned long n)
+{
+    unsigned long len = strnlen(s, n);
+    char *p = (char *)malloc(len + 1);
+
+    if (p) {
+        memcpy(p, s, len);
+        p[len] = '\0';
+    }
     return p;
 }

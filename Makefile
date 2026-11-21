@@ -102,6 +102,7 @@ QEMU_BASE := -drive file=$(BUILD)/os.img,format=raw -no-reboot -smp 2 \
         test-console-scroll test-hangar test-hangar-host test-usb-hid \
         test-random test-mission test-jpeg-prog test-img-formats test-browser-host test-gui-host \
         test-kfs test-kfs-readdir test-kfs-journal test-kfs-boot-recovery smoke smoke-e1000 fsck \
+        test-libc-string \
         screenshot vm-images clean help reconfig checkconfig
 
 all: $(BUILD)/os.img
@@ -414,6 +415,14 @@ test-play:
 
 test-gui-host:
 	sh tools/run-gui-tests.sh
+
+.PHONY: test-libc-string
+test-libc-string:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
+	  -fno-omit-frame-pointer -fno-builtin -Ilibc/include \
+	  tools/test_libc_string.c -o $(BUILD)/host-tests/test_libc_string
+	$(BUILD)/host-tests/test_libc_string
 
 test-kfs-journal:
 	$(PY) tools/test_kfs_journal.py
