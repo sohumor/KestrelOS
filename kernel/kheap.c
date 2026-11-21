@@ -14,6 +14,11 @@
 #define MAGIC_SMALL 0x4B534D4CU  /* 'KSML' */
 #define MAGIC_LARGE 0x4B4C5247U  /* 'KLRG' */
 
+/* The PMM covers at most 4 GiB, so anything larger can never be served.
+ * The cap also guarantees the `need` and `npages` arithmetic below can
+ * neither wrap size_t nor overflow int. */
+#define KMALLOC_MAX (4ULL * 1024 * 1024 * 1024)
+
 struct hdr {
     uint32_t magic;
     uint32_t info;               /* small: size class shift; large: npages */
@@ -50,7 +55,7 @@ static void refill(int shift)
 
 void *kmalloc(size_t size)
 {
-    if (size == 0)
+    if (size == 0 || size > KMALLOC_MAX)
         return NULL;
     size_t need = size + sizeof(struct hdr);
 
@@ -97,6 +102,10 @@ void kfree(void *ptr)
     struct hdr *h = (struct hdr *)ptr - 1;
     if (h->magic == MAGIC_SMALL) {
         int shift = h->info;
+        /* A neighbour's overflow may rewrite info while leaving the magic
+         * intact; keep freelist[shift] in bounds either way. */
+        if (shift < MIN_SHIFT || shift > MAX_SHIFT)
+            panic("kfree: bad size class %d at %p", shift, ptr);
         h->magic = 0;
         struct freeobj *o = (struct freeobj *)h;
         uint64_t f = spin_lock_irqsave(&heap_lock);
