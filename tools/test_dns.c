@@ -45,7 +45,7 @@ void *kmalloc(size_t size) { (void)size; return NULL; }
 void kfree(void *ptr) { (void)ptr; }
 struct krec_kbuf;
 void krec_kbuf_init(struct krec_kbuf *b, char *out, uint32_t cap)
-{ (void)b; (void)out; (void)cap; }
+{ memset(b, 0, sizeof(*b)); (void)out; (void)cap; }
 void krec_kbuf_putc(struct krec_kbuf *b, char c) { (void)b; (void)c; }
 void krec_kbuf_puts(struct krec_kbuf *b, const char *s) { (void)b; (void)s; }
 void krec_kbuf_escape(struct krec_kbuf *b, const char *s) { (void)b; (void)s; }
