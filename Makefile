@@ -434,6 +434,15 @@ test-kstring:
 	  -Ilibc/include tools/test_kstring.c -o $(BUILD)/host-tests/test_kstring
 	$(BUILD)/host-tests/test_kstring
 
+.PHONY: test-libz
+test-libz:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g \
+	  -fsanitize=address,undefined -fno-omit-frame-pointer -Ilibz \
+	  tools/test_libz.c libz/inflate.c libz/adler32.c libz/crc32.c \
+	  -o $(BUILD)/host-tests/test_libz
+	$(BUILD)/host-tests/test_libz
+
 smoke: all
 	$(PY) tools/e2e.py --smoke
 

@@ -561,6 +561,9 @@ def run_host_tests(tc):
         ] + rel_glob("libjs/*.c"), ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("test_kstring", [r("tools/test_kstring.c")],
          ["-fno-builtin", "-Ilibc/include"]),
+        ("test_libz", [r("tools/test_libz.c"), r("libz/inflate.c"),
+                       r("libz/adler32.c"), r("libz/crc32.c")],
+         ["-Ilibz"]),
     ]
 
     for name, srcs, flags in suites:
@@ -694,6 +697,7 @@ def generate_compile_commands(tc):
         ("tools/test_jsdom.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("tools/test_browser_stack.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Itools/browser-host", "-Ilibgui", "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs"]),
         ("tools/test_kstring.c", ["-fno-builtin", "-Ilibc/include"]),
+        ("tools/test_libz.c", ["-Ilibz"]),
     ]
     for rel, extra in host_suites:
         if os.path.isfile(r(rel)):
