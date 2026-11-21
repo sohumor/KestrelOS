@@ -117,6 +117,24 @@ int main(void)
         gui_icon(&win, 48 + (icon % 4) * 11, 38 + (icon / 4) * 7,
                  16, (enum gui_icon)icon, 0xFFFFFF);
 
+    /* Filled discs and weighted lines: the primitives gpaint's brush,
+     * shapes and eyedropper preview exercise. */
+    gui_fill_circle(&win, 80, 66, 5, 0x2277EE);
+    assert(gui_peek(&win, 80, 66) == 0x2277EE);
+    assert(gui_peek(&win, 78, 66) == 0x2277EE);
+    gui_disc(&win, 12, 52, 4, 0xEE2277);
+    assert(gui_peek(&win, 12, 52) == 0xEE2277);
+
+    gui_line_w(&win, 4, 60, 44, 60, 0x0A0A0A, 3);
+    assert(gui_peek(&win, 24, 60) == 0x0A0A0A);
+    assert(gui_peek(&win, 24, 61) == 0x0A0A0A);
+    assert(gui_peek(&win, 24, 59) == 0x0A0A0A);
+    assert(gui_peek(&win, 24, 62) == BG);
+    assert(gui_peek(&win, 24, 58) == BG);
+    gui_line_w(&win, 8, 66, 8, 70, 0x335577, 3);
+    assert(gui_peek(&win, 7, 68) == 0x335577);
+    assert(gui_peek(&win, 9, 68) == 0x335577);
+
     assert(changed_pixels(win.px, BG) > 500);
     assert(storage[0] == GUARD);
     assert(storage[W * H + 1] == GUARD);
