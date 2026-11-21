@@ -70,6 +70,7 @@ static const struct cmd commands[] = {
 
     { "games", 0 },
     { "snake",     "the classic snake game" },
+    { "life",      "Conway's Game of Life with cell editor and stamps" },
 };
 
 int main(int argc, char **argv)
