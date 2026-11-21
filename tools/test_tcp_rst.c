@@ -1,5 +1,6 @@
 /* Host receive-path regression; only privileged IRQ locking is replaced. */
 #include <stdio.h>
+#include <stdlib.h>
 #include "spinlock.h"
 
 static uint64_t host_lock(spinlock_t *lock)
@@ -20,6 +21,66 @@ static void host_unlock(spinlock_t *lock, uint64_t flags)
 
 uint32_t net_ip_addr(void) { return htonl(0x0a00020f); }
 uint64_t timer_ticks(void) { return 0; }
+
+/* Stubs for kernel dependencies tcp.c grew after this test was written
+ * (stats, krec snapshots, IPv6, scheduler hooks).  None run on the RST
+ * receive path under test, but the PE linker needs them resolved. */
+void net_stat_inc(int kind, uint32_t bytes) { (void)kind; (void)bytes; }
+bool task_exists(int pid) { (void)pid; return true; }
+bool net_ready(void) { return true; }
+bool net6_source_for(const uint8_t dst[16], uint8_t src_out[16])
+{
+    (void)dst; memset(src_out, 0, 16); return false;
+}
+int net6_send(const uint8_t dst[16], uint8_t next_header,
+              const void *payload, int len)
+{
+    (void)dst; (void)next_header; (void)payload; return len;
+}
+int net_ip_send(uint32_t dst_ip_be, uint8_t proto,
+                const void *payload, int len)
+{
+    (void)dst_ip_be; (void)proto; (void)payload; return len;
+}
+void net_wait_tick(void) {}
+uint32_t random_u32(void) { return 0x1a2b3c4d; }
+void *kmalloc(size_t size) { return malloc(size); }
+void kfree(void *ptr) { free(ptr); }
+struct task *smp_current_task(void) { return NULL; }
+void kprintf(const char *fmt, ...) { (void)fmt; }
+
+void krec_kbuf_init(struct krec_kbuf *b, char *out, uint32_t cap)
+{
+    b->out = out; b->len = 0; b->cap = cap; b->overflow = false;
+}
+void krec_kbuf_putc(struct krec_kbuf *b, char c)
+{
+    if (b->len + 1 >= b->cap) { b->overflow = true; return; }
+    b->out[b->len++] = c; b->out[b->len] = '\0';
+}
+void krec_kbuf_puts(struct krec_kbuf *b, const char *s)
+{
+    while (*s) krec_kbuf_putc(b, *s++);
+}
+void krec_kbuf_put_u64(struct krec_kbuf *b, uint64_t v)
+{
+    char tmp[24]; snprintf(tmp, sizeof(tmp), "%llu", (unsigned long long)v);
+    krec_kbuf_puts(b, tmp);
+}
+void krec_kbuf_put_i64(struct krec_kbuf *b, int64_t v)
+{
+    char tmp[24]; snprintf(tmp, sizeof(tmp), "%lld", (long long)v);
+    krec_kbuf_puts(b, tmp);
+}
+void krec_kbuf_put_ip4(struct krec_kbuf *b, uint32_t ip_be)
+{
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%u.%u.%u.%u",
+             ip_be & 0xff, (ip_be >> 8) & 0xff,
+             (ip_be >> 16) & 0xff, ip_be >> 24);
+    krec_kbuf_puts(b, tmp);
+}
+uint32_t krec_kbuf_finish(struct krec_kbuf *b) { return b->len; }
 
 static int failures;
 

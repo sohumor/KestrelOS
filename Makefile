@@ -435,6 +435,14 @@ test-kfs-boot-recovery: all
 
 test-kfs: test-kfs-readdir test-kfs-journal test-kfs-boot-recovery
 
+.PHONY: test-kstring
+test-kstring:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g \
+	  -fsanitize=address,undefined -fno-omit-frame-pointer -fno-builtin \
+	  -Ilibc/include tools/test_kstring.c -o $(BUILD)/host-tests/test_kstring
+	$(BUILD)/host-tests/test_kstring
+
 smoke: all
 	$(PY) tools/e2e.py --smoke
 

@@ -556,7 +556,7 @@ def run_host_tests(tc):
           "-Wl,/opt:ref" if sys.platform == "win32" else "-Wl,--gc-sections"]),
         ("test_net_checksum", [r("kernel/net_checksum.c"), r("tools/test_net_checksum.c")],
          ["-Ikernel/include", "-Iabi"]),
-        ("test_dns", [r("kernel/dns.c"), r("tools/test_dns.c")],
+        ("test_dns", [r("tools/test_dns.c")],
          ["-Ikernel/include", "-Iabi"]),
         ("test_gui_primitives", [r("tools/test_gui_primitives.c"), r("libgui/draw.c"), r("libgui/font_data.c")],
          ["-Iabi", "-Ilibgui", "-idirafter", "libc/include"]),
@@ -597,6 +597,8 @@ def run_host_tests(tc):
         ] + rel_glob("libjs/*.c"), ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("test_libc_string", [r("tools/test_libc_string.c")],
          ["-fno-builtin", "-Ilibc/include", "-Iabi"]),
+        ("test_kstring", [r("tools/test_kstring.c")],
+         ["-fno-builtin", "-Ilibc/include"]),
     ]
 
     for name, srcs, flags in suites:
@@ -730,6 +732,7 @@ def generate_compile_commands(tc):
         ("tools/test_jsdom.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Ilibweb", "-Ilibjs", "-Ilibtls"]),
         ("tools/test_browser_stack.c", ["-DJS_HOST", "-DCSS_WITH_DOM", "-Itools/browser-host", "-Ilibgui", "-Ilibz", "-Ilibtls", "-Ilibimg", "-Ilibweb", "-Ilibjs"]),
         ("tools/test_libc_string.c", ["-fno-builtin", "-Ilibc/include", "-Iabi"]),
+        ("tools/test_kstring.c", ["-fno-builtin", "-Ilibc/include"]),
     ]
     for rel, extra in host_suites:
         if os.path.isfile(r(rel)):
