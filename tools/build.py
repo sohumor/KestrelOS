@@ -97,10 +97,20 @@ def parse_depfile(dep_path):
         return []
     with open(dep_path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()
-    text = text.replace("\\\n", " ")
-    if ":" not in text:
+    # Normalize line endings (clang writes CRLF on Windows) and unwrap
+    # '\' line continuations so the whole first rule sits on one line.
+    text = text.replace("\r\n", "\n").replace("\\\n", " ")
+    # Keep only the first logical rule. With -MP the file then lists phony
+    # targets ('kernel/include/foo.h:'); reading those as dependencies
+    # would invent files that never exist and force a rebuild every time.
+    first_rule = text.split("\n", 1)[0]
+    # The target/dependency separator is the first ':' followed by
+    # whitespace or EOL. This skips the drive colon in absolute Windows
+    # targets like 'C:\repo\build\kernel/main.o: deps...'.
+    m = re.search(r":(?=\s|$)", first_rule)
+    if not m:
         return []
-    _, rhs = text.split(":", 1)
+    rhs = first_rule[m.end():]
     deps = []
     cur = []
     i = 0
@@ -135,10 +145,14 @@ def needs_rebuild(out_path, inputs, dep_path=None):
     return False
 
 
+# Overridable via `build.py --jobs N` (set by main); default = all cores.
+MAX_WORKERS = os.cpu_count() or 4
+
+
 def compile_jobs(jobs):
     if not jobs:
         return
-    workers = min(len(jobs), os.cpu_count() or 4)
+    workers = min(len(jobs), MAX_WORKERS)
     # Run every job to completion (like `make -k`) so one bad translation
     # unit does not hide failures in the others, then report them all.
     failed = []  # (job index, exception)
@@ -736,7 +750,13 @@ def main():
                     help="extra GDB arguments, e.g. batch commands (default: GDB_FLAGS)")
     ap.add_argument("--nic", default="rtl8139")
     ap.add_argument("--cpus", type=int, default=2)
+    ap.add_argument("-j", "--jobs", type=int, default=0, metavar="N",
+                    help="parallel compile/link workers (default: all cores)")
     args = ap.parse_args()
+
+    if args.jobs > 0:
+        global MAX_WORKERS
+        MAX_WORKERS = args.jobs
 
     if args.action == "gdb":
         gdb = find_tool([os.environ.get("GDB", "gdb")])
