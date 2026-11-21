@@ -128,6 +128,10 @@ uint64_t pmm_alloc_contig(int npages)
 
 void pmm_free(uint64_t phys)
 {
+    /* An unaligned or out-of-bitmap address is a caller bug; without this
+     * check the bit update below would silently corrupt adjacent .bss. */
+    if ((phys & (PAGE_SIZE - 1)) || phys >= MAX_PHYS)
+        panic("pmm: invalid free of %lx", phys);
     uint64_t p = phys / PAGE_SIZE;
     uint64_t f = spin_lock_irqsave(&pmm_lock);
     if (!is_used(p)) {
@@ -143,6 +147,8 @@ void pmm_free(uint64_t phys)
 
 void pmm_free_contig(uint64_t phys, int npages)
 {
+    if (npages <= 0)
+        panic("pmm: free_contig of %d pages at %lx", npages, phys);
     for (int i = 0; i < npages; i++)
         pmm_free(phys + (uint64_t)i * PAGE_SIZE);
 }
