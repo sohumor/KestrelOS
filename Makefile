@@ -420,7 +420,7 @@ test-gui-host:
 test-libc-string:
 	@mkdir -p $(BUILD)/host-tests
 	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g -fsanitize=address,undefined \
-	  -fno-omit-frame-pointer -fno-builtin -Ilibc/include \
+	  -fno-omit-frame-pointer -fno-builtin -Ilibc/include -Iabi \
 	  tools/test_libc_string.c -o $(BUILD)/host-tests/test_libc_string
 	$(BUILD)/host-tests/test_libc_string
 

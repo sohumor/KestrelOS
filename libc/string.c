@@ -152,6 +152,36 @@ int strncmp(const char *a, const char *b, unsigned long n)
     return (int)(unsigned char)*a - (int)(unsigned char)*b;
 }
 
+static int ascii_lower(int c)
+{
+    return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
+}
+
+int strcasecmp(const char *a, const char *b)
+{
+    int ca, cb;
+
+    do {
+        ca = ascii_lower((unsigned char)*a++);
+        cb = ascii_lower((unsigned char)*b++);
+    } while (ca == cb && ca != '\0');
+    return ca - cb;
+}
+
+int strncasecmp(const char *a, const char *b, unsigned long n)
+{
+    while (n && *a &&
+           ascii_lower((unsigned char)*a) ==
+               ascii_lower((unsigned char)*b)) {
+        a++;
+        b++;
+        n--;
+    }
+    if (n == 0)
+        return 0;
+    return ascii_lower((unsigned char)*a) - ascii_lower((unsigned char)*b);
+}
+
 char *strcpy(char *dst, const char *src)
 {
     char *d = dst;

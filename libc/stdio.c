@@ -241,7 +241,7 @@ static void format_core(struct fmt_sink *s, const char *fmt, va_list ap)
             break;
         }
         case 'p': {
-            unsigned long long v = (unsigned long long)(unsigned long)va_arg(ap, void *);
+            unsigned long long v = (unsigned long long)(uintptr_t)va_arg(ap, void *);
             sink_putc(s, '0');
             sink_putc(s, 'x');
             sink_num(s, v, 16, 0, 0, 16, 1, 0);
@@ -286,6 +286,23 @@ int snprintf(char *buf, unsigned long size, const char *fmt, ...)
 
     va_start(ap, fmt);
     n = vsnprintf(buf, size, fmt, ap);
+    va_end(ap);
+    return n;
+}
+
+int vsprintf(char *buf, const char *fmt, va_list ap)
+{
+    /* unbounded write: snprintf with an effectively infinite capacity */
+    return vsnprintf(buf, (unsigned long)-1, fmt, ap);
+}
+
+int sprintf(char *buf, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+
+    va_start(ap, fmt);
+    n = vsprintf(buf, fmt, ap);
     va_end(ap);
     return n;
 }
