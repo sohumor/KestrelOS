@@ -1,9 +1,14 @@
 /* gpaint.c - KestrelOS graphical paint program.
  *
  * Tools: Pen, Eraser, Flood Fill, Line, Rect, Circle (outline or filled),
- * 16-colour palette, 5 brush sizes, multi-step Undo history ring (Ctrl+Z),
- * KPX1 and 24/32-bit BMP compatibility, Talon [Copy Hex] / [Pick Talon]
- * parcel integration (K_PARCEL_COLOR), and dynamic KEV_RESIZE handling.
+ * Eyedropper, 16-colour palette, 5 brush sizes, multi-step Undo history
+ * ring (Ctrl+Z / u), KPX1 and 24/32-bit BMP compatibility, Talon
+ * [Copy Hex] / [Pick Talon] parcel integration (K_PARCEL_COLOR), and
+ * dynamic KEV_RESIZE handling.
+ *
+ * Right-click anywhere on the canvas samples the colour under the cursor
+ * with any tool.  When the file box is not focused the keys p/e/f/l/r/c/i
+ * switch tool, [ and ] shrink/grow the brush, and u (or Ctrl+Z) undoes.
  *
  * usage: gpaint [--cwd=<dir>] [file.kpx|file.bmp]
  */
@@ -38,11 +43,12 @@ enum paint_tool {
     TOOL_LINE,
     TOOL_RECT,
     TOOL_CIRCLE,
+    TOOL_PICK,
     TOOL_COUNT
 };
 
 static const char *const tool_names[TOOL_COUNT] = {
-    "Pen", "Eraser", "Fill", "Line", "Rect", "Circle"
+    "Pen", "Eraser", "Fill", "Line", "Rect", "Circle", "Pick"
 };
 
 static const uint32_t swatches[16] = {
@@ -257,6 +263,15 @@ static int canvas_flood_fill(int sx, int sy, uint32_t fill_col)
     }
     free(q);
     return 1;
+}
+
+/* Eyedropper: adopt the colour of the canvas pixel at (x, y). The caller
+ * guarantees the point is inside the canvas. */
+static void canvas_pick_colour(int x, int y)
+{
+    colour = canvas.px[(long)y * canvas.w + x] & 0x00FFFFFFU;
+    snprintf(status, sizeof(status), "Picked #%02X%02X%02X at %d,%d",
+             GUI_RED(colour), GUI_GREEN(colour), GUI_BLUE(colour), x, y);
 }
 
 static void draw_shape_to(gui_window *dst, int ox, int oy, int sh_tool,
@@ -790,7 +805,7 @@ static void draw_chrome(gui_window *win, gui_ui *ui, int *action)
         }
     }
 
-    y += 3 * 26 + 6;
+    y += ((TOOL_COUNT + 1) / 2) * 26 + 6;
     if (gui_checkbox(win, 10, y, "Filled", &shape_filled, ui))
         set_status_default();
 
@@ -888,11 +903,44 @@ int main(int argc, char **argv)
             if (ev.type == KEV_CLOSE)
                 break;
 
-            if (ev.type == KEV_KEY && ev.key == 26 && !namebox.focus) {
-                if (undo_pop() == 0)
+            if (ev.type == KEV_KEY && !namebox.focus) {
+                int k = (int)ev.key;
+                int new_tool = -1;
+
+                if (k == 'p')
+                    new_tool = TOOL_PEN;
+                else if (k == 'e')
+                    new_tool = TOOL_ERASER;
+                else if (k == 'f')
+                    new_tool = TOOL_FILL;
+                else if (k == 'l')
+                    new_tool = TOOL_LINE;
+                else if (k == 'r')
+                    new_tool = TOOL_RECT;
+                else if (k == 'c')
+                    new_tool = TOOL_CIRCLE;
+                else if (k == 'i')
+                    new_tool = TOOL_PICK;
+
+                if (new_tool >= 0) {
+                    tool = new_tool;
                     set_status_default();
-                else
-                    snprintf(status, sizeof(status), "Nothing to undo");
+                } else if (k == '[') {
+                    if (brush > 0) {
+                        brush--;
+                        set_status_default();
+                    }
+                } else if (k == ']') {
+                    if (brush < (int)(sizeof(brushes) / sizeof(brushes[0])) - 1) {
+                        brush++;
+                        set_status_default();
+                    }
+                } else if (k == 26 || k == 'u') { /* Ctrl+Z or u */
+                    if (undo_pop() == 0)
+                        set_status_default();
+                    else
+                        snprintf(status, sizeof(status), "Nothing to undo");
+                }
             }
 
             if (ev.type == KEV_MOUSE_DOWN || ev.type == KEV_MOUSE_MOVE ||
@@ -910,7 +958,11 @@ int main(int argc, char **argv)
                                  ui.down_x < CANVAS_X + (vw < canvas.w ? vw : canvas.w) &&
                                  ui.down_y < CANVAS_Y + (vh < canvas.h ? vh : canvas.h);
 
-                if (tool == TOOL_PEN || tool == TOOL_ERASER) {
+                if (ev.type == KEV_MOUSE_DOWN && inside &&
+                    (ev.buttons & (unsigned)K_MOUSE_RIGHT)) {
+                    /* Right-click is a quick eyedropper with any tool. */
+                    canvas_pick_colour(cxp, cyp);
+                } else if (tool == TOOL_PEN || tool == TOOL_ERASER) {
                     int px = last_x, py = last_y;
                     if (ev.type == KEV_MOUSE_UP || !inside) {
                         last_x = -1;
@@ -949,6 +1001,11 @@ int main(int argc, char **argv)
                                      "Filled at %d,%d   undo:%d",
                                      cxp, cyp, undo_count);
                         blit_canvas(win, 0, 0, canvas.w, canvas.h);
+                    }
+                } else if (tool == TOOL_PICK) {
+                    if (ev.type == KEV_MOUSE_DOWN && inside) {
+                        canvas_pick_colour(cxp, cyp);
+                        tool = TOOL_PEN;
                     }
                 } else {
                     /* Shape tools: Line, Rect, Circle */
