@@ -6,9 +6,9 @@
  *   cc -std=c11 -Wall -Wextra -Werror -O2 -g -Ilibc/include \
  *      tools/test_kstring.c -o build/host-tests/test_kstring
  *
- * Note: this libc provides no strnlen/memchr/strtok; the closest bounds,
- * not-found and signedness edges of the functions it does provide are
- * covered instead. */
+ * All public symbols string.c now defines are renamed so nothing can
+ * collide with the host CRT (lld-link pulls e.g. strnlen/strtok from
+ * libucrt for the CRT startup path and hard-errors on duplicates). */
 
 #include <assert.h>
 #include <stddef.h>
@@ -17,33 +17,53 @@
 #define memcpy   k_memcpy
 #define memmove  k_memmove
 #define memcmp   k_memcmp
+#define memchr   k_memchr
+#define memrchr  k_memrchr
 #define strlen   k_strlen
+#define strnlen  k_strnlen
 #define strcmp   k_strcmp
 #define strncmp  k_strncmp
+#define strcasecmp  k_strcasecmp
+#define strncasecmp k_strncasecmp
 #define strcpy   k_strcpy
 #define strncpy  k_strncpy
 #define strcat   k_strcat
 #define strncat  k_strncat
 #define strchr   k_strchr
 #define strrchr  k_strrchr
+#define strspn   k_strspn
+#define strcspn  k_strcspn
+#define strpbrk  k_strpbrk
 #define strstr   k_strstr
+#define strtok   k_strtok
 #define strdup   k_strdup
+#define strndup  k_strndup
 #include "../libc/string.c"
 #undef memset
 #undef memcpy
 #undef memmove
 #undef memcmp
+#undef memchr
+#undef memrchr
 #undef strlen
+#undef strnlen
 #undef strcmp
 #undef strncmp
+#undef strcasecmp
+#undef strncasecmp
 #undef strcpy
 #undef strncpy
 #undef strcat
 #undef strncat
 #undef strchr
 #undef strrchr
+#undef strspn
+#undef strcspn
+#undef strpbrk
 #undef strstr
+#undef strtok
 #undef strdup
+#undef strndup
 
 int puts(const char *s); /* host libc; libc/include/stdio.h stays unused */
 
