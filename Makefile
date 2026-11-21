@@ -443,6 +443,15 @@ test-libz:
 	  -o $(BUILD)/host-tests/test_libz
 	$(BUILD)/host-tests/test_libz
 
+.PHONY: test-kcrypto
+test-kcrypto:
+	@mkdir -p $(BUILD)/host-tests
+	$(CC) -std=c11 -Wall -Wextra -Werror -O2 -g \
+	  -fsanitize=address,undefined -fno-omit-frame-pointer -Ilibtls \
+	  tools/test_kcrypto.c libtls/bignum.c libtls/ecc.c \
+	  -o $(BUILD)/host-tests/test_kcrypto
+	$(BUILD)/host-tests/test_kcrypto
+
 smoke: all
 	$(PY) tools/e2e.py --smoke
 
