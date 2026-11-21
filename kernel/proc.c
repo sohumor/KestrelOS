@@ -152,14 +152,22 @@ static void runq_insert(struct task *t)
 
 static void runq_remove(struct task *t)
 {
+    /* Callers promise t is a ring member. If that is ever violated, either
+     * the wrong head gets dropped (singleton case) or the search below
+     * spins forever with interrupts off — a panic diagnoses it instead. */
+    if (!runq || (t->qnext == t && runq != t))
+        panic("sched: runq_remove: task %d not in run ring", t->pid);
     struct task *p = runq;
     if (t->qnext == t) {
         runq = NULL;
         t->qnext = NULL;
         return;
     }
-    while (p->qnext != t)
+    while (p->qnext != t) {
         p = p->qnext;
+        if (p == runq)
+            panic("sched: runq_remove: task %d not in run ring", t->pid);
+    }
     p->qnext = t->qnext;
     if (runq == t)
         runq = p;
@@ -356,8 +364,11 @@ static int event_wait_locked(struct task_event_channel *channel, uint32_t mask,
 
     uint64_t f = spin_lock_irqsave(&sched_lock);
     struct task_event_waiter **link = &channel->waiters;
-    while (*link != &waiter)
+    while (*link != &waiter) {
+        if (!*link)
+            panic("sched: event waiter already unlinked");
         link = &(*link)->next;
+    }
     *link = waiter.next;
     bool cancelled = !interruptible && event_wait_cancelled(waiter.task);
     spin_unlock_irqrestore(&sched_lock, f);
