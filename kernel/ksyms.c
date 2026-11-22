@@ -94,6 +94,7 @@ EXPORT_SYMBOL(klog_printf);
 #ifdef CONFIG_MODULES
 EXPORT_SYMBOL(module_service_acquire);
 EXPORT_SYMBOL(module_service_release);
+EXPORT_SYMBOL(module_required_service);
 #endif
 
 /* --- block device layer (optional) --------------------------------------

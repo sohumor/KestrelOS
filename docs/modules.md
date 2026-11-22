@@ -245,6 +245,37 @@ operation table after release. Release it in the consumer's exit hook and
 on any init failure after acquisition. Existing modules need no declaration
 change.
 
+### Required services
+
+A consumer that cannot initialize without a particular service can declare
+that dependency instead of acquiring and releasing it manually:
+
+```c
+MODULE_REQUIRE_SERVICE(storage, "storage-provider", 1, struct storage_ops);
+
+static int consumer_init(void)
+{
+    const struct storage_ops *ops = module_required_service(&storage);
+    return ops->start();
+}
+```
+
+The loader resolves up to eight requirements against live providers with
+the exact name, version and table size before publishing or initializing
+the consumer. A missing or incompatible provider rejects the load without
+running init; it does not trigger automatic provider loading. The loader
+pins each matched provider through the consumer's exit hook, and releases
+those pins on rejected loads, init failure, and normal unload. Bindings
+point only to already-live modules, so these load-time dependencies cannot
+form a cycle.
+
+The consumer may use the returned table through exit, without acquiring or
+releasing a separate reference. Do not retain it after exit. The lookup
+only accepts the address of the original declaration; a copy or an
+undeclared requirement returns null. The declaration imports the lookup
+symbol so older kernels cannot silently ignore the requirement. Dynamic
+acquire/release is still available for optional and shorter-lived use.
+
 ---
 
 ## 6. Tools

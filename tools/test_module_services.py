@@ -27,6 +27,11 @@ def probe_image(work):
         "service-reader": [],
         "service-wrong-version": ["-DPROBE_VERSION=2"],
         "service-wrong-size": ["-DPROBE_EXTRA_SIZE=1"],
+        "service-managed": ["-DPROBE_MANAGED"],
+        "service-managed-fail-init": ["-DPROBE_MANAGED", "-DPROBE_FAIL_INIT"],
+        "service-managed-wrong-first": ["-DPROBE_MANAGED", "-DPROBE_FIRST_VERSION=2",
+                                        "-DPROBE_SECOND_VERSION=1"],
+        "service-managed-wrong-second": ["-DPROBE_MANAGED", "-DPROBE_SECOND_VERSION=2"],
     }
     for name, defines in variants.items():
         subprocess.run([*cc, *flags, *defines, "-c", "tools/module_service_probe.c",
@@ -41,11 +46,11 @@ def probe_image(work):
     return image
 
 
-def check(h, command, status, output=None):
+def check(h, command, status, output=None, absent=None):
     h.send(command + "; echo SERVICE-STATUS-$?")
-    if output:
-        h.expect(output)
-    h.expect(f"\nSERVICE-STATUS-{status}\n")
+    text = h.expect(rf"(?s).*?\nSERVICE-STATUS-{status}\n", regex=True).group()
+    if (output and output not in text) or (absent and absent in text):
+        raise AssertionError(f"{command}: unexpected output {text!r}")
     wait_prompt(h)
 
 
@@ -73,6 +78,19 @@ def main():
             check(h, "rmmod service-reader", 0)
             check(h, "rmmod service-provider", 0)
             print("PASS module services: exact contract and provider lifetime")
+            init_marker = "managed probe: init entered"
+            check(h, "insmod service-managed", 1,
+                  "required service service-provider (v1, 8 bytes) unavailable", init_marker)
+            check(h, "insmod service-provider", 0)
+            for mismatch in ("wrong-first", "wrong-second"):
+                check(h, f"insmod service-managed-{mismatch}", 1,
+                      "required service service-provider (v2, 8 bytes) unavailable", init_marker)
+            check(h, "insmod service-managed-fail-init", 1, "managed probe: init read 42")
+            check(h, "insmod service-managed", 0, "managed probe: init read 42")
+            check(h, "rmmod service-provider", 1, "is in use (1 references)")
+            check(h, "rmmod service-managed", 0, "managed probe: exit read 42")
+            check(h, "rmmod service-provider", 0)
+            print("PASS required module services: pre-init rejection, rollback, provider pinned through exit")
         except (OSError, RuntimeError, AssertionError) as exc:
             print(f"FAIL module services: {exc}", file=sys.stderr)
             h.print_tail()
