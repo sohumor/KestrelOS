@@ -214,6 +214,12 @@ static void arena_free(void *p)
 
 /* --- loaded module registry -------------------------------------------- */
 
+struct module_requirement {
+    const struct module_service_requirement *identity;
+    struct module_service_requirement contract;
+    struct module *provider;
+};
+
 struct module {
     char name[MODULE_NAME_MAX];
     char desc[MODULE_DESC_MAX];
@@ -224,6 +230,8 @@ struct module {
     int (*init)(void);
     void (*exit)(void);
     struct module_service_decl service;
+    unsigned nrequirements;
+    struct module_requirement requirements[MODULE_SERVICE_REQUIREMENTS_MAX];
     struct module *next;
 };
 
@@ -255,6 +263,43 @@ static struct module *module_find(const char *name)
     for (m = modules; m; m = m->next)
         if (strcmp(m->name, name) == 0)
             return m;
+    return NULL;
+}
+
+static struct module *module_service_find(const char *name, uint32_t version,
+                                          uint32_t size)
+{
+    struct module *m = module_find(name);
+    if (m && m->state == MODULE_STATE_LIVE && m->service.version == version &&
+        m->service.size == size)
+        return m;
+    return NULL;
+}
+
+static void module_release_requirements(struct module *m)
+{
+    for (unsigned i = 0; i < m->nrequirements; i++) {
+        struct module_requirement *r = &m->requirements[i];
+        if (r->provider) {
+            r->provider->refs--;
+            r->provider = NULL;
+        }
+    }
+}
+
+static const struct module_service_requirement *module_bind_requirements(struct module *m)
+{
+    for (unsigned i = 0; i < m->nrequirements; i++) {
+        struct module_requirement *r = &m->requirements[i];
+        const struct module_service_requirement *contract = &r->contract;
+        r->provider = module_service_find(contract->provider, contract->version,
+                                          contract->size);
+        if (!r->provider) {
+            module_release_requirements(m);
+            return contract;
+        }
+        r->provider->refs++;
+    }
     return NULL;
 }
 
@@ -645,6 +690,35 @@ static int inside_module(const struct module *m, const void *p, size_t len)
     return a >= lo && a - lo < m->size && len <= m->size - (a - lo);
 }
 
+static int read_service_requirement(struct module *m, const void *value)
+{
+    struct module_service_requirement contract;
+    unsigned len;
+
+    if (m->nrequirements == MODULE_SERVICE_REQUIREMENTS_MAX ||
+        !inside_module(m, value, sizeof(contract)))
+        return -1;
+    for (unsigned i = 0; i < m->nrequirements; i++)
+        if (m->requirements[i].identity == value)
+            return -1;
+    memcpy(&contract, value, sizeof(contract));
+    if (!contract.version || !contract.size ||
+        contract.lookup != module_required_service)
+        return -1;
+    for (len = 0; len < MODULE_NAME_MAX; len++) {
+        if (!inside_module(m, contract.provider, len + 1))
+            return -1;
+        if (contract.provider[len] == '\0')
+            break;
+    }
+    if (!len || len == MODULE_NAME_MAX)
+        return -1;
+    struct module_requirement *r = &m->requirements[m->nrequirements++];
+    r->identity = value;
+    r->contract = contract;
+    return 0;
+}
+
 static int read_decl(struct load_ctx *c, struct module *m)
 {
     const struct module_decl *d = NULL;
@@ -698,6 +772,13 @@ static int read_decl(struct load_ctx *c, struct module *m)
             kprintf("module: %s: invalid service declaration\n", c->modname);
             return MODERR_NODECL;
         }
+        case MODDECL_REQUIRE_SERVICE:
+            if (read_service_requirement(m, d[j].value) < 0) {
+                kprintf("module: %s: invalid required service declaration\n",
+                        c->modname);
+                return MODERR_NODECL;
+            }
+            break;
         default:
             /* A newer module declaring something this loader predates. */
             kprintf("module: %s: ignoring unknown decl tag %u\n",
@@ -788,6 +869,14 @@ int module_load(const void *image, unsigned long size, const char *name)
         rc = MODERR_EXISTS;
         goto out;
     }
+    const struct module_service_requirement *missing = module_bind_requirements(m);
+    if (missing) {
+        spin_unlock_irqrestore(&module_registry_lock, f);
+        kprintf("module: %s: required service %s (v%u, %u bytes) unavailable\n",
+                m->name, missing->provider, missing->version, missing->size);
+        rc = MODERR_NOTFOUND;
+        goto out;
+    }
     m->next = modules;
     modules = m;
     spin_unlock_irqrestore(&module_registry_lock, f);
@@ -810,6 +899,7 @@ int module_load(const void *image, unsigned long size, const char *name)
                 break;
             }
         }
+        module_release_requirements(m);
         spin_unlock_irqrestore(&module_registry_lock, f);
         arena_free(m->base);
         kfree(m);
@@ -927,6 +1017,7 @@ int module_unload(const char *name)
             break;
         }
     }
+    module_release_requirements(m);
     spin_unlock_irqrestore(&module_registry_lock, f);
 
     kprintf("module: unloaded %s\n", m->name);
@@ -997,10 +1088,9 @@ int module_service_acquire(struct module_service_ref *ref, const char *name,
         return MODERR_BUSY;
 
     uint64_t f = spin_lock_irqsave(&module_registry_lock);
-    struct module *m = module_find(name);
+    struct module *m = module_service_find(name, version, size);
     int rc = MODERR_NOTFOUND;
-    if (m && m->state == MODULE_STATE_LIVE && m->service.version == version &&
-        m->service.size == size) {
+    if (m) {
         m->refs++;
         ref->provider = m;
         ref->ops = m->service.ops;
@@ -1020,4 +1110,23 @@ void module_service_release(struct module_service_ref *ref)
     ref->provider = NULL;
     ref->ops = NULL;
     spin_unlock_irqrestore(&module_registry_lock, f);
+}
+
+const void *module_required_service(const struct module_service_requirement *requirement)
+{
+    const void *ops = NULL;
+
+    if (!requirement)
+        return NULL;
+    uint64_t f = spin_lock_irqsave(&module_registry_lock);
+    for (const struct module *m = modules; m && !ops; m = m->next)
+        for (unsigned i = 0; i < m->nrequirements; i++) {
+            const struct module_requirement *r = &m->requirements[i];
+            if (r->identity == requirement && r->provider) {
+                ops = r->provider->service.ops;
+                break;
+            }
+        }
+    spin_unlock_irqrestore(&module_registry_lock, f);
+    return ops;
 }

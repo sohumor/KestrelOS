@@ -37,12 +37,23 @@ struct module_decl {
 #define MODDECL_INIT 3
 #define MODDECL_EXIT 4
 #define MODDECL_SERVICE 5
+#define MODDECL_REQUIRE_SERVICE 6
+#define MODULE_SERVICE_REQUIREMENTS_MAX 8
 
 struct module_service_decl {
     uint32_t version;
     uint32_t size;
     const void *ops;
 };
+
+struct module_service_requirement {
+    const char *provider;
+    uint32_t version;
+    uint32_t size;
+    const void *(*lookup)(const struct module_service_requirement *);
+};
+
+const void *module_required_service(const struct module_service_requirement *requirement);
 
 #define MODULE_DECL_SECTION ".kmod_decl"
 
@@ -71,6 +82,14 @@ struct module_service_decl {
         .version = (ver), .size = sizeof(table), .ops = &(table)           \
     };                                                                    \
     __KMOD_DECL(service, MODDECL_SERVICE, &__kmod_service)
+
+/* Resolve this contract before init and pin its provider through exit. */
+#define MODULE_REQUIRE_SERVICE(id, name, ver, type)                          \
+    static const struct module_service_requirement id = {                  \
+        .provider = (name), .version = (ver), .size = sizeof(type),         \
+        .lookup = module_required_service                                 \
+    };                                                                     \
+    __KMOD_DECL(require_##id, MODDECL_REQUIRE_SERVICE, &(id))
 
 /* --- what the kernel reports about a module --------------------------- */
 
