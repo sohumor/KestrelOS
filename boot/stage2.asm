@@ -1,7 +1,7 @@
 ; KestrelOS stage 2 bootloader — loaded at 0x7E00 by stage 1.
 ;
 ;  1. enable the A20 line
-;  2. collect the E820 memory map into the bootinfo block at 0x6000
+;  2. translate E820 into usable ranges in the boot handoff at 0x6000
 ;  3. enter "unreal mode" (4 GiB segment limits while staying in real mode)
 ;  4. load the kernel from disk (LBA 64+) to physical 1 MiB, 16 KiB at a time
 ;  5. build identity + higher-half page tables
@@ -24,19 +24,30 @@ ORG 0x7E00
 ;   0x5000  VBE controller info block   (512 bytes)
 ;   0x5200  VBE mode info block         (256 bytes)
 ;   0x5400  our copy of the mode list   (255 modes + terminator, 512 bytes)
-;   0x6000  bootinfo header + E820 array (128 entries max, ends at 0x6C20)
+;   0x5FE0  E820 query scratch (24 bytes)
+;   0x6000  handoff header + 128 ranges max (ends at 0x6830)
 ;   0x7C00  stage 1 / real-mode stack
 ;   0x7E00  stage 2
 ;   0x20000 kernel read buffer
 ;   0x70000 page tables
 ;
-; bootinfo layout (kernel/include/bootinfo.h):
-;   +0  u16 e820_count   +2  u8 boot_drive   +3  u8 fb_present
-;   +4  u32 fb_width     +8  u32 fb_height   +12 u32 fb_pitch
-;   +16 u32 fb_bpp       +20 u32 boot_seed   +24 u64 fb_phys
-;   +32 e820 entries, 24 bytes each
+; Version 1 wire layout (kernel/include/boot_handoff.h).
 BOOTINFO     equ 0x6000
-E820_ENTRIES equ BOOTINFO + 32
+BOOT_MAGIC   equ 0x544F4F42       ; bytes "BOOT"
+BOOT_VERSION equ 1
+BOOT_HEADER  equ 48
+BOOT_RANGE_SIZE equ 16
+BOOT_RANGE_MAX equ 128
+BOOT_COUNT   equ BOOTINFO + 8
+BOOT_FLAGS   equ BOOTINFO + 12
+BOOT_SEED    equ BOOTINFO + 16
+BOOT_FB_PHYS equ BOOTINFO + 24
+BOOT_FB_WIDTH equ BOOTINFO + 32
+BOOT_FB_HEIGHT equ BOOTINFO + 36
+BOOT_FB_PITCH equ BOOTINFO + 40
+BOOT_FB_BPP  equ BOOTINFO + 44
+BOOT_FB_PRESENT equ 1
+E820_SCRATCH equ 0x5FE0
 VBE_INFO     equ 0x5000
 VBE_MODE     equ 0x5200
 VBE_MODES    equ 0x5400
@@ -59,8 +70,11 @@ start:
     ; ---------------- clear the bootinfo header ----------------
     xor ax, ax
     mov di, BOOTINFO
-    mov cx, 16                   ; 32 bytes: counts, drive, framebuffer
+    mov cx, BOOT_HEADER / 2
     rep stosw
+    mov dword [BOOTINFO], BOOT_MAGIC
+    mov word [BOOTINFO + 4], BOOT_VERSION
+    mov word [BOOTINFO + 6], BOOT_HEADER
 
     ; ---------------- early boot entropy ----------------
     ; This is an input to the kernel pool, never a claim of 32 secret bits.
@@ -76,7 +90,7 @@ start:
     xor ebx, ecx
     movzx ecx, byte [boot_drive]
     xor ebx, ecx
-    mov [BOOTINFO + 20], ebx
+    mov [BOOT_SEED], ebx
 
     ; ---------------- A20 via the fast gate (port 0x92) ----------------
     in  al, 0x92
@@ -89,27 +103,60 @@ start:
 
     ; ---------------- E820 memory map ----------------
     xor ebx, ebx
-    xor bp, bp                   ; entry count
-    mov di, E820_ENTRIES
+    xor bp, bp                   ; usable range count
+    mov si, BOOTINFO + BOOT_HEADER
 .e820_loop:
+    mov di, E820_SCRATCH
     mov eax, 0xE820
     mov edx, 0x534D4150          ; 'SMAP'
     mov ecx, 24
     mov dword [di + 20], 1       ; ACPI 3.x "entry valid" default
+    push ds
+    push es
+    push si
+    push bp
     int 0x15
+    pop bp
+    pop si
+    pop es
+    pop ds
     jc  .e820_done
     cmp eax, 0x534D4150
     jne .e820_done
+    cmp ecx, 20
+    jb  .e820_next
+    cmp dword [E820_SCRATCH + 16], 1  ; usable RAM
+    jne .e820_next
+    cmp ecx, 24
+    jb  .e820_length
+    test dword [E820_SCRATCH + 20], 1 ; enabled ACPI 3.x entry
+    jz  .e820_next
+.e820_length:
+    mov eax, [E820_SCRATCH + 8]
+    or  eax, [E820_SCRATCH + 12]
+    jz  .e820_next
+    cmp bp, BOOT_RANGE_MAX
+    jae .e820_bad
+    mov eax, [E820_SCRATCH]
+    mov edx, [E820_SCRATCH + 4]
+    mov [si], eax
+    mov [si + 4], edx
+    add eax, [E820_SCRATCH + 8]
+    adc edx, [E820_SCRATCH + 12]
+    jc  .e820_bad
+    mov [si + 8], eax
+    mov [si + 12], edx
     inc bp
-    add di, 24
-    cmp bp, 128
-    jae .e820_done
+    add si, BOOT_RANGE_SIZE
+.e820_next:
     test ebx, ebx
     jnz .e820_loop
+    jmp .e820_done
+.e820_bad:
+    xor bp, bp                   ; the kernel rejects an empty resource map
 .e820_done:
-    mov [BOOTINFO], bp
-    mov al, [boot_drive]
-    mov [BOOTINFO + 2], al
+    movzx eax, bp
+    mov [BOOT_COUNT], eax
 
     ; ---------------- unreal mode: 4 GiB limits on DS/ES ----------------
     cli
@@ -315,17 +362,15 @@ vbe_setup:
 
     ; -------- stage the geometry (fb_present stays 0 for now) --------
     movzx eax, word [VBE_MODE + 0x12]   ; XResolution
-    mov [BOOTINFO + 4], eax
+    mov [BOOT_FB_WIDTH], eax
     movzx eax, word [VBE_MODE + 0x14]   ; YResolution
-    mov [BOOTINFO + 8], eax
+    mov [BOOT_FB_HEIGHT], eax
     call vbe_pitch
-    mov [BOOTINFO + 12], eax
+    mov [BOOT_FB_PITCH], eax
     mov eax, 32
-    mov [BOOTINFO + 16], eax
+    mov [BOOT_FB_BPP], eax
     mov eax, [VBE_MODE + 0x28]          ; PhysBasePtr
-    mov [BOOTINFO + 24], eax
-    xor eax, eax
-    mov [BOOTINFO + 28], eax
+    mov [BOOT_FB_PHYS], eax
 
     ; -------- set the mode, linear framebuffer --------
     mov bx, [vbe_mode]
@@ -337,7 +382,7 @@ vbe_setup:
     cmp ax, 0x004F
     jne .fail
 
-    mov byte [BOOTINFO + 3], 1
+    mov dword [BOOT_FLAGS], BOOT_FB_PRESENT
     pop ds
     ret
 
@@ -345,13 +390,6 @@ vbe_setup:
     xor ax, ax
     mov ds, ax
     mov es, ax
-    mov byte [BOOTINFO + 3], 0
-    mov dword [BOOTINFO + 4], 0
-    mov dword [BOOTINFO + 8], 0
-    mov dword [BOOTINFO + 12], 0
-    mov dword [BOOTINFO + 16], 0
-    mov dword [BOOTINFO + 24], 0
-    mov dword [BOOTINFO + 28], 0
     pop ds
     ret
 
@@ -495,6 +533,9 @@ long_start:
     mov fs, ax
     mov gs, ax
     mov rsp, 0x60000
-    mov edi, BOOTINFO            ; first argument to kmain (phys addr)
+    mov edi, BOOTINFO            ; handoff physical address
+    mov esi, [abs BOOT_COUNT]
+    imul esi, BOOT_RANGE_SIZE
+    add esi, BOOT_HEADER         ; handoff byte length
     mov rax, KERNEL_ENTRY
     jmp rax

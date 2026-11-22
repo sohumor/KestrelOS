@@ -10,7 +10,7 @@ from e2e import Harness, qemu_command, t_boot
 
 
 def main():
-    handoff = "PASS BIOS handoff: usable ranges, optional framebuffer, malformed map rejection"
+    handoff = "PASS boot handoff v1: resources decoded, truncated and unsupported data rejected"
     success = "PASS contiguous pages: fragmentation leaves text console available and clears on retry"
     with TemporaryDirectory() as directory:
         image = Path(directory) / "os.img"
@@ -28,7 +28,7 @@ def main():
         h = Harness(command)
         try:
             h.start()
-            if h.expect_any([handoff, "FAIL BIOS handoff"]) != handoff:
+            if h.expect_any([handoff, "FAIL boot handoff v1"]) != handoff:
                 raise AssertionError("guest rejected the boot handoff check")
             h.expect("fb: no contiguous memory for a ")
             if h.expect_any([success, "FAIL contiguous pages"]) != success:

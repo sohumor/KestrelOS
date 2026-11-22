@@ -1,43 +1,64 @@
 #include "../kernel/pmm.c"
-#include "bios_boot.h"
+#include "boot_handoff.h"
 #include "fb.h"
 
 static uint8_t saved_bitmap[sizeof(bitmap)];
 
-static bool check_bios_decode(void)
+static bool check_boot_handoff(void)
 {
-    static struct bios_bootinfo wire = {
-        .e820_count = 3,
-        .boot_seed = 17,
-        .e820 = {
-            {0x100000, 0x200000, BIOS_E820_USABLE, 1},
-            {0x300000, 0x100000, 2, 1},
-            {0x400000, 0, BIOS_E820_USABLE, 1},
+    struct {
+        struct boot_handoff_v1 header;
+        struct boot_handoff_range ranges[1];
+    } wire = {
+        .header = {
+            .magic = BOOT_HANDOFF_MAGIC,
+            .version = BOOT_HANDOFF_VERSION,
+            .header_size = sizeof(struct boot_handoff_v1),
+            .memory_count = 1,
+            .flags = BOOT_HANDOFF_FRAMEBUFFER,
+            .seed = 17,
+            .fb_phys = 0xe0000000,
+            .fb_width = 800,
+            .fb_height = 600,
+            .fb_pitch = 3200,
+            .fb_bpp = 32,
         },
+        .ranges = {{0x100000, 0x300000}},
     };
     static struct boot_resources out;
 
-    if (!bios_boot_decode(&wire, &out) || out.memory_count != 1 ||
+    if (!boot_handoff_decode(&wire, sizeof(wire), &out) || out.memory_count != 1 ||
         out.memory[0].base != 0x100000 || out.memory[0].end != 0x300000 ||
-        out.framebuffer.present || out.seed != 17)
+        !out.framebuffer.present || out.framebuffer.phys != 0xe0000000 ||
+        out.framebuffer.width != 800 || out.framebuffer.height != 600 ||
+        out.framebuffer.pitch != 3200 || out.framebuffer.bpp != 32 || out.seed != 17)
         return false;
 
-    wire.e820_count = BIOS_E820_MAX + 1;
-    if (bios_boot_decode(&wire, &out))
+    wire.header.flags = 0;
+    if (!boot_handoff_decode(&wire, sizeof(wire), &out) || out.framebuffer.present ||
+        boot_handoff_decode(&wire, sizeof(wire.header) - 1, &out) ||
+        boot_handoff_decode(&wire, sizeof(wire) - 1, &out))
         return false;
-    wire.e820_count = 1;
-    wire.e820[0].len = UINT64_MAX;
-    return !bios_boot_decode(&wire, &out);
+    wire.header.version++;
+    if (boot_handoff_decode(&wire, sizeof(wire), &out))
+        return false;
+    wire.header.version = BOOT_HANDOFF_VERSION;
+    wire.header.memory_count = BOOT_MAX_MEMORY_RANGES + 1;
+    if (boot_handoff_decode(&wire, sizeof(wire), &out))
+        return false;
+    wire.header.memory_count = 1;
+    wire.ranges[0].end = wire.ranges[0].base;
+    return !boot_handoff_decode(&wire, sizeof(wire), &out);
 }
 
 void __real_fb_init(const struct boot_framebuffer *fb);
 
 void __wrap_fb_init(const struct boot_framebuffer *fb)
 {
-    if (check_bios_decode())
-        kprintf("PASS BIOS handoff: usable ranges, optional framebuffer, malformed map rejection\n");
+    if (check_boot_handoff())
+        kprintf("PASS boot handoff v1: resources decoded, truncated and unsupported data rejected\n");
     else
-        kprintf("FAIL BIOS handoff: decoder rejected valid data or accepted malformed data\n");
+        kprintf("FAIL boot handoff v1: decoder rejected valid data or accepted malformed data\n");
 
     if (!fb->present) {
         kprintf("FAIL contiguous pages: guest has no framebuffer\n");

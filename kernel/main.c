@@ -1,5 +1,5 @@
 #include "kernel.h"
-#include "bios_boot.h"
+#include "boot_handoff.h"
 #include "console.h"
 #include "serial.h"
 #include "string.h"
@@ -81,7 +81,7 @@ static void housekeeper(void *arg)
     }
 }
 
-void kmain(uint64_t bootinfo_phys)
+void kmain(uint64_t handoff_phys, size_t handoff_size)
 {
     serial_init();
     testmode_init();
@@ -94,8 +94,10 @@ void kmain(uint64_t bootinfo_phys)
     console_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     kprintf("  from-scratch kernel booted in long mode\n\n");
 
-    if (!bios_boot_decode(P2V(bootinfo_phys), &boot))
-        panic("boot: invalid BIOS resource handoff");
+    if (handoff_phys >= BOOT_HANDOFF_MAP_LIMIT ||
+        handoff_size > BOOT_HANDOFF_MAP_LIMIT - handoff_phys ||
+        !boot_handoff_decode(P2V(handoff_phys), handoff_size, &boot))
+        panic("boot: invalid or unsupported resource handoff");
     random_init(boot.seed);
     entropy_pool_add(ENTROPY_BOOT, &boot, sizeof(boot), 0);
 
