@@ -9,22 +9,28 @@
 #include "vfs.h"
 
 #include "pulse.h"
+#include "pulse_stream.h"
 #include "flight.h"
 
 #define PARCEL_MAX_UIDS    8
 #define PARCEL_PMM_RESERVE 64
+#define PARCEL_HISTORY     32
+#define PARCEL_CHANGED     1U
+
+_Static_assert(offsetof(struct parcel_change, seq) == 0, "Talon sequence prefix");
 
 struct parcel_slot {
     bool valid;
-    uint64_t seq;
     struct k_parcel_info info;
     uint8_t *data;
 };
 
 struct parcel_bucket {
     uint32_t uid;
-    uint64_t last_seq;
     struct parcel_slot slots[K_PARCEL_MAX_SLOTS];
+    struct pulse_stream changes;
+    struct parcel_change history[PARCEL_HISTORY];
+    uint32_t topics[PARCEL_HISTORY];
 };
 
 struct parcel_watch_waiter {
@@ -75,6 +81,7 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
     struct k_parcel_info info;
     struct parcel_bucket *b, *new_bucket = NULL;
     uint8_t *payload = NULL, *evicted = NULL;
+    bool first = false;
     uint32_t uid, id;
     uint64_t f;
 
@@ -126,6 +133,8 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
             return -1;
         }
         new_bucket->uid = uid;
+        new_bucket->changes = (struct pulse_stream)
+            PULSE_STREAM_INIT(&parcel_lock, new_bucket->history, new_bucket->topics);
 
         f = spin_lock_irqsave(&parcel_lock);
         b = find_bucket_locked(uid);
@@ -140,6 +149,7 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
             buckets[slot] = new_bucket;
             b = new_bucket;
             new_bucket = NULL;
+            first = true;
         }
     }
 
@@ -152,12 +162,14 @@ long parcel_put(const struct k_parcel_put *req, const void *kdata)
         b->slots[i] = b->slots[i - 1];
 
     b->slots[0].valid = true;
-    b->slots[0].seq = ++b->last_seq;
     b->slots[0].info = info;
     b->slots[0].data = payload;
-    for (struct parcel_watch_waiter *w = parcel_watchers; w; w = w->next)
-        if (w->uid == uid)
-            task_event_notify(&w->channel, 1);
+    struct parcel_change change = { .info = info };
+    pulse_stream_publish_locked(&b->changes, PARCEL_CHANGED, &change);
+    if (first)
+        for (struct parcel_watch_waiter *w = parcel_watchers; w; w = w->next)
+            if (w->uid == uid)
+                task_event_notify(&w->channel, PARCEL_CHANGED);
     spin_unlock_irqrestore(&parcel_lock, f);
 
     if (new_bucket)
@@ -252,18 +264,11 @@ long parcel_watch(uint64_t *cursor, struct parcel_change *out,
     uint64_t deadline = timer_ticks() + ticks;
     uint64_t f = spin_lock_irqsave(&parcel_lock);
     for (;;) {
-        const struct parcel_bucket *b = find_bucket_locked(waiter.uid);
-        uint32_t count = 0;
-        for (int i = K_PARCEL_MAX_SLOTS - 1; b && i >= 0 && count < capacity; i--) {
-            const struct parcel_slot *s = &b->slots[i];
-            if (s->valid && s->seq > *cursor)
-                out[count++] = (struct parcel_change){ s->seq, s->info };
-        }
-        if (count) {
-            *cursor = out[count - 1].seq;
-            spin_unlock_irqrestore(&parcel_lock, f);
-            return count;
-        }
+        struct parcel_bucket *b = find_bucket_locked(waiter.uid);
+        if (b)
+            return pulse_stream_read_locked(&b->changes, cursor, PARCEL_CHANGED,
+                                            out, capacity, PULSE_CURSOR_MATCH,
+                                            deadline, f);
         if (!ticks || !sched_active || timer_ticks() >= deadline) {
             spin_unlock_irqrestore(&parcel_lock, f);
             return 0;
@@ -271,7 +276,7 @@ long parcel_watch(uint64_t *cursor, struct parcel_change *out,
 
         waiter.next = parcel_watchers;
         parcel_watchers = &waiter;
-        int rc = task_event_wait_locked(&waiter.channel, 1, deadline,
+        int rc = task_event_wait_locked(&waiter.channel, PARCEL_CHANGED, deadline,
                                         &parcel_lock, f);
         f = spin_lock_irqsave(&parcel_lock);
         struct parcel_watch_waiter **link = &parcel_watchers;
