@@ -76,6 +76,7 @@
 #define DOM_TRUNC_TEXT   0x20u  /* a text node was clipped              */
 #define DOM_TRUNC_COLLECT 0x40u /* collected style/script text clipped  */
 #define DOM_TRUNC_OPEN   0x80u  /* open-element stack cap hit           */
+#define DOM_TRUNC_CREDIT 0x100u /* shared document backing cap hit     */
 
 /* dom_document.repairs bits: structural repairs the parser had to make.
  * Not errors - the tree is fine - but a caller may want to say so, and
@@ -228,22 +229,28 @@ struct dom_document {
     void *priv;
 };
 
-/* Caps for one parse. A zero field means "use the compiled-in
- * default"; this exists so tests can drive the limit paths cheaply. */
+/* One backing-memory budget can fund multiple independent documents.
+ * Keep it alive until all funded documents are freed and serialize access
+ * as with the documents themselves. Initialize remaining to the byte cap. */
+struct dom_memory_credit {
+    unsigned long remaining;
+};
+
+/* Zero numeric fields select the compiled-in limits. */
 struct dom_limits {
     unsigned long max_input;
     unsigned long max_nodes;
     unsigned long max_depth;
     unsigned long max_arena;
+    struct dom_memory_credit *credit;
 };
 
 /* ------------------------------------------------------------------ *
  * Parsing
  * ------------------------------------------------------------------ */
 
-/* Parse len bytes of HTML into a fresh document. Returns 0 only when
- * out of memory; every other failure mode is reported through
- * dom_document.truncated and still yields a usable tree. */
+/* Parse len bytes of HTML into a fresh document. Returns 0 if the document
+ * could not be created; later limits are reported in dom_document.truncated. */
 struct dom_document *html_parse_document(const char *src, unsigned long len);
 struct dom_document *html_parse_document_limits(const char *src,
                                                 unsigned long len,

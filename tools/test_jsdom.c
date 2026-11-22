@@ -164,6 +164,44 @@ static char *test_clip_read(void *user, unsigned long *len_out)
     return copy;
 }
 
+static void test_parsed_document_credit(void)
+{
+    struct dom_document *doc = html_parse_document("<p>page</p>", 11);
+    struct jsdom_config cfg = {0};
+    struct jsdom *j;
+    char err[256] = {0};
+
+    CHECK(doc != NULL, "create page for DOMParser credit");
+    if (!doc)
+        return;
+    cfg.url = "https://example.test/";
+    cfg.max_parsed_document_bytes = 2 * dom_memory_used(doc);
+    j = jsdom_new(doc, &cfg);
+    CHECK(j != NULL, "create runtime with DOMParser credit");
+    if (j) {
+        CHECK(jsdom_eval(j,
+              "function denied(parser, source, mime) {"
+              " try { parser.parseFromString(source, mime); }"
+              " catch (e) { return true; } return false;"
+              "}"
+              "var parser = new DOMParser();"
+              "if (!denied(parser, '<p>' + 'x'.repeat(65536) + '</p>', 'text/html'))"
+              " throw Error('oversize parse accepted');"
+              "var h = parser.parseFromString('<p>html</p>', 'text/html');"
+              "var x = parser.parseFromString('<p>xml</p>', 'text/xml');"
+              "if (!denied(new DOMParser(), '<p/>', 'text/xml'))"
+              " throw Error('new parser bypassed page credit');"
+              "if (h.querySelector('p').textContent !== 'html' ||"
+              " x.documentElement.textContent !== 'xml' ||"
+              " document.querySelector('p').textContent !== 'page')"
+              " throw Error('denial disturbed a live document');",
+              "domparser-credit.js", err, sizeof err) == 0,
+              err[0] ? err : "DOMParser shares page credit across parsers and MIME types");
+        jsdom_free(j);
+    }
+    dom_document_free(doc);
+}
+
 static void test_wave5b_features(void)
 {
     struct jsdom_config cfg;
@@ -2890,6 +2928,7 @@ int main(void)
     web_storage_free(session_store);
     web_storage_free(local_store);
     test_wave5b_features();
+    test_parsed_document_credit();
     test_wave8b_features();
     printf("%d passed, %d failed\n", checks - failures, failures);
     return failures ? 1 : 0;

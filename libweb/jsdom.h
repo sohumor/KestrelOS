@@ -61,6 +61,7 @@ struct jsdom_config {
     int (*clipboard_write)(void *user, const char *text, unsigned long len);
     char *(*clipboard_read)(void *user, unsigned long *len_out);
     const struct css_stylesheet *stylesheet;
+    unsigned long max_parsed_document_bytes; /* zero selects DOM_MAX_ARENA */
 };
 
 struct jsdom *jsdom_new(struct dom_document *doc,
