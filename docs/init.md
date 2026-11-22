@@ -106,13 +106,20 @@ unsupported, and ignored.
 whitespace, or both. Both participate in topological startup ordering.
 A missing `after=` target is only a bad ordering hint, so init warns and
 continues. A missing or self-referential `requires=` target makes the unit
-fail. Anything still unplaced when no further progress is possible is part
-of a cycle and is marked `failed`; the algorithm always terminates.
+fail. Units in or ordered behind a cycle are marked `failed`.
+
+Init resolves service names into one dependency graph at startup. Boot
+ordering, requirement startup, and dependency-loss handling all use that
+graph. A reload validates the proposed graph before installing new settings,
+so a rejected edit leaves the running graph and unit states intact.
 
 Before starting a unit, init recursively starts every hard requirement.
+Boot and explicit starts wait for readiness through chains of requirements,
+including services that are disabled for automatic startup.
 A requirement is usable when it is running, or when it is a successful
 `restart=never` one-shot. If a hard requirement later becomes unavailable,
-init stops its active dependents and marks them failed. A control command
+init stops its active dependents and marks them failed in dependency order,
+so failure across a chain is published together. A control command
 that removes a requirement publishes that dependent failure before its
 acknowledgement; the terminating child remains supervised until it is reaped.
 
