@@ -10,6 +10,7 @@
 #include "kestrel_abi.h"
 #include "spinlock.h"
 #include "flight.h"
+#include "hangar_fmt.h"
 
 /* tools/mkimage.py writes this header immediately after the root KFS
  * filesystem partition. Derive the starting LBA from the KFS superblock at
@@ -21,6 +22,9 @@
 #define SWAP_MAX_PAGES         4096
 #define SWAP_VERSION           1
 #define VM_PMM_RESERVE         512
+#define SWAP_RAM_SLOTS         128
+#define SWAP_RAM_WORDS         128
+#define SWAP_RAM_BASE          (SWAP_MAX_PAGES + 1)
 
 struct swap_header {
     char magic[8];               /* "KSWAP01" plus NUL */
@@ -34,6 +38,12 @@ static uint64_t swap_start_lba = SWAP_DEFAULT_START_LBA;
 static uint32_t swap_pages;
 static uint32_t swap_used;
 static spinlock_t swap_lock = SPINLOCK_INIT;
+
+/* Swap token 0 is an exact zero page; 1..SWAP_MAX_PAGES are disk slots. */
+static struct swap_ram_page {
+    uint16_t size;
+    uint32_t words[SWAP_RAM_WORDS];
+} swap_ram[SWAP_RAM_SLOTS];
 
 static int bit_test(uint32_t bit)
 {
@@ -143,6 +153,68 @@ static uint64_t swap_lba(uint32_t slot)
            (uint64_t)slot * SWAP_SECTORS_PER_PAGE;
 }
 
+static int store_ram_page(const uint32_t *page)
+{
+    uint32_t packed[SWAP_RAM_WORDS];
+    size_t words = hangar_rle_encode(page, PAGE_SIZE / sizeof(*page),
+                                     packed, SWAP_RAM_WORDS);
+    if (!words)
+        return -1;
+    if (words == 2 && packed[0] == (HANGAR_RLE_RUN | (PAGE_SIZE / sizeof(*page))) &&
+        packed[1] == 0)
+        return 0;
+
+    uint64_t f = spin_lock_irqsave(&swap_lock);
+    for (int i = 0; i < SWAP_RAM_SLOTS; i++) {
+        struct swap_ram_page *slot = &swap_ram[i];
+        if (slot->size)
+            continue;
+        memcpy(slot->words, packed, words * sizeof(*packed));
+        slot->size = (uint16_t)words;
+        spin_unlock_irqrestore(&swap_lock, f);
+        return SWAP_RAM_BASE + i;
+    }
+    spin_unlock_irqrestore(&swap_lock, f);
+    return -1;
+}
+
+static bool is_ram_token(uint64_t token)
+{
+    return token >= SWAP_RAM_BASE && token < SWAP_RAM_BASE + SWAP_RAM_SLOTS;
+}
+
+static int restore_swap_page(uint64_t token, void *page)
+{
+    if (token == 0) {
+        memset(page, 0, PAGE_SIZE);
+        return 0;
+    }
+    if (is_ram_token(token)) {
+        const struct swap_ram_page *slot = &swap_ram[token - SWAP_RAM_BASE];
+        uint32_t packed[SWAP_RAM_WORDS];
+        uint64_t f = spin_lock_irqsave(&swap_lock);
+        size_t words = slot->size;
+        memcpy(packed, slot->words, words * sizeof(*packed));
+        spin_unlock_irqrestore(&swap_lock, f);
+        return hangar_rle_decode(packed, words, page, PAGE_SIZE / sizeof(*packed));
+    }
+    if (token > SWAP_MAX_PAGES || !swap_dev || !swap_slot_in_use((uint32_t)token - 1))
+        return -1;
+    return blockdev_read(swap_dev, swap_lba((uint32_t)token - 1),
+                         SWAP_SECTORS_PER_PAGE, page);
+}
+
+static void release_swap_page(uint64_t token)
+{
+    if (is_ram_token(token)) {
+        uint64_t f = spin_lock_irqsave(&swap_lock);
+        swap_ram[token - SWAP_RAM_BASE].size = 0;
+        spin_unlock_irqrestore(&swap_lock, f);
+    } else if (token > 0 && token <= SWAP_MAX_PAGES) {
+        swap_free_slot((uint32_t)token - 1);
+    }
+}
+
 static int page_is_managed(struct task *t, uint64_t va)
 {
     uint64_t end = va + PAGE_SIZE;
@@ -217,31 +289,33 @@ static int find_victim(struct task *avoid_task, uint64_t avoid_va,
 static int swap_out_one(struct task *avoid_task, uint64_t avoid_va)
 {
     struct victim_search v;
-    int slot;
-    uint64_t old;
 
-    if (!swap_dev || find_victim(avoid_task, avoid_va, &v) < 0)
-        return -1;
-    slot = swap_alloc_slot();
-    if (slot < 0)
+    if (find_victim(avoid_task, avoid_va, &v) < 0)
         return -1;
 
-    old = *v.pte;
-    if (blockdev_write(swap_dev, swap_lba((uint32_t)slot),
-                       SWAP_SECTORS_PER_PAGE, P2V(PTE_ADDR(old))) < 0) {
-        swap_free_slot((uint32_t)slot);
-        return -1;
+    uint64_t old = *v.pte;
+    const void *data = P2V(PTE_ADDR(old));
+    int token = store_ram_page(data);
+    if (token < 0) {
+        int slot = swap_dev ? swap_alloc_slot() : -1;
+        if (slot < 0)
+            return -1;
+        if (blockdev_write(swap_dev, swap_lba((uint32_t)slot),
+                           SWAP_SECTORS_PER_PAGE, data) < 0) {
+            swap_free_slot((uint32_t)slot);
+            return -1;
+        }
+        token = slot + 1;
     }
 
-    *v.pte = ((uint64_t)(slot + 1) << 12) | PTE_SWAP |
-             (old & (PTE_U | PTE_W));
+    *v.pte = ((uint64_t)token << 12) | PTE_SWAP | (old & (PTE_U | PTE_W));
     if (v.task == current)
         invlpg(v.va);
     pmm_free(PTE_ADDR(old));
-    flight_record(FLIGHT_CAT_VM, "swap_out",
-                  avoid_task ? (int16_t)avoid_task->pid : 0,
-                  v.va, (uint64_t)slot,
-                  avoid_task ? avoid_task->name : "");
+    const char *event = !token ? "swap_zero" :
+                        is_ram_token(token) ? "swap_pack" : "swap_out";
+    flight_record(FLIGHT_CAT_VM, event, (int16_t)v.task->pid, v.va,
+                  token ? (uint64_t)token - 1 : 0, v.task->name);
     return 0;
 }
 
@@ -319,22 +393,21 @@ static int handle_page_fault_locked(struct task *t, uint64_t address,
     pte = vmm_get_pte(t->pml4, page, 0);
     if (pte && (*pte & PTE_SWAP)) {
         uint64_t raw = *pte;
-        uint32_t slot = (uint32_t)((PTE_ADDR(raw) >> 12) - 1);
-        if (!swap_dev || !swap_slot_in_use(slot))
-            return -1;
+        uint64_t token = PTE_ADDR(raw) >> 12;
         phys = alloc_user_frame(t, page);
         if (!phys)
             return -1;
-        if (blockdev_read(swap_dev, swap_lba(slot),
-                          SWAP_SECTORS_PER_PAGE, P2V(phys)) < 0) {
+        if (restore_swap_page(token, P2V(phys)) < 0) {
             pmm_free(phys);
             return -1;
         }
-        swap_free_slot(slot);
         vmm_map_page(t->pml4, page, phys,
                      PTE_U | (raw & PTE_W));
-        flight_record(FLIGHT_CAT_VM, "swap_in", (int16_t)t->pid,
-                      page, (uint64_t)slot, t->name);
+        release_swap_page(token);
+        const char *event = !token ? "swap_refill" :
+                            is_ram_token(token) ? "swap_unpack" : "swap_in";
+        flight_record(FLIGHT_CAT_VM, event, (int16_t)t->pid,
+                      page, token ? token - 1 : 0, t->name);
         return 0;
     }
     if (pte && (*pte & PTE_P))
@@ -408,8 +481,7 @@ static int release_visit(uint64_t va, uint64_t *pte, void *arg)
     (void)va;
     (void)arg;
     if (*pte & PTE_SWAP) {
-        uint32_t slot = (uint32_t)((PTE_ADDR(*pte) >> 12) - 1);
-        swap_free_slot(slot);
+        release_swap_page(PTE_ADDR(*pte) >> 12);
         *pte = 0;
     }
     return 0;

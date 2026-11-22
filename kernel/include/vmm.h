@@ -11,7 +11,7 @@
 #define PTE_PS 0x080ULL
 #define PTE_G  0x100ULL
 /* Available-to-software leaf bit. A non-present PTE with this bit set
- * contains a one-based swap slot number in its address field. */
+ * contains a VM swap token in its address field. */
 #define PTE_SWAP 0x200ULL
 
 #define PTE_ADDR(e) ((e) & 0x000FFFFFFFFFF000ULL)
