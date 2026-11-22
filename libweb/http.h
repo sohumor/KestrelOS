@@ -10,7 +10,7 @@
  *
  * What it deliberately does not do: it never opens a socket itself. All
  * I/O goes through a struct http_transport obtained from a factory that
- * was registered for the URL's scheme, so TLS can be plugged in for
+ * is bound to the URL's scheme, so TLS can be plugged in for
  * https:// without this file knowing anything about it.
  *
  * Memory: every buffer has a documented ceiling and the client fails with
@@ -76,15 +76,15 @@ struct http_transport {
 };
 
 /* Open a transport to host:port. Returns HTTP_OK with *out filled, or a
- * negative HTTP_E* code. `user` is the pointer given to
+ * negative HTTP_E* code. `user` comes from the route or from
  * http_register_scheme() — a TLS factory would use it for its trust
  * store. `host` is the bare host (an IPv6 literal without brackets) and
  * doubles as the SNI name. */
 typedef int (*http_transport_fn)(const char *host, int port, int timeout_ms,
                                  void *user, struct http_transport *out);
 
-/* Bind a factory to a scheme ("http", "https", ...). Registering a
- * scheme twice replaces the earlier factory. Up to 8 schemes. Returns
+/* Bind a legacy client's factory to a scheme ("http", "https", ...).
+ * Registering a scheme twice replaces the earlier factory. Up to 8 schemes. Returns
  * HTTP_OK or HTTP_E_INVAL. Scheme names are compared case-insensitively.
  *
  * "http" is bound to the built-in TCP transport the first time a client
@@ -107,7 +107,7 @@ int http_tcp_transport(const char *host, int port, int timeout_ms,
 typedef int (*http_inflate_fn)(const void *src, unsigned long slen,
                                void **out, unsigned long *olen, int wrapper);
 
-/* Install the decompressor. Until this is called (or the file is built
+/* Install the decompressor for legacy clients. Until called (or built
  * with -DHTTP_HAVE_INFLATE, which makes inflate_buf the default) the
  * client does not advertise Accept-Encoding and rejects an encoded
  * response with HTTP_E_DECODE. */
@@ -188,6 +188,20 @@ struct cookie_jar;
 struct http_cache;
 
 struct http_client *http_client_new(void);
+
+struct http_route {
+    const char *scheme;
+    http_transport_fn open;
+    void *user;
+};
+
+/* Copy up to eight routes with distinct case-insensitive scheme names
+ * of 1–15 bytes. No implicit routes or decoder are installed; a NULL
+ * inflate hook disables decoding. Route user data is borrowed for the
+ * client's lifetime. Returns NULL on invalid routes or allocation failure. */
+struct http_client *http_client_new_profile(const struct http_route *routes,
+                                           unsigned count,
+                                           http_inflate_fn inflate);
 void http_client_free(struct http_client *c);
 
 /* Cookie jar and cache are created with the client; these expose them so
