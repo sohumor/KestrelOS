@@ -46,33 +46,31 @@ static int spawn_reader(const char *mode)
     int pid = spawn_caps(PROBE, args, &caps);
     close(ready[1]);
 
-    /* Startup can sleep on KFS. Only inspect task state after the child
-     * has primed its Pulse cursor and is about to enter the blocking poll. */
+    /* The host watchdog bounds startup, which can sleep on KFS. Start
+     * the park deadline only once the reader has primed its Pulse cursor. */
+    char marker;
+    int armed = pid >= 0 && read(ready[0], &marker, 1) == 1 && marker == 'R';
+    close(ready[0]);
     unsigned long start = uptime_ms();
-    int armed = 0;
-    while (pid >= 0 && uptime_ms() - start < 1000) {
-        if (!armed) {
-            char marker;
-            long n = read_nb(ready[0], &marker, 1);
-            if (n < 0 || (n == 1 && marker != 'R'))
-                break;
-            armed = n == 1;
-        }
-        if (armed) {
-            struct k_psinfo info;
-            for (int i = 0; psinfo(i, &info) == 0; i++) {
-                if (info.pid == pid && info.state == K_STATE_SLEEPING) {
-                    close(ready[0]);
-                    return pid;
-                }
-            }
+    while (armed && uptime_ms() - start < 1000) {
+        struct k_psinfo info;
+        for (int i = 0; psinfo(i, &info) == 0; i++) {
+            if (info.pid == pid && info.state == K_STATE_SLEEPING)
+                return pid;
         }
         sleep_ms(10);
     }
-    close(ready[0]);
     printf("FAIL Pulse %s reader did not park (pid=%d, ready=%d)\n",
            mode, pid, armed);
     return -1;
+}
+
+static int check_event(const char *mode)
+{
+    int pid = spawn_reader(mode);
+    return pid >= 0 &&
+           parcel_put(K_PARCEL_TEXT, "text/plain", "wait-probe", "x", 1) >= 0 &&
+           waitpid(pid) == 0;
 }
 
 int main(int argc, char **argv)
@@ -80,11 +78,7 @@ int main(int argc, char **argv)
     if (argc > 1 && strncmp(argv[1], "--cwd=", 6) != 0)
         return reader(argv[1]);
 
-    int event = spawn_reader("event");
-    int timeout = spawn_reader("timeout");
-    if (event < 0 || timeout < 0 ||
-        parcel_put(K_PARCEL_TEXT, "text/plain", "wait-probe", "x", 1) < 0 ||
-        waitpid(event) != 0 || waitpid(timeout) != 0) {
+    if (!check_event("event") || !check_event("timeout")) {
         puts("FAIL Pulse event delivery or timeout");
         return 1;
     }
