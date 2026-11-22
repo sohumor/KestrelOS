@@ -130,6 +130,7 @@ from the directory tree `DIR` (which becomes `/`) plus the manifest `M`.
 | `arch` | defaults to `x86_64` |
 | `depends` | comma-separated package names |
 | `maintainer` | free text |
+| `launch` | optional entry path, capability mask, and one to eight exact mount attachment paths |
 | `default-file-mode` | octal, default `0644` |
 | `default-dir-mode` | octal, default `0755` |
 
@@ -262,6 +263,7 @@ package whose files are missing.
 ```
 kpkg install [--force] <name|file.kpkg>...
 kpkg install-object [--force] <sha256>
+kpkg run <name> [args...]
 kpkg remove <name>
 kpkg list
 kpkg info <name>
@@ -293,6 +295,35 @@ digest; a bad object fails rather than falling back to the repository.
 An administrator can remove a bad object and reinstall from the
 repository. The store has no automatic garbage collection, and
 retaining an archive does not make extraction transactional.
+
+### Declared launch grants
+
+For example, `launch: /bin/hello 0x00 /` declares an entry point
+shipped as an executable file in the package, a zero capability mask,
+and a mount view containing only the root attachment. The entry and
+mount paths are canonical absolute ASCII paths without whitespace;
+mount paths are at most 63 bytes each and cannot repeat. The mask is
+two lowercase hexadecimal digits with an `0x` prefix, using the
+`KCAP_*` bits from `abi/kestrel_abi.h`. Zero means no bits.
+
+`kpkg run hello world` launches that entry with argument `world` and
+returns its exit status. It starts in `/`, forwarding only standard
+input, output and error. The [spawn grant](spawn-grants.md) intersects
+the requested mask with the caller's capabilities and selects attachments
+visible to the caller. The selected view applies during executable and
+library loading; an unavailable attachment causes launch to fail, with
+no fallback. Selecting the root attachment does not hide files on that
+filesystem. Inherited standard descriptors can still be used.
+
+The launcher reads a public, root-writable declaration in
+`/var/pkg/launch/<name>`, published after successful extraction and
+database recording. Installation does not run the entry point. Removal
+and replacement retire the prior declaration; a package without one
+cannot be started with `kpkg run`. The private package database stays
+private. This grant applies only through `kpkg run`; it does not prohibit
+direct execution or make package installation transactional.
+
+### Installation and removal
 
 **install** takes either a path (anything ending in `.kpkg`, or
 containing a `/`, resolved against the shell's startup directory) or a package

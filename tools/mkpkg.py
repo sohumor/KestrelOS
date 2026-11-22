@@ -22,6 +22,7 @@ Manifest format (a text file, '#' starts a comment):
     arch: x86_64                    optional, default x86_64
     depends: foo, bar               optional, comma separated
     maintainer: someone             optional
+    launch: /bin/hello 0x00 /       optional: entry, capability mask, mounts
     default-file-mode: 0644         optional
     default-dir-mode: 0755          optional
 
@@ -70,7 +71,7 @@ assert struct.calcsize(HEADER_FMT) == HEADER_SIZE
 assert struct.calcsize(FILE_FMT) == FILE_ENTRY_SIZE
 
 META_KEYS = ("name", "version", "description", "arch", "depends",
-             "maintainer")
+             "maintainer", "launch")
 RULE_WORDS = ("mode", "own", "dir", "exclude")
 
 
@@ -152,6 +153,8 @@ def load_manifest(path):
             key = key.strip().lower()
             value = value.strip()
             if key in META_KEYS:
+                if key == "launch" and key in m.meta:
+                    die("%s: duplicate launch declaration" % where)
                 m.meta[key] = value
             elif key == "default-file-mode":
                 m.file_mode = parse_mode(value, where)
@@ -264,6 +267,30 @@ def collect(root, m):
     return [entries[k] for k in sorted(entries)]
 
 
+def validate_launch(meta, entries, where):
+    if "launch" not in meta:
+        return
+    fields = meta["launch"].split()
+    if len(fields) < 3:
+        die("%s: launch needs an entry, a capability mask and mount paths" % where)
+    entry, mask, *mounts = fields
+    if (len(mask) != 4 or not mask.startswith("0x")
+            or any(c not in "0123456789abcdef" for c in mask[2:])
+            or int(mask, 16) > 0x7f):
+        die("%s: invalid launch capability mask" % where)
+    if len(mounts) > 8 or len(set(mounts)) != len(mounts):
+        die("%s: launch requires one to eight distinct mounts" % where)
+    for path, limit in [(entry, PATH_MAX), *((m, 63) for m in mounts)]:
+        if (len(path) > limit or not path.startswith("/")
+                or any(not 33 <= ord(c) <= 126 or c == "\\" for c in path)
+                or norm_dest(path, where) != path):
+            die("%s: invalid launch path %r" % (where, path))
+    if not any(e["dest"] == entry and e["type"] == TYPE_FILE
+               and e["mode"] & 0o111 for e in entries):
+        die("%s: launch entry is not an executable file in the package" % where)
+    meta["launch"] = " ".join(fields)
+
+
 def build_meta(m, entries):
     install_size = sum(len(e["data"]) for e in entries)
     lines = [
@@ -277,6 +304,8 @@ def build_meta(m, entries):
         "files: %d" % len(entries),
         "size: %d" % install_size,
     ]
+    if "launch" in m.meta:
+        lines.append("launch: " + m.meta["launch"])
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -285,6 +314,7 @@ def build(manifest_path, root, out_path):
     entries = collect(root, m)
     if not entries:
         die("%s: package would be empty" % manifest_path)
+    validate_launch(m.meta, entries, manifest_path)
     meta = build_meta(m, entries)
 
     meta_off = HEADER_SIZE
@@ -398,7 +428,10 @@ def read_package(path):
         if not line or ":" not in line:
             continue
         key, value = line.split(":", 1)
-        meta[key.strip().lower()] = value.strip()
+        key = key.strip().lower()
+        if key == "launch" and key in meta:
+            die("%s: duplicate launch declaration" % path)
+        meta[key] = value.strip()
 
     entries = []
     seen = set()
@@ -418,6 +451,7 @@ def read_package(path):
                         "size": size, "offset": offset, "type": etype,
                         "sha256": digest, "data_off": data_off})
 
+    validate_launch(meta, entries, path)
     return Package(path, raw, meta, entries, raw[body_end:])
 
 
@@ -449,7 +483,7 @@ def check(path):
 def listing(path):
     pkg = read_package(path)
     for key in ("name", "version", "arch", "description", "depends",
-                "maintainer", "files", "size"):
+                "maintainer", "files", "size", "launch"):
         if key in pkg.meta:
             print("%-12s %s" % (key + ":", pkg.meta[key]))
     print()

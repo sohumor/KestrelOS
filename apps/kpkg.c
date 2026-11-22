@@ -96,6 +96,7 @@ _Static_assert(sizeof(struct kpkg_file) == KPKG_ENT_SIZE,
 #define DB_DIR        "/var/pkg/db"
 #define CACHE_DIR     "/var/pkg/cache"
 #define OBJECT_DIR    "/var/pkg/objects"
+#define LAUNCH_DIR    "/var/pkg/launch"
 #define INDEX_CACHE   "/var/pkg/index.kpi"
 #define INDEX_NAME    "index.kpi"
 #define DEFAULT_REPO  "/var/pkg/repo"
@@ -107,6 +108,7 @@ _Static_assert(sizeof(struct kpkg_file) == KPKG_ENT_SIZE,
 #define PATH_MAX_      192
 #define IO_CHUNK       4096
 #define OBJECT_SHARD   8
+#define LAUNCH_MAX     (7 + 128 + 5 + K_SPAWN_GRANT_MAX_MOUNTS * K_SPAWN_GRANT_MOUNT_PATH)
 
 /* ---- tiny syscall wrappers -------------------------------------------
  * Named with a kp_ prefix so they cannot collide with libc wrappers for
@@ -372,6 +374,106 @@ static int path_is_safe(const char *p)
     if (n >= 2 && strcmp(p + n - 2, "/.") == 0)
         return 0;
     return 1;
+}
+
+static int path_under(const char *path, const char *dir)
+{
+    unsigned long n = strlen(dir);
+    return strncmp(path, dir, n) == 0 && (path[n] == '/' || path[n] == '\0');
+}
+
+struct pkg_launch {
+    char entry[128];
+    struct k_spawn_grant grant;
+};
+
+static int launch_field(const char **cursor, const char *end, char *out,
+                        unsigned long size)
+{
+    const char *p = *cursor, *start;
+    while (p < end && (*p == ' ' || *p == '\t'))
+        p++;
+    start = p;
+    while (p < end && *p != ' ' && *p != '\t') {
+        if ((unsigned char)*p < 33 || (unsigned char)*p > 126 || *p == '\\')
+            return -1;
+        p++;
+    }
+    *cursor = p;
+    unsigned long n = p - start;
+    if (n >= size)
+        return -1;
+    memcpy(out, start, n);
+    out[n] = '\0';
+    return n != 0;
+}
+
+static int launch_path(const char *path)
+{
+    return path_is_safe(path) && (path[1] == '\0' || path[strlen(path) - 1] != '/');
+}
+
+static int launch_value(const char *p, const char *end, struct pkg_launch *launch)
+{
+    char mask[5], mount[K_SPAWN_GRANT_MOUNT_PATH];
+    struct k_spawn_grant *grant = &launch->grant;
+    int rc;
+
+    if (launch_field(&p, end, launch->entry, sizeof(launch->entry)) != 1 ||
+        !launch_path(launch->entry) ||
+        launch_field(&p, end, mask, sizeof(mask)) != 1 ||
+        strlen(mask) != 4 || strncmp(mask, "0x", 2) != 0)
+        return -1;
+    for (int i = 2; i < 4; i++) {
+        static const char hex[] = "0123456789abcdef";
+        const char *digit = strchr(hex, mask[i]);
+        if (!digit)
+            return -1;
+        grant->caps.cap_mask = (grant->caps.cap_mask << 4) | (digit - hex);
+    }
+    if (grant->caps.cap_mask & ~KCAP_ALL)
+        return -1;
+
+    while ((rc = launch_field(&p, end, mount, sizeof(mount))) == 1) {
+        if (!launch_path(mount) || grant->n_mounts == K_SPAWN_GRANT_MAX_MOUNTS)
+            return -1;
+        for (uint32_t i = 0; i < grant->n_mounts; i++)
+            if (strcmp(grant->mounts[i], mount) == 0)
+                return -1;
+        strcpy(grant->mounts[grant->n_mounts++], mount);
+    }
+    if (rc < 0 || grant->n_mounts == 0)
+        return -1;
+
+    grant->version = K_SPAWN_GRANT_VERSION;
+    grant->flags = K_SPAWN_GRANT_MOUNT_VIEW;
+    strcpy(grant->caps.cwd, "/");
+    grant->caps.n_fds = 3;
+    for (int i = 0; i < 3; i++)
+        grant->caps.fds[i] = (struct k_spawn_fd){ i, i };
+    return 1;
+}
+
+static int launch_parse(const char *meta, unsigned long len, struct pkg_launch *launch,
+                        const char **line, unsigned long *line_len)
+{
+    const char *end = meta + len;
+
+    memset(launch, 0, sizeof(*launch));
+    *line = 0;
+    while (meta < end) {
+        const char *next = meta;
+        while (next < end && *next != '\n')
+            next++;
+        if (next - meta >= 7 && strncmp(meta, "launch:", 7) == 0) {
+            if (*line || launch_value(meta + 7, next, launch) < 0)
+                return -1;
+            *line = meta;
+            *line_len = next - meta;
+        }
+        meta = next < end ? next + 1 : end;
+    }
+    return *line != 0;
 }
 
 static int digest_valid(const char *hex)
@@ -651,6 +753,8 @@ struct pkg {
     char arch[32];
     char instsize[32];
     char sha[KPKG_DIGEST * 2 + 1];
+    const char *launch_line;
+    unsigned long launch_len;
 };
 
 static void pkg_free(struct pkg *p)
@@ -797,13 +901,22 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
         return -1;
     }
 
+    struct pkg_launch launch;
+    int has_launch = launch_parse((const char *)p->raw + p->h.meta_off,
+                                  p->h.meta_len, &launch, &p->launch_line,
+                                  &p->launch_len);
+    int launch_entries = 0;
+    if (has_launch < 0 || p->launch_len > LAUNCH_MAX) {
+        if (!quiet)
+            printf("kpkg: %s: invalid launch declaration\n", path);
+        pkg_free(p);
+        return -1;
+    }
     for (i = 0; i < p->count; i++) {
         struct kpkg_file e;
         pkg_entry(p, i, &e);
-        if (!path_is_safe(e.path) ||
-            (strncmp(e.path, OBJECT_DIR, sizeof(OBJECT_DIR) - 1) == 0 &&
-             (e.path[sizeof(OBJECT_DIR) - 1] == '/' ||
-              e.path[sizeof(OBJECT_DIR) - 1] == '\0'))) {
+        if (!path_is_safe(e.path) || path_under(e.path, OBJECT_DIR) ||
+            path_under(e.path, LAUNCH_DIR)) {
             if (!quiet)
                 printf("kpkg: %s: unsafe path in package\n", path);
             pkg_free(p);
@@ -825,6 +938,45 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
                 return -1;
             }
         }
+        if (has_launch && strcmp(e.path, launch.entry) == 0 &&
+            (++launch_entries != 1 || e.type != KPKG_TYPE_FILE || !(e.mode & 0111)))
+            break;
+    }
+    if (has_launch && (i != p->count || launch_entries != 1)) {
+        if (!quiet)
+            printf("kpkg: %s: launch entry must be an executable package file\n", path);
+        pkg_free(p);
+        return -1;
+    }
+    return 0;
+}
+
+static int launch_remove(const char *name)
+{
+    char path[PATH_MAX_];
+
+    snprintf(path, sizeof(path), "%s/%s", LAUNCH_DIR, name);
+    if (exists(path) && unlink_(path) < 0) {
+        printf("kpkg: cannot retire launch declaration for %s\n", name);
+        return -1;
+    }
+    return 0;
+}
+
+static int launch_publish(const struct pkg *p)
+{
+    char path[PATH_MAX_], stage[PATH_MAX_];
+
+    if (!p->launch_line)
+        return 0;
+    snprintf(path, sizeof(path), "%s/%s", LAUNCH_DIR, p->name);
+    snprintf(stage, sizeof(stage), "%s/.incoming-%d@", LAUNCH_DIR, getpid());
+    if (mkdirs_for(path) < 0 || kp_chmod(LAUNCH_DIR, 0755) < 0 ||
+        write_file(stage, p->launch_line, p->launch_len) < 0 ||
+        kp_chmod(stage, 0644) < 0 || rename_(stage, path) < 0) {
+        unlink_(stage);
+        printf("kpkg: cannot publish launch declaration for %s\n", p->name);
+        return -1;
     }
     return 0;
 }
@@ -1334,6 +1486,10 @@ static int install_file(struct instate *st, const char *file,
         pkg_free(&p);
         return -1;
     }
+    if (launch_remove(p.name) < 0) {
+        pkg_free(&p);
+        return -1;
+    }
     if (extract(&p) < 0) {
         printf("kpkg: %s: extraction failed, nothing recorded\n", p.name);
         pkg_free(&p);
@@ -1341,7 +1497,7 @@ static int install_file(struct instate *st, const char *file,
     }
     if (was_installed)
         prune_old(p.name, &p);
-    if (db_write(&p) < 0) {
+    if (db_write(&p) < 0 || launch_publish(&p) < 0) {
         pkg_free(&p);
         return -1;
     }
@@ -1490,6 +1646,39 @@ static int cmd_install_object(int argc, char **argv, int force)
     return install_file(&st, path, argv[0], 1) < 0;
 }
 
+static int cmd_run(int argc, char **argv)
+{
+    char path[PATH_MAX_];
+    unsigned char *buf;
+    unsigned long len, line_len;
+    const char *line;
+    struct pkg_launch launch;
+    int rc;
+
+    if (argc < 1 || !package_name_valid(argv[0])) {
+        printf("usage: kpkg run <name> [args...]\n");
+        return 1;
+    }
+    snprintf(path, sizeof(path), "%s/%s", LAUNCH_DIR, argv[0]);
+    if (read_file(path, &buf, &len, LAUNCH_MAX) != 0) {
+        printf("kpkg: %s has no installed launch declaration\n", argv[0]);
+        return 1;
+    }
+    rc = launch_parse((const char *)buf, len, &launch, &line, &line_len);
+    free(buf);
+    if (rc != 1) {
+        printf("kpkg: %s has an invalid launch declaration\n", argv[0]);
+        return 1;
+    }
+    argv[0] = launch.entry;
+    int pid = spawn_grant(launch.entry, argv, &launch.grant);
+    if (pid < 0) {
+        printf("kpkg: cannot spawn %s with its launch grant\n", launch.entry);
+        return 1;
+    }
+    return waitpid(pid);
+}
+
 static int cmd_remove(int argc, char **argv)
 {
     char dir[PATH_MAX_];
@@ -1505,13 +1694,17 @@ static int cmd_remove(int argc, char **argv)
         return 1;
     }
     name = argv[0];
-    if (!db_installed(name)) {
+    if (!package_name_valid(name) || !db_installed(name)) {
         printf("kpkg: %s is not installed\n", name);
         return 1;
     }
     n = db_files(name, &list);
     if (n < 0) {
         printf("kpkg: cannot read the file list for %s\n", name);
+        return 1;
+    }
+    if (launch_remove(name) < 0) {
+        free(list);
         return 1;
     }
 
@@ -1841,6 +2034,7 @@ static void usage(void)
     printf("usage: kpkg <command> [args]\n"
            "  install [--force] <name|file.kpkg>...  install packages\n"
            "  install-object [--force] <sha256>      install an exact local archive\n"
+           "  run <name> [args...]                   start an installed package with its declared grant\n"
            "  remove <name>                          remove a package\n"
            "  list                                   installed packages\n"
            "  info <name>                            metadata and files\n"
@@ -1854,6 +2048,9 @@ int main(int argc, char **argv)
 {
     const char *cmd;
     int force = 0, i, out = 1;
+
+    if (argc >= 2 && strcmp(argv[1], "run") == 0)
+        return cmd_run(argc - 2, argv + 2);
 
     g_cwd = kestrel_startup_cwd();
     conf_load();
