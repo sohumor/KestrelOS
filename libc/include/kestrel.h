@@ -41,6 +41,8 @@ int spawn_io(const char *path, char *const argv[], const char *in_path,
              const char *out_path, int append);
 int spawn_caps(const char *path, char *const argv[],
                const struct k_spawn_caps *caps);
+int spawn_grant(const char *path, char *const argv[],
+                const struct k_spawn_grant *grant);
 int pipe_(int fds[2]);
 int dup2_(int oldfd, int newfd);
 int rename_(const char *oldpath, const char *newpath);

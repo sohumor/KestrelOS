@@ -928,6 +928,20 @@ static long sys_spawn_caps(uint64_t upath, uint64_t uargv, uint64_t ucaps)
     return pid;
 }
 
+static long sys_spawn_grant(uint64_t upath, uint64_t uargv, uint64_t ugrant,
+                            uint64_t size)
+{
+    struct k_spawn_grant grant;
+
+    if (!cap_has(KCAP_SPAWN) || size != sizeof(grant) ||
+        copy_from_user(&grant, (const void *)ugrant, sizeof(grant)) < 0)
+        return -1;
+    long pid = uproc_spawn_grant_from_user((const char *)upath,
+                                          (char *const *)uargv, &grant);
+    flight_record_spawn(pid, (const char *)upath);
+    return pid;
+}
+
 static long sys_sandbox(uint64_t drop_caps, uint64_t uprefix)
 {
     char raw[sizeof(current->unveil_prefix)];
@@ -1362,6 +1376,9 @@ static void syscall_dispatch(struct regs *r)
     /* --- capabilities, atomic rename, pulses, talon parcels, WM v2 --- */
     case SYS_SPAWN_CAPS:
         ret = sys_spawn_caps(a1, a2, a3);
+        break;
+    case SYS_SPAWN_GRANT:
+        ret = sys_spawn_grant(a1, a2, a3, a4);
         break;
     case SYS_MISSION_SPAWN:
         ret = sys_mission_spawn(a1, a2, a3, a4);

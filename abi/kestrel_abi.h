@@ -111,6 +111,7 @@
 #define SYS_MISSION_SPAWN 90 /* (path, argv, const struct k_mission_grant*, u32 *id_or_NULL) -> pid/-1 */
 #define SYS_MISSION_CTL   91 /* (id, op, arg) -> 0/-1 */
 #define SYS_MISSION_INFO  92 /* (index, struct k_mission_info*) -> 0/-1 */
+#define SYS_SPAWN_GRANT   93 /* (path, argv, struct k_spawn_grant*, size) -> pid/-1 */
 
 /* --- IPv6: addresses are 16 network-order bytes passed by pointer --- */
 #define SYS_NETINFO6     78 /* (struct k_netinfo6*) -> 0 / -1 if no nic */
@@ -511,6 +512,20 @@ struct k_spawn_caps {
     uint32_t flags;
     uint64_t cap_mask;     /* 0 = inherit caller caps unchanged */
     char cwd[128];         /* absolute initial directory, "" = default */
+};
+
+#define K_SPAWN_GRANT_VERSION 1U
+#define K_SPAWN_GRANT_MOUNT_VIEW 0x01U
+#define K_SPAWN_GRANT_MAX_MOUNTS 8
+#define K_SPAWN_GRANT_MOUNT_PATH 64
+
+struct k_spawn_grant {
+    uint32_t version;
+    uint32_t flags;
+    uint32_t n_mounts;
+    uint32_t reserved;
+    struct k_spawn_caps caps;  /* cap_mask is exact: 0 grants no bits */
+    char mounts[K_SPAWN_GRANT_MAX_MOUNTS][K_SPAWN_GRANT_MOUNT_PATH];
 };
 
 /* --- Kernel Pulses (monotonic event stream) ------------------------- */
