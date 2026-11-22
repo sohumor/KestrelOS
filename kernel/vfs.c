@@ -269,9 +269,7 @@ int vfs_init(void)
     return rooted ? 0 : -1;
 }
 
-/* --- path dispatch ----------------------------------------------------
- * Every one of these is the same three lines: resolve, check the mount
- * implements the operation, call it. */
+/* --- path dispatch ---------------------------------------------------- */
 
 struct file *vfs_open(const char *path, int flags)
 {
@@ -291,14 +289,16 @@ struct file *vfs_open_guarded(const char *path, int flags,
         (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) &&
         !unveil_allows(path, 0))
         return NULL;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->open == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return NULL;
     if (guard && guard->exclude->ops != m->type->ops)
         guard = NULL;
-    f = m->type->ops->open(m, rel, flags, guard);
-    if (f == NULL)
+    f = m->type->ops->open ? m->type->ops->open(m, rel, flags, guard) : NULL;
+    if (!f) {
+        mount_release(m);
         return NULL;
+    }
     f->ops = m->type->ops;
     f->mnt = m;
     if (strlen(path) < sizeof(f->path))
@@ -315,10 +315,12 @@ int vfs_stat(const char *path, struct k_stat *st)
 
     if (path == NULL || st == NULL || !unveil_allows(path, 0))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->stat == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return -1;
-    return m->type->ops->stat(m, rel, st);
+    int result = m->type->ops->stat ? m->type->ops->stat(m, rel, st) : -1;
+    mount_release(m);
+    return result;
 }
 
 int vfs_readdir(const char *path, int index, struct k_dirent *de)
@@ -328,10 +330,12 @@ int vfs_readdir(const char *path, int index, struct k_dirent *de)
 
     if (path == NULL || de == NULL || index < 0 || !unveil_allows(path, 0))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->readdir == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return -1;
-    return m->type->ops->readdir(m, rel, index, de);
+    int result = m->type->ops->readdir ? m->type->ops->readdir(m, rel, index, de) : -1;
+    mount_release(m);
+    return result;
 }
 
 int vfs_unlink(const char *path)
@@ -341,10 +345,12 @@ int vfs_unlink(const char *path)
 
     if (path == NULL || !unveil_allows(path, 1))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->unlink == NULL)
-        return -1;              /* e.g. /dev, which is immutable */
-    return m->type->ops->unlink(m, rel);
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
+        return -1;
+    int result = m->type->ops->unlink ? m->type->ops->unlink(m, rel) : -1;
+    mount_release(m);
+    return result;
 }
 
 int vfs_mkdir(const char *path)
@@ -354,10 +360,12 @@ int vfs_mkdir(const char *path)
 
     if (path == NULL || !unveil_allows(path, 1))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->mkdir == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return -1;
-    return m->type->ops->mkdir(m, rel);
+    int result = m->type->ops->mkdir ? m->type->ops->mkdir(m, rel) : -1;
+    mount_release(m);
+    return result;
 }
 
 int vfs_rename(const char *oldpath, const char *newpath)
@@ -369,13 +377,16 @@ int vfs_rename(const char *oldpath, const char *newpath)
         return -1;
     if (!unveil_allows(oldpath, 1) || !unveil_allows(newpath, 1))
         return -1;
-    oldm = mount_resolve(oldpath, &oldrel);
-    newm = mount_resolve(newpath, &newrel);
-    if (oldm == NULL || newm == NULL || oldm != newm)
+    oldm = mount_resolve_acquire(oldpath, &oldrel);
+    if (!oldm)
         return -1;
-    if (oldm->type->ops->rename == NULL)
-        return -1;
-    return oldm->type->ops->rename(oldm, oldrel, newrel);
+    newm = mount_resolve_acquire(newpath, &newrel);
+    int result = -1;
+    if (oldm == newm && oldm->type->ops->rename)
+        result = oldm->type->ops->rename(oldm, oldrel, newrel);
+    mount_release(newm);
+    mount_release(oldm);
+    return result;
 }
 
 int vfs_chmod(const char *path, uint32_t mode)
@@ -385,10 +396,12 @@ int vfs_chmod(const char *path, uint32_t mode)
 
     if (path == NULL || !unveil_allows(path, 1))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->chmod == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return -1;
-    return m->type->ops->chmod(m, rel, mode);
+    int result = m->type->ops->chmod ? m->type->ops->chmod(m, rel, mode) : -1;
+    mount_release(m);
+    return result;
 }
 
 int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
@@ -398,10 +411,12 @@ int vfs_chown(const char *path, uint32_t uid, uint32_t gid)
 
     if (path == NULL || !unveil_allows(path, 1))
         return -1;
-    m = mount_resolve(path, &rel);
-    if (m == NULL || m->type->ops->chown == NULL)
+    m = mount_resolve_acquire(path, &rel);
+    if (!m)
         return -1;
-    return m->type->ops->chown(m, rel, uid, gid);
+    int result = m->type->ops->chown ? m->type->ops->chown(m, rel, uid, gid) : -1;
+    mount_release(m);
+    return result;
 }
 
 /* Executability is stat plus the shared policy, so it needs no operation
@@ -431,6 +446,7 @@ struct file *vfs_file_dup(struct file *f)
 void vfs_close(struct file *f)
 {
     const struct fs_ops *ops;
+    struct mount *m;
     int gone;
 
     if (f == NULL)
@@ -442,10 +458,12 @@ void vfs_close(struct file *f)
         return;
 
     ops = f->ops;
+    m = f->mnt;
     if (ops != NULL && ops->close != NULL)
         ops->close(f);
     else
         kfree(f);
+    mount_release(m);
 }
 
 long vfs_read_ex(struct file *f, void *buf, unsigned long n, int blocking,

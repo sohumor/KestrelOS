@@ -1427,8 +1427,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         /* Two instances of one device would each keep their own copy of
          * the superblock and write both back, so the block bitmap would
          * diverge on the first allocation. Refuse instead. */
-        if (instances[i].used && instances[i].mounted &&
-            instances[i].bd == bd) {
+        if (instances[i].used && instances[i].bd == bd) {
             spin_unlock_irqrestore(&kfs_meta_lock, f);
             kprintf("kfs: %s is already mounted\n", bd->name);
             return -1;
@@ -1438,6 +1437,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         if (!instances[i].used) {
             fs = &instances[i];
             memset(fs, 0, sizeof(*fs));
+            fs->bd = bd;
             fs->used = 1;
             break;
         }
@@ -1448,7 +1448,6 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
         return -1;
     }
 
-    fs->bd = bd;
     fs->spb = KFS_BLOCK_SIZE / bd->block_size;
 
     /* The filesystem may be the whole device, or the boot disk's
@@ -1494,9 +1493,7 @@ static int kfs_type_mount(struct blockdev *bd, void **fs_priv)
     return 0;
 }
 
-/* Retire an instance. Handles still open keep the slot reserved (their
- * reads and writes now fail, since `mounted` is clear) until the last
- * close releases it, so a struct file never points at a recycled slot. */
+/* Retire an instance once the last handle and its mount are gone. */
 static void instance_release(struct kfs_fs *fs)
 {
     uint64_t f = spin_lock_irqsave(&kfs_meta_lock);
@@ -1600,7 +1597,7 @@ static int inode_is_open(struct kfs_fs *fs, uint32_t inum)
 
 /* A KFS handle. The struct file must stay first: the VFS casts between
  * the two. Keeping the instance in the handle (rather than reaching
- * through f->mnt) means an open fd survives its mount point going away. */
+ * through f->mnt) keeps the filesystem's handle state local. */
 struct kfs_file {
     struct file f;
     struct kfs_fs *fs;

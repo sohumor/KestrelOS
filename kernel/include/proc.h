@@ -15,6 +15,7 @@
 #define VM_MAX_FILES 8
 
 struct file;                     /* defined by the VFS layer */
+struct mount_view;
 struct task_event_waiter;
 
 struct task_event_channel {
@@ -69,6 +70,7 @@ struct task {
     struct file *vm_files[VM_MAX_FILES]; /* unique VMA backing handles */
     int vm_file_count;
     struct file *files[MAX_OPEN_FILES];
+    struct mount_view *mount_view;
     struct task *qnext;          /* circular run queue */
     struct task *allnext;        /* global task list (for ps) */
     struct task *reapnext;       /* deferred SMP-safe stack reclamation */

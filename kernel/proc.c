@@ -6,6 +6,7 @@
 #include "timer.h"
 #include "vmm.h"
 #include "vfs.h"
+#include "mount.h"
 #include "fpu.h"
 #include "wm.h"
 #include "vm.h"
@@ -444,6 +445,7 @@ void task_exit(int code)
         current->user = false;
         vmm_destroy_user(upml4);
     }
+    mount_view_set_current(NULL);
 
     /* Queue by numeric identity so an already-exited parent can never leave
      * a dangling task pointer in a long-lived child. */
@@ -525,6 +527,8 @@ struct task *kthread_create_mission(void (*func)(void *), void *arg,
     *--sp = 0;                          /* r15 */
     t->rsp = (uint64_t)sp;
 
+    t->mount_view = current ? current->mount_view : NULL;
+    mount_view_retain(t->mount_view);
     uint64_t f = irq_save();
     spin_lock(&sched_lock);
     t->mission_id = mission_id;

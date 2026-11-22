@@ -198,7 +198,7 @@ static uint32_t render_mounts(char *out, uint32_t cap)
     struct sbuf b = { out, 0, cap };
     struct mount *m;
 
-    for (int i = 0; mount_list(i, &m) == 0; i++) {
+    for (int i = 0; (m = mount_list_acquire(i)) != NULL; i++) {
         struct fs_statfs sf;
 
         sb_puts(&b, m->bd ? m->bd->name : "-");
@@ -216,6 +216,7 @@ static uint32_t render_mounts(char *out, uint32_t cap)
         sb_putc(&b, ' ');
         sb_putu(&b, sf.free_blocks);
         sb_putc(&b, '\n');
+        mount_release(m);
     }
     b.p[b.len] = '\0';
     return b.len;

@@ -2,6 +2,7 @@
 #include "mount.h"
 #include "blockdev.h"
 #include "proc.h"
+#include "kheap.h"
 #include "string.h"
 #include "spinlock.h"
 
@@ -15,12 +16,17 @@
  *
  * The type's mount()/unmount() callbacks do real disk I/O, so they are
  * deliberately called with interrupts on and the table lock dropped. The
- * slot is reserved first (used = 1, priv = NULL) so no second mounter can
- * claim the same path underneath, and released again if mount() fails. */
+ * path is reserved until mount() succeeds. Removing a host attachment
+ * leaves its slot reserved until the last reference and unmount finish. */
 
 static struct fs_type *types[FS_TYPE_MAX];
 static struct mount mounts[MOUNT_MAX];
 static spinlock_t mount_lock = SPINLOCK_INIT;
+
+struct mount_view {
+    unsigned refs;
+    struct mount *items[MOUNT_MAX];
+};
 
 /* ---------- filesystem registry ---------- */
 
@@ -151,9 +157,22 @@ static int covers(const char *mp, const char *path, size_t *mplen_out)
     return 1;
 }
 
-struct mount *mount_resolve(const char *path, const char **rel_out)
+static struct mount *visible_at(const struct mount_view *view, int i)
+{
+    if (view)
+        return view->items[i];
+    return mounts[i].attached ? &mounts[i] : NULL;
+}
+
+static struct mount_view *current_view(void)
+{
+    return current ? current->mount_view : NULL;
+}
+
+struct mount *mount_resolve_acquire(const char *path, const char **rel_out)
 {
     struct mount *best = NULL;
+    const struct mount_view *view = current_view();
     size_t bestlen = 0;
 
     if (path == NULL || path[0] != '/')
@@ -162,15 +181,16 @@ struct mount *mount_resolve(const char *path, const char **rel_out)
     uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
         size_t mplen;
-        if (!mounts[i].used || mounts[i].priv == NULL)
-            continue;           /* a slot mid-mount is not usable yet */
-        if (!covers(mounts[i].path, path, &mplen))
+        struct mount *m = visible_at(view, i);
+        if (!m || !covers(m->path, path, &mplen))
             continue;
         if (best == NULL || mplen > bestlen) {
-            best = &mounts[i];
+            best = m;
             bestlen = mplen;
         }
     }
+    if (best)
+        best->refs++;
     spin_unlock_irqrestore(&mount_lock, f);
 
     if (best == NULL)
@@ -183,27 +203,112 @@ struct mount *mount_resolve(const char *path, const char **rel_out)
     return best;
 }
 
-int mount_list(int index, struct mount **out)
+struct mount *mount_list_acquire(int index)
 {
+    const struct mount_view *view = current_view();
     int seen = 0;
-    int r = -1;
-
-    if (index < 0 || out == NULL)
-        return -1;
+    struct mount *found = NULL;
 
     uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
-        if (!mounts[i].used || mounts[i].priv == NULL)
-            continue;           /* a slot mid-mount is not usable yet */
-        if (seen == index) {
-            *out = &mounts[i];
-            r = 0;
+        struct mount *m = visible_at(view, i);
+        if (m && seen++ == index) {
+            m->refs++;
+            found = m;
             break;
         }
-        seen++;
     }
     spin_unlock_irqrestore(&mount_lock, f);
-    return r;
+    return found;
+}
+
+static void mount_finish(struct mount *m)
+{
+    if (m->type->unmount)
+        m->type->unmount(m->priv);
+    blockdev_release(m->bd);
+
+    uint64_t f = spin_lock_irqsave(&mount_lock);
+    memset(m, 0, sizeof(*m));
+    spin_unlock_irqrestore(&mount_lock, f);
+}
+
+void mount_release(struct mount *m)
+{
+    if (!m)
+        return;
+    uint64_t f = spin_lock_irqsave(&mount_lock);
+    bool finish = --m->refs == 0 && !m->attached;
+    spin_unlock_irqrestore(&mount_lock, f);
+    if (finish)
+        mount_finish(m);
+}
+
+struct mount_view *mount_view_create(const char *const paths[], size_t count)
+{
+    const struct mount_view *parent = current_view();
+    char names[MOUNT_MAX][MOUNT_PATH_MAX];
+    if (count > MOUNT_MAX || (!paths && count))
+        return NULL;
+    for (size_t i = 0; i < count; i++)
+        if (canon_path(paths[i], names[i]) < 0)
+            return NULL;
+
+    struct mount_view *view = kzalloc(sizeof(*view));
+    if (!view)
+        return NULL;
+    view->refs = 1;
+
+    uint64_t f = spin_lock_irqsave(&mount_lock);
+    for (size_t i = 0; i < count; i++) {
+        struct mount *m = NULL;
+        for (int j = 0; j < MOUNT_MAX; j++) {
+            struct mount *candidate = visible_at(parent, j);
+            if (candidate && strcmp(candidate->path, names[i]) == 0) {
+                m = candidate;
+                break;
+            }
+        }
+        if (!m) {
+            spin_unlock_irqrestore(&mount_lock, f);
+            mount_view_release(view);
+            return NULL;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (view->items[j] == m) {
+                spin_unlock_irqrestore(&mount_lock, f);
+                mount_view_release(view);
+                return NULL;
+            }
+        }
+        m->refs++;
+        view->items[i] = m;
+    }
+    spin_unlock_irqrestore(&mount_lock, f);
+    return view;
+}
+
+void mount_view_retain(struct mount_view *view)
+{
+    if (view)
+        __atomic_add_fetch(&view->refs, 1, __ATOMIC_RELAXED);
+}
+
+void mount_view_release(struct mount_view *view)
+{
+    if (!view || __atomic_sub_fetch(&view->refs, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    for (int i = 0; i < MOUNT_MAX; i++)
+        mount_release(view->items[i]);
+    kfree(view);
+}
+
+void mount_view_set_current(struct mount_view *view)
+{
+    struct mount_view *old = current->mount_view;
+    mount_view_retain(view);
+    current->mount_view = view;
+    mount_view_release(old);
 }
 
 int mount_add(const char *path, const char *fstype, const char *devname)
@@ -230,11 +335,11 @@ int mount_add(const char *path, const char *fstype, const char *devname)
         }
     }
 
-    /* Reserve the slot with priv still NULL: mount_resolve() skips such
-     * a slot, so nothing can traverse a half-built mount. */
+    /* Reserve the path until mount() publishes the attachment. */
     uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
-        if (mounts[i].used && strcmp(mounts[i].path, mp) == 0) {
+        if (mounts[i].used && (mounts[i].attached || !mounts[i].priv) &&
+            strcmp(mounts[i].path, mp) == 0) {
             spin_unlock_irqrestore(&mount_lock, f);
             blockdev_release(bd);
             kprintf("mount: %s is already a mount point\n", mp);
@@ -272,6 +377,7 @@ int mount_add(const char *path, const char *fstype, const char *devname)
 
     f = spin_lock_irqsave(&mount_lock);
     m->priv = priv;
+    m->attached = 1;
     spin_unlock_irqrestore(&mount_lock, f);
     return 0;
 }
@@ -280,9 +386,6 @@ int mount_remove(const char *path)
 {
     char mp[MOUNT_PATH_MAX];
     struct mount *m = NULL;
-    struct fs_type *type;
-    struct blockdev *bd;
-    void *priv;
 
     if (canon_path(path, mp) < 0)
         return -1;
@@ -291,26 +394,20 @@ int mount_remove(const char *path)
 
     uint64_t f = spin_lock_irqsave(&mount_lock);
     for (int i = 0; i < MOUNT_MAX; i++) {
-        if (mounts[i].used && strcmp(mounts[i].path, mp) == 0) {
+        if (mounts[i].attached && strcmp(mounts[i].path, mp) == 0) {
             m = &mounts[i];
             break;
         }
     }
-    if (m == NULL || m->priv == NULL) {
+    if (!m) {
         spin_unlock_irqrestore(&mount_lock, f);
         return -1;
     }
-    /* Detach first: from here no new path can resolve into it, so the
-     * unmount callback cannot race a fresh open. Handles already open
-     * keep their own reference to the instance and are unaffected. */
-    type = m->type;
-    bd = m->bd;
-    priv = m->priv;
-    memset(m, 0, sizeof(*m));
+    m->attached = 0;
+    bool finish = m->refs == 0;
     spin_unlock_irqrestore(&mount_lock, f);
 
-    if (type->unmount != NULL)
-        type->unmount(priv);
-    blockdev_release(bd);
+    if (finish)
+        mount_finish(m);
     return 0;
 }
