@@ -534,7 +534,7 @@ long_start:
     mov gs, ax
     mov rsp, 0x60000
     mov edi, BOOTINFO            ; handoff physical address
-    mov esi, [BOOT_COUNT]
+    mov esi, [abs BOOT_COUNT]
     imul esi, BOOT_RANGE_SIZE
     add esi, BOOT_HEADER         ; handoff byte length
     mov rax, KERNEL_ENTRY
