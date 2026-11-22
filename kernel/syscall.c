@@ -689,7 +689,7 @@ static long sys_mount(uint64_t upath, uint64_t utype, uint64_t udev)
 {
     char path[UPROC_PATH_MAX], type[32], dev[32];
 
-    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
+    if (current->mount_view || current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -708,7 +708,7 @@ static long sys_umount(uint64_t upath)
 {
     char path[UPROC_PATH_MAX];
 
-    if (current->uid != 0 || !cap_has(KCAP_ADMIN))
+    if (current->mount_view || current->uid != 0 || !cap_has(KCAP_ADMIN))
         return -1;
     if (copy_str_from_user(path, (const void *)upath, sizeof(path)) < 0)
         return -1;
@@ -721,7 +721,8 @@ static long sys_mountlist(uint64_t index, uint64_t uinfo)
     struct k_mountinfo ki;
     struct fs_statfs sf;
 
-    if (mount_list((int)index, &m) < 0 || !m)
+    m = mount_list_acquire((int)index);
+    if (!m)
         return -1;
     memset(&ki, 0, sizeof(ki));
     strncpy(ki.path, m->path, sizeof(ki.path) - 1);
@@ -735,6 +736,7 @@ static long sys_mountlist(uint64_t index, uint64_t uinfo)
         ki.free_blocks = sf.free_blocks;
         ki.block_size = sf.block_size;
     }
+    mount_release(m);
     return copy_to_user((void *)uinfo, &ki, sizeof(ki));
 }
 

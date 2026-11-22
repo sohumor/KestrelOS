@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include "kestrel_abi.h"
 
@@ -20,6 +21,7 @@
 struct blockdev;
 struct file;
 struct mount;
+struct mount_view;
 struct open_guard;
 
 #define FS_TYPE_NAME_MAX  16
@@ -89,6 +91,8 @@ struct mount {
     struct blockdev *bd;        /* may be NULL */
     void *priv;                 /* the instance handed back by mount() */
     int used;
+    int attached;
+    unsigned refs;
 };
 
 /* --- filesystem registry --- */
@@ -104,14 +108,23 @@ int fs_list(int index, struct fs_type **out);
  * filesystem that needs none) at `path`. Returns 0 or -1. */
 int mount_add(const char *path, const char *fstype, const char *devname);
 
-/* Unmount the filesystem mounted exactly at `path`. Returns 0 or -1.
- * The root mount cannot be removed. */
+/* Remove the host attachment at `path`. Existing views and handles keep
+ * the instance alive. The root mount cannot be removed. */
 int mount_remove(const char *path);
 
-/* Longest-prefix resolution. Returns the mount covering `path` and, in
- * *rel_out, the path relative to it (always starting with '/', pointing
- * either into `path` or at a literal "/"), or NULL if nothing covers it. */
-struct mount *mount_resolve(const char *path, const char **rel_out);
+/* Acquire the mount covering `path` in the caller's view, or NULL.
+ * *rel_out is the path relative to it, starting with '/' and pointing
+ * into `path` or at a literal "/". */
+struct mount *mount_resolve_acquire(const char *path, const char **rel_out);
 
-/* Enumerate mounts: index 0, 1, 2 ... until it returns -1. */
-int mount_list(int index, struct mount **out);
+/* Acquire mount at the given index in the caller's view, or NULL. */
+struct mount *mount_list_acquire(int index);
+void mount_release(struct mount *m);
+
+/* Select exact attachment paths from the caller's view or, for an
+ * unscoped task, the live host table. The caller owns one reference. */
+struct mount_view *mount_view_create(const char *const paths[], size_t count);
+void mount_view_retain(struct mount_view *view);
+void mount_view_release(struct mount_view *view);
+/* Install a retained reference for this task; NULL selects the host table. */
+void mount_view_set_current(struct mount_view *view);
