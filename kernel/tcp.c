@@ -666,6 +666,11 @@ static void tcp_segment(uint32_t src_ip_be, const uint8_t *src_ip6,
      * A later segment which fills the hole can then complete the close
      * without waiting for the peer's FIN retransmission timer. */
     uint32_t fin_seq = seq + (uint32_t)dlen;
+    if ((fl & TCP_FIN) && c->peer_fin && fin_seq == c->rcv_nxt - 1) {
+        c->need_ack = true;
+        if (c->state == TCP_TIME_WAIT)
+            c->tw_deadline = timer_ticks() + TCP_TW_TICKS;
+    }
     if ((fl & TCP_FIN) && !c->peer_fin) {
         int32_t delta = (int32_t)(fin_seq - c->rcv_nxt);
         int window = TCP_RXBUF - c->rx_len;
@@ -717,7 +722,16 @@ static void conn_pump(struct tcp_conn *c)
     if (c->state == TCP_TIME_WAIT) {
         if (now >= c->tw_deadline)
             c->state = TCP_CLOSED;
+        bool ack_now = c->need_ack && c->state == TCP_TIME_WAIT;
+        uint32_t ack_seq = c->snd_nxt;
+        if (ack_now)
+            c->need_ack = false;
         spin_unlock_irqrestore(&tcp_lock, f);
+        if (ack_now && seg_send(c, TCP_ACK, ack_seq, 0, false) < 0) {
+            f = spin_lock_irqsave(&tcp_lock);
+            c->need_ack = true;
+            spin_unlock_irqrestore(&tcp_lock, f);
+        }
         goto out;
     }
 
