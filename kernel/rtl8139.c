@@ -94,7 +94,7 @@ static void rx_drain(void)
             return;
         }
 
-        net_rx(p + 4, len - 4);
+        net_rx_submit(p + 4, len - 4);
 
         rx_pos = (rx_pos + 4 + len + 3) & ~3u;
         if (rx_pos >= RX_RING_LEN)

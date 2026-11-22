@@ -5,8 +5,8 @@
 /* KestrelOS TCP: client-side connections over the IPv4 layer in net.c.
  *
  * Handles are small integers (slot indices). All blocking calls run in
- * task context and spin on net_wait_tick(); tcp_input() is the IRQ-side
- * entry point and never transmits, allocates or sleeps. */
+ * task context and spin on net_wait_tick(); tcp_input() is the receive
+ * consumer's entry point and never transmits, allocates or sleeps. */
 
 #define TCP_CONNS   8       /* simultaneous connections */
 #define TCP_MSS     1460    /* announced + maximum segment payload */
@@ -28,7 +28,7 @@ int  tcp_recv(int handle, void *buf, int max, int timeout_ms);
 /* Graceful close (FIN handshake). Returns 0 / -1. */
 int  tcp_close(int handle);
 
-/* IRQ context: one TCP segment (IPv4 payload) arrived from src_ip_be. */
+/* One TCP segment (IPv4 payload) arrived from src_ip_be. */
 void tcp_input(uint32_t src_ip_be, const uint8_t *seg, int len);
 
 /* Task context: retransmit / timeout / delayed-ACK pump. Call ~10x/s. */

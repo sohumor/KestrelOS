@@ -70,16 +70,13 @@ int  udp_send(uint32_t ip_be, uint16_t sport, uint16_t dport,
 /* Returns payload length or -1 on timeout/error. Binds port if needed. */
 int  udp_recv(uint16_t port, void *buf, int maxlen, int timeout_ms);
 
-/* Drain NIC RX ring; safe to call anywhere, no-op when no NIC. */
-void net_poll(void);
-
 /* ---- stack internals (net.c / udp.c / dns.c / rtl8139.c) ---- */
 
 #define ETH_MTU          1500
 #define NET_UDP_MAX      1472   /* ETH_MTU - 20 (ip) - 8 (udp) */
 
-/* Frame handoff from the NIC driver; runs in IRQ context — must not sleep. */
-void net_rx(const uint8_t *frame, int len);
+/* Copy a frame from a driver-owned buffer; safe in IRQ context. */
+void net_rx_submit(const uint8_t *frame, int len);
 
 /* Build+send one IPv4 packet (resolves the MAC via ARP or the cache). */
 int  net_ip_send(uint32_t dst_ip_be, uint8_t proto,

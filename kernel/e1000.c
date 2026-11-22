@@ -202,7 +202,7 @@ static void rx_drain(void)
 
         if ((d->status & RXD_STAT_EOP) && d->errors == 0 &&
             len > 0 && len <= BUF_SIZE)
-            net_rx(rx_buf + rx_next * BUF_SIZE, len);
+            net_rx_submit(rx_buf + rx_next * BUF_SIZE, len);
 
         d->status = 0;
         reg_write(REG_RDT, (uint32_t)rx_next);   /* hand it back to hw */

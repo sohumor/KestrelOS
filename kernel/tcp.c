@@ -13,7 +13,7 @@
 /* TCP (client side).
  *
  * Split of responsibilities:
- *   tcp_input()  runs in the NIC IRQ. It validates the segment, advances
+ *   tcp_input()  runs in the receive consumer. It validates the segment, advances
  *                the sequence state, copies payload into the connection's
  *                receive ring and raises flags. It never transmits: sending
  *                goes through net_ip_send(), which may block for seconds
@@ -26,7 +26,7 @@
  * Everything touched by both contexts is guarded by tcp_lock. Merely
  * disabling local interrupts is insufficient once tasks can run on other
  * CPUs. Buffers are kmalloc'd once per slot in task context and kept for
- * reuse, so the IRQ path never allocates.
+ * reuse, so input never allocates.
  */
 
 #define IP_PROTO_TCP  6
@@ -270,7 +270,7 @@ static int seg_send(struct tcp_conn *c, uint8_t flags, uint32_t seq,
 }
 
 /* Task context. Buffers are deliberately kept for reuse by the next
- * connection so that the IRQ path never has to allocate. */
+ * connection so that input never has to allocate. */
 static void conn_release_locked(struct tcp_conn *c)
 {
     c->used = false;
@@ -323,7 +323,7 @@ static uint16_t port_alloc(void)
     return 0;
 }
 
-/* IRQ context: match an incoming segment to a connection. */
+/* Match an incoming segment to a connection. */
 static struct tcp_conn *conn_lookup(uint32_t src_ip, const uint8_t *src_ip6,
                                     uint16_t sport, uint16_t dport)
 {
@@ -587,7 +587,7 @@ void tcp_input6(const uint8_t src[16], const uint8_t dst[16],
     tcp_segment(0, src, seg, len);
 }
 
-/* IRQ context: one checksum-verified segment from an IPv4 or IPv6 peer. */
+/* One checksum-verified segment from an IPv4 or IPv6 peer. */
 static void tcp_segment(uint32_t src_ip_be, const uint8_t *src_ip6,
                         const uint8_t *seg, int len)
 {

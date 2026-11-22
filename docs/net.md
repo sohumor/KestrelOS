@@ -23,13 +23,15 @@ DNS resolver.
 ## Architecture
 
 ```
-                 task context                     IRQ context
-  udp_send/dns/ping ──> net_ip_send ──┐    NIC IRQ ──> rx_drain ──> net_rx
-                          │           │                               │
-                    arp_resolve       │                 ┌── ARP ──────┤
-                   (wait + retry)     v                 │  (reply,    v
-                          └────> netdev->send <── ICMP echo reply   IPv4 demux
-                                  (TX descr.)               ICMP / UDP / TCP
+  NIC IRQ / driver poll ──> net_rx_submit ──> bounded frame queue
+                                                  │
+                                          net-rx kernel task
+                                                  │
+                                      ARP / IPv4 / IPv6 dispatch
+                                         │                   │
+                                  immediate replies       UDP / TCP
+                                         v
+                                   netdev->send <── outbound task
 ```
 
 ## NIC drivers
@@ -57,14 +59,16 @@ disabled ("net: no NIC found").
   mode). The IRQ handler reads ICR (which acks it), tolerates spurious
   entry (shared level-triggered PCI lines), and drains the RX ring.
 
-* **RX path runs inside the IRQ handler.** The ISR acks by writing the ISR
-  bits back, drains the RX ring, and hands each frame to `net_rx()`. This
-  path never sleeps: it may transmit short replies (ARP reply, ICMP echo
-  reply) synchronously, and queues UDP payloads for tasks to pick up.
-  Queue slot buffers are preallocated at bind time in task context, so the
-  IRQ path never calls `kmalloc`.
-* **TX is synchronous** from task context (and for the small IRQ-context
-  replies): copy into the driver's next TX buffer (4 fixed DMA pages on
+* **RX separates DMA ownership from protocol work.** RTL8139, e1000 and
+  polled VirtIO submit copies to one 64-frame FIFO. The NIC may reclaim
+  its descriptor immediately; the queue retains its own copy until
+  dispatch returns. Full queues drop new frames and count them in
+  `rx_drops`. A waiting kernel task wakes when frames arrive and yields
+  after each batch of at most 16. DHCP and initial IPv6 discovery drain
+  via task polling before the worker starts. Protocol handlers can send
+  immediate replies but must not wait for another receive.
+* **TX is synchronous** from task context: copy into the driver's next
+  TX buffer (4 fixed DMA pages on
   the RTL8139, 16 ring descriptors on the e1000), kick the doorbell
   register, busy-wait only if the descriptor is still owned by hardware.
 * **RTL8139 RX ring** is `8192 + 16 + 1500` bytes with the RCR WRAP bit set, so a
@@ -74,8 +78,8 @@ disabled ("net: no NIC found").
 * **ARP**: 16-entry cache. `arp_resolve()` (task context) sends requests
   and waits ~1 s with 3 retries; off-subnet destinations resolve the
   gateway MAC instead. The stack also learns the source MAC of every
-  received ARP and IPv4 packet, which is why ICMP echo replies from IRQ
-  context never block on ARP.
+  received ARP and IPv4 packet, which lets immediate ICMP replies avoid
+  waiting for ARP resolution.
 * **IPv4**: ihl=5 on send, ttl 64, header checksum generated and
   verified. Fragments are dropped (no reassembly). ICMP (1), TCP (6), and
   UDP (17) are demultiplexed.

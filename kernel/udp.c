@@ -9,9 +9,8 @@
 
 /* UDP: port bindings with small per-port receive queues.
  *
- * udp_input runs in IRQ context, so queue slot buffers are allocated
- * up front in task context (bind time) and only recycled afterwards --
- * kmalloc is never called from the IRQ path.
+ * Queue slot buffers are allocated at bind time and recycled, so receiving
+ * a datagram never allocates memory.
  */
 
 #define UDP_PORTS  16
@@ -84,8 +83,8 @@ static void bind_gc(void)
     }
 }
 
-/* Task context: find an existing binding or claim a free entry. Slot
- * buffers persist across rebinds so the IRQ path never allocates. */
+/* Find an existing binding or claim a free entry. Slot buffers persist
+ * across rebinds so input never allocates. */
 static struct udp_bind *bind_get(uint16_t port)
 {
     int pid = current ? current->pid : 0;
@@ -146,7 +145,7 @@ void udp_unbind(uint16_t port)
     spin_unlock_irqrestore(&udp_lock, f);
 }
 
-/* IRQ context: queue a checksum-verified UDP segment on its binding. */
+/* Queue a checksum-verified UDP segment on its binding. */
 static void udp_queue(uint32_t src_ip_be, const uint8_t *seg, int ulen)
 {
     const struct udp_hdr *uh = (const struct udp_hdr *)seg;
@@ -179,7 +178,7 @@ static void udp_queue(uint32_t src_ip_be, const uint8_t *seg, int ulen)
     spin_unlock_irqrestore(&udp_lock, f);
 }
 
-/* IRQ context: parse a UDP segment and queue it on its binding. */
+/* Parse a UDP segment and queue it on its binding. */
 void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
                const uint8_t *seg, int len)
 {
@@ -202,7 +201,7 @@ void udp_input(uint32_t src_ip_be, uint32_t dst_ip_be,
     udp_queue(src_ip_be, seg, ulen);
 }
 
-/* IRQ context: IPv6 UDP; the checksum is mandatory (RFC 8200 8.1). The
+/* IPv6 UDP: the checksum is mandatory (RFC 8200 8.1). The
  * IPv4-only source field of the queue slot is left zero. */
 void udp_input6(const uint8_t src[16], const uint8_t dst[16],
                 const uint8_t *seg, int len)
