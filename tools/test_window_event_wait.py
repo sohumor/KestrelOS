@@ -59,6 +59,10 @@ def test_reuse(work):
     h = Harness(command)
     try:
         h.start()
+        occlusion = "PASS compositor occlusion: same pixels, fewer covered writes"
+        if h.expect_any([occlusion, "FAIL compositor occlusion"]) != occlusion:
+            raise AssertionError("guest rejected compositor occlusion")
+        print(occlusion)
         t_boot(h)
         t_login(h)
         t_prompt(h)

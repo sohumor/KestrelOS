@@ -33,10 +33,9 @@
  * with fb_flush_rect(). A quiet desktop costs nothing; a moving pointer
  * costs two 12x19 rectangles.
  *
- * Paint order inside a damage rectangle: desktop fill, K_WIN_DESKTOP
- * windows, ordinary windows bottom-to-top, then the pointer. Because every
- * rectangle is recomposited from the bottom up there is no save-under to
- * get wrong and the cursor cannot leave a trail.
+ * Each damage rectangle is painted bottom-to-top, starting at the
+ * highest opaque client that covers each piece, or the desktop fill if
+ * none is found. The pointer is drawn last; no save-under is needed.
  *
  * Console handover. wm_active() is false until the first window exists and
  * the compositor never writes a pixel before that, so the boot console owns
@@ -75,6 +74,7 @@
 #define WM_HEAL_TICKS   50                    /* ~1 s at 50 Hz */
 
 #define WM_MAX_DAMAGE   8
+#define WM_SPLIT_BUDGET 4
 #define WM_SHADOW_PX    5
 
 /* ---------------------------------------------------------------- theme */
@@ -907,38 +907,63 @@ static void paint_cursor(const struct rect *clip)
     }
 }
 
-/* True when a K_WIN_DESKTOP window already covers `clip` completely, in
- * which case the background fill underneath it is wasted work. */
-static bool desktop_covers(const struct rect *clip)
+static void paint_stack(const struct rect *clip, int opaque)
 {
-    for (int i = 0; i < nz; i++) {
-        const struct window *win = &wins[zord[i]];
-        struct rect r;
-
-        if (!(win->flags & K_WIN_DESKTOP))
-            continue;
-        r.x = win->x; r.y = win->y; r.w = win->w; r.h = win->h;
-        if (clip->x >= r.x && clip->y >= r.y &&
-            clip->x + clip->w <= r.x + r.w &&
-            clip->y + clip->h <= r.y + r.h)
-            return true;
-    }
-    return false;
-}
-
-static void compose_rect(const struct rect *clip)
-{
-    if (!desktop_covers(clip))
+    if (opaque < 0) {
         fb_fill_rect(clip->x, clip->y, clip->w, clip->h,
                      wm_theme.desktop_bg);
+    } else {
+        const struct window *win = &wins[zord[opaque]];
+        blit_clip(clip, win->x, win->y, win->w, win->h, win->pix, win->w);
+    }
 
-    for (int i = 0; i < nz; i++) {
+    for (int i = opaque + 1; i < nz; i++) {
         struct window *win = &wins[zord[i]];
         if (!win_visible(win) || !win->pix)
             continue;
         paint_window(win, clip);
     }
+}
 
+/* Only clients are used as opaque bases. In particular, upper window
+ * shadows still need the pixels drawn underneath them. */
+static void compose_stack(const struct rect *clip, int top, int *splits)
+{
+    for (int i = top; i >= 0; i--) {
+        const struct window *win = &wins[zord[i]];
+        if (!win_visible(win) || !win->pix)
+            continue;
+        struct rect client = {win->x, win->y, win->w, win->h}, cover;
+        if (!rect_isect(clip, &client, &cover))
+            continue;
+        if (cover.w == clip->w && cover.h == clip->h) {
+            paint_stack(clip, i);
+            return;
+        }
+        if (!*splits)
+            continue;
+
+        --*splits;
+        int right = cover.x + cover.w, bottom = cover.y + cover.h;
+        struct rect rest[] = {
+            {clip->x, clip->y, clip->w, cover.y - clip->y},
+            {clip->x, bottom, clip->w, clip->y + clip->h - bottom},
+            {clip->x, cover.y, cover.x - clip->x, cover.h},
+            {right, cover.y, clip->x + clip->w - right, cover.h},
+        };
+        paint_stack(&cover, i);
+        for (unsigned j = 0; j < sizeof(rest) / sizeof(rest[0]); j++)
+            if (rest[j].w > 0 && rest[j].h > 0)
+                compose_stack(&rest[j], i - 1, splits);
+        return;
+    }
+    paint_stack(clip, -1);
+}
+
+static void compose_rect(const struct rect *clip)
+{
+    int splits = WM_SPLIT_BUDGET;
+    compose_stack(clip, nz - 1, &splits);
     paint_cursor(clip);
 }
 
