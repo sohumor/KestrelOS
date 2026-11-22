@@ -2550,6 +2550,13 @@ def t_pipe_lifetime(h):
     wait_prompt(h)
 
 
+def t_spawn_grant(h):
+    h.send("sigtest --spawn-grant")
+    h.expect("uproc: cannot read /bin/sigtest")
+    h.expect("sigtest: mount view, exact capabilities, cwd and descriptor grants verified")
+    wait_prompt(h)
+
+
 def t_elf_banner_quiet(h):
     """ELF diagnostics stay on serial, not in the VGA console cell grid."""
     symbols = {}
@@ -3842,6 +3849,7 @@ TESTS = [
     ("pipe", t_pipe),
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
+    ("spawn-grant", t_spawn_grant),
     ("waitpid-children", t_waitpid_children),
     ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),

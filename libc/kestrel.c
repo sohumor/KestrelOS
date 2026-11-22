@@ -121,6 +121,13 @@ int spawn_caps(const char *path, char *const argv[],
     return (int)syscall(SYS_SPAWN_CAPS, (long)path, (long)argv, (long)caps, 0);
 }
 
+int spawn_grant(const char *path, char *const argv[],
+                const struct k_spawn_grant *grant)
+{
+    return (int)syscall(SYS_SPAWN_GRANT, (long)path, (long)argv, (long)grant,
+                        sizeof(*grant));
+}
+
 int pipe_(int fds[2])
 {
     return (int)syscall(SYS_PIPE, (long)fds, 0, 0, 0);

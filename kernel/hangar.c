@@ -445,6 +445,11 @@ static int park_preflight(struct hangar_manifest *m, char *reason)
         reason3(reason, who, " is a system task and cannot be parked", NULL);
         return -1;
     }
+    if (current->mount_view) {
+        reason3(reason, who, " has a private mount view that cannot be parked",
+                NULL);
+        return -1;
+    }
     for (int i = 0;; i++) {
         struct hangar_win meta;
         const uint32_t *pix;

@@ -102,6 +102,109 @@ static int test_pipe_lifetime(void)
     return 0;
 }
 
+static int grant_descendant(void)
+{
+    struct k_stat st;
+    if (mkdir_("/tmp/sigtest-spawn-grant") == 0) {
+        unlink_("/tmp/sigtest-spawn-grant");
+        return 1;
+    }
+    return stat_("/bin/sigtest", &st) < 0 ||
+           stat_("/dev/zero", &st) == 0;
+}
+
+static int grant_child(void)
+{
+    char byte = 'x';
+    struct k_mountinfo info;
+    if (grant_descendant() || strcmp(kestrel_startup_cwd(), "/doc") != 0 ||
+        read(7, &byte, 1) != 1 || byte != 0 || read(8, &byte, 1) != -1 ||
+        syscall(SYS_MOUNTLIST, 0, (long)&info, 0, 0) < 0 ||
+        strcmp(info.path, "/") != 0 ||
+        syscall(SYS_MOUNTLIST, 1, (long)&info, 0, 0) != -1)
+        return 1;
+
+    char *args[] = { "sigtest", "--grant-descendant", 0 };
+    struct k_spawn_grant wider = {
+        .version = K_SPAWN_GRANT_VERSION,
+        .flags = K_SPAWN_GRANT_MOUNT_VIEW,
+        .n_mounts = 2,
+        .caps.cap_mask = KCAP_ALL,
+        .mounts = { "/", "/dev" },
+    };
+    if (spawn_grant("/bin/sigtest", args, &wider) != -1)
+        return 1;
+    wider.flags = 0;
+    wider.n_mounts = 0;
+    int child = spawn_grant("/bin/sigtest", args, &wider);
+    return child < 0 || waitpid(child) != 0;
+}
+
+static int grant_zero(void)
+{
+    struct k_stat st;
+    char *args[] = { "sigtest", "--grant-descendant", 0 };
+    return stat_("/bin/sigtest", &st) != -1 ||
+           spawn("/bin/sigtest", args) != -1;
+}
+
+static int test_spawn_grant(void)
+{
+    if (mkdir_("/tmp/sigtest-spawn-grant") != 0 ||
+        unlink_("/tmp/sigtest-spawn-grant") != 0)
+        return 1;
+    int fd = open("/dev/zero", O_RDONLY);
+    if (fd < 0 || dup2_(fd, 8) != 8)
+        return 1;
+
+    char *args[] = { "sigtest", "--grant-child", 0 };
+    struct k_spawn_grant grant = {
+        .version = K_SPAWN_GRANT_VERSION,
+        .flags = K_SPAWN_GRANT_MOUNT_VIEW,
+        .n_mounts = 1,
+        .caps = {
+            .n_fds = 1,
+            .cap_mask = KCAP_FS_READ | KCAP_SPAWN,
+            .cwd = "/doc",
+            .fds = { { .child_fd = 7, .parent_fd = fd } },
+        },
+        .mounts = { "/" },
+    };
+    grant.caps.fds[1] = grant.caps.fds[0];
+    grant.caps.n_fds = 2;
+    if (spawn_grant("/bin/sigtest", args, &grant) != -1)
+        return 1;
+    grant.caps.n_fds = 1;
+    grant.version++;
+    if (spawn_grant("/bin/sigtest", args, &grant) != -1)
+        return 1;
+    grant.version = K_SPAWN_GRANT_VERSION;
+    if (syscall(SYS_SPAWN_GRANT, (long)"/bin/sigtest", (long)args,
+                (long)&grant, sizeof(grant) - 1) != -1)
+        return 1;
+
+    int child = spawn_grant("/bin/sigtest", args, &grant);
+    close(8);
+    close(fd);
+    if (child < 0 || waitpid(child) != 0)
+        return 1;
+
+    args[1] = "--grant-zero";
+    grant.caps.n_fds = 0;
+    grant.caps.cap_mask = 0;
+    child = spawn_grant("/bin/sigtest", args, &grant);
+    if (child < 0 || waitpid(child) != 0)
+        return 1;
+
+    grant.n_mounts = 0;
+    child = spawn_grant("/bin/sigtest", args, &grant);
+    if (child < 0 || waitpid(child) != -1)
+        return 1;
+
+    printf("sigtest: mount view, exact capabilities, cwd and descriptor grants verified\n");
+    return 0;
+}
+
 enum { WAITANY_CHILD_STATUS = 37 };
 
 static int test_waitany_bad_pointer(void)
@@ -169,6 +272,14 @@ int main(int argc, char **argv)
         return interrupt_reader(atoi(argv[2]));
     if (argc > 1 && strcmp(argv[1], "--pipe-lifetime") == 0)
         return test_pipe_lifetime();
+    if (argc > 1 && strcmp(argv[1], "--spawn-grant") == 0)
+        return test_spawn_grant();
+    if (argc > 1 && strcmp(argv[1], "--grant-child") == 0)
+        return grant_child();
+    if (argc > 1 && strcmp(argv[1], "--grant-descendant") == 0)
+        return grant_descendant();
+    if (argc > 1 && strcmp(argv[1], "--grant-zero") == 0)
+        return grant_zero();
     if (argc > 1 && strcmp(argv[1], "--waitany-bad-pointer") == 0)
         return test_waitany_bad_pointer();
     if (argc > 1 && strcmp(argv[1], "--waitany-child") == 0)

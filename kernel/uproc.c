@@ -3,6 +3,7 @@
 #include "uproc.h"
 #include "elf.h"
 #include "vfs.h"
+#include "mount.h"
 #include "vmm.h"
 #include "pmm.h"
 #include "vm.h"
@@ -31,6 +32,7 @@ struct uproc_pkg {
     struct file *fds[K_SPAWN_CAPS_MAX_FDS];
     int has_cap_mask;
     uint64_t cap_mask;
+    struct mount_view *mount_view;
     int mission_id;
 };
 
@@ -244,6 +246,7 @@ static void free_pkg(struct uproc_pkg *pkg)
             pkg->fds[i] = NULL;
         }
     }
+    mount_view_release(pkg->mount_view);
     kfree(pkg);
 }
 
@@ -258,6 +261,8 @@ static void user_task_thunk(void *arg)
     uint64_t entry, brk, argv_user, cwd_user, rsp, f;
     int argc;
 
+    if (pkg->mount_view)
+        mount_view_set_current(pkg->mount_view);
     if (pmm_free_pages() <= 256) {
         kprintf("uproc: out of memory spawning %s\n", pkg->path);
         goto fail;
@@ -567,8 +572,9 @@ static int str_terminated_in(const char *s, size_t max)
     return 0;
 }
 
-int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
-                               const struct k_spawn_caps *kcaps)
+static int spawn_caps_from_user(const char *upath, char *const *uargv,
+                                const struct k_spawn_caps *kcaps,
+                                const struct k_spawn_grant *grant)
 {
     struct uproc_pkg *pkg;
 
@@ -583,12 +589,29 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
     if (!pkg)
         return -1;
 
+    if (grant && (grant->flags & K_SPAWN_GRANT_MOUNT_VIEW)) {
+        const char *paths[K_SPAWN_GRANT_MAX_MOUNTS];
+        for (uint32_t i = 0; i < grant->n_mounts; i++) {
+            paths[i] = grant->mounts[i];
+            if (!str_terminated_in(paths[i], sizeof(grant->mounts[i])))
+                goto fail;
+        }
+        pkg->mount_view = mount_view_create(paths, grant->n_mounts);
+        if (!pkg->mount_view)
+            goto fail;
+    }
+
     for (uint32_t i = 0; i < kcaps->n_fds; i++) {
         int32_t cfd = kcaps->fds[i].child_fd;
         int32_t pfd = kcaps->fds[i].parent_fd;
         if (cfd < 0 || cfd >= MAX_OPEN_FILES ||
             pfd < 0 || pfd >= MAX_OPEN_FILES)
             goto fail;
+        if (grant) {
+            for (int j = 0; j < pkg->n_fds; j++)
+                if (pkg->fd_nums[j] == cfd)
+                    goto fail;
+        }
 
         struct file *pf = current->files[pfd];
         if (!pf) {
@@ -611,7 +634,7 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
         memcpy(pkg->cwd, kcaps->cwd, sizeof(pkg->cwd));
 
     pkg->has_cap_mask = 1;
-    pkg->cap_mask = kcaps->cap_mask
+    pkg->cap_mask = (grant || kcaps->cap_mask)
                   ? (current->cap_mask & kcaps->cap_mask)
                   : current->cap_mask;
 
@@ -620,6 +643,26 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
 fail:
     free_pkg(pkg);
     return -1;
+}
+
+int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
+                               const struct k_spawn_caps *kcaps)
+{
+    return spawn_caps_from_user(upath, uargv, kcaps, NULL);
+}
+
+int uproc_spawn_grant_from_user(const char *upath, char *const *uargv,
+                                const struct k_spawn_grant *grant)
+{
+    if (grant->version != K_SPAWN_GRANT_VERSION || grant->reserved ||
+        (grant->flags & ~K_SPAWN_GRANT_MOUNT_VIEW) ||
+        (grant->caps.flags & ~K_SPAWN_CLOSE_OTHER) ||
+        (grant->caps.cap_mask & ~KCAP_ALL) ||
+        (grant->caps.cwd[0] && grant->caps.cwd[0] != '/') ||
+        grant->n_mounts > K_SPAWN_GRANT_MAX_MOUNTS ||
+        (!(grant->flags & K_SPAWN_GRANT_MOUNT_VIEW) && grant->n_mounts))
+        return -1;
+    return spawn_caps_from_user(upath, uargv, &grant->caps, grant);
 }
 
 int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
