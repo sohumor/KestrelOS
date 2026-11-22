@@ -1,129 +1,62 @@
 #include "keyboard.h"
-#include "input.h"
-#include "kestrel_abi.h"
+#include "keyboard_seat.h"
 #include "interrupts.h"
 #include "io.h"
 #include "random.h"
-#include "spinlock.h"
 
-/* US QWERTY, scancode set 1 */
-static const char map_normal[0x40] = {
-    0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0, 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0, '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-    '*', 0, ' ', 0,
+/* Translate PS/2 set 1 positions to physical keyboard usages. */
+static const uint8_t base[0x59] = {
+    [0x01] = 0x29, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24,
+    0x25, 0x26, 0x27, 0x2d, 0x2e, 0x2a, 0x2b, 0x14,
+    0x1a, 0x08, 0x15, 0x17, 0x1c, 0x18, 0x0c, 0x12,
+    0x13, 0x2f, 0x30, 0x28, 0xe0, 0x04, 0x16, 0x07,
+    0x09, 0x0a, 0x0b, 0x0d, 0x0e, 0x0f, 0x33, 0x34,
+    0x35, 0xe1, 0x31, 0x1d, 0x1b, 0x06, 0x19, 0x05,
+    0x11, 0x10, 0x36, 0x37, 0x38, 0xe5, 0x55, 0xe2,
+    0x2c, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+    0x40, 0x41, 0x42, 0x43,
+    [0x57] = 0x44, 0x45,
 };
 
-static const char map_shift[0x40] = {
-    0, 27, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0, 'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0, '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
-    '*', 0, ' ', 0,
+static const uint8_t extended[0x5d] = {
+    [0x1c] = KKEY_KP_ENTER, [0x1d] = KKEY_RCTRL,
+    [0x38] = KKEY_RALT,
+    [0x47] = KKEY_HOME, [0x48] = KKEY_UP, [0x49] = KKEY_PAGEUP,
+    [0x4b] = KKEY_LEFT, [0x4d] = KKEY_RIGHT, [0x4f] = KKEY_END,
+    [0x50] = KKEY_DOWN, [0x51] = KKEY_PAGEDOWN, [0x53] = KKEY_DELETE,
+    [0x5b] = KKEY_LGUI, [0x5c] = KKEY_RGUI,
 };
 
-static bool shift, ctrl, alt, caps, ext;
-static spinlock_t keyboard_lock = SPINLOCK_INIT;
-
-static void handle_scancode(uint8_t sc)
-{
-    entropy_pool_add_interrupt(ENTROPY_KEYBOARD, sc);
-
-    if (sc == 0xE0) {
-        ext = true;
-        return;
-    }
-
-    bool release = sc & 0x80;
-    sc &= 0x7F;
-
-    if (ext) {
-        ext = false;
-        /* Right ctrl (E0 1D / E0 9D) carries state, so its break code must
-         * be handled before the release filter or `ctrl` latches on. */
-        if (sc == 0x1D) {
-            ctrl = !release;
-            return;
-        }
-        if (sc == 0x38) {
-            alt = !release;
-            return;
-        }
-        if (sc == 0x5B || sc == 0x5C) {
-            if (!release)
-                input_push(KEY_LAUNCHER);
-            return;
-        }
-        if (release)
-            return;
-        switch (sc) {
-        case 0x48: input_push(KEY_UP); return;
-        case 0x50: input_push(KEY_DOWN); return;
-        case 0x4B: input_push(KEY_LEFT); return;
-        case 0x4D: input_push(KEY_RIGHT); return;
-        case 0x47: input_push(KEY_HOME); return;
-        case 0x4F: input_push(KEY_END); return;
-        case 0x49: input_push(KEY_PGUP); return;
-        case 0x51: input_push(KEY_PGDN); return;
-        case 0x53: input_push(KEY_DELETE); return;
-        case 0x1C: input_push('\n'); return;      /* keypad enter */
-        }
-        return;
-    }
-
-    switch (sc) {
-    case 0x2A: case 0x36: shift = !release; return;
-    case 0x1D: ctrl = !release; return;
-    case 0x38: alt = !release; return;
-    case 0x3A: if (!release) caps = !caps; return;
-    }
-
-    if (release || sc >= 0x40)
-        return;
-
-    if (alt && sc == 0x0F) {
-        input_push(KEY_WM_NEXT);
-        return;
-    }
-    if (alt && sc == 0x3E) {
-        input_push(KEY_WM_CLOSE);
-        return;
-    }
-    if (alt && sc >= 0x02 && sc <= 0x05) {
-        input_push((uint8_t)(KEY_WM_WS1 + (sc - 0x02)));
-        return;
-    }
-
-    if (ctrl && sc == 0x32) {
-        input_push(KEY_MISSION);
-        return;
-    }
-    char c = shift ? map_shift[sc] : map_normal[sc];
-    if (!c)
-        return;
-    if (caps && !shift && c >= 'a' && c <= 'z')
-        c -= 32;
-    else if (caps && shift && c >= 'A' && c <= 'Z')
-        c += 32;
-    if (ctrl && (c >= 'a' && c <= 'z'))
-        c -= 96;                                  /* ctrl-a = 1 ... */
-    else if (ctrl && (c >= 'A' && c <= 'Z'))
-        c -= 64;
-    input_push((uint8_t)c);
-}
-
-void keyboard_handle_scancode(uint8_t sc)
-{
-    uint64_t flags = spin_lock_irqsave(&keyboard_lock);
-    handle_scancode(sc);
-    spin_unlock_irqrestore(&keyboard_lock, flags);
-}
+static struct keyboard_source ps2_keyboard;
+static bool e0;
+static unsigned pause_left;
 
 static void kbd_irq(struct regs *r)
 {
     (void)r;
-    keyboard_handle_scancode(inb(0x60));
+    uint8_t sc = inb(0x60);
+    entropy_pool_add_interrupt(ENTROPY_KEYBOARD, sc);
+
+    if (pause_left) {
+        pause_left--;
+        return;
+    }
+    if (sc == 0xe1) {
+        pause_left = 5;
+        e0 = false;
+        return;
+    }
+    if (sc == 0xe0) {
+        e0 = true;
+        return;
+    }
+
+    unsigned code = sc & 0x7f;
+    const uint8_t *map = e0 ? extended : base;
+    unsigned count = e0 ? sizeof(extended) : sizeof(base);
+    e0 = false;
+    if (code < count && map[code])
+        keyboard_source_key(&ps2_keyboard, map[code], !(sc & 0x80));
 }
 
 void keyboard_init(void)

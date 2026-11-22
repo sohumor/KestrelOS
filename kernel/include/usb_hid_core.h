@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef void (*usb_hid_emit_fn)(uint8_t scancode, void *ctx);
+typedef void (*usb_hid_emit_fn)(uint8_t usage, bool down, void *ctx);
 
 /* Returns false for invalid/error reports. Keep the last accepted report as
  * previous; error reports must not replace it. No repeat is generated. */
