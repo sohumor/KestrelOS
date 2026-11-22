@@ -83,7 +83,7 @@ static void poll_frames(void)
         const uint8_t *buf = P2V(phys);
         int frame_len = virtio_net_frame_len(buf, len, device.modern);
         if (frame_len >= 0)
-            net_rx(buf + header_size, frame_len);
+            net_rx_submit(buf + header_size, frame_len);
         struct virtq_buf b = {phys, BUF_SIZE, 2};
         if (virtq_submit(&rx, &b, 1) < 0) {
             present = 0;

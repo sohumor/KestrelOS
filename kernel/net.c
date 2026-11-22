@@ -13,10 +13,9 @@
 
 /* Ethernet / ARP / IPv4 / ICMP core.
  *
- * RX runs in IRQ context (net_rx from the NIC ISR): it may transmit
- * replies (ARP reply, ICMP echo reply) but never sleeps or waits.
- * All blocking waits (arp_resolve, icmp_ping, udp_recv) run in task
- * context and spin on net_wait_tick().
+ * Drivers copy received frames into a bounded ingress queue. Its sole
+ * consumer dispatches protocols and any immediate replies in task context.
+ * Input handlers must not wait for other packets to reach that consumer.
  */
 
 #define ETHERTYPE_IP  0x0800
@@ -70,6 +69,20 @@ static bool ready;
 static uint32_t cfg_ip, cfg_mask, cfg_gw, cfg_dns;   /* network order */
 
 static const uint8_t bcast_mac[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+#define NET_RX_SLOTS 64
+#define NET_RX_BATCH 16
+
+static struct rx_frame {
+    int len;
+    uint8_t data[sizeof(struct eth_hdr) + ETH_MTU];
+} rx_frames[NET_RX_SLOTS];
+static unsigned rx_head, rx_count;
+static bool rx_draining, rx_worker_started;
+static spinlock_t rx_lock = SPINLOCK_INIT;
+static struct task_event_channel rx_ready;
+
+static void net_rx_drain(void);
 
 /* ---- telemetry counters ---- */
 
@@ -173,11 +186,14 @@ uint32_t net_dns_addr(void)
     return cfg_dns;
 }
 
-void net_poll(void)
+static void net_poll(void)
 {
     const struct netdev *nd = netdev_current();
-    if (ready && nd)
+    if (ready && nd) {
         nd->poll();
+        if (!rx_worker_started)
+            net_rx_drain();
+    }
 }
 
 void net_wait_tick(void)
@@ -239,7 +255,7 @@ static struct arp_entry arp_cache[ARP_CACHE_SIZE];
 static int arp_next;
 static spinlock_t arp_lock = SPINLOCK_INIT;
 
-/* Called from IRQ context only (rx path). */
+/* Receive path. */
 static void arp_learn(uint32_t ip, const uint8_t *mac)
 {
     if (ip == 0)
@@ -326,7 +342,7 @@ static int arp_resolve(uint32_t ip, uint8_t *mac_out)
     return -1;
 }
 
-/* IRQ context. */
+/* Receive path. */
 static void arp_input(const uint8_t *pkt, int len)
 {
     if (len < (int)sizeof(struct arp_pkt)) {
@@ -360,8 +376,8 @@ static void arp_input(const uint8_t *pkt, int len)
 /* ---- IPv4 ---- */
 
 /* Transmit to an already-known next-hop MAC. The RX path must use this:
- * resolving ARP from IRQ context would re-enter rx_drain on the same
- * unconsumed frame and recurse until the kernel stack overflows. */
+ * resolving ARP from the receiver would wait for a reply queued behind
+ * the frame currently being dispatched. */
 static int ip_send_mac(const uint8_t *dst_mac, uint32_t dst_ip_be,
                        uint8_t proto, const void *payload, int len)
 {
@@ -411,7 +427,7 @@ static volatile uint32_t ping_target;            /* network order */
 static volatile uint64_t ping_reply_ticks;
 static spinlock_t ping_lock = SPINLOCK_INIT;
 
-/* IRQ context. src_mac is the frame's sender, i.e. our next hop back. */
+/* src_mac is the frame's sender, i.e. our next hop back. */
 static void icmp_input(uint32_t src_ip, const uint8_t *src_mac,
                        const uint8_t *pkt, int len)
 {
@@ -529,7 +545,7 @@ long icmp_ping(uint32_t ip_be, int timeout_ms)
     return -1;
 }
 
-/* IRQ context. */
+/* Receive path. */
 static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
 {
     if (len < (int)sizeof(struct ip_hdr)) {
@@ -563,7 +579,7 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
         return;
     }
 
-    /* Learn sender's MAC so replies never block on ARP in IRQ context. */
+    /* Learn sender's MAC so replies never block the receive queue on ARP. */
     arp_learn(ip->src, eh->src);
 
     const uint8_t *payload = pkt + ihl;
@@ -579,15 +595,33 @@ static void ipv4_input(const struct eth_hdr *eh, const uint8_t *pkt, int len)
         net_stat_inc(NET_STAT_RX_DROP, 0);
 }
 
-/* ---- frame entry point (IRQ context) ---- */
+/* ---- ingress ---- */
 
-void net_rx(const uint8_t *frame, int len)
+void net_rx_submit(const uint8_t *frame, int len)
 {
-    if (!frame || len < (int)sizeof(struct eth_hdr)) {
+    if (!frame || len < (int)sizeof(struct eth_hdr) ||
+        len > (int)sizeof(rx_frames[0].data)) {
         net_stat_inc(NET_STAT_RX_DROP, 0);
         return;
     }
+
+    uint64_t f = spin_lock_irqsave(&rx_lock);
+    if (rx_count == NET_RX_SLOTS) {
+        spin_unlock_irqrestore(&rx_lock, f);
+        net_stat_inc(NET_STAT_RX_DROP, 0);
+        return;
+    }
+    struct rx_frame *slot = &rx_frames[(rx_head + rx_count) % NET_RX_SLOTS];
+    slot->len = len;
+    memcpy(slot->data, frame, (size_t)len);
     net_stat_inc(NET_STAT_RX_PKT, (uint32_t)len);
+    if (rx_count++ == 0)
+        task_event_notify(&rx_ready, 1);
+    spin_unlock_irqrestore(&rx_lock, f);
+}
+
+static void net_rx_dispatch(const uint8_t *frame, int len)
+{
     const struct eth_hdr *eh = (const struct eth_hdr *)frame;
     uint16_t type = ntohs(eh->type);
     const uint8_t *payload = frame + sizeof(*eh);
@@ -599,6 +633,44 @@ void net_rx(const uint8_t *frame, int len)
         ipv4_input(eh, payload, plen);
     else if (type == ETHERTYPE_IPV6)
         ipv6_input(eh->src, payload, plen);
+}
+
+static void net_rx_drain(void)
+{
+    uint64_t f = spin_lock_irqsave(&rx_lock);
+    if (rx_draining) {
+        spin_unlock_irqrestore(&rx_lock, f);
+        return;
+    }
+    rx_draining = true;
+    for (unsigned i = 0; i < NET_RX_BATCH && rx_count; i++) {
+        const struct rx_frame *slot = &rx_frames[rx_head];
+
+        /* The queued head still occupies a slot while dispatch runs. */
+        spin_unlock_irqrestore(&rx_lock, f);
+        net_rx_dispatch(slot->data, slot->len);
+        f = spin_lock_irqsave(&rx_lock);
+        rx_head = (rx_head + 1) % NET_RX_SLOTS;
+        rx_count--;
+    }
+    rx_draining = false;
+    spin_unlock_irqrestore(&rx_lock, f);
+}
+
+static void net_rx_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint64_t f = spin_lock_irqsave(&rx_lock);
+        if (!rx_count) {
+            if (task_event_wait_locked(&rx_ready, 1, UINT64_MAX, &rx_lock, f) < 0)
+                return;
+            continue;
+        }
+        spin_unlock_irqrestore(&rx_lock, f);
+        net_rx_drain();
+        yield();
+    }
 }
 
 void net_configure(uint32_t ip, uint32_t mask, uint32_t gw, uint32_t dns)
@@ -645,6 +717,9 @@ void net_init(void)
         kprintf("net: ip 10.0.2.15/24 gw 10.0.2.2 dns 10.0.2.3 (static fallback)\n");
     }
     net6_init();
+    rx_worker_started = kthread_create(net_rx_worker, NULL, "net-rx") != NULL;
+    if (!rx_worker_started)
+        kprintf("net: receive worker unavailable; using task polling\n");
 }
 
 void net_get_info(struct k_netinfo *out)

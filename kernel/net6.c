@@ -1,11 +1,10 @@
 /* IPv6 (RFC 8200), ICMPv6 (RFC 4443), Neighbor Discovery (RFC 4861) and
  * stateless address autoconfiguration (RFC 4862) with RDNSS (RFC 8106).
  *
- * Same model as the IPv4 core in net.c: frames arrive from the NIC in IRQ
- * context, where we only parse, learn neighbors, update configuration and
- * answer synchronously (NS, echo).  Anything that may wait (neighbor
- * resolution, ping, router solicitation) runs in task context and spins on
- * net_wait_tick().
+ * The IPv4 core's receive consumer dispatches IPv6 frames too. Input
+ * parses, learns neighbors, updates configuration and replies using the
+ * sender's MAC. Neighbor resolution, ping and router solicitation use
+ * net_wait_tick() outside the receive consumer.
  *
  * One interface, one link-local address (fe80::/64 + modified EUI-64) and at
  * most one SLAAC global address from the first autonomous /64 prefix an RA
@@ -379,7 +378,7 @@ long icmp6_ping(const uint8_t dst[16], int timeout_ms)
     return rtt;
 }
 
-/* ---- ICMPv6 input (IRQ context) ---- */
+/* ---- ICMPv6 input ---- */
 
 static void nd_input_ns(const uint8_t *eth_src, const struct ip6_hdr *ip,
                         const uint8_t *m, int len)
@@ -518,7 +517,7 @@ static void icmp6_input(const uint8_t *eth_src, const struct ip6_hdr *ip,
     }
 }
 
-/* ---- IPv6 input (IRQ context) ---- */
+/* ---- IPv6 input ---- */
 
 void ipv6_input(const uint8_t *eth_src, const uint8_t *pkt, int len)
 {
