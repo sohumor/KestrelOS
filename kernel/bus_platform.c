@@ -33,6 +33,7 @@ static struct platform_dev platform_devs[] = {
     { .dev = { .name = "serial0"  }, .info = { 0x03F8, 8, 4  } },
     { .dev = { .name = "cmos"     }, .info = { 0x0070, 2, 8  } },
     { .dev = { .name = "ata-primary" }, .info = { 0x01F0, 8, 14 } },
+    { .dev = { .name = "ata-secondary" }, .info = { 0x0170, 8, 15 } },
 };
 
 #define PLATFORM_NDEVS \

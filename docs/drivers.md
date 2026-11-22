@@ -207,6 +207,20 @@ machine where the keyboard is somewhere else.
 A module with fixed hardware of its own calls
 `platform_device_add(&dev, &info)` to put it on the bus.
 
+### Compatibility ATA storage
+
+The platform bus publishes primary and secondary ATA channels. The PIO
+driver uses one lock per channel because two targets on the same channel
+share the command registers. Each detected 512-byte ATA disk is a separate
+block device: `hda` and `hdb` on the primary channel, `hdc` and `hdd` on
+the secondary. Absent targets and ATAPI devices do not consume a block
+device name; populated slots keep their hardware-derived names.
+
+On an ATA boot, KestrelOS still mounts root from `hda`. Data disks may hold
+a whole-device KFS image and be mounted separately, for example with
+`mount -t kfs hdb /mnt/data` after creating the mount directory. This
+does not add partition scanning or change the boot image format.
+
 ## Initcall levels
 
 `kernel/include/initcall.h` defines four levels. `kmain()` runs them in
