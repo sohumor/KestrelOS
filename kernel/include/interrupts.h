@@ -26,11 +26,28 @@ void irq_install_handler(int irq, irq_handler_t handler);
 int irq_subscribe(unsigned irq, irq_listener_t listener, void *context);
 int irq_unsubscribe(unsigned irq, irq_listener_t listener, void *context);
 
+#define IRQ_LINE_COUNT 16
+
+enum irq_route {
+    IRQ_UNCLAIMED,
+    IRQ_SPURIOUS,
+    IRQ_DELIVER,
+};
+
+struct irq_controller {
+    /* A delivered vector supplies a valid logical line. A spurious
+     * vector is consumed here, with any controller-specific EOI. */
+    enum irq_route (*claim)(unsigned vector, unsigned *line);
+    void (*complete)(unsigned line);
+};
+
+/* Install once during boot, before external interrupts are enabled. */
+void irq_controller_bind(const struct irq_controller *controller);
+
 void pic_init(void);
 void pic_send_eoi(int irq);
 void pic_set_mask(int irq);
 void pic_clear_mask(int irq);
-int  pic_is_spurious(int irq);
 
 static inline void sti(void) { __asm__ volatile("sti"); }
 static inline void cli(void) { __asm__ volatile("cli"); }
