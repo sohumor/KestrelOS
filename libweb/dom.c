@@ -276,6 +276,7 @@ struct dom_priv {
     unsigned long arena_total;      /* bytes handed to malloc for chunks */
 
     unsigned long max_input, max_nodes, max_depth, max_arena;
+    struct dom_memory_credit *credit;
 
     struct intern_ent *itab;
     unsigned long icap, icount;
@@ -288,6 +289,31 @@ struct dom_priv {
 
 #define CHUNK_MIN  (8UL * 1024UL)
 #define CHUNK_MAX  (1024UL * 1024UL)
+
+static int credit_take(struct dom_memory_credit *credit, unsigned long bytes)
+{
+    if (credit) {
+        if (bytes > credit->remaining)
+            return 0;
+        credit->remaining -= bytes;
+    }
+    return 1;
+}
+
+static void credit_return(struct dom_memory_credit *credit, unsigned long bytes)
+{
+    if (credit)
+        credit->remaining += bytes;
+}
+
+static int document_charge(struct dom_document *d, unsigned long bytes)
+{
+    struct dom_priv *pv = (struct dom_priv *)d->priv;
+    if (credit_take(pv->credit, bytes))
+        return 1;
+    d->truncated |= DOM_TRUNC_CREDIT;
+    return 0;
+}
 
 static void *arena_alloc(struct dom_document *d, unsigned long n)
 {
@@ -317,8 +343,11 @@ static void *arena_alloc(struct dom_document *d, unsigned long n)
         d->truncated |= DOM_TRUNC_MEMORY;
         return 0;
     }
+    if (!document_charge(d, hdr + want))
+        return 0;
     c = (struct dom_chunk *)malloc(hdr + want);
     if (!c) {
+        credit_return(pv->credit, hdr + want);
         d->oom = 1;
         return 0;
     }
@@ -354,8 +383,11 @@ static int intern_grow(struct dom_document *d)
     struct intern_ent *nt;
     unsigned long i;
 
+    if (!document_charge(d, ncap * sizeof *nt))
+        return 0;
     nt = (struct intern_ent *)calloc(ncap, sizeof *nt);
     if (!nt) {
+        credit_return(pv->credit, ncap * sizeof *nt);
         d->oom = 1;
         return 0;
     }
@@ -369,6 +401,7 @@ static int intern_grow(struct dom_document *d)
         nt[h] = pv->itab[i];
     }
     free(pv->itab);
+    credit_return(pv->credit, pv->icap * sizeof *nt);
     pv->itab = nt;
     pv->icap = ncap;
     return 1;
@@ -446,8 +479,11 @@ static int id_grow(struct dom_document *d)
     struct id_ent *nt;
     unsigned long i;
 
+    if (!document_charge(d, ncap * sizeof *nt))
+        return 0;
     nt = (struct id_ent *)calloc(ncap, sizeof *nt);
     if (!nt) {
+        credit_return(pv->credit, ncap * sizeof *nt);
         d->oom = 1;
         return 0;
     }
@@ -461,6 +497,7 @@ static int id_grow(struct dom_document *d)
         nt[h] = pv->idtab[i];
     }
     free(pv->idtab);
+    credit_return(pv->credit, pv->idcap * sizeof *nt);
     pv->idtab = nt;
     pv->idcap = ncap;
     return 1;
@@ -556,16 +593,23 @@ struct dom_document *dom_document_new_limits(const struct dom_limits *lim)
 {
     struct dom_document *d;
     struct dom_priv *pv;
+    struct dom_memory_credit *credit = lim ? lim->credit : 0;
 
-    d = (struct dom_document *)calloc(1, sizeof *d);
-    if (!d)
+    if (!credit_take(credit, sizeof *d + sizeof *pv))
         return 0;
+    d = (struct dom_document *)calloc(1, sizeof *d);
+    if (!d) {
+        credit_return(credit, sizeof *d + sizeof *pv);
+        return 0;
+    }
     pv = (struct dom_priv *)calloc(1, sizeof *pv);
     if (!pv) {
         free(d);
+        credit_return(credit, sizeof *d + sizeof *pv);
         return 0;
     }
     d->priv = pv;
+    pv->credit = credit;
     pv->max_input = (lim && lim->max_input) ? lim->max_input : DOM_MAX_INPUT;
     pv->max_nodes = (lim && lim->max_nodes) ? lim->max_nodes : DOM_MAX_NODES;
     pv->max_depth = (lim && lim->max_depth) ? lim->max_depth : DOM_MAX_DEPTH;
@@ -588,9 +632,13 @@ struct dom_document *dom_document_new_limits(const struct dom_limits *lim)
     d->nnodes = 1;
 
     d->title = "";
-    /* These two grow with realloc rather than living in the arena,
-     * because the CSS and JS agents want one flat buffer. They are the
-     * only heap blocks the document owns outside its chunks. */
+    /* CSS and JS agents need flat buffers rather than arena chunks. */
+    if (!document_charge(d, 2)) {
+        dom_document_free(d);
+        return 0;
+    }
+    pv->style_cap = 1;
+    pv->script_cap = 1;
     d->style_text = (char *)malloc(1);
     d->script_text = (char *)malloc(1);
     if (!d->style_text || !d->script_text) {
@@ -599,8 +647,6 @@ struct dom_document *dom_document_new_limits(const struct dom_limits *lim)
     }
     d->style_text[0] = 0;
     d->script_text[0] = 0;
-    pv->style_cap = 1;
-    pv->script_cap = 1;
     return d;
 }
 
@@ -613,11 +659,16 @@ void dom_document_free(struct dom_document *d)
 {
     struct dom_priv *pv;
     struct dom_chunk *c;
+    struct dom_memory_credit *credit = 0;
+    unsigned long charged = 0;
 
     if (!d)
         return;
     pv = (struct dom_priv *)d->priv;
     if (pv) {
+        credit = pv->credit;
+        if (credit)
+            charged = dom_memory_used(d);
         c = pv->chunks;
         while (c) {
             struct dom_chunk *nx = c->next;
@@ -631,6 +682,7 @@ void dom_document_free(struct dom_document *d)
     free(d->style_text);
     free(d->script_text);
     free(d);
+    credit_return(credit, charged);
 }
 
 /* Input cap lives in priv; the parser asks for it. */
@@ -1471,12 +1523,16 @@ static int collect(struct dom_document *d, char **buf, unsigned long *len,
         d->truncated |= DOM_TRUNC_COLLECT;
     }
     if (*len + n + 2 > *cap) {
+        struct dom_priv *pv = (struct dom_priv *)d->priv;
         unsigned long ncap = *cap ? *cap : 1024;
         char *nb;
         while (ncap < *len + n + 2)
             ncap *= 2;
+        if (!document_charge(d, ncap - *cap))
+            return 0;
         nb = (char *)realloc(*buf, ncap);
         if (!nb) {
+            credit_return(pv->credit, ncap - *cap);
             d->oom = 1;
             return 0;
         }

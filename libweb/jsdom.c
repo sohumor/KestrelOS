@@ -444,6 +444,7 @@ struct jsdom {
     struct dom_document **parsed_docs;
     unsigned int parsed_doc_count;
     unsigned int parsed_doc_cap;
+    struct dom_memory_credit parsed_doc_credit;
     struct css_stylesheet *author_sheet;
     const struct css_stylesheet *external_sheet;
     uint64_t initial_style_hash;
@@ -17229,9 +17230,10 @@ static void xml_decode_entities(const char *src, unsigned long len,
 
 static struct dom_document *jsdom_parse_xml_document(const char *src,
                                                      unsigned long len,
-                                                     const char *default_ns)
+                                                     const char *default_ns,
+                                                     const struct dom_limits *limits)
 {
-    struct dom_document *d = dom_document_new();
+    struct dom_document *d = dom_document_new_limits(limits);
     struct dom_node *stack[64];
     const char *ns_stack[64];
     int sp = 0;
@@ -17241,7 +17243,7 @@ static struct dom_document *jsdom_parse_xml_document(const char *src,
         return 0;
     stack[0] = d->root;
     ns_stack[0] = default_ns;
-    while (i < len) {
+    while (i < len && !(d->truncated & DOM_TRUNC_CREDIT)) {
         if (src[i] == '<') {
             if (i + 4 <= len && !memcmp(src + i, "<!--", 4)) {
                 unsigned long start = i + 4, end = start;
@@ -17452,38 +17454,42 @@ static int dom_parser_parse_from_string(js_ctx *c, js_value t,
             ? js_throw_error(c, JS_ERR_TYPE,
                              "parseFromString requires string and type")
             : JS_THROW;
+    const struct dom_limits limits = { .credit = &h->j->parsed_doc_credit };
     if (!strcmp(mime, "text/html")) {
-        doc2 = html_parse_document(markup, strlen(markup));
+        doc2 = html_parse_document_limits(markup, strlen(markup), &limits);
         proto = h->j->html_document_proto;
     } else if (!strcmp(mime, "image/svg+xml")) {
         doc2 = jsdom_parse_xml_document(markup, strlen(markup),
-                                        DOM_NS_SVG_URI);
+                                        DOM_NS_SVG_URI, &limits);
         proto = h->j->doc_proto;
     } else if (!strcmp(mime, "text/xml") ||
                !strcmp(mime, "application/xml")) {
-        doc2 = jsdom_parse_xml_document(markup, strlen(markup), 0);
+        doc2 = jsdom_parse_xml_document(markup, strlen(markup), 0, &limits);
         proto = h->j->doc_proto;
     } else if (!strcmp(mime, "application/xhtml+xml")) {
         doc2 = jsdom_parse_xml_document(markup, strlen(markup),
-                                        DOM_NS_HTML_URI);
+                                        DOM_NS_HTML_URI, &limits);
         proto = h->j->doc_proto;
     } else {
         return js_throw_error(c, JS_ERR_TYPE,
                               "unsupported DOMParser MIME type");
     }
-    if (!doc2)
+    if (!doc2 || (doc2->truncated & DOM_TRUNC_CREDIT)) {
+        dom_document_free(doc2);
         return js_throw_error(c, JS_ERR_ERROR, "cannot parse document");
-    if (!track_parsed_document(h->j, doc2)) {
+    }
+    ref = (struct doc_ref *)calloc(1, sizeof(*ref));
+    if (!ref || !track_parsed_document(h->j, doc2)) {
+        free(ref);
         dom_document_free(doc2);
         return js_throw_error(c, JS_ERR_ERROR, "out of memory");
     }
-    ref = (struct doc_ref *)calloc(1, sizeof(*ref));
-    if (!ref)
-        return js_throw_error(c, JS_ERR_ERROR, "out of memory");
     ref->doc = doc2;
     snprintf(ref->content_type, sizeof(ref->content_type), "%s", mime);
     docobj = new_host_data(h->j, 0, HOST_DOCUMENT, ref, proto);
     if (!docobj) {
+        h->j->parsed_doc_count--;
+        dom_document_free(doc2);
         free(ref);
         return JS_THROW;
     }
@@ -18957,6 +18963,8 @@ struct jsdom *jsdom_new(struct dom_document *doc,
     if (!j)
         return 0;
     j->doc = doc;
+    j->parsed_doc_credit.remaining = cfg && cfg->max_parsed_document_bytes
+        ? cfg->max_parsed_document_bytes : DOM_MAX_ARENA;
     j->external_sheet = cfg ? cfg->stylesheet : 0;
     if (j->external_sheet)
         j->initial_style_hash = style_tags_hash(doc);

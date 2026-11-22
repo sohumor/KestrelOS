@@ -1163,6 +1163,55 @@ static unsigned int tree_depth(const struct dom_node *root)
     return max;
 }
 
+static void run_memory_credit(void)
+{
+    struct dom_document *example = dom_document_new();
+    unsigned long base = dom_memory_used(example);
+    struct dom_memory_credit credit = { 2 * base };
+    struct dom_limits limits = { .credit = &credit };
+    struct dom_document *a, *b;
+
+    dom_document_free(example);
+    a = dom_document_new_limits(&limits);
+    b = dom_document_new_limits(&limits);
+    ok(a && b && !credit.remaining, "two documents share exact backing credit");
+    if (a && b) {
+        ok(!dom_collect_style(a, "p{}", 3) &&
+           (a->truncated & DOM_TRUNC_CREDIT) && !a->style_len,
+           "flat stylesheet growth respects shared credit");
+        dom_document_free(b);
+        b = NULL;
+        ok(credit.remaining == base, "freeing one document returns its credit");
+        ok(dom_collect_style(a, "p{}", 3) &&
+           credit.remaining == 2 * base - dom_memory_used(a),
+           "surviving document can reuse returned credit");
+        unsigned long remaining = credit.remaining;
+        b = dom_document_new_limits(&limits);
+        ok(!b && credit.remaining == remaining,
+           "failed document construction returns partial reservations");
+    }
+    dom_document_free(b);
+    dom_document_free(a);
+    ok(credit.remaining == 2 * base, "all DOM credit returned");
+
+    credit.remaining = DOM_MAX_ARENA;
+    a = dom_document_new_limits(&limits);
+    if (a) {
+        for (int i = 0; i < 180; i++) {
+            char name[24];
+            snprintf(name, sizeof name, "element-%d", i);
+            struct dom_node *n = dom_create_element(a, name, -1);
+            if (!n || !dom_set_attr(n, "id", name) || !dom_append_child(a->root, n))
+                break;
+        }
+    }
+    ok(a && a->nnodes == 181 && dom_get_element_by_id(a, "element-179") &&
+       credit.remaining == DOM_MAX_ARENA - dom_memory_used(a),
+       "credit tracks new chunks and replacement of both indexes");
+    dom_document_free(a);
+    ok(credit.remaining == DOM_MAX_ARENA, "grown document releases all credit");
+}
+
 static void run_limits(int quick)
 {
     struct dom_document *d;
@@ -1597,6 +1646,7 @@ int main(int argc, char **argv)
     run_api();
     run_page();
     run_limits(quick);
+    run_memory_credit();
     run_adversarial();
     run_fuzz(iters);
 

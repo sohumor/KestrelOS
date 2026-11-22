@@ -154,6 +154,18 @@ CSS transitions/animations, and CSS filters are not provided.
 
 ## JavaScript and DOM
 
+Each page runtime gives the detached documents created by its
+`DOMParser` instances one backing-memory budget. HTML, XML, XHTML, and
+SVG share it: creating another parser does not provide more credit.
+The default is 64 MiB, and embedders can set a different
+`max_parsed_document_bytes`. Backing includes DOM arena capacity,
+indexes, and collected stylesheet and script buffers; it does not
+include parser scratch space, JS wrappers, or the main document.
+Existing per-document limits still apply. If a parse runs out of shared
+credit, it throws instead of exposing a partial document and returns its
+reservation. Successful detached documents stay funded until page
+teardown, including any later DOM growth.
+
 Classic inline and external scripts run in document order through `libjs`. The
 interpreter provides ES6+ execution within explicit memory and step budgets:
 
