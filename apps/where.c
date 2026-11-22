@@ -215,7 +215,6 @@ int main(int argc, char **argv)
     int col, rc, hdr;
     int i;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (!end_opts && strcmp(argv[i], "--") == 0) {
             end_opts = 1;

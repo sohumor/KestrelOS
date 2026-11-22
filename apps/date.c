@@ -22,24 +22,12 @@ static const char *const wdays[7] = {
     "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 int main(int argc, char **argv)
 {
+    (void)argv;
     struct k_rtc tm;
     const char *wd;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc > 1) {
         printf("usage: date\n");
         return 1;

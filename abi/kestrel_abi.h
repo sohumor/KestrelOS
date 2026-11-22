@@ -510,7 +510,7 @@ struct k_spawn_caps {
     uint32_t n_fds;
     uint32_t flags;
     uint64_t cap_mask;     /* 0 = inherit caller caps unchanged */
-    char cwd[128];         /* "" = do not append --cwd= */
+    char cwd[128];         /* absolute initial directory, "" = default */
 };
 
 /* --- Kernel Pulses (monotonic event stream) ------------------------- */

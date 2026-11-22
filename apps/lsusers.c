@@ -18,13 +18,6 @@
 #define DB_MAX     4096
 #define FIELD_MAX  128
 
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
-
 static long slurp(const char *path, char *buf, unsigned long max)
 {
     long total = 0;
@@ -169,7 +162,6 @@ static int list_users(void)
 
 int main(int argc, char **argv)
 {
-    argc = strip_cwd_arg(argc, argv);
     if (argc == 2 && strcmp(argv[1], "-g") == 0)
         return list_groups();
     if (argc > 1) {

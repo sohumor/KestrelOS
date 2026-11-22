@@ -5,7 +5,6 @@
 /* Repeated opens make live grant changes observable without relaunching. */
 int main(int argc, char **argv)
 {
-    if (argc > 1 && !strncmp(argv[argc - 1], "--cwd=", 6)) argc--;
     if (argc != 4) { puts("usage: missionprobe <read-path> <deny-path|-> <deny-ip|->"); return 1; }
     int last = -1;
     uint32_t host = !strcmp(argv[3], "-") ? 0 : ip_aton(argv[3]);

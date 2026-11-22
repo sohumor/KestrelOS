@@ -42,8 +42,6 @@ int main(int argc, char *argv[])
     int family = NET_AF_ANY;
 
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         if (strcmp(argv[i], "-6") == 0) {
             family = NET_AF_INET6;
             continue;

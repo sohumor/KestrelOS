@@ -63,7 +63,6 @@ int main(int argc, char **argv)
     int verbose = 0, rflag = 0;
     int i, total = 0, shown = 0, bound = 0;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--krec") == 0) {
             rflag = 1;

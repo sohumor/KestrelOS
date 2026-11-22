@@ -77,7 +77,7 @@ static int spawn_reader(const char *mode)
 
 int main(int argc, char **argv)
 {
-    if (argc > 1 && strncmp(argv[1], "--cwd=", 6) != 0)
+    if (argc > 1)
         return reader(argv[1]);
 
     int event = spawn_reader("event");

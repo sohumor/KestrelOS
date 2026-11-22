@@ -22,6 +22,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <kestrel_pulse.h>
 #include <krec.h>
 #include <stdarg.h>
@@ -1566,7 +1567,7 @@ int main(int argc, char **argv)
     uint32_t u32_val = 0;
     int i, rc = 0;
 
-    argc = krec_strip_cwd(argc, argv, &g_cwd);
+    g_cwd = kestrel_startup_cwd();
     if (!g_cwd || !g_cwd[0])
         g_cwd = "/";
 

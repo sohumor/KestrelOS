@@ -12,18 +12,6 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 /* Strict non-negative decimal parse. Returns -1 on any junk. */
 static int parse_pid(const char *s)
 {
@@ -63,7 +51,6 @@ int main(int argc, char **argv)
     unsigned int me;
     int i, pid, rc = 0;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc < 2) {
         printf("usage: kill <pid>...\n");
         return 1;

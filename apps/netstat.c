@@ -489,8 +489,6 @@ int main(int argc, char **argv)
     int i;
 
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         if (strcmp(argv[i], "-i") == 0) {
             want_i = any = 1;
         } else if (strcmp(argv[i], "-R") == 0 ||

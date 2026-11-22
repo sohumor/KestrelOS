@@ -16,6 +16,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <kestrel_pulse.h>
 #include <krec.h>
 #include <stdio.h>
@@ -2082,14 +2083,11 @@ int main(int argc, char **argv)
     gui_window *win;
     gui_ui ui;
     struct k_event ev;
-    const char *cwd_arg = 0;
     const char *target = 0;
     int sw = 1024, sh = 768, win_w = 880, win_h = 560;
     unsigned long last_blink = 0;
 
-    argc = krec_strip_cwd(argc, argv, &cwd_arg);
-    if (cwd_arg && cwd_arg[0])
-        snprintf(g_cwd, sizeof(g_cwd), "%s", cwd_arg);
+    snprintf(g_cwd, sizeof(g_cwd), "%s", kestrel_startup_cwd());
     if (argc > 1)
         target = argv[1];
 

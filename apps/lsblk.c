@@ -17,13 +17,6 @@
 #define TABLE_MAX   1024
 #define FIELD_MAX   64
 
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
-
 static int next_field(const char **pp, char *out, unsigned long outsz)
 {
     const char *p = *pp;
@@ -70,6 +63,7 @@ static void human(unsigned long long bytes, char *out, unsigned long outsz)
 
 int main(int argc, char **argv)
 {
+    (void)argv;
     char buf[TABLE_MAX];
     char name[FIELD_MAX], bs[FIELD_MAX], nb[FIELD_MAX];
     char size[24];
@@ -78,7 +72,6 @@ int main(int argc, char **argv)
     long n;
     int fd, count = 0;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc > 1) {
         printf("usage: lsblk\n");
         return 1;

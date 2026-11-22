@@ -4,6 +4,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,20 +14,6 @@
 #define CTRL_D   4
 
 static const char *g_cwd = "/";
-
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            g_cwd = argv[i] + 6;
-        else
-            argv[out++] = argv[i];
-    }
-    return out;
-}
 
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
@@ -115,7 +102,7 @@ int main(int argc, char **argv)
     int nlines = 10;
     int i, fd, files = 0, rc = 0;
 
-    argc = strip_cwd_arg(argc, argv);
+    g_cwd = kestrel_startup_cwd();
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0) {

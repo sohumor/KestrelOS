@@ -63,6 +63,7 @@ struct task {
     int wait_child_pid;          /* pid being waited on, 0 = none */
     uint64_t user_heap_start;    /* immutable first heap address */
     uint64_t user_brk;           /* heap break for user processes */
+    char startup_cwd[sizeof(((struct k_spawn_caps *)0)->cwd)];
     struct vm_area vm_areas[VM_MAX_AREAS];
     int vm_area_count;
     struct file *vm_files[VM_MAX_FILES]; /* unique VMA backing handles */

@@ -13,18 +13,6 @@
 #define MAX_SECS 86400UL        /* one day; longer is a typo, not a request */
 #define TICK_MS  100UL          /* poll the console this often */
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 static int quit_requested(void)
 {
     char buf[16];
@@ -44,7 +32,6 @@ int main(int argc, char **argv)
     long secs;
     const char *s;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc != 2) {
         printf("usage: sleep <seconds>\n");
         return 1;

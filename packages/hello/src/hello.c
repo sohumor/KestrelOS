@@ -16,8 +16,6 @@ int main(int argc, char **argv)
     int i;
 
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         who = argv[i];
         break;
     }

@@ -1146,7 +1146,6 @@ static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
                                 int out_fd_stage, int *status_out)
 {
     char path[MAX_PATH];
-    char cwdarg[SPAWN_ARG_MAX];
     char *sargv[SPAWN_MAX_ARGS + 1];
     struct k_spawn_caps caps;
     int i, pid, argn = 0;
@@ -1156,8 +1155,8 @@ static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
         *status_out = 127;
         return -1;
     }
-    if (st->ntok > SPAWN_MAX_ARGS - 1) {
-        printf("sh: too many arguments (max %d)\n", SPAWN_MAX_ARGS - 1);
+    if (st->ntok > SPAWN_MAX_ARGS) {
+        printf("sh: too many arguments (max %d)\n", SPAWN_MAX_ARGS);
         *status_out = 1;
         return -1;
     }
@@ -1173,13 +1172,8 @@ static int spawn_stage_external(const struct pipe_stage *st, int in_fd,
         sargv[argn++] = st->tok[i];
 
     memset(&caps, 0, sizeof(caps));
-    if (strlen(cwd) + sizeof("--cwd=") <= SPAWN_ARG_MAX) {
+    if (strlen(cwd) < sizeof(caps.cwd)) {
         strcpy(caps.cwd, cwd);
-        if (argn > 0 && strncmp(sargv[argn - 1], "--cwd=", 6) == 0) {
-            memcpy(cwdarg, "--cwd=", 6);
-            strcpy(cwdarg + 6, cwd);
-            sargv[argn++] = cwdarg;
-        }
     } else {
         printf("sh: cwd too long to pass on; %s will resolve against /\n",
                st->tok[0]);
@@ -1460,7 +1454,7 @@ static int stdin_is_tty(void)
     return 1;
 }
 
-static void apply_cwd_arg(const char *arg)
+static void apply_startup_cwd(const char *arg)
 {
     char norm[MAX_PATH];
     struct k_stat st;
@@ -1484,11 +1478,9 @@ int main(int argc, char **argv)
     int force_interactive = 0;
     int i;
 
-    apply_cwd_arg(kestrel_startup_cwd());
+    apply_startup_cwd(kestrel_startup_cwd());
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            apply_cwd_arg(argv[i] + 6);
-        } else if (strcmp(argv[i], "-i") == 0) {
+        if (strcmp(argv[i], "-i") == 0) {
             force_interactive = 1;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             cmd_str = argv[++i];

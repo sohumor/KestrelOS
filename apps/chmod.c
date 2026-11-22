@@ -23,16 +23,6 @@ static int sc_chmod(const char *path, int mode)
     return (int)syscall(SYS_CHMOD, (long)path, mode, 0, 0);
 }
 
-/* Pull the shell-injected trailing "--cwd=<path>" argument, if any. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0) {
-        g_cwd = argv[argc - 1] + 6;
-        return argc - 1;
-    }
-    return argc;
-}
-
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
@@ -144,7 +134,6 @@ int main(int argc, char **argv)
     int rc = 0;
 
     g_cwd = kestrel_startup_cwd();
-    argc = strip_cwd_arg(argc, argv);
 
     first = 1;
     if (first < argc && strcmp(argv[first], "-v") == 0) {

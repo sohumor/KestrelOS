@@ -10,7 +10,7 @@
  * with any tool.  When the file box is not focused the keys p/e/f/l/r/c/i
  * switch tool, [ and ] shrink/grow the brush, and u (or Ctrl+Z) undoes.
  *
- * usage: gpaint [--cwd=<dir>] [file.kpx|file.bmp]
+ * usage: gpaint [file.kpx|file.bmp]
  */
 
 #include <kestrel.h>
@@ -854,10 +854,6 @@ int main(int argc, char **argv)
 
     snprintf(g_cwd, sizeof(g_cwd), "%s", kestrel_startup_cwd());
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            snprintf(g_cwd, sizeof(g_cwd), "%s", argv[i] + 6);
-            continue;
-        }
         snprintf(namebuf, sizeof(namebuf), "%s", argv[i]);
         namebox.len = (int)strlen(namebuf);
         namebox.caret = namebox.len;

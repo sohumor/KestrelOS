@@ -20,20 +20,6 @@
 
 static const char *g_cwd;
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            g_cwd = argv[i] + 6;
-        else
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
     if (tok[0] == '/')
@@ -114,7 +100,6 @@ int main(int argc, char **argv)
     int status = 0, quiet = 0, rc, i;
 
     g_cwd = kestrel_startup_cwd();
-    argc = strip_cwd_arg(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-O") == 0) {

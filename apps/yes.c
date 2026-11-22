@@ -14,18 +14,6 @@
 
 #define LINESZ 256
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 static int quit_requested(void)
 {
     char buf[16];
@@ -45,7 +33,6 @@ int main(int argc, char **argv)
     unsigned long len = 0;
     int i;
 
-    argc = strip_cwd_arg(argc, argv);
 
     if (argc < 2) {
         snprintf(line, sizeof(line), "y");

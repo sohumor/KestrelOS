@@ -161,7 +161,7 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--startup-cwd") == 0)
         return strcmp(kestrel_startup_cwd(), "/doc") != 0 ||
-               !((argc == 3 && strcmp(argv[2], "--cwd=/doc") == 0) ||
+               !(argc == 2 ||
                  (argc == 16 && strcmp(argv[15], "unused") == 0));
     if (argc > 1 && strcmp(argv[1], "--pipe-read") == 0)
         return test_pipe_read();

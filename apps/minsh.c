@@ -8,26 +8,18 @@
  * Prompt: "kestrel:<cwd>$ ". Tokenizes on whitespace (max 16 tokens,
  * double quotes group words). Builtins: cd, pwd, exit, help. Anything
  * else is resolved to a binary (absolute, then <cwd>/name, then
- * /bin/name) and spawned. The shell appends one extra argv element
- * "--cwd=<cwd>" so path-taking apps can resolve relative arguments
- * themselves; apps that ignore argv are unaffected. The hint is dropped
- * (with a warning) when it would not fit the kernel's per-argument limit.
+ * /bin/name) and spawned with the initial directory in spawn metadata.
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define MAX_LINE   256
-/* One below the kernel's argv limit: run_external appends --cwd=<path> as
- * an extra element, and an argv[16] would be dropped by the copy-in loop. */
-#define MAX_TOKENS 15
+#define MAX_TOKENS 16
 #define MAX_PATH   256
-/* Kernel per-argument limit, from kernel/include/uproc.h (UPROC_ARG_MAX).
- * The kernel copies each argv entry with strncpy into a slot this big, so
- * a longer argument reaches the child silently truncated. */
-#define SPAWN_ARG_MAX 128
 
 static char cwd[MAX_PATH] = "/";
 
@@ -145,8 +137,8 @@ static void builtin_cd(int ntok, char **tok)
 static void run_external(int ntok, char **tok)
 {
     char path[MAX_PATH];
-    char cwdarg[MAX_PATH + 8];
-    char *sargv[MAX_TOKENS + 2];
+    char *sargv[MAX_TOKENS + 1];
+    struct k_spawn_caps caps = {0};
     struct k_stat st;
     int i, pid, code;
 
@@ -170,18 +162,15 @@ static void run_external(int ntok, char **tok)
     for (i = 0; i < ntok; i++)
         sargv[i] = tok[i];
 
-    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
-    /* A hint the kernel would truncate points at a directory that does not
-     * exist, which is worse than no hint at all: apps then resolve against /. */
-    if (strlen(cwdarg) < SPAWN_ARG_MAX) {
-        sargv[i++] = cwdarg;
+    if (strlen(cwd) < sizeof(caps.cwd)) {
+        strcpy(caps.cwd, cwd);
     } else {
         printf("minsh: cwd too long to pass on; %s will resolve against /\n",
                tok[0]);
     }
     sargv[i] = 0;
 
-    pid = spawn(path, sargv);
+    pid = spawn_caps(path, sargv, &caps);
     if (pid < 0) {
         printf("minsh: spawn failed: %s\n", path);
         return;
@@ -195,19 +184,13 @@ static void run_external(int ntok, char **tok)
  * builtins and then runs /bin/help, falling back to a pointer if it cannot. */
 static void builtin_help(void)
 {
-    char cwdarg[MAX_PATH + 8];
     char arg0[] = "help";
-    char *hargv[3];
+    char *hargv[] = { arg0, 0 };
     struct k_stat st;
-    int n = 0, pid;
+    int pid;
 
     puts("builtins: cd pwd exit help");
     if (stat_("/bin/help", &st) == 0 && !st.is_dir) {
-        hargv[n++] = arg0;
-        snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", cwd);
-        if (strlen(cwdarg) < SPAWN_ARG_MAX)
-            hargv[n++] = cwdarg;
-        hargv[n] = 0;
         pid = spawn("/bin/help", hargv);
         if (pid >= 0) {
             waitpid(pid);
@@ -226,6 +209,7 @@ int main(int argc, char **argv)
     (void)argc;
     (void)argv;
 
+    snprintf(cwd, sizeof(cwd), "%s", kestrel_startup_cwd());
     for (;;) {
         printf("kestrel:%s$ ", cwd);
         if (!readline(line, (int)sizeof(line))) {

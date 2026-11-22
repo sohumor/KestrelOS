@@ -8,13 +8,6 @@
 #define PASSWD_PATH "/etc/passwd"
 #define DB_MAX     4096
 
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
-
 static long slurp(const char *path, char *buf, unsigned long max)
 {
     long total = 0;
@@ -80,13 +73,13 @@ static int split_fields(char *line, char **f, int maxf)
 
 int main(int argc, char **argv)
 {
+    (void)argv;
     char buf[DB_MAX];
     char *p;
     char *line;
     char *f[6];
     int uid;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc > 1) {
         printf("usage: whoami\n");
         return 1;

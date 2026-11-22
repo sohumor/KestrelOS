@@ -1100,13 +1100,9 @@ int main(int argc, char **argv)
     struct k_event ev;
     int i;
 
+    (void)argc;
+    (void)argv;
     snprintf(cwd, sizeof(cwd), "%s", kestrel_startup_cwd());
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            strncpy(cwd, argv[i] + 6, sizeof(cwd) - 1);
-            cwd[sizeof(cwd) - 1] = '\0';
-        }
-    }
 
     for (i = 0; i < TOTAL; i++)
         clear_cells(grid[i], 0, MAX_COLS);

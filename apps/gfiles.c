@@ -908,9 +908,7 @@ int main(int argc, char **argv)
     for (i = 1; i < argc; i++) {
         const char *arg = argv[i];
 
-        if (strncmp(arg, "--cwd=", 6) == 0)
-            cwd_opt = arg + 6;
-        else if (arg[0] != '\0' && !dir_opt)
+        if (arg[0] != '\0' && !dir_opt)
             dir_opt = arg;
     }
     snprintf(cwd, sizeof(cwd), "%s", cwd_opt[0] ? cwd_opt : "/");

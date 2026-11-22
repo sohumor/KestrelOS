@@ -35,7 +35,6 @@ int main(int argc, char **argv)
     int rflag = 0;
     int i;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--krec") == 0) {
             rflag = 1;

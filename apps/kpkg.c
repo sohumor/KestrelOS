@@ -1744,27 +1744,12 @@ static void usage(void)
            "\nrepository: %s\n", g_conf.repo);
 }
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            g_cwd = argv[i] + 6;
-        else
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 int main(int argc, char **argv)
 {
     const char *cmd;
     int force = 0, i, out = 1;
 
     g_cwd = kestrel_startup_cwd();
-    argc = strip_cwd_arg(argc, argv);
     conf_load();
 
     for (i = 1; i < argc; i++) {

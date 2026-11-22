@@ -102,12 +102,9 @@ static int do_listen(int nargs, char *args[])
 
 int main(int argc, char *argv[])
 {
-    /* strip the shell-injected --cwd= argument */
     char *args[32];
     int nargs = 0;
     for (int i = 1; i < argc && nargs < 32; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         args[nargs++] = argv[i];
     }
 

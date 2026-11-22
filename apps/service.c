@@ -411,7 +411,6 @@ int main(int argc, char **argv)
     const char *verb;
     int rflag = 0, out = 1, i;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--krec") == 0)
             rflag = 1;

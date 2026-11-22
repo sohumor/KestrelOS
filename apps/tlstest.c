@@ -73,8 +73,6 @@ int main(int argc, char *argv[])
     for (i = 1; i < argc; i++) {
         const char *a = argv[i];
 
-        if (strncmp(a, "--cwd=", 6) == 0)
-            continue;
         if (strcmp(a, "--roots") == 0)
             return list_roots();
         if (strcmp(a, "--insecure") == 0) {

@@ -68,9 +68,6 @@ int main(int argc, char **argv)
     char reason[K_HANGAR_REASON_MAX];
     int v, rc;
 
-    /* The shell appends --cwd=DIR to every spawn; it means nothing here. */
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        argc--;
     if (argc < 2 || !strcmp(argv[1], "list"))
         return argc > 2 ? usage() : cmd_list();
     if (argc != 3 || parse_num(argv[2], &v) < 0)

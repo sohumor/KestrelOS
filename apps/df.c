@@ -103,7 +103,6 @@ int main(int argc, char **argv)
     const char *p;
     int hflag = 0, rflag = 0;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--krec") == 0) {
             rflag = 1;

@@ -9,7 +9,7 @@
  * Falls back to the full-screen ANSI console editor when invoked with -t or
  * when no window manager is available.
  *
- * Usage: edit [-t] [--cwd=<dir>] [file]
+ * Usage: edit [-t] [file]
  */
 
 #include <kestrel.h>
@@ -999,9 +999,7 @@ int main(int argc, char *argv[])
     int force_text = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            cwd = argv[i] + 6;
-        else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--text") == 0)
+        if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--text") == 0)
             force_text = 1;
         else if (!arg)
             arg = argv[i];

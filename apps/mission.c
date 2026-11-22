@@ -111,7 +111,7 @@ static int add_arg(char list[][64], unsigned *count, unsigned max, const char *a
     return 0;
 }
 
-static int run(int argc, char **argv, char *cwd)
+static int run(int argc, char **argv)
 {
     struct mission_manifest *m = calloc(1, sizeof(*m));
     struct mission_options *o = calloc(1, sizeof(*o));
@@ -152,10 +152,9 @@ static int run(int argc, char **argv, char *cwd)
     int n = 0;
     child[n++] = m->exec;
     for (int i = start; i < argc; i++) {
-        if (n >= 15) goto invalid;
+        if (n >= 16) goto invalid;
         child[n++] = argv[i];
     }
-    if (cwd) child[n++] = cwd;
     child[n] = NULL;
     uint32_t mid;
     int pid = mission_spawn_id(m->exec, child, &g, &mid);
@@ -172,12 +171,10 @@ done:
 
 int main(int argc, char **argv)
 {
-    char *cwd = NULL;
-    if (argc > 1 && !strncmp(argv[argc - 1], "--cwd=", 6)) cwd = argv[--argc];
     if (argc == 2 && !strcmp(argv[1], "list")) return list();
     if (argc == 2 && !strcmp(argv[1], "ps")) return ps();
     if (argc == 3 && !strcmp(argv[1], "show")) return show(argv[2]);
-    if (argc >= 3 && !strcmp(argv[1], "run")) return run(argc, argv, cwd);
+    if (argc >= 3 && !strcmp(argv[1], "run")) return run(argc, argv);
     unsigned id, arg = 0, op;
     if (argc >= 3 && number(argv[2], &id) == 0 && id) {
         if (argc == 3 && !strcmp(argv[1], "end")) op = K_MISSION_END;

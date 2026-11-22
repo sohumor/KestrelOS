@@ -78,13 +78,10 @@ int main(int argc, char **argv)
 {
     unsigned long i;
     const char *filter = 0;
-    int nmatch = 0, j;
+    int nmatch = 0;
 
-    /* The shell appends "--cwd=<path>"; help has no use for it. */
-    for (j = 1; j < argc; j++) {
-        if (strncmp(argv[j], "--cwd=", 6) != 0 && !filter)
-            filter = argv[j];
-    }
+    if (argc > 1)
+        filter = argv[1];
 
     if (filter) {
         printf("KestrelOS commands matching \"%s\":\n", filter);

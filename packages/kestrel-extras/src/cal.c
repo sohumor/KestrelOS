@@ -143,25 +143,12 @@ static void print_year(int y)
     }
 }
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 int main(int argc, char **argv)
 {
     struct k_rtc tm;
     int nums[2], nnum = 0;
     int month, year, want_year = 0, i;
 
-    argc = strip_cwd_arg(argc, argv);
 
     if (syscall(SYS_RTC, (long)&tm, 0, 0, 0) == 0 && tm.year >= 1 &&
         tm.mon >= 1 && tm.mon <= 12) {
