@@ -5,7 +5,6 @@
 #include "smp.h"
 #include "spinlock.h"
 
-#define PIC_IRQ_COUNT 16
 #define IRQ_SUBSCRIBERS 4
 
 struct idt_entry {
@@ -27,7 +26,8 @@ extern uint64_t isr_table[256];
 
 static struct idt_entry idt[256];
 static struct idtr idtr;
-static irq_handler_t irq_handlers[PIC_IRQ_COUNT];
+static irq_handler_t irq_handlers[IRQ_LINE_COUNT];
+static const struct irq_controller *irq_controller;
 
 struct irq_subscriber {
     irq_listener_t listener;
@@ -39,7 +39,7 @@ struct irq_line {
     struct irq_subscriber subscribers[IRQ_SUBSCRIBERS];
 };
 
-static struct irq_line irq_lines[PIC_IRQ_COUNT];
+static struct irq_line irq_lines[IRQ_LINE_COUNT];
 
 /* Optional hook the syscall layer installs for vector 0x80. */
 void (*syscall_entry_hook)(struct regs *r);
@@ -84,15 +84,20 @@ void idt_load(void)
     __asm__ volatile("lidt %0" : : "m"(idtr));
 }
 
+void irq_controller_bind(const struct irq_controller *controller)
+{
+    irq_controller = controller;
+}
+
 void irq_install_handler(int irq, irq_handler_t handler)
 {
-    if ((unsigned)irq < PIC_IRQ_COUNT)
+    if ((unsigned)irq < IRQ_LINE_COUNT)
         __atomic_store_n(&irq_handlers[irq], handler, __ATOMIC_RELEASE);
 }
 
 int irq_subscribe(unsigned irq, irq_listener_t listener, void *context)
 {
-    if (irq >= PIC_IRQ_COUNT || !listener)
+    if (irq >= IRQ_LINE_COUNT || !listener)
         return -1;
     struct irq_line *line = &irq_lines[irq];
     struct irq_subscriber *slot = NULL;
@@ -114,7 +119,7 @@ int irq_subscribe(unsigned irq, irq_listener_t listener, void *context)
 
 int irq_unsubscribe(unsigned irq, irq_listener_t listener, void *context)
 {
-    if (irq >= PIC_IRQ_COUNT || !listener)
+    if (irq >= IRQ_LINE_COUNT || !listener)
         return -1;
     struct irq_line *line = &irq_lines[irq];
     uint64_t flags = spin_lock_irqsave(&line->lock);
@@ -182,17 +187,6 @@ void isr_dispatch(struct regs *r)
         panic("unhandled exception");
     }
 
-    if (r->vector >= 32 && r->vector < 32 + PIC_IRQ_COUNT) {
-        int irq = r->vector - 32;
-        if ((irq == 7 || irq == 15) && pic_is_spurious(irq))
-            return;
-        dispatch_irq(irq, r);
-        pic_send_eoi(irq);
-        if (irq_preempt_hook)
-            irq_preempt_hook(r);
-        return;
-    }
-
     if (r->vector == 0x80) {
         if (syscall_entry_hook)
             syscall_entry_hook(r);
@@ -206,6 +200,20 @@ void isr_dispatch(struct regs *r)
         if (irq_preempt_hook)
             irq_preempt_hook(r);
         return;
+    }
+
+    if (irq_controller) {
+        unsigned line;
+        enum irq_route route = irq_controller->claim(r->vector, &line);
+        if (route == IRQ_SPURIOUS)
+            return;
+        if (route == IRQ_DELIVER) {
+            dispatch_irq(line, r);
+            irq_controller->complete(line);
+            if (irq_preempt_hook)
+                irq_preempt_hook(r);
+            return;
+        }
     }
 
     kprintf("[unexpected interrupt vector %lu]\n", r->vector);

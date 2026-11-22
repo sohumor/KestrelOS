@@ -31,6 +31,10 @@ def main():
         h = Harness(command)
         try:
             h.start()
+            route = h.expect(r"(?:PASS|FAIL) PIC routing[^\n]*\n",
+                             regex=True).group(0).strip()
+            if route.startswith("FAIL"):
+                raise AssertionError(route)
             if h.expect_any([success, "FAIL shared IRQ subscriptions"]) != success:
                 raise AssertionError("guest rejected the shared IRQ checks")
             cross_cpu = h.expect(r"(?:PASS|FAIL) cross-CPU IRQ removal[^\n]*\n",
@@ -38,6 +42,7 @@ def main():
             if cross_cpu.startswith("FAIL"):
                 raise AssertionError(cross_cpu)
             t_boot(h)
+            print(route)
             print(success)
             print(cross_cpu)
         except (OSError, RuntimeError, AssertionError) as exc:

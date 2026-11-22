@@ -16,8 +16,29 @@ static void count_legacy_irq(struct regs *r)
     count_irq(r, &legacy_ticks);
 }
 
+static int check_pic_spurious(void)
+{
+    unsigned master = 0, slave = 0;
+    if (irq_subscribe(7, count_irq, &master) < 0)
+        return -1;
+    if (irq_subscribe(15, count_irq, &slave) < 0) {
+        irq_unsubscribe(7, count_irq, &master);
+        return -1;
+    }
+    __asm__ volatile("int $0x27; int $0x2f" ::: "memory");
+    int removed_master = irq_unsubscribe(7, count_irq, &master);
+    int removed_slave = irq_unsubscribe(15, count_irq, &slave);
+    return master || slave || removed_master || removed_slave ? -1 : 0;
+}
+
 static int shared_irq_probe(void)
 {
+    if (check_pic_spurious() < 0) {
+        kprintf("FAIL PIC routing: spurious IRQ7 and IRQ15 check\n");
+        return -1;
+    }
+    kprintf("PASS PIC routing: spurious IRQ7 and IRQ15 did not reach subscribers\n");
+
     irq_install_handler(0, count_legacy_irq);
     bool registered = irq_subscribe(0, count_irq, &first_ticks) == 0 &&
                       irq_subscribe(0, count_irq, &second_ticks) == 0 &&
