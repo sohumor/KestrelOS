@@ -18,8 +18,9 @@ struct parcel_change {
     struct k_parcel_info info;
 };
 
-/* Replay the current UID's retained changes oldest first, then follow
- * from the last returned sequence. A zero cursor starts at the oldest
+/* Replay the current UID's retained metadata (independent of payload
+ * slots) oldest first, then follow from the last returned sequence.
+ * A zero cursor starts at the oldest
  * retained change. A gap means older records were evicted. Returns the
  * number copied, zero on timeout or -1 on error/cancellation. */
 long parcel_watch(uint64_t *cursor, struct parcel_change *out,
