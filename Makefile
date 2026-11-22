@@ -177,9 +177,13 @@ $(BUILD)/libc/%.o: libc/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(UCFLAGS) -c $< -o $@
 
-$(BUILD)/libc/%.o: libc/%.asm
+$(BUILD)/kestrel_syscalls.inc: abi/kestrel_abi.h tools/gen_syscall_inc.py
 	@mkdir -p $(dir $@)
-	$(NASM) -f elf64 $< -o $@
+	$(PY) tools/gen_syscall_inc.py $< $@
+
+$(BUILD)/libc/%.o: libc/%.asm $(BUILD)/kestrel_syscalls.inc
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf64 -I$(BUILD)/ $< -o $@
 
 $(BUILD)/libgui/%.o: libgui/%.c
 	@mkdir -p $(dir $@)

@@ -6,7 +6,7 @@ section .text
 
 global __kestrel_sigreturn
 
-SYS_SIGRETURN equ 65
+%include "kestrel_syscalls.inc"
 
 __kestrel_sigreturn:
     mov eax, SYS_SIGRETURN

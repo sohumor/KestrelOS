@@ -14,7 +14,7 @@ global _start
 global kestrel_startup_cwd
 extern main
 
-SYS_EXIT equ 0
+%include "kestrel_syscalls.inc"
 
 section .text
 
