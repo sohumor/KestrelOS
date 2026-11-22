@@ -1,6 +1,8 @@
 # KestrelOS Userspace ABI
 
 Ground truth header shared by kernel and libc: `abi/kestrel_abi.h`.
+Both build paths generate the NASM syscall constants from its
+`SYS_*` definitions; assembly stubs use the same numbers as C.
 Userspace public headers: `libc/include/{stdio,stdlib,string,kestrel}.h`.
 Link script: `apps/user.ld`.
 

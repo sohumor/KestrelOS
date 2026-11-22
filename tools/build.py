@@ -261,12 +261,14 @@ def build_all(tc):
             jobs.append([tc["cc"]] + flags + ["-c", src_rel, "-o", obj])
         return obj
 
-    def queue_asm(src_rel, obj_rel):
+    def queue_asm(src_rel, obj_rel, include=None):
         src = r(src_rel)
         obj = b(obj_rel)
         os.makedirs(os.path.dirname(obj), exist_ok=True)
-        if needs_rebuild(obj, [src]):
-            jobs.append([tc["nasm"], "-f", "elf64", src_rel, "-o", obj])
+        inputs = [src, include] if include else [src]
+        flags = ["-I" + os.path.dirname(include).replace("\\", "/") + "/"] if include else []
+        if needs_rebuild(obj, inputs):
+            jobs.append([tc["nasm"], "-f", "elf64"] + flags + [src_rel, "-o", obj])
         return obj
 
     # Kernel objects
@@ -299,14 +301,19 @@ def build_all(tc):
         mod_bins.append(kmod)
 
     # Libc
-    crt0 = queue_asm("libc/crt0.asm", "libc/crt0.o")
+    syscall_inc = b("kestrel_syscalls.inc")
+    syscall_header = r("abi/kestrel_abi.h")
+    syscall_gen = r("tools/gen_syscall_inc.py")
+    if needs_rebuild(syscall_inc, [syscall_header, syscall_gen]):
+        run_cmd([sys.executable, syscall_gen, syscall_header, syscall_inc])
+    crt0 = queue_asm("libc/crt0.asm", "libc/crt0.o", syscall_inc)
     libc_objs = []
     for s in rel_glob("libc/*.asm"):
         rel = os.path.relpath(s, ROOT).replace("\\", "/")
         if rel == "libc/crt0.asm":
             continue
         base = os.path.splitext(os.path.basename(rel))[0]
-        libc_objs.append(queue_asm(rel, "libc/%s.o" % base))
+        libc_objs.append(queue_asm(rel, "libc/%s.o" % base, syscall_inc))
     for s in rel_glob("libc/*.c"):
         rel = os.path.relpath(s, ROOT).replace("\\", "/")
         base = os.path.splitext(os.path.basename(rel))[0]

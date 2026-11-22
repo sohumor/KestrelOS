@@ -7,7 +7,8 @@ the asymmetric CLIs: build.py groups host tests and exposes compdb; make offers
 individual tests, VM helpers and configuration helpers. Host test *recipes*,
 filesystem staging/copy operations, boot-sector size expressions and incremental
 dependency tracking are not compared. Native compile, ELF assembly, archive and
-link commands are compared including ordered flags, inputs and output paths.
+link commands and syscall include generation are compared including ordered
+flags, inputs and output paths.
 Archive member order alone is ignored (the two runners enumerate libc's C/ASM
 members differently); link order is never ignored.
 """
@@ -91,7 +92,9 @@ def native_commands(commands, out_dir):
     for cmd in commands:
         cmd = [str(arg).replace(out_dir + "/", "build/")
                .replace(build.ROOT + "/", "") for arg in cmd]
-        if not cmd or cmd[0] not in {"gcc", "ld", "ar", "nasm"}:
+        if len(cmd) > 1 and cmd[1] == "tools/gen_syscall_inc.py":
+            cmd[0] = "python"
+        elif not cmd or cmd[0] not in {"gcc", "ld", "ar", "nasm"}:
             continue
         if cmd[0] == "nasm" and "elf64" not in cmd:
             continue
@@ -121,9 +124,10 @@ def main():
         ok = compare("public Make targets", phony,
                      set().union(*COMMANDS.values(), MAKE_ONLY))
         ok &= compare("Python subcommands", set(COMMANDS), python_actions())
-        dry_run = command_output(make_args + ["-Bn", "all"])
+        dry_run = command_output(make_args + ["PY=" + sys.executable, "-Bn", "all"])
         make_commands = [shlex.split(line) for line in dry_run.replace("\\\n", " ").splitlines()
-                         if line.startswith(("gcc ", "ld ", "ar ", "nasm "))]
+                         if line.startswith(("gcc ", "ld ", "ar ", "nasm ",
+                                             sys.executable + " tools/gen_syscall_inc.py "))]
         recorded = []
         tc = {"cc": "gcc", "ld": "ld", "ar": "ar", "nasm": "nasm",
               "objcopy": "objcopy", "is_clang": False,
