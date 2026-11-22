@@ -36,6 +36,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define JS_INTERNAL
 #include "js.h"
 
 typedef struct { const char *src; const char *want; } tcase;
@@ -1533,6 +1534,93 @@ fail:
     return failure != NULL;
 }
 
+static int check_shared_heap_budget(void)
+{
+    const unsigned long capacity = 4UL * 1024 * 1024;
+    js_config cfg;
+    js_heap_budget pool, small;
+    js_ctx *first = NULL, *second = NULL, *replacement = NULL;
+    js_value result;
+    js_sbuf scratch = {0};
+    unsigned long bootstrap, before;
+    const char *failure = "contexts did not reserve separate backing";
+
+    js_heap_budget_init(&pool, capacity);
+    js_config_default(&cfg);
+    cfg.heap_budget = &pool;
+    first = js_new(&cfg);
+    bootstrap = capacity - js_heap_budget_remaining(&pool);
+    second = js_new(&cfg);
+    if (!first || !second || bootstrap == 0 ||
+        js_heap_budget_remaining(&pool) != capacity - 2 * bootstrap)
+        goto done;
+
+    failure = "a failed context initialization leaked its reservation";
+    js_heap_budget_init(&small, bootstrap - 1);
+    cfg.heap_budget = &small;
+    replacement = js_new(&cfg);
+    if (replacement || js_heap_budget_remaining(&small) != bootstrap - 1)
+        goto done;
+    cfg.heap_budget = &pool;
+
+    failure = "temporary capacity was not charged or returned";
+    before = js_heap_budget_remaining(&pool);
+    js_sb_init(&scratch, first);
+    if (js_sb_putc(&scratch, 'a') != JS_OK || scratch.cap == 0 ||
+        js_heap_budget_remaining(&pool) != before - scratch.cap ||
+        js_sb_puts(&scratch, "abcdefghijklmnopqrstuvwxyz"
+                             "abcdefghijklmnopqrstuvwxyz"
+                             "abcdefghijklmnopqrstuvwxyz") != JS_OK ||
+        js_heap_budget_remaining(&pool) != before - scratch.cap)
+        goto done;
+    js_sb_free(&scratch);
+    if (js_heap_budget_remaining(&pool) != before)
+        goto done;
+
+    failure = "shared exhaustion was catchable or consumed the rejected reservation";
+    if (js_eval(first, "var keep = 42;", "keep", &result) != JS_OK ||
+        js_eval(second, "try { new Uint8Array(8 * 1024 * 1024); } catch (e) { 1; }",
+                "shared-heap-limit", &result) != JS_THROW ||
+        !js_fatal(second) || js_heap_budget_remaining(&pool) == 0 ||
+        strcmp(js_error_text(second, result),
+               "FatalError: shared script heap budget exhausted") != 0)
+        goto done;
+
+    failure = "freeing a context did not restore credit without affecting its sibling";
+    before = js_heap_budget_remaining(&pool);
+    js_free(second);
+    second = NULL;
+    if (js_heap_budget_remaining(&pool) < before + bootstrap ||
+        js_eval(first, "keep", "read-keep", &result) != JS_OK ||
+        result.type != JS_NUMBER || result.u.num != 42)
+        goto done;
+
+    failure = "local cap stopped taking precedence over available shared credit";
+    cfg.max_heap = capacity / 2;
+    replacement = js_new(&cfg);
+    before = js_heap_budget_remaining(&pool);
+    if (!replacement || before < cfg.max_heap ||
+        js_alloc_raw(replacement, cfg.max_heap) ||
+        js_heap_budget_remaining(&pool) != before ||
+        strcmp(js_error_text(replacement, js_undefined()),
+               "FatalError: script heap limit exceeded") != 0)
+        goto done;
+    failure = NULL;
+
+done:
+    js_sb_free(&scratch);
+    js_free(replacement);
+    js_free(second);
+    js_free(first);
+    if (!failure && js_heap_budget_remaining(&pool) != capacity)
+        failure = "credit remained charged after all contexts were destroyed";
+    if (failure)
+        printf("FAIL [shared heap budget] %s\n", failure);
+    else
+        printf("PASS shared JS heap credit: local cap, scratch growth, isolation and reuse\n");
+    return failure != NULL;
+}
+
 int main(int argc, char **argv)
 {
     int i, pass = 0, fail = 0, verbose = 0;
@@ -1598,6 +1686,10 @@ int main(int argc, char **argv)
     else
         fail++;
     if (check_shared_execution_budget() == 0)
+        pass++;
+    else
+        fail++;
+    if (check_shared_heap_budget() == 0)
         pass++;
     else
         fail++;
