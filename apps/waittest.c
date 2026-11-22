@@ -12,8 +12,46 @@ static int alive(int pid)
     return 0;
 }
 
+/* Spawn n children and let them all exit before collecting any, so every
+ * exit status has to be held by the kernel until its parent asks. */
+static int exited_unwaited(int n, int use_waitany)
+{
+    int *pids = malloc(sizeof(int) * (unsigned)n);
+    char *true_args[] = { "true", 0 };
+    int lost = 0;
+
+    if (!pids)
+        return -1;
+    for (int i = 0; i < n; i++) {
+        pids[i] = spawn("/bin/true", true_args);
+        if (pids[i] < 0) {
+            free(pids);
+            return -1;
+        }
+    }
+    for (int i = 0; i < n; i++)
+        while (alive(pids[i]))
+            sleep_ms(10);
+    for (int i = 0; i < n; i++) {
+        int pid = pids[i];
+        long code = use_waitany ? waitany(&pid) : waitpid(pid);
+        if (code != 0)
+            lost++;
+    }
+    free(pids);
+    return lost;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc > 2 && strcmp(argv[1], "many") == 0) {
+        int n = atoi(argv[2]);
+        int lost_pid = exited_unwaited(n, 0);
+        int lost_any = exited_unwaited(n, 1);
+        printf("waittest: %d exited children, waitpid lost %d, "
+               "waitany lost %d\n", n, lost_pid, lost_any);
+        return lost_pid || lost_any;
+    }
     if (argc > 1 && strcmp(argv[1], "child") == 0) {
         sleep_ms(1500);
         return 73;

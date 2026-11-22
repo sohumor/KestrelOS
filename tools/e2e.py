@@ -2544,6 +2544,13 @@ def t_waitpid_children(h):
     wait_prompt(h)
 
 
+def t_waitpid_retains(h):
+    h.send("waittest many 140")
+    h.expect("waittest: 140 exited children, waitpid lost 0, waitany lost 0",
+             timeout=PKG_TIMEOUT)
+    wait_prompt(h)
+
+
 def t_pipe_lifetime(h):
     h.send("sigtest --pipe-lifetime")
     h.expect("sigtest: pipe dup + spawn + peer close verified")
@@ -3841,6 +3848,7 @@ TESTS = [
     ("pipe-read", t_pipe_read),
     ("pipe-lifetime", t_pipe_lifetime),
     ("waitpid-children", t_waitpid_children),
+    ("waitpid-retains", t_waitpid_retains),
     ("elf-banner-quiet", t_elf_banner_quiet),
     ("krec-pipeline", t_krec_pipeline),
     ("talon-cli", t_talon_cli),

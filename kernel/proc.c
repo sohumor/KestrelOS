@@ -62,6 +62,16 @@ bool task_is_child(int parent_pid, int pid)
     return found;
 }
 
+/* Whether pid can still wait for its children's exit statuses. */
+bool task_collects_exits(int pid)
+{
+    uint64_t flags = spin_lock_irqsave(&sched_lock);
+    struct task *t = task_find_locked(pid);
+    bool collects = t && !t->exits_released;
+    spin_unlock_irqrestore(&sched_lock, flags);
+    return collects;
+}
+
 int task_child_pids(int parent_pid, int *out, int max)
 {
     if (!out || max <= 0)
@@ -422,6 +432,7 @@ void task_exit(int code)
     /* Before the address space goes away: the compositor clears its own
      * PTEs and returns the pixel frames itself. */
     wm_cleanup_task(current->pid);
+    uproc_release_exits();
 
     /* Nothing else references these handles, and the task struct itself is
      * about to be freed — a ring-3 fault must not leak them. */

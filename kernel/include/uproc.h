@@ -48,8 +48,10 @@ struct k_spawn_caps;
 int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
                                const struct k_spawn_caps *kcaps);
 
-/* Exit-code ring for waitpid; record is called right before task_exit. */
+/* Exit records for waitpid; record is called right before task_exit, and
+ * release from task_exit drops the exiting task's uncollected children. */
 void uproc_record_exit(int pid, long code);
+void uproc_release_exits(void);
 long uproc_waitpid(int pid);
 long uproc_waitany(int *pid_out);
 long uproc_exec_from_user(const char *upath, char *const *uargv);   /* blocks; -1 if pid unknown/forgotten */

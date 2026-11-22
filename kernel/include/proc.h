@@ -79,6 +79,7 @@ struct task {
     char unveil_prefix[64];
     int park_state;              /* Hangar: 0, 1 = requested, 2 = parking */
     bool hangar_io;              /* kernel-owned /hangar I/O in progress */
+    bool exits_released;         /* exiting: children's exits not kept */
 };
 
 extern bool sched_active;
@@ -114,6 +115,7 @@ void task_wake_sleepers(void);
 void task_signal_wake(struct task *t, bool resume_stopped);
 bool task_exists(int pid);
 bool task_is_child(int parent_pid, int pid);
+bool task_collects_exits(int pid);
 int task_psinfo(uint64_t index, struct k_psinfo *out);
 int task_child_pids(int parent_pid, int *out, int max);
 bool task_address_space_matches(int pid, uint64_t *pml4);

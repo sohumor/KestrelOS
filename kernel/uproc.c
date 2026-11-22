@@ -38,71 +38,100 @@ struct uproc_pkg {
  * holds a NUL-terminated prefix. Mirrors COPY_STR_TRUNC in syscall.c. */
 #define UPROC_COPY_TRUNC (-2)
 
-/* --- exit-code ring for waitpid ------------------------------------- */
+/* --- exit records for waitpid ---------------------------------------- */
 
-#define EXIT_RING 128
-
-static struct {
+/* One per exited task whose parent can still wait. A record stays until
+ * the parent collects it or exits itself; pids are never reused, so a pid
+ * names at most one record. Newest first. */
+struct exit_record {
+    struct exit_record *next;
     int pid;
     int ppid;
     long code;
-    int collected;
-} exit_ring[EXIT_RING];
-static int exit_head;
+};
+
+static struct exit_record *exit_records;
 static spinlock_t exit_lock = SPINLOCK_INIT;
 
 void uproc_record_exit(int pid, long code)
 {
     int ppid = current ? current->parent_pid : 0;
     const char *name = current ? current->name : "";
+    struct exit_record *rec = kmalloc(sizeof(*rec));
     uint64_t f = spin_lock_irqsave(&exit_lock);
-    exit_ring[exit_head].pid = pid;
-    exit_ring[exit_head].ppid = ppid;
-    exit_ring[exit_head].code = code;
-    exit_ring[exit_head].collected = 0;
-    exit_head = (exit_head + 1) % EXIT_RING;
+    if (rec && task_collects_exits(ppid)) {
+        rec->pid = pid;
+        rec->ppid = ppid;
+        rec->code = code;
+        rec->next = exit_records;
+        exit_records = rec;
+        rec = NULL;
+    }
     spin_unlock_irqrestore(&exit_lock, f);
+    kfree(rec);
 
     pulse_emit(K_TOPIC_PROC, K_PULSE_PROC_EXIT,
                (uint32_t)pid, (uint32_t)code, name);
 }
 
-static int exit_collect_pid(int ppid, int pid, long *code)
+void uproc_release_exits(void)
 {
-    if (pid <= 0)
-        return 0;
+    struct exit_record *dropped = NULL;
     uint64_t f = spin_lock_irqsave(&exit_lock);
-    for (int i = 0; i < EXIT_RING; i++) {
-        int idx = (exit_head - 1 - i + EXIT_RING) % EXIT_RING;
-        if (exit_ring[idx].pid == pid && exit_ring[idx].ppid == ppid &&
-            !exit_ring[idx].collected) {
-            *code = exit_ring[idx].code;
-            exit_ring[idx].collected = 1;
-            spin_unlock_irqrestore(&exit_lock, f);
-            return 1;
+    current->exits_released = true;
+    for (struct exit_record **link = &exit_records; *link;) {
+        struct exit_record *rec = *link;
+        if (rec->ppid == current->pid) {
+            *link = rec->next;
+            rec->next = dropped;
+            dropped = rec;
+        } else {
+            link = &rec->next;
         }
     }
     spin_unlock_irqrestore(&exit_lock, f);
-    return 0;
+    while (dropped) {
+        struct exit_record *next = dropped->next;
+        kfree(dropped);
+        dropped = next;
+    }
+}
+
+/* Take ppid's record for pid, or its oldest record when pid is 0. */
+static int exit_collect(int ppid, int pid, int *pid_out, long *code)
+{
+    struct exit_record **found = NULL;
+    uint64_t f = spin_lock_irqsave(&exit_lock);
+    for (struct exit_record **link = &exit_records; *link;
+         link = &(*link)->next) {
+        if ((*link)->ppid != ppid || (pid > 0 && (*link)->pid != pid))
+            continue;
+        found = link;
+        if (pid > 0)
+            break;
+    }
+    struct exit_record *rec = found ? *found : NULL;
+    if (rec) {
+        *found = rec->next;
+        *pid_out = rec->pid;
+        *code = rec->code;
+    }
+    spin_unlock_irqrestore(&exit_lock, f);
+    if (!rec)
+        return 0;
+    kfree(rec);
+    return 1;
+}
+
+static int exit_collect_pid(int ppid, int pid, long *code)
+{
+    int found_pid;
+    return pid > 0 && exit_collect(ppid, pid, &found_pid, code);
 }
 
 static int exit_collect_any(int ppid, int *pid_out, long *code)
 {
-    uint64_t f = spin_lock_irqsave(&exit_lock);
-    for (int i = 0; i < EXIT_RING; i++) {
-        int idx = (exit_head + i) % EXIT_RING;
-        if (exit_ring[idx].pid > 0 &&
-            exit_ring[idx].ppid == ppid &&
-            !exit_ring[idx].collected) {
-            *pid_out = exit_ring[idx].pid;
-            *code = exit_ring[idx].code;
-            exit_ring[idx].collected = 1;
-            spin_unlock_irqrestore(&exit_lock, f);
-            return 1;
-        }
-    }
-    spin_unlock_irqrestore(&exit_lock, f);
-    return 0;
+    return exit_collect(ppid, 0, pid_out, code);
 }
 
 long uproc_waitpid(int pid)
@@ -120,7 +149,7 @@ long uproc_waitpid(int pid)
         if (!alive) {
             if (exit_collect_pid(ppid, pid, &code))
                 return code;
-            return -1;             /* never existed, or record overwritten */
+            return -1;             /* not a child, or never existed */
         }
         if (current && current->kill_pending)
             return -1;
