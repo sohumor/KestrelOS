@@ -77,6 +77,53 @@ static void setup(struct kfs_fs *fs, int entries)
     }
 }
 
+static void test_dir_scan(void)
+{
+    struct kfs_fs fs;
+    uint32_t slot = 123;
+    setup(&fs, 2000);
+    assert(dir_lookup(&fs, 1, "entry1999", &slot) == 2001);
+    assert(slot == 3999 * sizeof(struct kfs_dirent));
+    assert(dir_lookup(&fs, 1, "missing", NULL) == 0);
+    assert(journal_begin(&fs) == 0);
+    assert(dir_add(&fs, 1, "new", 42, 1) == 0);
+    assert(dir_lookup(&fs, 1, "new", &slot) == 42 && slot == 0);
+    assert(dir_add(&fs, 1, "next", 43, 1) == 0);
+    assert(dir_lookup(&fs, 1, "next", &slot) == 43 && slot == 128);
+    journal_abort();
+    assert(dir_lookup(&fs, 1, "new", NULL) == 0);
+    setup(&fs, 2000);
+    for (unsigned i = 0; i < 3998; i += 2) {
+        unsigned off = i * sizeof(struct kfs_dirent);
+        struct kfs_dirent *de = (void *)(disk[3 + off / 4096] + off % 4096);
+        de->ino = 2;
+        strcpy(de->name, "occupied");
+    }
+    assert(journal_begin(&fs) == 0);
+    assert(dir_add(&fs, 1, "late", 44, 1) == 0);
+    assert(dir_lookup(&fs, 1, "late", &slot) == 44 && slot == 3998 * 64);
+    journal_abort();
+    setup(&fs, 0);
+    assert(dir_lookup(&fs, 1, "missing", NULL) == 0);
+    ((struct kfs_inode *)disk[1])->direct[0] = 3;
+    bcache_invalidate(&fs);
+    assert(journal_begin(&fs) == 0);
+    assert(dir_add(&fs, 1, "first", 42, 1) == 0);
+    assert(dir_add(&fs, 1, "second", 43, 1) == 0);
+    assert(journal_commit(&fs) == 0);
+    assert(dir_lookup(&fs, 1, "second", &slot) == 43 && slot == 64);
+    setup(&fs, 3);
+    fail_reads = 1;
+    assert(dir_lookup(&fs, 1, "entry0", NULL) == 0);
+    assert(dir_add(&fs, 1, "new", 42, 1) == -1);
+    fail_reads = 0;
+    struct kfs_inode *ip = (void *)disk[1];
+    ip->direct[0] = 0;
+    assert(dir_lookup(&fs, 1, "entry0", NULL) == 0);
+    assert(dir_add(&fs, 1, "new", 42, 1) == -1);
+    puts("PASS KFS directory scan: indirect lookup, miss, holes, pending writes, abort, append, empty, errors");
+}
+
 int main(int argc, char **argv)
 {
     int baseline = argc == 2 && strcmp(argv[1], "--baseline") == 0;
@@ -136,5 +183,6 @@ int main(int argc, char **argv)
     fail_reads = 0;
     assert(kfs_readdir(&fs, 1, 0, &de) == 0 && de.ino == 2);
     puts("PASS KFS readdir: counts, names, holes, rewind, mutation/abort, empty, errors");
+    test_dir_scan();
     return 0;
 }

@@ -814,13 +814,22 @@ static uint32_t dir_lookup(struct kfs_fs *fs, uint32_t dir, const char *name,
     struct kfs_dirent de;
     if (iget(fs, dir, &ip) < 0 || ip.type != KFS_TYPE_DIR)
         return 0;
-    for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
-        if (readi(fs, dir, off, &de, sizeof(de)) != sizeof(de))
+    for (uint32_t base = 0; base < ip.size; base += KFS_BLOCK_SIZE) {
+        uint32_t n = ip.size - base;
+        if (n > KFS_BLOCK_SIZE)
+            n = KFS_BLOCK_SIZE;
+        if (n < sizeof(de))
+            break;
+        uint32_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
+        if (!b || bread(fs, b, data_buf) < 0)
             return 0;
-        if (de.ino != 0 && strncmp(de.name, name, sizeof(de.name)) == 0) {
-            if (slot_out)
-                *slot_out = off;
-            return de.ino;
+        for (uint32_t off = 0; off + sizeof(de) <= n; off += sizeof(de)) {
+            memcpy(&de, data_buf + off, sizeof(de));
+            if (de.ino != 0 && strncmp(de.name, name, sizeof(de.name)) == 0) {
+                if (slot_out)
+                    *slot_out = base + off;
+                return de.ino;
+            }
         }
     }
     return 0;
@@ -836,12 +845,22 @@ static int dir_add(struct kfs_fs *fs, uint32_t dir, const char *name,
         return -1;
 
     uint32_t slot = ip.size;
-    for (uint32_t off = 0; off + sizeof(de) <= ip.size; off += sizeof(de)) {
-        if (readi(fs, dir, off, &de, sizeof(de)) != sizeof(de))
-            return -1;
-        if (de.ino == 0) {
-            slot = off;
+    for (uint32_t base = 0; base < ip.size && slot == ip.size;
+         base += KFS_BLOCK_SIZE) {
+        uint32_t n = ip.size - base;
+        if (n > KFS_BLOCK_SIZE)
+            n = KFS_BLOCK_SIZE;
+        if (n < sizeof(de))
             break;
+        uint32_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
+        if (!b || bread(fs, b, data_buf) < 0)
+            return -1;
+        for (uint32_t off = 0; off + sizeof(de) <= n; off += sizeof(de)) {
+            memcpy(&de, data_buf + off, sizeof(de));
+            if (de.ino == 0) {
+                slot = base + off;
+                break;
+            }
         }
     }
 
