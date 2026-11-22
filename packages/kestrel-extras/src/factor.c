@@ -84,25 +84,12 @@ static void factor(unsigned long long n)
     printf("\n");
 }
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 int main(int argc, char **argv)
 {
     unsigned long long v;
     char line[64];
     int i, rc = 0;
 
-    argc = strip_cwd_arg(argc, argv);
 
     if (argc < 2) {
         while (readline(line, sizeof(line)) != 0) {

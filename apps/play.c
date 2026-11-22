@@ -5,6 +5,7 @@
 
 #ifndef PLAY_HOST_TEST
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include "gui.h"
 #endif
 
@@ -124,7 +125,7 @@ static int mixer_write(int volume)
 
 int main(int argc, char **argv)
 {
-    const char *file = "/media/chime.wav", *cwd = "/", *error = 0;
+    const char *file = "/media/chime.wav", *cwd = kestrel_startup_cwd(), *error = 0;
     char path[512], line[160];
     struct k_stat st;
     struct wave_pcm pcm;
@@ -136,12 +137,8 @@ int main(int argc, char **argv)
     struct k_event ev;
     memset(&ui, 0, sizeof(ui));
     memset(&pcm, 0, sizeof(pcm));
-    for (int i = 1; i < argc; i++) {
-        if (!strncmp(argv[i], "--cwd=", 6))
-            cwd = argv[i] + 6;
-        else
-            file = argv[i];
-    }
+    if (argc > 1)
+        file = argv[argc - 1];
     if (file[0] == '/')
         snprintf(path, sizeof(path), "%s", file);
     else

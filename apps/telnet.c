@@ -97,8 +97,6 @@ int main(int argc, char **argv)
     long got;
 
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         if (strcmp(argv[i], "-n") == 0) {
             crlf = 0;
         } else if (strcmp(argv[i], "-h") == 0 ||

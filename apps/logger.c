@@ -245,25 +245,12 @@ static void ensure_dirs(void)
         mkdir_(dir);
 }
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 int main(int argc, char **argv)
 {
     char seqbuf[128];
     uint32_t next;
     int i, custom = 0;
 
-    argc = strip_cwd_arg(argc, argv);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f") && i + 1 < argc) {
             log_path = argv[++i];

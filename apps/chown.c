@@ -33,15 +33,6 @@ static int sc_chown(const char *path, int uid, int gid)
     return (int)syscall(SYS_CHOWN, (long)path, uid, gid, 0);
 }
 
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0) {
-        g_cwd = argv[argc - 1] + 6;
-        return argc - 1;
-    }
-    return argc;
-}
-
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
     if (tok[0] == '/')
@@ -165,7 +156,6 @@ int main(int argc, char **argv)
     int rc = 0;
 
     g_cwd = kestrel_startup_cwd();
-    argc = strip_cwd_arg(argc, argv);
     if (argc < 3) {
         printf("usage: chown <user>[:<group>] <file>...\n");
         printf("       chown :<group> <file>...\n");

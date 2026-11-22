@@ -143,7 +143,6 @@ int main(int argc, char **argv)
     int nspecs = 0, no_header = 0, hdr, rc, i;
     enum out_mode mode = MODE_TABLE;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--krec") == 0 || strcmp(argv[i], "--raw") == 0) {
             mode = MODE_KREC;

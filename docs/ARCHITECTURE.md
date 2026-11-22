@@ -471,9 +471,8 @@ applications (`desktop`, `terminal`, `browser`, `sysmon` with Flight Deck tab,
 and 70+ CLI utilities with `@krec` `-r` record pipelines (`where`, `sortby`,
 `pick`, `talon`, `inspect`, `flight`, `netstat`, `kjs`).
 
-The shell (`apps/sh.c`) supports pipe-backed multi-stage pipelines and appends
-`--cwd=<cwd>` to spawned commands so path-taking utilities can resolve relative
-arguments cleanly; each such utility uses a small `strip_cwd_arg()` helper.
+The shell (`apps/sh.c`) supports pipe-backed multi-stage pipelines and passes
+the initial directory as spawn metadata, separately from the command arguments.
 
 ## HOWTO: add a new system call
 
@@ -560,10 +559,6 @@ timeouts) but must never `panic()` on user-supplied input.
 
    int main(int argc, char **argv)
    {
-       /* The shell appends "--cwd=<path>"; drop it if you ignore it. */
-       if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-           argc--;
-
        printf("hello, %s\n", argc > 1 ? argv[1] : "world");
        return 0;
    }
@@ -574,8 +569,8 @@ timeouts) but must never `panic()` on user-supplied input.
    and no floating point inside the kernel. Return 0 for success; the shell prints
    `[exit N]` for anything else.
 
-3. **Handle paths** if the app takes filenames: parse the trailing
-   `--cwd=<path>` argument and join relative paths against it, the way
+3. **Handle paths** if the app takes filenames: call `kestrel_startup_cwd()`
+   from `<kestrel_cwd.h>` and join relative paths against it, the way
    `apps/cat.c` and `apps/ls.c` do. Absolute paths always work.
 
 4. **Build and run**:

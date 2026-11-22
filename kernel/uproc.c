@@ -331,6 +331,7 @@ static void user_task_thunk(void *arg)
 
     current->user_heap_start = brk;
     current->user_brk = brk;
+    memcpy(current->startup_cwd, pkg->cwd, sizeof(pkg->cwd));
 
     /* argv can occupy just over one page at the ABI limits. Populate only
      * the stack pages it needs; the remainder of the 16-page reservation
@@ -606,22 +607,8 @@ int uproc_spawn_caps_from_user(const char *upath, char *const *uargv,
         }
     }
 
-    if (kcaps->cwd[0]) {
-        if (kcaps->cwd[0] == '/')
-            memcpy(pkg->cwd, kcaps->cwd, sizeof(pkg->cwd));
-        int slot = -1;
-        if (pkg->argc > 0 &&
-            strncmp(pkg->argv[pkg->argc - 1], "--cwd=", 6) == 0) {
-            slot = pkg->argc - 1;
-        } else if (pkg->argc < UPROC_MAX_ARGS) {
-            slot = pkg->argc++;
-        }
-        if (slot >= 0) {
-            memcpy(pkg->argv[slot], "--cwd=", 6);
-            strncpy(pkg->argv[slot] + 6, kcaps->cwd, UPROC_ARG_MAX - 7);
-            pkg->argv[slot][UPROC_ARG_MAX - 1] = '\0';
-        }
-    }
+    if (kcaps->cwd[0] == '/')
+        memcpy(pkg->cwd, kcaps->cwd, sizeof(pkg->cwd));
 
     pkg->has_cap_mask = 1;
     pkg->cap_mask = kcaps->cap_mask
@@ -644,6 +631,7 @@ int uproc_spawn_mission_from_user(const char *upath, char *const *uargv,
     int id = mission_create(grant, pkg->path);
     if (id < 0) { free_pkg(pkg); return -1; }
     pkg->mission_id = id;
+    memcpy(pkg->cwd, current->startup_cwd, sizeof(pkg->cwd));
     int pid = spawn_pkg(pkg);
     if (pid >= 0 && mission_id) *mission_id = (uint32_t)id;
     mission_put(id);

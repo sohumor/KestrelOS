@@ -88,7 +88,6 @@ void krec_print_table(int fd, const struct krec_schema *s,
                       int show_header);
 
 /* Utility helpers for pipeline and CLI apps */
-int krec_strip_cwd(int argc, char **argv, const char **cwd_out);
 int krec_strcasecmp(const char *a, const char *b);
 const char *krec_strcasestr(const char *hay, const char *needle);
 void krec_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));

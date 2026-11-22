@@ -59,22 +59,6 @@ static int rest_is_ws(const char *s)
 
 /* ---- public CLI helpers ---------------------------------------------- */
 
-int krec_strip_cwd(int argc, char **argv, const char **cwd_out)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            if (cwd_out)
-                *cwd_out = argv[i] + 6;
-        } else {
-            argv[out++] = argv[i];
-        }
-    }
-    argv[out] = 0;
-    return out;
-}
-
 int krec_strcasecmp(const char *a, const char *b)
 {
     while (*a && lower_ch((unsigned char)*a) == lower_ch((unsigned char)*b)) {

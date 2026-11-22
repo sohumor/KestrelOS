@@ -125,10 +125,6 @@ int main(int argc, char **argv)
     static char msg[512];
     int i, len = 0, pos;
 
-    /* Drop the shell-injected trailing "--cwd=<path>" argument. */
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        argc--;
-
     if (argc < 2) {
         printf("usage: banner TEXT...\n");
         return 1;

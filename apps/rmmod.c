@@ -16,10 +16,6 @@
 
 int main(int argc, char **argv)
 {
-    /* Drop the shell-injected trailing "--cwd=<path>" argument. */
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        argc--;
-
     if (argc != 2) {
         printf("usage: rmmod <name>\n");
         return 1;

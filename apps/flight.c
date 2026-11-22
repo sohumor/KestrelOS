@@ -93,7 +93,6 @@ int main(int argc, char **argv)
     int want_pid = 0;
     int limit = -1;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (strcmp(arg, "--krec") == 0 || strcmp(arg, "-r") == 0) {

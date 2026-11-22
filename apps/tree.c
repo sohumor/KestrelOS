@@ -25,20 +25,6 @@ static char g_path[MAX_PATH];
 static char g_prefix[PREFIX_SZ];
 static int g_dirs, g_files;
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            g_cwd = argv[i] + 6;
-        else
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 /* Join a possibly relative path with the cwd. */
 static void resolve(const char *tok, char *out, unsigned long outsz)
 {
@@ -132,7 +118,6 @@ int main(int argc, char **argv)
     int i;
 
     g_cwd = kestrel_startup_cwd();
-    argc = strip_cwd_arg(argc, argv);
 
     for (i = 1; i < argc; i++) {
         if (argv[i][0] == '-' && argv[i][1] != '\0') {

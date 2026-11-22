@@ -8,6 +8,7 @@
  */
 
 #include <kestrel.h>
+#include <kestrel_cwd.h>
 #include <krec.h>
 #include <stdio.h>
 #include <string.h>
@@ -104,7 +105,7 @@ int main(int argc, char **argv)
     char path[MAX_PATH];
     int i, rc = 0, show_all = 0, rflag = 0, paths = 0;
 
-    argc = krec_strip_cwd(argc, argv, &g_cwd);
+    g_cwd = kestrel_startup_cwd();
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--krec") == 0) {

@@ -97,7 +97,7 @@ int main(int argc, char **argv)
     pid = getpid();
 
     for (int i = 1; i < argc; i++) {
-        if (!argv[i][0] || !strncmp(argv[i], "--cwd=", 6)) {
+        if (!argv[i][0]) {
             continue;
         } else if (!strcmp(argv[i], "--bg")) {
             background = 1;

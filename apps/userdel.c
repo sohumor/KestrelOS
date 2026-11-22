@@ -34,13 +34,6 @@ static int sc_chmod(const char *path, int mode)
     return (int)syscall(SYS_CHMOD, (long)path, mode, 0, 0);
 }
 
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
-
 static long slurp(const char *path, char *buf, unsigned long max)
 {
     long total = 0;
@@ -367,7 +360,6 @@ int main(int argc, char **argv)
     int i;
     int rc = 0;
 
-    argc = strip_cwd_arg(argc, argv);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-r") == 0) {
             remove_home = 1;

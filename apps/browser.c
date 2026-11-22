@@ -9165,9 +9165,7 @@ int main(int argc, char **argv)
     g_cwd = kestrel_startup_cwd();
 #endif
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            g_cwd = argv[i] + 6;
-        } else if (strcmp(argv[i], "-t") == 0 ||
+        if (strcmp(argv[i], "-t") == 0 ||
                    strcmp(argv[i], "--text") == 0) {
             text = 1;
         } else if (strcmp(argv[i], "-l") == 0) {

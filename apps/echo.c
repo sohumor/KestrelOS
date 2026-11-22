@@ -7,10 +7,6 @@ int main(int argc, char **argv)
 {
     int i;
 
-    /* Drop the shell-injected trailing "--cwd=<path>" argument. */
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        argc--;
-
     for (i = 1; i < argc; i++) {
         if (i > 1)
             putchar(' ');

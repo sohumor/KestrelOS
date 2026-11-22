@@ -3719,6 +3719,8 @@ def t_mission_grant(h):
     block = mission_command(h, "mission run cat --fs-read /tmp/mission-allowed -- /tmp/mission-allowed")
     assert re.search(r"\nMISSION-ALLOWED-READ\n", block), block
     assert "cannot open" not in block and "[exit 1]" not in block, block
+    block = mission_command(h, 'sh -c "cd /tmp && mission run cat --fs-read /tmp/mission-allowed -- mission-allowed"')
+    assert re.search(r"\nMISSION-ALLOWED-READ\n", block), block
     block = mission_command(h, "mission run missionprobe --fs-read /etc/passwd --bg -- /tmp/mission-allowed - -")
     assert "grant widens filesystem paths" in block and " pid " not in block, block
     # Even a child that exits immediately has a race-free mission id result.

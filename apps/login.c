@@ -2,12 +2,12 @@
  *
  * Prompts for a username and a password (the password is read raw from
  * fd 0 and never echoed), checks it against /etc/shadow, and on success
- * drops to the account's uid with SYS_SETUID before SYS_EXEC'ing the
+ * drops to the account's uid with SYS_SETUID before starting the
  * account's shell in its home directory.
  *
  * SYS_SETUID only works while the caller is still root, so login has to
  * do it before handing over. That also means login cannot recover its
- * privileges once it has switched: an exec failure after setuid is fatal
+ * privileges once it has switched: a spawn failure after setuid is fatal
  * and we exit so that init starts a fresh login.
  *
  * Everything about the account database is best-effort: a missing
@@ -29,7 +29,6 @@
 #define FIELD_MAX  128        /* longest field we keep */
 #define MAX_TRIES  3          /* failures before the banner starts over */
 #define FAIL_DELAY 2000       /* ms of penalty after a bad password */
-#define SPAWN_ARG_MAX 128     /* kernel limit, from kernel/include/uproc.h */
 
 struct account {
     char name[FIELD_MAX];
@@ -59,11 +58,6 @@ static int sc_chown(const char *path, int uid, int gid)
 static int sc_chmod(const char *path, int mode)
 {
     return (int)syscall(SYS_CHMOD, (long)path, mode, 0, 0);
-}
-
-static int sc_exec(const char *path, char *const argv[])
-{
-    return (int)syscall(SYS_EXEC, (long)path, (long)argv, 0, 0);
 }
 
 /* ---- account file parsing ---- */
@@ -324,20 +318,19 @@ static void banner(void)
     printf("\n");
 }
 
-/* Replace login with the account's shell. Only returns on failure. */
-static void start_shell(const struct account *a)
+static int start_shell(const struct account *a)
 {
-    char cwdarg[FIELD_MAX + 8];
-    char *sargv[3];
+    struct k_spawn_caps caps = {0};
+    char *sargv[] = { (char *)a->shell, 0 };
+    struct k_stat st;
 
-    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", a->home);
-    if (strlen(cwdarg) >= SPAWN_ARG_MAX)
-        snprintf(cwdarg, sizeof(cwdarg), "--cwd=/");
-
-    sargv[0] = (char *)a->shell;
-    sargv[1] = cwdarg;
-    sargv[2] = 0;
-    sc_exec(a->shell, sargv);
+    if (a->home[0] == '/' && stat_(a->home, &st) == 0 && st.is_dir)
+        snprintf(caps.cwd, sizeof(caps.cwd), "%s", a->home);
+    int pid = spawn_caps(a->shell, sargv, &caps);
+    if (pid >= 0)
+        return waitpid(pid);
+    printf("login: cannot spawn %s\n", a->shell);
+    return 1;
 }
 
 int main(int argc, char **argv)
@@ -376,9 +369,7 @@ int main(int argc, char **argv)
                     printf("login: cannot become uid %d\n", acct.uid);
                     return 1;
                 }
-                start_shell(&acct);
-                printf("login: cannot exec %s\n", acct.shell);
-                return 1;
+                return start_shell(&acct);
             }
             memset(pass, 0, sizeof(pass));
             printf("login incorrect\n");

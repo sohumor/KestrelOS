@@ -34,8 +34,8 @@ lazy `PT_LOAD` areas, resolves the supported dynamic relocations, and enters
 `_start`. It provides `rdi = argc` and `rsi = argv` (a NUL-terminated
 `char *` array on the user stack, `argv[argc] == 0`). An absolute cwd from
 `SYS_SPAWN_CAPS` is passed in `rdx` as a NUL-terminated string on the initial
-stack; otherwise `rdx` is zero. The existing `--cwd=` argument is still
-supplied when it fits, for older binaries. CRT0 exposes the initial
+stack; otherwise `rdx` is zero. Mission launches inherit the caller's
+initial directory. The directory is not part of argv. CRT0 exposes the initial
 directory through `kestrel_startup_cwd()` (default `/`), calls
 `main(argc, argv)`, and passes its return value to `SYS_EXIT`.
 

@@ -14,18 +14,6 @@
 #define WAIT_MS       3000
 #define STEP_MS       100
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 /* 1 when pid 1 is a running init that can service the request. */
 static int init_present(void)
 {
@@ -72,9 +60,9 @@ static int request(const char *what)
 
 int main(int argc, char **argv)
 {
+    (void)argv;
     int waited;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc > 1) {
         printf("usage: halt\n");
         return 1;

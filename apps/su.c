@@ -23,7 +23,6 @@
 
 #define DB_MAX     4096
 #define FIELD_MAX  128
-#define SPAWN_ARG_MAX 128
 
 struct account {
     char name[FIELD_MAX];
@@ -39,18 +38,6 @@ static void secure_zero(void *p, unsigned long n)
 
     while (n--)
         *vp++ = 0;
-}
-
-/* Pull shell-injected "--cwd=<path>" arguments anywhere in argv. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
 }
 
 static long slurp(const char *path, char *buf, unsigned long max)
@@ -284,7 +271,6 @@ static int stdin_is_nonconsole(void)
 int main(int argc, char **argv)
 {
     char pass[FIELD_MAX];
-    char cwdarg[FIELD_MAX + 8];
     char caller_name[FIELD_MAX];
     const char *target = "root";
     struct account acct;
@@ -297,7 +283,6 @@ int main(int argc, char **argv)
     int pid;
     int status;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc > 2) {
         printf("usage: su [username]\n");
         return 1;
@@ -346,20 +331,16 @@ int main(int argc, char **argv)
     if (acct.home[0] != '/' || stat_(acct.home, &st) != 0 || !st.is_dir)
         copy_field(acct.home, "/", sizeof(acct.home));
 
-    snprintf(cwdarg, sizeof(cwdarg), "--cwd=%s", acct.home);
-    if (strlen(cwdarg) >= SPAWN_ARG_MAX)
-        snprintf(cwdarg, sizeof(cwdarg), "--cwd=/");
-
     printf("su: %s -> %s (exit the nested shell to come back)\n",
            caller_name, acct.name);
 
     sargv[sargc++] = acct.shell;
     if (strcmp(acct.shell, "/bin/sh") == 0 && stdin_is_nonconsole())
         sargv[sargc++] = "-i";
-    sargv[sargc++] = cwdarg;
     sargv[sargc] = 0;
 
     memset(&caps, 0, sizeof(caps));
+    snprintf(caps.cwd, sizeof(caps.cwd), "%s", acct.home);
     caps.fds[0].child_fd = 0;
     caps.fds[0].parent_fd = 0;
     caps.fds[1].child_fd = 1;

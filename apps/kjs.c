@@ -1452,21 +1452,6 @@ int main(int argc, char **argv)
     snprintf(g_rt.cwd, sizeof(g_rt.cwd), "%s", kestrel_startup_cwd());
     normalize_path(g_rt.cwd);
 
-    /* Strip --cwd=<path> first, preserving order of script and user args. */
-    {
-        int out = 1;
-        for (i = 1; i < argc; i++) {
-            if (strncmp(argv[i], "--cwd=", 6) == 0) {
-                snprintf(g_rt.cwd, sizeof(g_rt.cwd), "%s", argv[i] + 6);
-                normalize_path(g_rt.cwd);
-            } else {
-                argv[out++] = argv[i];
-            }
-        }
-        argv[out] = 0;
-        argc = out;
-    }
-
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage();

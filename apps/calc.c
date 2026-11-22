@@ -28,18 +28,6 @@ static const char *g_p;
 static int g_err;
 static int g_depth;
 
-/* Pull the shell-injected "--cwd=<path>" argument, wherever it sits. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    int i, out = 1;
-
-    for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) != 0)
-            argv[out++] = argv[i];
-    }
-    return out;
-}
-
 static void skip_ws(void)
 {
     while (*g_p == ' ' || *g_p == '\t')
@@ -217,7 +205,6 @@ int main(int argc, char **argv)
     long v;
     int i;
 
-    argc = strip_cwd_arg(argc, argv);
     if (argc < 2) {
         printf("usage: calc \"<expression>\"\n");
         return 1;

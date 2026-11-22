@@ -88,7 +88,6 @@ int main(int argc, char **argv)
     int follow = 0, limit = -1, rflag = 0;
     int i, count, start, printed = 0;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-f")) {
             follow = 1;

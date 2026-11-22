@@ -8,8 +8,6 @@ int main(int argc, char *argv[])
 {
     const char *name = 0;
     for (int i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0)
-            continue;
         if (!name)
             name = argv[i];
     }

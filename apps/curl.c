@@ -102,9 +102,7 @@ int main(int argc, char **argv)
 
     g_cwd = kestrel_startup_cwd();
     for (i = 1; i < argc; i++) {
-        if (strncmp(argv[i], "--cwd=", 6) == 0) {
-            g_cwd = argv[i] + 6;
-        } else if (strcmp(argv[i], "-i") == 0) {
+        if (strcmp(argv[i], "-i") == 0) {
             inc_hdr = 1;
         } else if (strcmp(argv[i], "-s") == 0) {
             silent = 1;

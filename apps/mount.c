@@ -28,14 +28,6 @@
 #define TABLE_MAX   2048
 #define FIELD_MAX   64
 
-/* Pull the shell-injected trailing "--cwd=<path>" argument, if any. */
-static int strip_cwd_arg(int argc, char **argv)
-{
-    if (argc > 1 && strncmp(argv[argc - 1], "--cwd=", 6) == 0)
-        return argc - 1;
-    return argc;
-}
-
 /* Copy the next whitespace-delimited field of *pp into out, advancing
  * *pp past it. Returns 1 on a field, 0 at end of line. */
 static int next_field(const char **pp, char *out, unsigned long outsz)
@@ -130,7 +122,6 @@ static int usage(void)
 
 int main(int argc, char **argv)
 {
-    argc = strip_cwd_arg(argc, argv);
 
     if (argc == 1)
         return list_mounts();

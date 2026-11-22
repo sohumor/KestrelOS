@@ -93,7 +93,6 @@ int main(int argc, char **argv)
     int reverse = 0, force_num = 0, icase = 0;
     int col, hdr, rc, i;
 
-    argc = krec_strip_cwd(argc, argv, 0);
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0) {
             usage();
