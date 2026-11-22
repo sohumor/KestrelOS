@@ -130,6 +130,7 @@ from the directory tree `DIR` (which becomes `/`) plus the manifest `M`.
 | `arch` | defaults to `x86_64` |
 | `depends` | comma-separated package names |
 | `maintainer` | free text |
+| `launch` | optional entry path, capability mask, and one to eight exact mount attachment paths |
 | `default-file-mode` | octal, default `0644` |
 | `default-dir-mode` | octal, default `0755` |
 
@@ -219,6 +220,7 @@ corrupt one or two packages claiming the same name.
 | `/var/pkg/repo/` | the local repository shipped in the image |
 | `/var/pkg/repo/index.kpi` | its index |
 | `/var/pkg/cache/` | packages downloaded over HTTP or HTTPS |
+| `/var/pkg/objects/<first 8 hex>/<remaining 56 hex>` | verified archives keyed by container SHA-256 |
 | `/var/pkg/index.kpi` | the index fetched by `kpkg update` |
 | `/var/pkg/db/<name>/meta` | the package's metadata block plus `installed: <unix time>` |
 | `/var/pkg/db/<name>/files` | one line per installed path |
@@ -260,6 +262,8 @@ package whose files are missing.
 
 ```
 kpkg install [--force] <name|file.kpkg>...
+kpkg install-object [--force] <sha256>
+kpkg run <name> [args...]
 kpkg remove <name>
 kpkg list
 kpkg info <name>
@@ -268,13 +272,61 @@ kpkg verify [name]
 kpkg update
 ```
 
-`install`, `remove` and `update` require uid 0 (`kpkg` checks
+`install`, `install-object`, `remove` and `update` require uid 0 (`kpkg` checks
 `SYS_GETUID` itself; the filesystem permissions would stop a non-root
 user anyway, but the error message is much clearer this way).
 `list`, `info`, `search` and `verify` are readable by anyone.
 
+### Content-addressed archives
+
+A successful install prints its object ID: the 64 lowercase hexadecimal
+digits of the archive's trailer SHA-256. Before extraction, kpkg checks
+the container, paths and individual payload hashes, then publishes the
+archive in the root-owned object store by rename. Package entries cannot
+target the object store. Removing a package removes its installed
+files, not its archive.
+
+A named install still uses the repository index to select a digest,
+but reuses that object if it is already stored. To replay a specific
+archive without an index or network, use `kpkg install-object <sha256>`.
+Dependencies must already be installed for offline replay. A stored
+archive is revalidated on every use and must match the requested
+digest; a bad object fails rather than falling back to the repository.
+An administrator can remove a bad object and reinstall from the
+repository. The store has no automatic garbage collection, and
+retaining an archive does not make extraction transactional.
+
+### Declared launch grants
+
+For example, `launch: /bin/hello 0x00 /` declares an entry point
+shipped as an executable file in the package, a zero capability mask,
+and a mount view containing only the root attachment. The entry and
+mount paths are canonical absolute ASCII paths without whitespace;
+mount paths are at most 63 bytes each and cannot repeat. The mask is
+two lowercase hexadecimal digits with an `0x` prefix, using the
+`KCAP_*` bits from `abi/kestrel_abi.h`. Zero means no bits.
+
+`kpkg run hello world` launches that entry with argument `world` and
+returns its exit status. It starts in `/`, forwarding only standard
+input, output and error. The [spawn grant](spawn-grants.md) intersects
+the requested mask with the caller's capabilities and selects attachments
+visible to the caller. The selected view applies during executable and
+library loading; an unavailable attachment causes launch to fail, with
+no fallback. Selecting the root attachment does not hide files on that
+filesystem. Inherited standard descriptors can still be used.
+
+The launcher reads a public, root-writable declaration in
+`/var/pkg/launch/<name>`, published after successful extraction and
+database recording. Installation does not run the entry point. Removal
+and replacement retire the prior declaration; a package without one
+cannot be started with `kpkg run`. The private package database stays
+private. This grant applies only through `kpkg run`; it does not prohibit
+direct execution or make package installation transactional.
+
+### Installation and removal
+
 **install** takes either a path (anything ending in `.kpkg`, or
-containing a `/`, resolved against the shell's `--cwd`) or a package
+containing a `/`, resolved against the shell's startup directory) or a package
 name looked up in the index. In order it:
 
 1. loads the file, checks the structure and the trailer digest, and -
