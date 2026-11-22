@@ -1,6 +1,7 @@
 /* kpkg.c - the KestrelOS package manager.
  *
  *   kpkg install <name|file.kpkg>   install, resolving dependencies
+ *   kpkg install-object <sha256>   install an exact local archive
  *   kpkg remove  <name>             remove exactly what it installed
  *   kpkg list                       installed packages and versions
  *   kpkg info    <name>             metadata and file list
@@ -94,6 +95,7 @@ _Static_assert(sizeof(struct kpkg_file) == KPKG_ENT_SIZE,
 #define PKG_DIR       "/var/pkg"
 #define DB_DIR        "/var/pkg/db"
 #define CACHE_DIR     "/var/pkg/cache"
+#define OBJECT_DIR    "/var/pkg/objects"
 #define INDEX_CACHE   "/var/pkg/index.kpi"
 #define INDEX_NAME    "index.kpi"
 #define DEFAULT_REPO  "/var/pkg/repo"
@@ -104,6 +106,7 @@ _Static_assert(sizeof(struct kpkg_file) == KPKG_ENT_SIZE,
 #define NAME_MAX_      64
 #define PATH_MAX_      192
 #define IO_CHUNK       4096
+#define OBJECT_SHARD   8
 
 /* ---- tiny syscall wrappers -------------------------------------------
  * Named with a kp_ prefix so they cannot collide with libc wrappers for
@@ -362,10 +365,39 @@ static int path_is_safe(const char *p)
         if (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r')
             return 0;                   /* would break the database format */
     }
-    if (strstr(p, "/../") || strstr(p, "//"))
+    if (strstr(p, "/../") || strstr(p, "/./") || strstr(p, "//"))
         return 0;
     if (n >= 3 && strcmp(p + n - 3, "/..") == 0)
         return 0;
+    if (n >= 2 && strcmp(p + n - 2, "/.") == 0)
+        return 0;
+    return 1;
+}
+
+static int digest_valid(const char *hex)
+{
+    if (strlen(hex) != KPKG_DIGEST * 2)
+        return 0;
+    for (unsigned long i = 0; hex[i]; i++) {
+        char c = hex[i];
+        if ((c < '0' || c > '9') && (c < 'a' || c > 'f'))
+            return 0;
+    }
+    return 1;
+}
+
+static int package_name_valid(const char *name)
+{
+    unsigned long n = strlen(name);
+    if (!n || n >= NAME_MAX_ - 1 || !strcmp(name, ".") || !strcmp(name, ".."))
+        return 0;
+    for (unsigned long i = 0; i < n; i++) {
+        char c = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+              c == '.' || c == '+'))
+            return 0;
+    }
     return 1;
 }
 
@@ -499,6 +531,7 @@ struct idxent {
 static int idx_parse(const char *line, struct idxent *e)
 {
     char num[32];
+    char sha[sizeof(e->sha) + 1];
     const char *p = line;
 
     memset(e, 0, sizeof(*e));
@@ -512,11 +545,13 @@ static int idx_parse(const char *line, struct idxent *e)
     if (!p)
         return -1;
     e->size = parse_dec(num);
-    p = next_field(p, e->sha, sizeof(e->sha));
-    if (!p)
+    p = next_field(p, sha, sizeof(sha));
+    if (!p || !digest_valid(sha))
         return -1;
+    strcpy(e->sha, sha);
     p = next_field(p, e->file, sizeof(e->file));
-    if (!p)
+    if (!p || strchr(e->file, '/') || !strcmp(e->file, ".") ||
+        !strcmp(e->file, ".."))
         return -1;
     p = next_field(p, e->depends, sizeof(e->depends));
     if (!p)
@@ -615,6 +650,7 @@ struct pkg {
     char depends[256];
     char arch[32];
     char instsize[32];
+    char sha[KPKG_DIGEST * 2 + 1];
 };
 
 static void pkg_free(struct pkg *p)
@@ -722,11 +758,11 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
     body = p->size - KPKG_DIGEST;
     p->count = p->h.ftab_count;
     if (p->h.meta_off < KPKG_HDR_SIZE ||
-        p->h.meta_off + p->h.meta_len > body ||
+        (unsigned long)p->h.meta_off + p->h.meta_len > body ||
         p->h.ftab_off < KPKG_HDR_SIZE ||
         p->h.ftab_off + p->count * KPKG_ENT_SIZE > body ||
         p->h.data_off < KPKG_HDR_SIZE ||
-        p->h.data_off + p->h.data_len > body) {
+        (unsigned long)p->h.data_off + p->h.data_len > body) {
         if (!quiet)
             printf("kpkg: %s: corrupt (block outside the file)\n", path);
         pkg_free(p);
@@ -740,6 +776,7 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
         pkg_free(p);
         return -1;
     }
+    hex_str(digest, KPKG_DIGEST, p->sha);
 
     {
         const char *meta = (const char *)(p->raw + p->h.meta_off);
@@ -753,9 +790,9 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
         meta_get(meta, p->h.meta_len, "size", p->instsize,
                  sizeof(p->instsize));
     }
-    if (p->name[0] == '\0' || p->version[0] == '\0') {
+    if (!package_name_valid(p->name) || p->version[0] == '\0') {
         if (!quiet)
-            printf("kpkg: %s: metadata has no name or version\n", path);
+            printf("kpkg: %s: invalid package name or missing version\n", path);
         pkg_free(p);
         return -1;
     }
@@ -763,18 +800,30 @@ static int pkg_load(const char *path, struct pkg *p, int quiet)
     for (i = 0; i < p->count; i++) {
         struct kpkg_file e;
         pkg_entry(p, i, &e);
-        if (!path_is_safe(e.path)) {
+        if (!path_is_safe(e.path) ||
+            (strncmp(e.path, OBJECT_DIR, sizeof(OBJECT_DIR) - 1) == 0 &&
+             (e.path[sizeof(OBJECT_DIR) - 1] == '/' ||
+              e.path[sizeof(OBJECT_DIR) - 1] == '\0'))) {
             if (!quiet)
                 printf("kpkg: %s: unsafe path in package\n", path);
             pkg_free(p);
             return -1;
         }
-        if (e.type == KPKG_TYPE_FILE &&
-            (unsigned long)e.offset + e.size > p->h.data_len) {
+        if (e.type != KPKG_TYPE_DIR && (e.type != KPKG_TYPE_FILE ||
+            (unsigned long)e.offset + e.size > p->h.data_len)) {
             if (!quiet)
-                printf("kpkg: %s: %s runs past the payload\n", path, e.path);
+                printf("kpkg: %s: invalid entry for %s\n", path, e.path);
             pkg_free(p);
             return -1;
+        }
+        if (e.type == KPKG_TYPE_FILE) {
+            digest_of(pkg_data(p, &e), e.size, digest);
+            if (memcmp(digest, e.sha256, KPKG_DIGEST) != 0) {
+                if (!quiet)
+                    printf("kpkg: %s: payload digest mismatch\n", e.path);
+                pkg_free(p);
+                return -1;
+            }
         }
     }
     return 0;
@@ -1011,7 +1060,6 @@ static int other_owner(const char *path, const char *skip)
 
 static int extract(const struct pkg *p)
 {
-    unsigned char digest[KPKG_DIGEST];
     unsigned long i;
 
     for (i = 0; i < p->count; i++) {
@@ -1024,11 +1072,6 @@ static int extract(const struct pkg *p)
                 return -1;
             }
         } else {
-            digest_of(pkg_data(p, &e), e.size, digest);
-            if (memcmp(digest, e.sha256, KPKG_DIGEST) != 0) {
-                printf("kpkg: %s: payload digest mismatch\n", e.path);
-                return -1;
-            }
             if (mkdirs_for(e.path) < 0) {
                 printf("kpkg: cannot create the parent of %s\n", e.path);
                 return -1;
@@ -1151,9 +1194,42 @@ struct instate {
     int depth;
     int force;
     int installed;
+    int offline;
 };
 
 static int install_by_name(struct instate *st, const char *name);
+
+static void object_path(const char *sha, char *out, unsigned long outsz)
+{
+    char shard[OBJECT_SHARD + 1];
+    memcpy(shard, sha, OBJECT_SHARD);
+    shard[OBJECT_SHARD] = '\0';
+    snprintf(out, outsz, "%s/%s/%s", OBJECT_DIR, shard, sha + OBJECT_SHARD);
+}
+
+static int object_publish(const struct pkg *p)
+{
+    char path[PATH_MAX_], stage[PATH_MAX_];
+    object_path(p->sha, path, sizeof(path));
+    if (exists(path)) {
+        struct pkg cached;
+        if (pkg_load(path, &cached, 0) < 0)
+            return -1;
+        int match = strcmp(cached.sha, p->sha) == 0;
+        pkg_free(&cached);
+        return match ? 0 : -1;
+    }
+
+    if (mkdirs_for(path) < 0 || kp_chmod(OBJECT_DIR, 0700) < 0)
+        return -1;
+    snprintf(stage, sizeof(stage), "%s/.incoming-%d", OBJECT_DIR, getpid());
+    if (write_file(stage, p->raw, p->size) < 0 ||
+        kp_chmod(stage, 0444) < 0 || rename_(stage, path) < 0) {
+        unlink_(stage);
+        return -1;
+    }
+    return 0;
+}
 
 static int stack_has(const struct instate *st, const char *name)
 {
@@ -1168,7 +1244,7 @@ static int stack_has(const struct instate *st, const char *name)
 /* Install a package that is already on disk. `want_sha` is the digest
  * the repository index promised, or 0 for a local file. */
 static int install_file(struct instate *st, const char *file,
-                        const char *want_sha)
+                        const char *want_sha, int stored)
 {
     struct pkg p;
     char dep[NAME_MAX_];
@@ -1178,17 +1254,10 @@ static int install_file(struct instate *st, const char *file,
     if (pkg_load(file, &p, 0) < 0)
         return -1;
 
-    if (want_sha && want_sha[0]) {
-        unsigned char digest[KPKG_DIGEST];
-        char hex[KPKG_DIGEST * 2 + 1];
-        digest_of(p.raw, p.size - KPKG_DIGEST, digest);
-        hex_str(digest, KPKG_DIGEST, hex);
-        if (strcmp(hex, want_sha) != 0) {
-            printf("kpkg: %s: does not match the digest in the index\n",
-                   p.name);
-            pkg_free(&p);
-            return -1;
-        }
+    if (want_sha && strcmp(p.sha, want_sha) != 0) {
+        printf("kpkg: %s: does not match requested object %s\n", p.name, want_sha);
+        pkg_free(&p);
+        return -1;
     }
 
     if (stack_has(st, p.name)) {
@@ -1229,8 +1298,21 @@ static int install_file(struct instate *st, const char *file,
         dep[n] = '\0';
         if (n == 0)
             continue;
+        if (!package_name_valid(dep)) {
+            printf("kpkg: %s: invalid dependency %s\n", p.name, dep);
+            st->depth--;
+            pkg_free(&p);
+            return -1;
+        }
         if (db_installed(dep))
             continue;
+        if (st->offline) {
+            printf("kpkg: %s: offline object install requires installed %s\n",
+                   p.name, dep);
+            st->depth--;
+            pkg_free(&p);
+            return -1;
+        }
         printf("kpkg: %s requires %s\n", p.name, dep);
         if (install_by_name(st, dep) < 0) {
             st->depth--;
@@ -1247,6 +1329,11 @@ static int install_file(struct instate *st, const char *file,
         return -1;
     }
 
+    if (!stored && object_publish(&p) < 0) {
+        printf("kpkg: cannot publish object %s\n", p.sha);
+        pkg_free(&p);
+        return -1;
+    }
     if (extract(&p) < 0) {
         printf("kpkg: %s: extraction failed, nothing recorded\n", p.name);
         pkg_free(&p);
@@ -1260,6 +1347,7 @@ static int install_file(struct instate *st, const char *file,
     }
 
     printf("kpkg: installed %s %s (%lu files)\n", p.name, p.version, p.count);
+    printf("kpkg: object %s\n", p.sha);
     st->installed++;
     pkg_free(&p);
     return 0;
@@ -1310,13 +1398,16 @@ static int install_by_name(struct instate *st, const char *name)
         printf("kpkg: %s: not in the repository index\n", name);
         return -1;
     }
+    object_path(e.sha, file, sizeof(file));
+    if (exists(file))
+        return install_file(st, file, e.sha, 1);
     if (repo_is_http() || repo_is_https()) {
         if (fetch_to_cache(e.file, file, sizeof(file)) < 0)
             return -1;
     } else {
         snprintf(file, sizeof(file), "%s/%s", g_conf.repo, e.file);
     }
-    return install_file(st, file, e.sha);
+    return install_file(st, file, e.sha, 0);
 }
 
 /* ---- commands ------------------------------------------------------------ */
@@ -1372,7 +1463,7 @@ static int cmd_install(int argc, char **argv, int force)
         if (looks_like_file(argv[i])) {
             char path[PATH_MAX_];
             resolve_path(argv[i], path, sizeof(path));
-            if (install_file(&st, path, 0) < 0)
+            if (install_file(&st, path, 0, 0) < 0)
                 rc = 1;
         } else if (install_by_name(&st, argv[i]) < 0) {
             rc = 1;
@@ -1383,6 +1474,20 @@ static int cmd_install(int argc, char **argv, int force)
         return 1;
     }
     return rc;
+}
+
+static int cmd_install_object(int argc, char **argv, int force)
+{
+    char path[PATH_MAX_];
+    struct instate st = { .force = force, .offline = 1 };
+    if (need_root("install-object") < 0)
+        return 1;
+    if (argc != 1 || !digest_valid(argv[0])) {
+        printf("usage: kpkg install-object [--force] <sha256>\n");
+        return 1;
+    }
+    object_path(argv[0], path, sizeof(path));
+    return install_file(&st, path, argv[0], 1) < 0;
 }
 
 static int cmd_remove(int argc, char **argv)
@@ -1735,6 +1840,7 @@ static void usage(void)
 {
     printf("usage: kpkg <command> [args]\n"
            "  install [--force] <name|file.kpkg>...  install packages\n"
+           "  install-object [--force] <sha256>      install an exact local archive\n"
            "  remove <name>                          remove a package\n"
            "  list                                   installed packages\n"
            "  info <name>                            metadata and files\n"
@@ -1768,6 +1874,8 @@ int main(int argc, char **argv)
 
     if (strcmp(cmd, "install") == 0)
         return cmd_install(argc - 2, argv + 2, force);
+    if (strcmp(cmd, "install-object") == 0)
+        return cmd_install_object(argc - 2, argv + 2, force);
     if (strcmp(cmd, "remove") == 0)
         return cmd_remove(argc - 2, argv + 2);
     if (strcmp(cmd, "list") == 0)
