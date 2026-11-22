@@ -571,9 +571,9 @@ understands the ANSI sequences the libc `term_*` helpers emit.
 
 - The kernel could not read a valid KFS superblock from LBA 2048 of the
   primary master. Confirm the boot log line
-  `ata: primary master: ..., N sectors` is present: if it says
-  `ata: primary master not present` or `ata: no controller on primary bus`,
-  the problem is the controller attachment (see above), not the filesystem.
+  `ata: primary master: ..., N sectors` is present. If it is missing on
+  an ATA boot, check the controller attachment (see above) before
+  troubleshooting the filesystem.
 - If ATA is fine but the FS is not, the image may have been built without
   the filesystem stage. Rebuild with `make clean && make` and verify with
   `make fsck`, which runs `tools/kfsck.py` over `build/fs.img` and lists
