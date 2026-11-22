@@ -29,21 +29,69 @@ struct js_chunk {
 
 #define JS_CHUNK 65536UL
 
-int js_oom(js_ctx *ctx)
+static int heap_exhausted(js_ctx *ctx, const char *reason)
 {
     if (!ctx->fatal) {
         ctx->fatal = 1;
-        ctx->fatal_msg = "script heap limit exceeded";
+        ctx->fatal_msg = reason;
         ctx->has_exception = 1;
         ctx->exception = js_undefined();
     }
     return JS_THROW;
 }
 
+int js_oom(js_ctx *ctx)
+{
+    return heap_exhausted(ctx, "script heap limit exceeded");
+}
+
+static int reserve_credit(unsigned long *credit, unsigned long amount)
+{
+    unsigned long left = __atomic_load_n(credit, __ATOMIC_RELAXED);
+    while (left >= amount) {
+        if (__atomic_compare_exchange_n(credit, &left, left - amount, 1,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+            return 1;
+    }
+    return 0;
+}
+
+void js_heap_budget_init(js_heap_budget *budget, unsigned long bytes)
+{
+    budget->remaining = bytes;
+}
+
+unsigned long js_heap_budget_remaining(const js_heap_budget *budget)
+{
+    return __atomic_load_n(&budget->remaining, __ATOMIC_RELAXED);
+}
+
+static int heap_reserve(js_ctx *ctx, unsigned long bytes)
+{
+    if (bytes > ctx->cfg.max_heap - ctx->heap_used)
+        return js_oom(ctx);
+    if (ctx->cfg.heap_budget &&
+        !reserve_credit(&ctx->cfg.heap_budget->remaining, bytes))
+        return heap_exhausted(ctx, "shared script heap budget exhausted");
+    ctx->heap_used += bytes;
+    return JS_OK;
+}
+
+static void heap_release(js_ctx *ctx, unsigned long bytes)
+{
+    ctx->heap_used -= bytes;
+    if (ctx->cfg.heap_budget)
+        __atomic_fetch_add(&ctx->cfg.heap_budget->remaining, bytes, __ATOMIC_RELAXED);
+}
+
 void *js_alloc_raw(js_ctx *ctx, unsigned long n)
 {
     char *p;
 
+    if (n > ~0UL - 15UL) {
+        js_oom(ctx);
+        return 0;
+    }
     n = (n + 15UL) & ~15UL;
     if (n == 0)
         n = 16;
@@ -54,24 +102,27 @@ void *js_alloc_raw(js_ctx *ctx, unsigned long n)
         return p;
     }
     {
-        unsigned long want = n + sizeof(struct js_chunk) + 16;
+        unsigned long want;
         struct js_chunk *c;
 
-        if (want < JS_CHUNK)
-            want = JS_CHUNK;
-        if (ctx->heap_used + want > ctx->cfg.max_heap) {
+        if (n > ~0UL - sizeof(struct js_chunk) - 16) {
             js_oom(ctx);
             return 0;
         }
+        want = n + sizeof(struct js_chunk) + 16;
+        if (want < JS_CHUNK)
+            want = JS_CHUNK;
+        if (heap_reserve(ctx, want) != JS_OK)
+            return 0;
         c = (struct js_chunk *)malloc(want);
         if (!c) {
+            heap_release(ctx, want);
             js_oom(ctx);
             return 0;
         }
         c->size = want;
         c->next = ctx->chunks;
         ctx->chunks = c;
-        ctx->heap_used += want;
         p = (char *)c + sizeof(struct js_chunk);
         p = (char *)(((uintptr_t)p + 15U) & ~(uintptr_t)15U);
         ctx->cur = p + n;
@@ -101,21 +152,34 @@ void js_sb_init(js_sbuf *b, js_ctx *ctx)
 
 int js_sb_put(js_sbuf *b, const char *s, unsigned long n)
 {
+    unsigned long need;
+
     if (b->err)
         return JS_THROW;
-    if (b->n + n + 1 > b->cap) {
-        unsigned long nc = b->cap ? b->cap * 2 : 64;
+    if (n >= ~0UL - b->n) {
+        b->err = 1;
+        return js_oom(b->ctx);
+    }
+    need = b->n + n + 1;
+    if (need > b->cap) {
+        unsigned long nc = b->cap ? b->cap : 64;
         char *np;
-        while (nc < b->n + n + 1)
-            nc *= 2;
-        if (nc > b->ctx->cfg.max_string ||
-            b->ctx->heap_used + nc - b->cap > b->ctx->cfg.max_heap) {
+        while (nc < need)
+            nc = nc > (~0UL / 2) ? need : nc * 2;
+        if (nc > b->ctx->cfg.max_string) {
             b->err = 1;
             return js_oom(b->ctx);
         }
+        if (heap_reserve(b->ctx, nc - b->cap) != JS_OK) {
+            b->err = 1;
+            return JS_THROW;
+        }
         np = (char *)realloc(b->p, nc);
-        if (!np) { b->err = 1; return js_oom(b->ctx); }
-        b->ctx->heap_used += nc - b->cap;
+        if (!np) {
+            heap_release(b->ctx, nc - b->cap);
+            b->err = 1;
+            return js_oom(b->ctx);
+        }
         b->p = np;
         b->cap = nc;
     }
@@ -132,8 +196,8 @@ int js_sb_puts(js_sbuf *b, const char *s) { return js_sb_put(b, s, strlen(s)); }
 void js_sb_free(js_sbuf *b)
 {
     if (b->p) {
-        b->ctx->heap_used -= b->cap;
         free(b->p);
+        heap_release(b->ctx, b->cap);
         b->p = 0;
         b->cap = 0;
         b->n = 0;
@@ -162,17 +226,6 @@ unsigned long js_execution_budget_remaining(const js_execution_budget *budget)
     return __atomic_load_n(&budget->remaining, __ATOMIC_RELAXED);
 }
 
-static int take_execution_step(js_execution_budget *budget)
-{
-    unsigned long left = js_execution_budget_remaining(budget);
-    while (left) {
-        if (__atomic_compare_exchange_n(&budget->remaining, &left, left - 1,
-                                        1, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
-            return 1;
-    }
-    return 0;
-}
-
 int js_step(js_ctx *ctx)
 {
     const char *limit;
@@ -181,7 +234,7 @@ int js_step(js_ctx *ctx)
     if (ctx->cfg.max_steps && ctx->steps >= ctx->cfg.max_steps) {
         limit = "script step limit exceeded";
     } else if (ctx->cfg.execution_budget &&
-               !take_execution_step(ctx->cfg.execution_budget)) {
+               !reserve_credit(&ctx->cfg.execution_budget->remaining, 1)) {
         limit = "shared script execution budget exhausted";
     } else {
         ctx->steps++;
@@ -3036,7 +3089,9 @@ void js_free(js_ctx *ctx)
     c = ctx->chunks;
     while (c) {
         struct js_chunk *n = c->next;
+        unsigned long size = c->size;
         free(c);
+        heap_release(ctx, size);
         c = n;
     }
     free(ctx);

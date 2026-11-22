@@ -107,6 +107,18 @@ typedef struct js_execution_budget {
 void js_execution_budget_init(js_execution_budget *budget, unsigned long steps);
 unsigned long js_execution_budget_remaining(const js_execution_budget *budget);
 
+/* Live bytes charged to the contexts' heap caps: arena chunks and
+ * temporary string buffer capacity. The host owns the pool and must keep
+ * it alive until all attached contexts are freed. Initialize once before
+ * attaching; do not copy or reinitialize a pool in use. Independent
+ * contexts may draw from it concurrently. */
+typedef struct js_heap_budget {
+    unsigned long remaining;
+} js_heap_budget;
+
+void js_heap_budget_init(js_heap_budget *budget, unsigned long bytes);
+unsigned long js_heap_budget_remaining(const js_heap_budget *budget);
+
 typedef struct js_config {
     unsigned long max_heap;       /* bytes; default 16 MiB */
     unsigned long max_steps;      /* default 20,000,000; 0 = unlimited */
@@ -119,6 +131,7 @@ typedef struct js_config {
     int (*random_bytes)(void *user, uint8_t *out, unsigned long len);
     void *user;
     js_execution_budget *execution_budget;      /* optional; 0 steps = empty */
+    js_heap_budget *heap_budget;                /* optional; 0 bytes = empty */
 } js_config;
 
 void    js_config_default(js_config *cfg);
