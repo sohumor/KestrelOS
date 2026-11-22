@@ -229,52 +229,62 @@ struct scheme_ent {
     void *user;
 };
 
-static struct scheme_ent g_schemes[SCHEME_MAX];
-static int g_nschemes;
-static http_inflate_fn g_inflate =
-#ifdef HTTP_HAVE_INFLATE
-    inflate_buf;
-#else
-    0;
-#endif
+struct http_policy {
+    struct scheme_ent schemes[SCHEME_MAX];
+    int nschemes;
+    http_inflate_fn inflate;
+};
 
-int http_register_scheme(const char *scheme, http_transport_fn fn, void *user)
+static struct http_policy legacy_policy = {
+#ifdef HTTP_HAVE_INFLATE
+    .inflate = inflate_buf,
+#endif
+};
+
+static int scheme_register(struct http_policy *p, const char *scheme,
+                           http_transport_fn fn, void *user)
 {
     int i;
 
     if (scheme == 0 || *scheme == '\0' || strlen(scheme) >= 16)
         return HTTP_E_INVAL;
-    for (i = 0; i < g_nschemes; i++) {
-        if (ci_eq(g_schemes[i].name, scheme)) {
-            g_schemes[i].fn = fn;
-            g_schemes[i].user = user;
+    for (i = 0; i < p->nschemes; i++) {
+        if (ci_eq(p->schemes[i].name, scheme)) {
+            p->schemes[i].fn = fn;
+            p->schemes[i].user = user;
             return HTTP_OK;
         }
     }
     if (fn == 0)
         return HTTP_OK;
-    if (g_nschemes >= SCHEME_MAX)
+    if (p->nschemes >= SCHEME_MAX)
         return HTTP_E_INVAL;
-    strcpy(g_schemes[g_nschemes].name, scheme);
-    g_schemes[g_nschemes].fn = fn;
-    g_schemes[g_nschemes].user = user;
-    g_nschemes++;
+    strcpy(p->schemes[i].name, scheme);
+    p->schemes[i].fn = fn;
+    p->schemes[i].user = user;
+    p->nschemes++;
     return HTTP_OK;
 }
 
-static struct scheme_ent *scheme_find(const char *scheme)
+static const struct scheme_ent *scheme_find(const struct http_policy *p,
+                                           const char *scheme)
 {
     int i;
 
-    for (i = 0; i < g_nschemes; i++)
-        if (ci_eq(g_schemes[i].name, scheme) && g_schemes[i].fn)
-            return &g_schemes[i];
+    for (i = 0; i < p->nschemes; i++)
+        if (ci_eq(p->schemes[i].name, scheme) && p->schemes[i].fn)
+            return &p->schemes[i];
     return 0;
+}
+
+int http_register_scheme(const char *scheme, http_transport_fn fn, void *user)
+{
+    return scheme_register(&legacy_policy, scheme, fn, user);
 }
 
 void http_set_inflate(http_inflate_fn fn)
 {
-    g_inflate = fn;
+    legacy_policy.inflate = fn;
 }
 
 /* ---- built-in TCP transport ------------------------------------------ */
@@ -397,6 +407,8 @@ struct hconn {
 
 struct http_client {
     struct hconn pool[HTTP_POOL_MAX];
+    const struct http_policy *policy;
+    struct http_policy profile;
     struct cookie_jar *jar;
     struct http_cache *cache;
     char agent[96];
@@ -908,15 +920,15 @@ static int coding_list(const char *v, int *out, int max)
 }
 
 /* Inflate `in` through the coding list (applied last-to-first). */
-static int decode_body(struct hbuf *in, const int *codings, int ncod,
-                       struct body_out *out)
+static int decode_body(http_inflate_fn inflate, struct hbuf *in,
+                       const int *codings, int ncod, struct body_out *out)
 {
     void *cur = in->p;
     unsigned long curlen = in->len;
     void *owned = 0;
     int i, rc = HTTP_OK;
 
-    if (g_inflate == 0)
+    if (inflate == 0)
         return HTTP_E_DECODE;
     if (in->p == 0 || in->len == 0)
         return HTTP_OK;                  /* nothing was sent */
@@ -924,13 +936,13 @@ static int decode_body(struct hbuf *in, const int *codings, int ncod,
         void *o = 0;
         unsigned long ol = 0;
         int wrapper = codings[i];
-        int r = g_inflate(cur, curlen, &o, &ol, wrapper);
+        int r = inflate(cur, curlen, &o, &ol, wrapper);
 
         if (r != 0 && wrapper == HTTP_INFLATE_ZLIB) {
             /* Servers labelled "deflate" often send a raw stream. */
             o = 0;
             ol = 0;
-            r = g_inflate(cur, curlen, &o, &ol, HTTP_INFLATE_RAW);
+            r = inflate(cur, curlen, &o, &ol, HTTP_INFLATE_RAW);
         }
         if (r != 0 || o == 0) {
             free(owned);
@@ -1110,7 +1122,7 @@ static int build_request(struct http_client *c, struct exch *e, struct hbuf *hb)
                                     "text/plain;q=0.9,image/png,image/jpeg,"
                                     "image/gif,*/*;q=0.5"))
         return HTTP_E_TOOBIG;
-    if (g_inflate && !(e->req->flags & HTTP_F_NO_DECODE)) {
+    if (c->policy->inflate && !(e->req->flags & HTTP_F_NO_DECODE)) {
         if (hb_str(hb, "\r\nAccept-Encoding: gzip, deflate"))
             return HTTP_E_TOOBIG;
     } else if (hb_str(hb, "\r\nAccept-Encoding: identity")) {
@@ -1400,7 +1412,7 @@ static int exchange(struct http_client *c, struct exch *e,
                     struct http_response *res)
 {
     char origin[URL_HOST_MAX + 32];
-    struct scheme_ent *se;
+    const struct scheme_ent *se;
     struct hconn *conn = 0;
     struct hbuf head;
     struct hbuf coded;
@@ -1418,7 +1430,7 @@ static int exchange(struct http_client *c, struct exch *e,
 
     if (url_origin(e->u, origin, sizeof(origin)) != URL_OK)
         return HTTP_E_URL;
-    se = scheme_find(e->u->scheme);
+    se = scheme_find(c->policy, e->u->scheme);
     if (se == 0)
         return HTTP_E_SCHEME;
     port = url_effective_port(e->u);
@@ -1525,7 +1537,7 @@ static int exchange(struct http_client *c, struct exch *e,
                 rc = HTTP_E_DECODE;
                 goto done;
             }
-            if (ncod > 0 && g_inflate == 0) {
+            if (ncod > 0 && c->policy->inflate == 0) {
                 rc = HTTP_E_DECODE;
                 goto done;
             }
@@ -1547,7 +1559,7 @@ static int exchange(struct http_client *c, struct exch *e,
     }
 
     if (rc == HTTP_OK && ncod > 0)
-        rc = decode_body(&coded, codings, ncod, e->out);
+        rc = decode_body(c->policy->inflate, &coded, codings, ncod, e->out);
     hb_free(&coded);
 
     /* Trailers may have been appended to the header block. */
@@ -1624,18 +1636,58 @@ static int method_cacheable(const char *m)
 
 /* ---- public API -------------------------------------------------------- */
 
-struct http_client *http_client_new(void)
+static struct http_client *client_alloc(void)
 {
     struct http_client *c = malloc(sizeof(*c));
 
-    if (c == 0)
-        return 0;
-    memset(c, 0, sizeof(*c));
+    if (c)
+        memset(c, 0, sizeof(*c));
+    return c;
+}
+
+static void client_init(struct http_client *c, const struct http_policy *policy)
+{
+    c->policy = policy;
     snprintf(c->agent, sizeof(c->agent), "KestrelOS/1.0 (libweb)");
     c->jar = cookie_jar_new();
     c->cache = http_cache_new(HTTP_CACHE_BYTES);
-    if (scheme_find("http") == 0)
+}
+
+struct http_client *http_client_new(void)
+{
+    struct http_client *c = client_alloc();
+
+    if (!c)
+        return 0;
+    client_init(c, &legacy_policy);
+    if (scheme_find(&legacy_policy, "http") == 0)
         http_register_scheme("http", http_tcp_transport, 0);
+    return c;
+}
+
+struct http_client *http_client_new_profile(const struct http_route *routes,
+                                            unsigned count,
+                                            http_inflate_fn inflate)
+{
+    struct http_client *c;
+    unsigned i;
+
+    if (count > SCHEME_MAX || (count && !routes))
+        return 0;
+    c = client_alloc();
+    if (!c)
+        return 0;
+    for (i = 0; i < count; i++) {
+        const struct http_route *r = &routes[i];
+
+        if (!r->scheme || !r->open || scheme_find(&c->profile, r->scheme) ||
+            scheme_register(&c->profile, r->scheme, r->open, r->user) != HTTP_OK) {
+            free(c);
+            return 0;
+        }
+    }
+    c->profile.inflate = inflate;
+    client_init(c, &c->profile);
     return c;
 }
 
@@ -1712,6 +1764,8 @@ int http_fetch(struct http_client *c, const struct http_request *req,
         return HTTP_E_URL;
     if (!cur.has_scheme || !cur.has_authority || cur.host[0] == '\0')
         return HTTP_E_URL;
+    if (c->policy == &c->profile && !scheme_find(c->policy, cur.scheme))
+        return HTTP_E_SCHEME;
     url_normalize(&cur, URL_N_PORT | URL_N_DOTS | URL_N_EMPTY_PATH);
 
     memset(&out, 0, sizeof(out));

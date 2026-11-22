@@ -357,6 +357,15 @@ static int sock_factory(const char *host, int port, int timeout_ms, void *user,
     return HTTP_OK;
 }
 
+static int counted_factory(const char *host, int port, int timeout_ms,
+                           void *user, struct http_transport *out)
+{
+    int *opens = user;
+
+    (*opens)++;
+    return sock_factory(host, port, timeout_ms, 0, out);
+}
+
 /* ===================================================================== *
  * The python3 server, written out at run time
  * ===================================================================== */
@@ -487,6 +496,9 @@ static const char *const PYSRC[] = {
 "                                          ('Content-Length', '0')], b'')\n",
 "        elif path == '/relredir':\n",
 "            out = resp(302, 'Found', [('Location', 'method'),\n",
+"                                      ('Content-Length', '0')], b'')\n",
+"        elif path == '/httpsredir':\n",
+"            out = resp(302, 'Found', [('Location', 'https://profile.test/method'),\n",
 "                                      ('Content-Length', '0')], b'')\n",
 "        elif path == '/loop1':\n",
 "            out = resp(302, 'Found', [('Location', '/loop2'),\n",
@@ -1451,6 +1463,54 @@ static void test_encoding(void)
     http_client_free(c);
 }
 
+static void test_fetch_profiles(void)
+{
+    char scheme[] = "HTTP";
+    int opens_a = 0, opens_b = 0, opens_global = 0;
+    struct http_route routes[] = {
+        { scheme, counted_factory, &opens_a },
+        { "http", counted_factory, &opens_b },
+    };
+    struct http_response r;
+    struct http_client *a = http_client_new_profile(routes, 1, test_inflate);
+    struct http_client *b = http_client_new_profile(routes + 1, 1, 0);
+    struct http_client *closed = http_client_new_profile(0, 0, 0);
+    struct http_client *duplicate = http_client_new_profile(routes, 2, 0);
+
+    printf("  client-owned fetch profiles\n");
+    T(a && b && closed, "create independent and empty profiles");
+    T(!duplicate, "duplicate scheme rejected case-insensitively");
+    http_client_free(duplicate);
+    if (!a || !b || !closed)
+        goto done;
+
+    scheme[0] = 'x';
+    routes[0].user = &opens_global;
+    http_register_scheme("https", counted_factory, &opens_global);
+    http_register_scheme("http", counted_factory, &opens_global);
+    http_set_inflate(0);
+    TI(http_get_url(closed, U("profile.test", "/method"), &r), HTTP_E_SCHEME,
+       "empty profile does not inherit global TCP");
+    TI(http_get_url(a, U("profile.test", "/gzip"), &r), HTTP_OK,
+       "profile uses its own route and decoder");
+    http_response_free(&r);
+    TI(http_get_url(b, U("profile.test", "/gzip"), &r), HTTP_E_DECODE,
+       "second profile has no decoder or cached decoded body");
+    TI(opens_a, 1, "first profile used its copied route");
+    TI(opens_b, 1, "second profile opened its own connection");
+    TI(http_get_url(a, U("profile.test", "/httpsredir"), &r), HTTP_E_SCHEME,
+       "redirect cannot reach a process-wide route absent from the profile");
+    TI(opens_global, 0, "profile requests never use a process-wide route");
+    http_set_inflate(test_inflate);
+    http_register_scheme("http", sock_factory, 0);
+    http_register_scheme("https", 0, 0);
+
+done:
+    http_client_free(closed);
+    http_client_free(b);
+    http_client_free(a);
+}
+
 static void test_keepalive(void)
 {
     struct http_client *c = http_client_new();
@@ -1933,6 +1993,7 @@ int main(int argc, char **argv)
         test_redirects();
         test_post();
         test_encoding();
+        test_fetch_profiles();
         test_keepalive();
         test_stale_pool();
         test_request_options();
