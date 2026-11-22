@@ -820,8 +820,8 @@ static uint32_t dir_lookup(struct kfs_fs *fs, uint32_t dir, const char *name,
             n = KFS_BLOCK_SIZE;
         if (n < sizeof(de))
             break;
-        uint32_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
-        if (!b || bread(fs, b, data_buf) < 0)
+        int64_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
+        if (b <= 0 || bread(fs, (uint32_t)b, data_buf) < 0)
             return 0;
         for (uint32_t off = 0; off + sizeof(de) <= n; off += sizeof(de)) {
             memcpy(&de, data_buf + off, sizeof(de));
@@ -852,8 +852,8 @@ static int dir_add(struct kfs_fs *fs, uint32_t dir, const char *name,
             n = KFS_BLOCK_SIZE;
         if (n < sizeof(de))
             break;
-        uint32_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
-        if (!b || bread(fs, b, data_buf) < 0)
+        int64_t b = bmap(fs, dir, &ip, base / KFS_BLOCK_SIZE, 0);
+        if (b <= 0 || bread(fs, (uint32_t)b, data_buf) < 0)
             return -1;
         for (uint32_t off = 0; off + sizeof(de) <= n; off += sizeof(de)) {
             memcpy(&de, data_buf + off, sizeof(de));
