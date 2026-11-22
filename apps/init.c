@@ -104,17 +104,27 @@ struct unit {
     int  stopping;            /* an operator stop is in flight */
     int  restart_pending;     /* start again as soon as it is reaped */
     int  dependency_failed;   /* stopped because a required unit went away */
-    int  start_guard;         /* recursive dependency-start cycle guard */
     int  boot_pending;        /* waiting for an S_STARTING boot predecessor */
     int  seq;                 /* start order, for reverse shutdown */
-    int  order;               /* resolved dependency order (services) */
     unsigned long win_start;  /* uptime ms the failure window opened */
     unsigned long next_start; /* uptime ms a backoff restart is due */
     unsigned long start_ms;   /* uptime ms this instance was spawned */
     unsigned long start_timeout_ms;
 };
 
+struct service_graph {
+    uint32_t after[MAX_UNITS];
+    uint32_t requires[MAX_UNITS];
+    uint32_t requirements[MAX_UNITS];
+    uint32_t invalid;
+    int order[MAX_UNITS];
+    int count;
+};
+
+_Static_assert(MAX_UNITS <= 32, "service graph masks must hold every unit");
+
 static struct unit units[MAX_UNITS];
+static struct service_graph graph;
 static int nunits;
 static int seq_counter;
 static int state_dirty;
@@ -336,7 +346,6 @@ static struct unit *unit_alloc(void)
     u = &units[nunits++];
     memset(u, 0, sizeof(*u));
     u->enabled = 1;
-    u->order = -1;
     u->start_timeout_ms = START_TIMEOUT_MS;
     return u;
 }
@@ -632,70 +641,68 @@ static int split_deps(const char *spec, char *scratch, char **out)
     return split_ws(scratch, out, MAX_DEPS);
 }
 
-static int deps_placed(struct unit *u, const char *spec, int required)
+static uint32_t resolve_edges(struct service_graph *g, int index,
+                              const char *spec, int required)
 {
     char scratch[DEPSZ];
     char *dep[MAX_DEPS];
-    struct unit *d;
-    int n, i;
+    uint32_t edges = 0;
+    int n = split_deps(spec, scratch, dep);
 
-    n = split_deps(spec, scratch, dep);
-    for (i = 0; i < n; i++) {
-        d = find_unit(dep[i]);
-        if (d == u || !d || d->kind != K_SERVICE) {
+    for (int i = 0; i < n; i++) {
+        const struct unit *d = find_unit(dep[i]);
+        if (!d || d == &units[index] || d->kind != K_SERVICE) {
             if (required) {
                 logf(K_LOG_ERR, "service %s: requires=%s is not a service",
-                     u->name, dep[i]);
-                u->state = S_FAILED;
+                     units[index].name, dep[i]);
+                g->invalid |= 1u << index;
             } else {
                 logf(K_LOG_WARN, "service %s: after=%s ignored",
-                     u->name, dep[i]);
+                     units[index].name, dep[i]);
             }
             continue;
         }
-        if (d->order < 0)
-            return 0;
+        edges |= 1u << (d - units);
     }
-    return 1;
+    return edges;
 }
 
-/* Order services so every name in after= and requires= is placed first.
- * Missing after= targets are ordering hints and are ignored; missing hard
- * requirements fail the unit. Anything left unplaced is a real cycle. */
-static void order_services(void)
+static void build_service_graph(struct service_graph *g, int replacement,
+                                const struct unit *fresh)
 {
-    struct unit *u;
-    int placed = 0, changed, i;
+    uint32_t remaining = 0;
+    uint32_t before;
 
-    for (i = 0; i < nunits; i++)
-        if (units[i].kind == K_SERVICE)
-            units[i].order = -1;
+    memset(g, 0, sizeof(*g));
+    for (int i = 0; i < nunits; i++) {
+        if (units[i].kind != K_SERVICE)
+            continue;
+        const struct unit *u = i == replacement ? fresh : &units[i];
+        g->after[i] = resolve_edges(g, i, u->after, 0);
+        g->requires[i] = resolve_edges(g, i, u->requires, 1);
+        remaining |= 1u << i;
+    }
 
     do {
-        changed = 0;
-        for (i = 0; i < nunits; i++) {
-            u = &units[i];
-            if (u->kind != K_SERVICE || u->order >= 0)
+        before = remaining;
+        for (int i = 0; i < nunits; i++) {
+            if (!(remaining & (1u << i)) ||
+                ((g->after[i] | g->requires[i]) & remaining))
                 continue;
-            if (!deps_placed(u, u->after, 0) ||
-                !deps_placed(u, u->requires, 1))
-                continue;
-            u->order = placed++;
-            changed = 1;
+            g->order[g->count++] = i;
+            g->requirements[i] = g->requires[i];
+            for (int j = 0; j < nunits; j++)
+                if (g->requires[i] & (1u << j))
+                    g->requirements[i] |= g->requirements[j];
+            remaining &= ~(1u << i);
         }
-    } while (changed);
+    } while (before != remaining);
 
-    for (i = 0; i < nunits; i++) {
-        u = &units[i];
-        if (u->kind == K_SERVICE && u->order < 0) {
-            logf(K_LOG_ERR,
-                 "service %s: dependency cycle (after=%s requires=%s)",
-                 u->name, u->after[0] ? u->after : "-",
-                 u->requires[0] ? u->requires : "-");
-            u->state = S_FAILED;
-            u->order = placed++;
-        }
-    }
+    g->invalid |= remaining;
+    for (int i = 0; i < nunits; i++)
+        if (remaining & (1u << i))
+            logf(K_LOG_ERR, "service %s: blocked by dependency cycle",
+                 units[i].name);
 }
 
 /* --- state file ------------------------------------------------------- */
@@ -755,26 +762,31 @@ static int requirement_satisfied(const struct unit *u)
            u->respawn == R_NEVER;
 }
 
+static int any_req_starting(const struct unit *u)
+{
+    uint32_t requirements = graph.requirements[u - units];
+
+    for (int i = 0; i < nunits; i++)
+        if ((requirements & (1u << i)) && units[i].state == S_STARTING)
+            return 1;
+    return 0;
+}
+
 /* Returns 0 when all requirements are ready, 1 when at least one is still
  * S_STARTING (caller should stay S_STOPPED and retry on later ticks), or
  * -1 when a requirement is unavailable or failed. */
 static int ensure_requirements(struct unit *u)
 {
-    char scratch[DEPSZ];
-    char *dep[MAX_DEPS];
-    struct unit *d;
-    int n, i;
+    uint32_t requirements = graph.requires[u - units];
     int waiting = 0;
 
-    if (u->kind != K_SERVICE || !u->requires[0])
-        return 0;
-    n = split_deps(u->requires, scratch, dep);
-    for (i = 0; i < n; i++) {
-        d = find_unit(dep[i]);
-        if (!d || d == u || d->kind != K_SERVICE ||
-            d->state == S_FAILED) {
+    for (int i = 0; i < nunits; i++) {
+        if (!(requirements & (1u << i)))
+            continue;
+        struct unit *d = &units[i];
+        if (d->state == S_FAILED) {
             logf(K_LOG_ERR, "%s: required service %s is unavailable",
-                 u->name, dep[i]);
+                 u->name, d->name);
             return -1;
         }
         /* enabled=no controls automatic boot, not whether another unit may
@@ -783,35 +795,18 @@ static int ensure_requirements(struct unit *u)
             d->enabled = 1;
         if (!requirement_satisfied(d) && d->state != S_STARTING)
             unit_start(d);
-        if (d->state == S_STARTING) {
-            waiting = 1;
-            continue;
-        }
         if (!requirement_satisfied(d)) {
+            if (d->state == S_STARTING ||
+                (d->state == S_STOPPED && any_req_starting(d))) {
+                waiting = 1;
+                continue;
+            }
             logf(K_LOG_ERR, "%s: required service %s did not become ready",
-                 u->name, dep[i]);
+                 u->name, d->name);
             return -1;
         }
     }
     return waiting ? 1 : 0;
-}
-
-static int any_req_starting(const struct unit *u)
-{
-    char scratch[DEPSZ];
-    char *dep[MAX_DEPS];
-    struct unit *d;
-    int n, i;
-
-    if (u->kind != K_SERVICE || !u->requires[0])
-        return 0;
-    n = split_deps(u->requires, scratch, dep);
-    for (i = 0; i < n; i++) {
-        d = find_unit(dep[i]);
-        if (d && (d->state == S_STARTING || any_req_starting(d)))
-            return 1;
-    }
-    return 0;
 }
 
 static void unit_spawn(struct unit *u)
@@ -882,22 +877,21 @@ static void unit_start(struct unit *u)
 
     if (u->state == S_RUNNING || u->state == S_STARTING)
         return;
-    if (u->start_guard) {
-        logf(K_LOG_ERR, "%s: recursive requirement cycle", u->name);
+    if (graph.invalid & (1u << (u - units))) {
         u->state = S_FAILED;
         state_dirty = 1;
         return;
     }
-    u->start_guard = 1;
     req = ensure_requirements(u);
     if (req < 0) {
         u->state = S_FAILED;
         state_dirty = 1;
     } else if (req == 0) {
         unit_spawn(u);
+    } else if (u->state != S_STOPPED && u->state != S_WAITING) {
+        u->state = S_STOPPED;
+        state_dirty = 1;
     }
-    /* req > 0 means a dependency is S_STARTING; leave u S_STOPPED for retry */
-    u->start_guard = 0;
 }
 
 /* Non-blocking check for units in S_STARTING on every supervisor tick. */
@@ -1095,26 +1089,19 @@ static void unit_stop(struct unit *u)
 static int reload_service(struct unit *u)
 {
     struct unit fresh;
-    struct unit old;
-    int saved_state[MAX_UNITS];
-    int saved_order[MAX_UNITS];
-    int runtime_enabled = u->enabled;
-    int i;
+    struct service_graph candidate;
+    int index = u - units;
 
     if (u->kind != K_SERVICE)
         return -1;
     memset(&fresh, 0, sizeof(fresh));
-    fresh.enabled = 1;
-    fresh.order = -1;
-    fresh.start_timeout_ms = START_TIMEOUT_MS;
     if (svc_load(&fresh, u->name) < 0)
         return -1;
 
-    memcpy(&old, u, sizeof(old));
-    for (i = 0; i < nunits; i++) {
-        saved_state[i] = units[i].state;
-        saved_order[i] = units[i].order;
-    }
+    build_service_graph(&candidate, index, &fresh);
+    if (candidate.invalid & (1u << index))
+        return -1;
+
     setstr(u->exec, sizeof(u->exec), fresh.exec);
     setstr(u->args, sizeof(u->args), fresh.args);
     setstr(u->out, sizeof(u->out), fresh.out);
@@ -1122,36 +1109,10 @@ static int reload_service(struct unit *u)
     setstr(u->requires, sizeof(u->requires), fresh.requires);
     setstr(u->ready, sizeof(u->ready), fresh.ready);
     u->respawn = fresh.respawn;
-    /* enabled= is a boot policy. A live `service reload` must not undo an
-     * operator's earlier `service start` of a boot-disabled unit. */
-    u->enabled = runtime_enabled;
     u->start_timeout_ms = fresh.start_timeout_ms;
     if (u->state == S_FAILED)
         u->state = u->enabled ? S_STOPPED : S_DISABLED;
-    order_services();
-    if (u->state != S_FAILED)
-        return 0;
-
-    /* Dependency validation is part of reload's transaction: a bad edit
-     * must not replace the last working config or fail neighbouring units
-     * that were only pulled into its temporary cycle. */
-    memcpy(u, &old, sizeof(old));
-    for (i = 0; i < nunits; i++) {
-        units[i].state = saved_state[i];
-        units[i].order = saved_order[i];
-    }
-    return -1;
-}
-
-static int unit_requires(const struct unit *u, const char *name)
-{
-    char scratch[DEPSZ];
-    char *dep[MAX_DEPS];
-    int n = split_deps(u->requires, scratch, dep);
-
-    for (int i = 0; i < n; i++)
-        if (!strcmp(dep[i], name))
-            return 1;
+    graph = candidate;
     return 0;
 }
 
@@ -1161,14 +1122,16 @@ static void enforce_dependencies(void)
 {
     int i, j;
 
-    for (i = 0; i < nunits; i++) {
-        struct unit *u = &units[i];
+    for (i = 0; i < graph.count; i++) {
+        int index = graph.order[i];
+        struct unit *u = &units[index];
         if (u->state != S_RUNNING && u->state != S_STARTING &&
             u->state != S_WAITING)
             continue;
         for (j = 0; j < nunits; j++) {
             struct unit *d = &units[j];
-            if (!unit_requires(u, d->name) || requirement_satisfied(d))
+            if (!(graph.requires[index] & (1u << j)) ||
+                requirement_satisfied(d))
                 continue;
             /* If a starting unit depends on another unit that is still
              * starting, wait until it settles. */
@@ -1199,38 +1162,28 @@ static void enforce_dependencies(void)
     }
 }
 
-static int deps_starting(const struct unit *u, const char *spec)
+static int deps_starting(int index)
 {
-    char scratch[DEPSZ];
-    char *dep[MAX_DEPS];
-    struct unit *d;
-    int n, i;
+    uint32_t edges = graph.after[index] | graph.requires[index];
 
-    if (!spec[0])
-        return 0;
-    n = split_deps(spec, scratch, dep);
-    for (i = 0; i < n; i++) {
-        d = find_unit(dep[i]);
-        if (d && d != u && (d->state == S_STARTING || d->boot_pending))
+    for (int i = 0; i < nunits; i++)
+        if ((edges & (1u << i)) &&
+            (units[i].state == S_STARTING || units[i].boot_pending))
             return 1;
-    }
     return 0;
 }
 
 static void run_boot_pending(void)
 {
-    int o, i;
-
-    for (o = 0; o < nunits; o++) {
-        for (i = 0; i < nunits; i++) {
-            struct unit *u = &units[i];
-            if (u->kind != K_SERVICE || u->order != o || !u->boot_pending)
-                continue;
-            if (deps_starting(u, u->after) || deps_starting(u, u->requires))
-                continue;
-            u->boot_pending = 0;
-            if (u->state != S_FAILED && u->enabled)
-                unit_start(u);
+    for (int i = 0; i < graph.count; i++) {
+        int index = graph.order[i];
+        struct unit *u = &units[index];
+        if (!u->boot_pending || deps_starting(index))
+            continue;
+        u->boot_pending = 0;
+        if (u->state != S_FAILED && u->enabled) {
+            unit_start(u);
+            u->boot_pending = u->state == S_STOPPED && any_req_starting(u);
         }
     }
 }
@@ -1563,25 +1516,21 @@ static void run_setup(void)
 
 static void start_all(void)
 {
-    int i, o;
+    int i;
 
     for (i = 0; i < nunits; i++)
         if (units[i].kind == K_SYSINIT && units[i].state != S_FAILED)
             unit_run_sync(&units[i]);
 
-    order_services();
-    for (o = 0; o < nunits; o++) {
-        for (i = 0; i < nunits; i++) {
-            struct unit *u = &units[i];
-            if (u->kind != K_SERVICE || u->order != o ||
-                u->state == S_FAILED || !u->enabled)
-                continue;
-            if (deps_starting(u, u->after) || deps_starting(u, u->requires))
-                u->boot_pending = 1;
-            else
-                unit_start(u);
-        }
+    build_service_graph(&graph, -1, 0);
+    for (i = 0; i < nunits; i++) {
+        struct unit *u = &units[i];
+        if (graph.invalid & (1u << i))
+            u->state = S_FAILED;
+        u->boot_pending = u->kind == K_SERVICE && u->state != S_FAILED &&
+                          u->enabled;
     }
+    run_boot_pending();
 
     for (i = 0; i < nunits; i++)
         if ((units[i].kind == K_RESPAWN || units[i].kind == K_ONCE) &&
