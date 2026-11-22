@@ -6,8 +6,9 @@
 #include "proc.h"
 #include "timer.h"
 #include "initcall.h"
-#include "keyboard.h"
+#include "keyboard_seat.h"
 #include "mouse.h"
+#include "random.h"
 #include "usb_hid_core.h"
 #include "string.h"
 
@@ -35,6 +36,7 @@ struct usb_device {
     uint64_t input, output, buffer;
     struct ring control, interrupt;
     uint8_t previous[8];
+    struct keyboard_source keyboard;
     bool active, pending, logged;
 };
 
@@ -122,10 +124,27 @@ static void queue_report(struct usb_device *d)
     wr(doorbells + d->slot * 4, d->ep);
 }
 
-static void emit_scancode(uint8_t sc, void *ctx)
+static void emit_key(uint8_t usage, bool down, void *ctx)
 {
-    (void)ctx;
-    keyboard_handle_scancode(sc);
+    entropy_pool_add_interrupt(ENTROPY_KEYBOARD, usage | ((uint32_t)down << 8));
+    keyboard_source_key(ctx, usage, down);
+}
+
+static void stop_keyboard(struct usb_device *d)
+{
+    keyboard_source_clear(&d->keyboard);
+    d->active = false;
+}
+
+static void port_changed(unsigned port)
+{
+    if (!port || port > ports || (rd(op + 0x400 + (port - 1) * 16) & 1))
+        return;
+    for (unsigned slot = 1; slot <= slots; slot++) {
+        struct usb_device *d = &devices[slot];
+        if (d->active && d->protocol == 1 && d->port == port)
+            stop_keyboard(d);
+    }
 }
 
 static void report_event(struct trb e)
@@ -141,18 +160,17 @@ static void report_event(struct trb e)
     d->pending = false;
     if (code != 1 && code != 13) {
         kprintf("usb: slot %u transfer error %u; endpoint stopped\n", slot, code);
-        d->active = false;
+        if (d->protocol == 1)
+            stop_keyboard(d);
+        else
+            d->active = false;
         return;
     }
     unsigned residual = e.status & 0xFFFFFF;
     unsigned len = residual <= d->packet ? d->packet - residual : 0;
     uint8_t *data = P2V(d->buffer);
     if (d->protocol == 1 && len >= 8) {
-        /* Keep each E0 sequence atomic against the PS/2 IRQ on this CPU. */
-        uint64_t flags = irq_save();
-        bool accepted = usb_hid_keyboard(d->previous, data, emit_scancode, NULL);
-        irq_restore(flags);
-        if (accepted)
+        if (usb_hid_keyboard(d->previous, data, emit_key, &d->keyboard))
             memcpy(d->previous, data, 8);
     } else if (d->protocol == 2) {
         struct usb_hid_mouse m;
@@ -185,6 +203,8 @@ static void drain_events(void)
             completed = true;
         } else if (type == 32) {
             report_event(e);
+        } else if (type == 34) {
+            port_changed((e.parameter >> 24) & 0xff);
         }
         if (++event_next == TRBS) {
             event_next = 0;
@@ -504,6 +524,9 @@ int xhci_init(void)
     return 0;
 fail:
     running = false;
+    for (unsigned slot = 1; slot <= slots; slot++)
+        if (devices[slot].active && devices[slot].protocol == 1)
+            stop_keyboard(&devices[slot]);
     wr(op, 0);
     wait_reg(op + 4, 1, 1);
     return -1;

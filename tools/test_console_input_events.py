@@ -10,6 +10,7 @@ from e2e import Harness, qemu_command, t_boot
 
 
 def main():
+    seat = "PASS keyboard seat: shared chords, independent modifier release"
     success = "PASS console input events: queued input, parked reader wake, and cancellation"
     with TemporaryDirectory() as directory:
         image = Path(directory) / "os.img"
@@ -27,6 +28,9 @@ def main():
         h = Harness(command)
         try:
             h.start()
+            if h.expect_any([seat, "FAIL keyboard seat"]) != seat:
+                raise AssertionError("guest rejected the keyboard seat checks")
+            print(seat)
             if h.expect_any([success, "FAIL console input events"]) != success:
                 raise AssertionError("guest rejected the console input checks")
             t_boot(h)
