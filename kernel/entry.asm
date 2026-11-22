@@ -1,6 +1,6 @@
 ; KestrelOS kernel entry — first bytes of the kernel binary.
-; Stage 2 jumps here at 0xFFFFFFFF80100000 in 64-bit long mode with
-; RDI = physical address of the bootinfo block.
+; The loader jumps here at 0xFFFFFFFF80100000 in 64-bit long mode with
+; RDI = physical address of the handoff, RSI = its byte length.
 
 BITS 64
 section .text.entry
