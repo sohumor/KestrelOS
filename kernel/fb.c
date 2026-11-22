@@ -71,7 +71,7 @@ static bool clip(int *x, int *y, int *w, int *h, int *ox, int *oy)
     return true;
 }
 
-void fb_init(struct bootinfo *bi)
+void fb_init(const struct boot_framebuffer *fb)
 {
     have_fb = false;
     dev = NULL;
@@ -79,14 +79,14 @@ void fb_init(struct bootinfo *bi)
     fbw = fbh = fbpitch = fbbpp = fbsize = 0;
     fbphys = 0;
 
-    if (!bi || !bi->fb_present) {
+    if (!fb || !fb->present) {
         kprintf("fb: no linear framebuffer, staying in text mode\n");
         return;
     }
 
-    uint32_t w = bi->fb_width, h = bi->fb_height;
-    uint32_t pitch = bi->fb_pitch, bpp = bi->fb_bpp;
-    uint64_t phys = bi->fb_phys;
+    uint32_t w = fb->width, h = fb->height;
+    uint32_t pitch = fb->pitch, bpp = fb->bpp;
+    uint64_t phys = fb->phys;
 
     if (bpp != 32 || w < 320 || h < 200 || w > FB_MAX_W || h > FB_MAX_H ||
         pitch < w * 4 || phys == 0 || (phys & (PAGE_SIZE - 1))) {

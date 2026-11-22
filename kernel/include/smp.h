@@ -1,7 +1,6 @@
 #pragma once
 
 #include <stdint.h>
-#include "bootinfo.h"
 
 #define SMP_MAX_CPUS 16
 #define SMP_RESCHEDULE_VECTOR 0xF0
@@ -11,7 +10,7 @@ struct regs;
 
 /* Discover processors, map/enable the bootstrap local APIC and install the
  * BSP's GS-based per-CPU area. Requires the rebuilt kernel page tables. */
-void smp_init(struct bootinfo *bi);
+void smp_init(void);
 
 /* Allocate per-CPU bootstrap tasks and issue INIT/SIPI to discovered APs.
  * Requires the heap and process scheduler. */

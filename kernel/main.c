@@ -1,5 +1,5 @@
 #include "kernel.h"
-#include "bootinfo.h"
+#include "bios_boot.h"
 #include "console.h"
 #include "serial.h"
 #include "string.h"
@@ -38,7 +38,7 @@
 #include "hda.h"
 #include "testmode.h"
 
-struct bootinfo *boot_info;
+static struct boot_resources boot;
 
 /* Start userspace. uproc_spawn only creates the task — the ELF load
  * happens on that task, so a missing or corrupt /bin/init shows up as an
@@ -94,20 +94,16 @@ void kmain(uint64_t bootinfo_phys)
     console_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     kprintf("  from-scratch kernel booted in long mode\n\n");
 
-    boot_info = P2V(bootinfo_phys);
-    random_init(boot_info->boot_seed);
-    entropy_pool_add(ENTROPY_BOOT, boot_info,
-                     sizeof(*boot_info) +
-                         (size_t)boot_info->e820_count *
-                             sizeof(struct e820_entry),
-                     0);
+    if (!bios_boot_decode(P2V(bootinfo_phys), &boot))
+        panic("boot: invalid BIOS resource handoff");
+    random_init(boot.seed);
+    entropy_pool_add(ENTROPY_BOOT, &boot, sizeof(boot), 0);
 
     uint64_t usable = 0;
-    for (int i = 0; i < boot_info->e820_count; i++)
-        if (boot_info->e820[i].type == E820_USABLE)
-            usable += boot_info->e820[i].len;
-    kprintf("mem: %lu MiB usable (%u E820 entries)\n",
-            usable / (1024 * 1024), boot_info->e820_count);
+    for (size_t i = 0; i < boot.memory_count; i++)
+        usable += boot.memory[i].end - boot.memory[i].base;
+    kprintf("mem: %lu MiB usable (%u boot ranges)\n",
+            usable / (1024 * 1024), (unsigned)boot.memory_count);
 
     gdt_init();
     idt_init();
@@ -120,9 +116,9 @@ void kmain(uint64_t bootinfo_phys)
             TIMER_HZ);
 
     fpu_init();
-    pmm_init(boot_info);
+    pmm_init(boot.memory, boot.memory_count);
     vmm_init();
-    smp_init(boot_info);
+    smp_init();
     kheap_init();
     kprintf("mem: pmm %lu pages free, paging rebuilt, heap ready\n",
             pmm_free_pages());
@@ -130,7 +126,7 @@ void kmain(uint64_t bootinfo_phys)
     /* Needs the physical allocator (shadow buffer) and paging (the
      * aperture is outside the direct map), so it cannot run any earlier.
      * On success the console switches itself to the framebuffer. */
-    fb_init(boot_info);
+    fb_init(&boot.framebuffer);
 
     proc_init();
     kprintf("proc: scheduler online\n");
