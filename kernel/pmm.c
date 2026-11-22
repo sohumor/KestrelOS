@@ -30,16 +30,15 @@ static inline int is_used(uint64_t page)
     return bitmap[page / 8] & (1 << (page % 8));
 }
 
-void pmm_init(struct bootinfo *bi)
+void pmm_init(const struct boot_memory_range *ranges, size_t count)
 {
     memset(bitmap, 0xFF, sizeof(bitmap));
 
-    for (int i = 0; i < bi->e820_count; i++) {
-        struct e820_entry *e = &bi->e820[i];
-        if (e->type != E820_USABLE)
+    for (size_t i = 0; i < count; i++) {
+        if (ranges[i].base >= MAX_PHYS)
             continue;
-        uint64_t start = (e->base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        uint64_t end = (e->base + e->len) & ~(PAGE_SIZE - 1);
+        uint64_t start = (ranges[i].base + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        uint64_t end = ranges[i].end & ~(PAGE_SIZE - 1);
         if (end > MAX_PHYS)
             end = MAX_PHYS;
         for (uint64_t a = start; a < end; a += PAGE_SIZE) {

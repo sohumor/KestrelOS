@@ -346,9 +346,8 @@ void smp_broadcast_reschedule(void)
                 (3U << 18) | SMP_RESCHEDULE_VECTOR); /* all excluding self */
 }
 
-void smp_init(struct bootinfo *bi)
+void smp_init(void)
 {
-    (void)bi;
     uint32_t a, b, c, d;
     cpuid(1, &a, &b, &c, &d);
     uint8_t bsp_id = (uint8_t)(b >> 24);
